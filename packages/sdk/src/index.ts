@@ -1,6 +1,6 @@
-export { AHandServer } from "./server.js";
-export { DeviceConnection } from "./connection.js";
-export type { ExecOptions } from "./connection.js";
-export { Job } from "./job.js";
-export type { JobResult } from "./job.js";
-export { encodeEnvelope, decodeEnvelope, makeEnvelope } from "./codec.js";
+export { AHandServer } from "./server.ts";
+export { DeviceConnection } from "./connection.ts";
+export type { ExecOptions } from "./connection.ts";
+export { Job } from "./job.ts";
+export type { JobResult } from "./job.ts";
+export { encodeEnvelope, decodeEnvelope, makeEnvelope } from "./codec.ts";

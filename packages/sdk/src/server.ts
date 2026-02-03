@@ -1,8 +1,8 @@
 import { EventEmitter } from "node:events";
 import type WebSocket from "ws";
 import type { Envelope as EnvelopeMsg } from "@ahand/proto";
-import { decodeEnvelope } from "./codec.js";
-import { DeviceConnection } from "./connection.js";
+import { decodeEnvelope } from "./codec.ts";
+import { DeviceConnection } from "./connection.ts";
 
 export class AHandServer extends EventEmitter {
   private readonly _devices = new Map<string, DeviceConnection>();

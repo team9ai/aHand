@@ -1,7 +1,7 @@
 import type WebSocket from "ws";
 import type { Hello as HelloMsg, Envelope as EnvelopeMsg } from "@ahand/proto";
-import { encodeEnvelope, makeEnvelope, decodeEnvelope } from "./codec.js";
-import { Job } from "./job.js";
+import { encodeEnvelope, makeEnvelope, decodeEnvelope } from "./codec.ts";
+import { Job } from "./job.ts";
 
 export interface ExecOptions {
   cwd?: string;
