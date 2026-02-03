@@ -5,3 +5,13 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ahand-protocol = { path = "../ahand-protocol" }
+tokio.workspace = true
+prost.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+clap = { version = "4", features = ["derive"] }
+gethostname = "1"

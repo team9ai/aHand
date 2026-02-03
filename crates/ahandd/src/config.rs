@@ -1,0 +1,48 @@
+use serde::Deserialize;
+use std::path::Path;
+
+#[derive(Debug, Deserialize)]
+pub struct Config {
+    /// WebSocket server URL (e.g. "ws://localhost:3000/ws")
+    pub server_url: String,
+
+    /// Unique device identifier. Auto-generated if omitted.
+    pub device_id: Option<String>,
+
+    #[serde(default)]
+    pub policy: PolicyConfig,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PolicyConfig {
+    /// If non-empty, only these tools are allowed.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+
+    /// Working directories that are denied.
+    #[serde(default)]
+    pub denied_paths: Vec<String>,
+}
+
+impl Config {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        let config: Config = toml::from_str(&content)?;
+        Ok(config)
+    }
+
+    pub fn device_id(&self) -> String {
+        self.device_id
+            .clone()
+            .unwrap_or_else(|| uuid_v4())
+    }
+}
+
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{:032x}", ts)
+}

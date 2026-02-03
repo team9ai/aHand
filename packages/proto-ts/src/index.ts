@@ -1,3 +1,13 @@
-// @ahand/proto - generated protocol types
-// This file will re-export ts-proto generated code
-export {};
+export {
+  Envelope,
+  Hello,
+  JobRequest,
+  JobEvent,
+  JobFinished,
+  JobRejected,
+} from "./generated/ahand/v1/envelope.js";
+
+export type {
+  DeepPartial,
+  MessageFns,
+} from "./generated/ahand/v1/envelope.js";

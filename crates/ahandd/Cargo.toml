@@ -1,6 +1,21 @@
 [package]
 name = "ahandd"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
+ahand-protocol = { path = "../ahand-protocol" }
+tokio.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+toml = "0.8"
+futures-util = "0.3"
+gethostname = "1"
+clap = { version = "4", features = ["derive", "env"] }
