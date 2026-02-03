@@ -22,6 +22,7 @@ export interface Envelope {
   jobEvent?: JobEvent | undefined;
   jobFinished?: JobFinished | undefined;
   jobRejected?: JobRejected | undefined;
+  cancelJob?: CancelJob | undefined;
 }
 
 /** Hello - initial handshake after WS connection. */
@@ -73,6 +74,11 @@ export interface JobRejected {
   reason: string;
 }
 
+/** CancelJob - request to cancel a running job. */
+export interface CancelJob {
+  jobId: string;
+}
+
 function createBaseEnvelope(): Envelope {
   return {
     deviceId: "",
@@ -86,6 +92,7 @@ function createBaseEnvelope(): Envelope {
     jobEvent: undefined,
     jobFinished: undefined,
     jobRejected: undefined,
+    cancelJob: undefined,
   };
 }
 
@@ -123,6 +130,9 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.jobRejected !== undefined) {
       JobRejected.encode(message.jobRejected, writer.uint32(114).fork()).join();
+    }
+    if (message.cancelJob !== undefined) {
+      CancelJob.encode(message.cancelJob, writer.uint32(122).fork()).join();
     }
     return writer;
   },
@@ -222,6 +232,14 @@ export const Envelope: MessageFns<Envelope> = {
           message.jobRejected = JobRejected.decode(reader, reader.uint32());
           continue;
         }
+        case 15: {
+          if (tag !== 122) {
+            break;
+          }
+
+          message.cancelJob = CancelJob.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -276,6 +294,11 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.job_rejected)
         ? JobRejected.fromJSON(object.job_rejected)
         : undefined,
+      cancelJob: isSet(object.cancelJob)
+        ? CancelJob.fromJSON(object.cancelJob)
+        : isSet(object.cancel_job)
+        ? CancelJob.fromJSON(object.cancel_job)
+        : undefined,
     };
   },
 
@@ -314,6 +337,9 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.jobRejected !== undefined) {
       obj.jobRejected = JobRejected.toJSON(message.jobRejected);
     }
+    if (message.cancelJob !== undefined) {
+      obj.cancelJob = CancelJob.toJSON(message.cancelJob);
+    }
     return obj;
   },
 
@@ -340,6 +366,9 @@ export const Envelope: MessageFns<Envelope> = {
       : undefined;
     message.jobRejected = (object.jobRejected !== undefined && object.jobRejected !== null)
       ? JobRejected.fromPartial(object.jobRejected)
+      : undefined;
+    message.cancelJob = (object.cancelJob !== undefined && object.cancelJob !== null)
+      ? CancelJob.fromPartial(object.cancelJob)
       : undefined;
     return message;
   },
@@ -1000,6 +1029,70 @@ export const JobRejected: MessageFns<JobRejected> = {
     const message = createBaseJobRejected();
     message.jobId = object.jobId ?? "";
     message.reason = object.reason ?? "";
+    return message;
+  },
+};
+
+function createBaseCancelJob(): CancelJob {
+  return { jobId: "" };
+}
+
+export const CancelJob: MessageFns<CancelJob> = {
+  encode(message: CancelJob, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.jobId !== "") {
+      writer.uint32(10).string(message.jobId);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): CancelJob {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseCancelJob();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.jobId = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): CancelJob {
+    return {
+      jobId: isSet(object.jobId)
+        ? globalThis.String(object.jobId)
+        : isSet(object.job_id)
+        ? globalThis.String(object.job_id)
+        : "",
+    };
+  },
+
+  toJSON(message: CancelJob): unknown {
+    const obj: any = {};
+    if (message.jobId !== "") {
+      obj.jobId = message.jobId;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<CancelJob>): CancelJob {
+    return CancelJob.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<CancelJob>): CancelJob {
+    const message = createBaseCancelJob();
+    message.jobId = object.jobId ?? "";
     return message;
   },
 };

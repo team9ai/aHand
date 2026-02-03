@@ -35,5 +35,6 @@ export function makeEnvelope(
     jobEvent: payload.jobEvent,
     jobFinished: payload.jobFinished,
     jobRejected: payload.jobRejected,
+    cancelJob: payload.cancelJob,
   };
 }

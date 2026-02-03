@@ -5,6 +5,7 @@ export {
   JobEvent,
   JobFinished,
   JobRejected,
+  CancelJob,
 } from "./generated/ahand/v1/envelope.ts";
 
 export type {

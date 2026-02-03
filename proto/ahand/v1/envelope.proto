@@ -17,6 +17,7 @@ message Envelope {
     JobEvent    job_event    = 12;
     JobFinished job_finished = 13;
     JobRejected job_rejected = 14;
+    CancelJob   cancel_job   = 15;
   }
 }
 
@@ -60,4 +61,9 @@ message JobFinished {
 message JobRejected {
   string job_id = 1;
   string reason = 2;
+}
+
+// CancelJob - request to cancel a running job.
+message CancelJob {
+  string job_id = 1;
 }

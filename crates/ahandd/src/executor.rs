@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ahand_protocol::{envelope, job_event, Envelope, JobEvent, JobFinished, JobRequest};
 use prost::Message;
 use tokio::io::AsyncReadExt;
@@ -5,14 +7,28 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::store::RunStore;
+
 /// Runs a job and sends Envelope-wrapped events back via the channel.
+///
+/// Listens on `cancel_rx` for a cancellation signal.  When received the child
+/// process is killed and a `JobFinished` with `error = "cancelled"` is sent.
+///
+/// If a `RunStore` is provided, stdout/stderr chunks and the final result are
+/// persisted to disk.
 pub async fn run_job(
     device_id: String,
     req: JobRequest,
     tx: mpsc::UnboundedSender<Vec<u8>>,
+    mut cancel_rx: mpsc::Receiver<()>,
+    store: Option<Arc<RunStore>>,
 ) {
     let job_id = req.job_id.clone();
     info!(job_id = %job_id, tool = %req.tool, "starting job");
+
+    if let Some(s) = &store {
+        s.start_run(&job_id, &req);
+    }
 
     let mut cmd = Command::new(&req.tool);
     cmd.args(&req.args);
@@ -33,7 +49,7 @@ pub async fn run_job(
         Ok(c) => c,
         Err(e) => {
             warn!(job_id = %job_id, error = %e, "failed to spawn");
-            let _ = send_finished(&device_id, &job_id, -1, &e.to_string(), &tx);
+            finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store);
             return;
         }
     };
@@ -47,6 +63,8 @@ pub async fn run_job(
     let device_id_err = device_id.clone();
     let job_id_out = job_id.clone();
     let job_id_err = job_id.clone();
+    let store_out = store.clone();
+    let store_err = store.clone();
 
     // Stream stdout.
     let stdout_handle = tokio::spawn(async move {
@@ -56,10 +74,14 @@ pub async fn run_job(
                 match out.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
+                        let chunk = &buf[..n];
+                        if let Some(s) = &store_out {
+                            s.append_stdout(&job_id_out, chunk);
+                        }
                         let envelope = make_event_envelope(
                             &device_id_out,
                             &job_id_out,
-                            Some(buf[..n].to_vec()),
+                            Some(chunk.to_vec()),
                             None,
                         );
                         let _ = tx_out.send(encode_envelope(&envelope));
@@ -78,11 +100,15 @@ pub async fn run_job(
                 match err.read(&mut buf).await {
                     Ok(0) => break,
                     Ok(n) => {
+                        let chunk = &buf[..n];
+                        if let Some(s) = &store_err {
+                            s.append_stderr(&job_id_err, chunk);
+                        }
                         let envelope = make_event_envelope(
                             &device_id_err,
                             &job_id_err,
                             None,
-                            Some(buf[..n].to_vec()),
+                            Some(chunk.to_vec()),
                         );
                         let _ = tx_err.send(encode_envelope(&envelope));
                     }
@@ -92,47 +118,78 @@ pub async fn run_job(
         }
     });
 
-    // Await with optional timeout.
+    // Wait for the child, with optional timeout and cancel support.
     let wait_result = if req.timeout_ms > 0 {
         let timeout = std::time::Duration::from_millis(req.timeout_ms);
-        match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(r) => r,
-            Err(_) => {
-                warn!(job_id = %job_id, "job timed out, killing process");
+        tokio::select! {
+            r = tokio::time::timeout(timeout, child.wait()) => {
+                match r {
+                    Ok(r) => Some(r),
+                    Err(_) => {
+                        warn!(job_id = %job_id, "job timed out, killing process");
+                        let _ = child.kill().await;
+                        let _ = stdout_handle.await;
+                        let _ = stderr_handle.await;
+                        finish(&device_id, &job_id, -1, "timeout", &tx, &store);
+                        return;
+                    }
+                }
+            }
+            _ = cancel_rx.recv() => {
+                warn!(job_id = %job_id, "job cancelled, killing process");
                 let _ = child.kill().await;
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
-                let _ = send_finished(&device_id, &job_id, -1, "timeout", &tx);
+                finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
                 return;
             }
         }
     } else {
-        child.wait().await
+        tokio::select! {
+            r = child.wait() => Some(r),
+            _ = cancel_rx.recv() => {
+                warn!(job_id = %job_id, "job cancelled, killing process");
+                let _ = child.kill().await;
+                let _ = stdout_handle.await;
+                let _ = stderr_handle.await;
+                finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
+                return;
+            }
+        }
     };
 
     let _ = stdout_handle.await;
     let _ = stderr_handle.await;
 
     match wait_result {
-        Ok(status) => {
+        Some(Ok(status)) => {
             let code = status.code().unwrap_or(-1);
             info!(job_id = %job_id, exit_code = code, "job finished");
-            let _ = send_finished(&device_id, &job_id, code, "", &tx);
+            finish(&device_id, &job_id, code, "", &tx, &store);
         }
-        Err(e) => {
+        Some(Err(e)) => {
             warn!(job_id = %job_id, error = %e, "job wait error");
-            let _ = send_finished(&device_id, &job_id, -1, &e.to_string(), &tx);
+            finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store);
+        }
+        None => {
+            // Should not happen, but handle gracefully.
+            finish(&device_id, &job_id, -1, "unknown error", &tx, &store);
         }
     }
 }
 
-fn send_finished(
+fn finish(
     device_id: &str,
     job_id: &str,
     exit_code: i32,
     error: &str,
     tx: &mpsc::UnboundedSender<Vec<u8>>,
-) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
+    store: &Option<Arc<RunStore>>,
+) {
+    if let Some(s) = &store {
+        s.finish_run(job_id, exit_code, error);
+    }
+
     let envelope = Envelope {
         device_id: device_id.to_string(),
         msg_id: new_msg_id(),
@@ -144,7 +201,7 @@ fn send_finished(
         })),
         ..Default::default()
     };
-    tx.send(encode_envelope(&envelope))
+    let _ = tx.send(encode_envelope(&envelope));
 }
 
 fn make_event_envelope(

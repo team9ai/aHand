@@ -1,4 +1,4 @@
-use ahand_protocol::{envelope, Envelope, Hello, JobRequest};
+use ahand_protocol::{envelope, CancelJob, Envelope, Hello, JobRequest};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -25,6 +25,11 @@ enum Cmd {
         /// Arguments to the tool
         args: Vec<String>,
     },
+    /// Cancel a running job
+    Cancel {
+        /// Job ID to cancel
+        job_id: String,
+    },
     /// Ping the server (connect, send Hello, disconnect)
     Ping,
 }
@@ -37,6 +42,9 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Cmd::Exec { tool, args: tool_args } => {
             exec(&args.url, &tool, &tool_args).await?;
+        }
+        Cmd::Cancel { job_id } => {
+            cancel(&args.url, &job_id).await?;
         }
         Cmd::Ping => {
             ping(&args.url).await?;
@@ -163,6 +171,51 @@ async fn exec(url: &str, tool: &str, args: &[String]) -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn cancel(url: &str, job_id: &str) -> anyhow::Result<()> {
+    let (mut sink, mut stream, device_id) = connect_and_hello(url).await?;
+
+    let cancel_env = Envelope {
+        device_id: device_id.clone(),
+        msg_id: "cancel-0".to_string(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::CancelJob(CancelJob {
+            job_id: job_id.to_string(),
+        })),
+        ..Default::default()
+    };
+
+    sink.send(tungstenite::Message::Binary(cancel_env.encode_to_vec().into()))
+        .await?;
+
+    eprintln!("[cancel] sent cancel request for job {job_id}");
+
+    // Wait for the JobFinished confirmation.
+    while let Some(msg) = stream.next().await {
+        let msg = msg?;
+        let data = match msg {
+            tungstenite::Message::Binary(b) => b,
+            tungstenite::Message::Close(_) => break,
+            _ => continue,
+        };
+
+        let envelope = Envelope::decode(data.as_ref())?;
+
+        if let Some(envelope::Payload::JobFinished(fin)) = envelope.payload {
+            if fin.job_id == job_id {
+                if fin.error.is_empty() {
+                    eprintln!("[finished] exit_code={}", fin.exit_code);
+                } else {
+                    eprintln!("[finished] exit_code={} error={}", fin.exit_code, fin.error);
+                }
+                break;
+            }
+        }
+    }
+
+    sink.close().await?;
     Ok(())
 }
 

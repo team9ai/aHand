@@ -56,6 +56,24 @@ app.post("/exec", async (c) => {
   return c.json({ jobId: job.jobId, ...result });
 });
 
+app.post("/cancel", async (c) => {
+  const body = await c.req.json<{
+    deviceId?: string;
+    jobId: string;
+  }>();
+
+  const device = body.deviceId
+    ? ahand.device(body.deviceId)
+    : ahand.devices()[0];
+
+  if (!device) {
+    return c.json({ error: "no device connected" }, 404);
+  }
+
+  device.cancelJob(body.jobId);
+  return c.json({ ok: true, jobId: body.jobId });
+});
+
 // ── SDK events ──────────────────────────────────────────────────────
 ahand.onDevice((conn) => {
   console.log(
@@ -75,6 +93,7 @@ const server = serve({ fetch: app.fetch, port: PORT }, () => {
   console.log(`  WebSocket: ws://localhost:${PORT}/ws`);
   console.log(`  Devices:   http://localhost:${PORT}/devices`);
   console.log(`  Exec:      POST http://localhost:${PORT}/exec`);
+  console.log(`  Cancel:    POST http://localhost:${PORT}/cancel`);
 });
 
 injectWebSocket(server);

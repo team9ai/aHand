@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -8,6 +8,12 @@ pub struct Config {
 
     /// Unique device identifier. Auto-generated if omitted.
     pub device_id: Option<String>,
+
+    /// Maximum number of concurrent jobs. Defaults to 8.
+    pub max_concurrent_jobs: Option<usize>,
+
+    /// Directory for trace logs and run artifacts. Defaults to ~/.ahand/data.
+    pub data_dir: Option<String>,
 
     #[serde(default)]
     pub policy: PolicyConfig,
@@ -35,6 +41,19 @@ impl Config {
         self.device_id
             .clone()
             .unwrap_or_else(|| uuid_v4())
+    }
+
+    /// Resolve the data directory path. Returns `None` only if explicitly
+    /// set to an empty string (indicating the user wants persistence disabled).
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        match &self.data_dir {
+            Some(dir) if dir.is_empty() => None,
+            Some(dir) => Some(PathBuf::from(dir)),
+            None => {
+                // Default: ~/.ahand/data
+                dirs::home_dir().map(|h| h.join(".ahand").join("data"))
+            }
+        }
     }
 }
 

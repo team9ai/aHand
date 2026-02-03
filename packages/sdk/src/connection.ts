@@ -58,7 +58,17 @@ export class DeviceConnection {
     });
 
     this._ws.send(encodeEnvelope(envelope));
+
+    job._cancelFn = () => this.cancelJob(jobId);
+
     return job;
+  }
+
+  cancelJob(jobId: string): void {
+    const envelope = makeEnvelope(this.deviceId, {
+      cancelJob: { jobId },
+    });
+    this._ws.send(encodeEnvelope(envelope));
   }
 
   close(): void {

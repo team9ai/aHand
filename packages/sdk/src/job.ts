@@ -14,6 +14,8 @@ export class Job extends EventEmitter {
   readonly jobId: string;
   private _resolve!: (result: JobResult) => void;
   private _reject!: (reason: unknown) => void;
+  /** Callback set by DeviceConnection to send a CancelJob message. */
+  _cancelFn?: () => void;
 
   /** Resolves when the job completes or is rejected. */
   readonly done: Promise<JobResult>;
@@ -25,6 +27,11 @@ export class Job extends EventEmitter {
       this._resolve = resolve;
       this._reject = reject;
     });
+  }
+
+  /** Request cancellation of this job. */
+  cancel(): void {
+    this._cancelFn?.();
   }
 
   /** @internal Called by DeviceConnection when a JobEvent arrives. */
