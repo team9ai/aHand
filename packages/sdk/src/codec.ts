@@ -9,16 +9,14 @@ export function decodeEnvelope(data: Uint8Array): EnvelopeMsg {
   return Envelope.decode(data);
 }
 
-let _seq = 0;
-
 export function nextMsgId(): string {
   return crypto.randomUUID();
 }
 
-export function nextSeq(): number {
-  return ++_seq;
-}
-
+/**
+ * Build an Envelope with seq=0 and ack=0.
+ * The Outbox will overwrite seq/ack via stamp() before sending.
+ */
 export function makeEnvelope(
   deviceId: string,
   payload: Partial<EnvelopeMsg>,
@@ -27,8 +25,8 @@ export function makeEnvelope(
     deviceId,
     traceId: payload.traceId ?? "",
     msgId: nextMsgId(),
-    seq: nextSeq(),
-    ack: payload.ack ?? 0,
+    seq: 0,
+    ack: 0,
     tsMs: Date.now(),
     hello: payload.hello,
     jobRequest: payload.jobRequest,

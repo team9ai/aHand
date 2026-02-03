@@ -1,7 +1,8 @@
 import type WebSocket from "ws";
 import type { Hello as HelloMsg, Envelope as EnvelopeMsg } from "@ahand/proto";
-import { encodeEnvelope, makeEnvelope, decodeEnvelope } from "./codec.ts";
+import { makeEnvelope, decodeEnvelope } from "./codec.ts";
 import { Job } from "./job.ts";
+import { Outbox, prepareOutbound } from "./outbox.ts";
 
 export interface ExecOptions {
   cwd?: string;
@@ -14,11 +15,19 @@ export class DeviceConnection {
   readonly hello: HelloMsg;
   private readonly _ws: WebSocket;
   private readonly _jobs = new Map<string, Job>();
+  /** Outbox for seq/ack tracking. Injected by AHandServer on reconnect. */
+  private _outbox: Outbox;
 
-  constructor(deviceId: string, hello: HelloMsg, ws: WebSocket) {
+  constructor(
+    deviceId: string,
+    hello: HelloMsg,
+    ws: WebSocket,
+    outbox?: Outbox,
+  ) {
     this.deviceId = deviceId;
     this.hello = hello;
     this._ws = ws;
+    this._outbox = outbox ?? new Outbox();
 
     this._ws.on("message", (raw: Buffer) => {
       this._handleMessage(raw);
@@ -41,6 +50,11 @@ export class DeviceConnection {
     return this._ws.readyState === this._ws.OPEN;
   }
 
+  /** @internal Access the outbox (used by AHandServer for reconnect transfer). */
+  get outbox(): Outbox {
+    return this._outbox;
+  }
+
   exec(tool: string, args: string[], opts?: ExecOptions): Job {
     const jobId = crypto.randomUUID();
     const job = new Job(jobId);
@@ -57,7 +71,7 @@ export class DeviceConnection {
       },
     });
 
-    this._ws.send(encodeEnvelope(envelope));
+    this._send(envelope);
 
     job._cancelFn = () => this.cancelJob(jobId);
 
@@ -68,7 +82,7 @@ export class DeviceConnection {
     const envelope = makeEnvelope(this.deviceId, {
       cancelJob: { jobId },
     });
-    this._ws.send(encodeEnvelope(envelope));
+    this._send(envelope);
   }
 
   close(): void {
@@ -85,12 +99,26 @@ export class DeviceConnection {
     };
   }
 
+  /** Stamp via outbox, encode, and send over WS. */
+  private _send(envelope: EnvelopeMsg): void {
+    const data = prepareOutbound(this._outbox, envelope);
+    this._ws.send(data);
+  }
+
   private _handleMessage(raw: Buffer): void {
     let envelope: EnvelopeMsg;
     try {
       envelope = decodeEnvelope(new Uint8Array(raw));
     } catch {
       return;
+    }
+
+    // Update outbox with peer's seq and ack.
+    if (envelope.seq > 0) {
+      this._outbox.onRecv(envelope.seq);
+    }
+    if (envelope.ack > 0) {
+      this._outbox.onPeerAck(envelope.ack);
     }
 
     if (envelope.jobEvent) {

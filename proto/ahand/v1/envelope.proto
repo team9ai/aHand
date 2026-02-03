@@ -27,6 +27,7 @@ message Hello {
   string hostname   = 2;
   string os         = 3;
   repeated string capabilities = 4;
+  uint64 last_ack   = 5;  // on reconnect, the highest seq received from peer
 }
 
 // JobRequest - cloud asks local to execute a tool.

@@ -15,6 +15,13 @@ pub struct Config {
     /// Directory for trace logs and run artifacts. Defaults to ~/.ahand/data.
     pub data_dir: Option<String>,
 
+    /// Enable debug IPC server (Unix socket).
+    #[serde(default)]
+    pub debug_ipc: Option<bool>,
+
+    /// Custom path for the IPC Unix socket. Defaults to ~/.ahand/ahandd.sock.
+    pub ipc_socket_path: Option<String>,
+
     #[serde(default)]
     pub policy: PolicyConfig,
 }
@@ -41,6 +48,17 @@ impl Config {
         self.device_id
             .clone()
             .unwrap_or_else(|| uuid_v4())
+    }
+
+    /// Resolve the IPC socket path. Default: ~/.ahand/ahandd.sock.
+    pub fn ipc_socket_path(&self) -> PathBuf {
+        match &self.ipc_socket_path {
+            Some(p) => PathBuf::from(p),
+            None => dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".ahand")
+                .join("ahandd.sock"),
+        }
     }
 
     /// Resolve the data directory path. Returns `None` only if explicitly

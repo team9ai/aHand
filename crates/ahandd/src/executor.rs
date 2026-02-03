@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use ahand_protocol::{envelope, job_event, Envelope, JobEvent, JobFinished, JobRequest};
-use prost::Message;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -16,13 +15,14 @@ use crate::store::RunStore;
 ///
 /// If a `RunStore` is provided, stdout/stderr chunks and the final result are
 /// persisted to disk.
+/// Returns `(exit_code, error)` for the caller to use (e.g. for idempotency caching).
 pub async fn run_job(
     device_id: String,
     req: JobRequest,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::UnboundedSender<Envelope>,
     mut cancel_rx: mpsc::Receiver<()>,
     store: Option<Arc<RunStore>>,
-) {
+) -> (i32, String) {
     let job_id = req.job_id.clone();
     info!(job_id = %job_id, tool = %req.tool, "starting job");
 
@@ -49,8 +49,7 @@ pub async fn run_job(
         Ok(c) => c,
         Err(e) => {
             warn!(job_id = %job_id, error = %e, "failed to spawn");
-            finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store);
-            return;
+            return finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store);
         }
     };
 
@@ -84,7 +83,7 @@ pub async fn run_job(
                             Some(chunk.to_vec()),
                             None,
                         );
-                        let _ = tx_out.send(encode_envelope(&envelope));
+                        let _ = tx_out.send(envelope);
                     }
                     Err(_) => break,
                 }
@@ -110,7 +109,7 @@ pub async fn run_job(
                             None,
                             Some(chunk.to_vec()),
                         );
-                        let _ = tx_err.send(encode_envelope(&envelope));
+                        let _ = tx_err.send(envelope);
                     }
                     Err(_) => break,
                 }
@@ -130,8 +129,7 @@ pub async fn run_job(
                         let _ = child.kill().await;
                         let _ = stdout_handle.await;
                         let _ = stderr_handle.await;
-                        finish(&device_id, &job_id, -1, "timeout", &tx, &store);
-                        return;
+                        return finish(&device_id, &job_id, -1, "timeout", &tx, &store);
                     }
                 }
             }
@@ -140,8 +138,7 @@ pub async fn run_job(
                 let _ = child.kill().await;
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
-                finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
-                return;
+                return finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
             }
         }
     } else {
@@ -152,8 +149,7 @@ pub async fn run_job(
                 let _ = child.kill().await;
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
-                finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
-                return;
+                return finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
             }
         }
     };
@@ -165,15 +161,15 @@ pub async fn run_job(
         Some(Ok(status)) => {
             let code = status.code().unwrap_or(-1);
             info!(job_id = %job_id, exit_code = code, "job finished");
-            finish(&device_id, &job_id, code, "", &tx, &store);
+            finish(&device_id, &job_id, code, "", &tx, &store)
         }
         Some(Err(e)) => {
             warn!(job_id = %job_id, error = %e, "job wait error");
-            finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store);
+            finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store)
         }
         None => {
             // Should not happen, but handle gracefully.
-            finish(&device_id, &job_id, -1, "unknown error", &tx, &store);
+            finish(&device_id, &job_id, -1, "unknown error", &tx, &store)
         }
     }
 }
@@ -183,9 +179,9 @@ fn finish(
     job_id: &str,
     exit_code: i32,
     error: &str,
-    tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tx: &mpsc::UnboundedSender<Envelope>,
     store: &Option<Arc<RunStore>>,
-) {
+) -> (i32, String) {
     if let Some(s) = &store {
         s.finish_run(job_id, exit_code, error);
     }
@@ -201,7 +197,8 @@ fn finish(
         })),
         ..Default::default()
     };
-    let _ = tx.send(encode_envelope(&envelope));
+    let _ = tx.send(envelope);
+    (exit_code, error.to_string())
 }
 
 fn make_event_envelope(
@@ -226,10 +223,6 @@ fn make_event_envelope(
         })),
         ..Default::default()
     }
-}
-
-fn encode_envelope(envelope: &Envelope) -> Vec<u8> {
-    envelope.encode_to_vec()
 }
 
 fn now_ms() -> u64 {

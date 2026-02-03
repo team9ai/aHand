@@ -3,6 +3,7 @@ import type WebSocket from "ws";
 import type { Envelope as EnvelopeMsg } from "@ahand/proto";
 import { decodeEnvelope } from "./codec.ts";
 import { DeviceConnection } from "./connection.ts";
+import { Outbox } from "./outbox.ts";
 
 export class AHandServer extends EventEmitter {
   private readonly _devices = new Map<string, DeviceConnection>();
@@ -27,13 +28,32 @@ export class AHandServer extends EventEmitter {
       }
 
       const deviceId = envelope.deviceId;
-      const conn = new DeviceConnection(deviceId, envelope.hello, ws);
+      const hello = envelope.hello;
 
-      // Replace existing connection for the same deviceId (reconnect).
+      // On reconnect: transfer the outbox from the old connection.
+      let outbox: Outbox | undefined;
       const existing = this._devices.get(deviceId);
       if (existing) {
+        outbox = existing.outbox;
+
+        // The daemon's Hello carries last_ack — clear acknowledged messages.
+        if (hello.lastAck > 0) {
+          outbox.onPeerAck(hello.lastAck);
+        }
+
         existing.close();
       }
+
+      const conn = new DeviceConnection(deviceId, hello, ws, outbox);
+
+      // Replay unacked messages to the new connection.
+      if (outbox) {
+        const unacked = outbox.drainUnacked();
+        for (const data of unacked) {
+          ws.send(data);
+        }
+      }
+
       this._devices.set(deviceId, conn);
 
       ws.on("close", () => {

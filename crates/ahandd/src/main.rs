@@ -1,12 +1,16 @@
 mod client;
 mod config;
 mod executor;
+mod ipc;
+mod outbox;
 mod policy;
 mod registry;
 mod store;
 
-use clap::Parser;
 use std::path::PathBuf;
+use std::sync::Arc;
+
+use clap::Parser;
 use tracing::info;
 
 #[derive(Parser)]
@@ -27,6 +31,14 @@ struct Args {
     /// Directory for trace logs and run artifacts
     #[arg(long, env = "AHAND_DATA_DIR")]
     data_dir: Option<String>,
+
+    /// Enable debug IPC server (Unix socket)
+    #[arg(long, env = "AHAND_DEBUG_IPC")]
+    debug_ipc: bool,
+
+    /// Custom path for the IPC Unix socket
+    #[arg(long, env = "AHAND_IPC_SOCKET")]
+    ipc_socket: Option<String>,
 }
 
 #[tokio::main]
@@ -47,6 +59,8 @@ async fn main() -> anyhow::Result<()> {
             device_id: None,
             max_concurrent_jobs: None,
             data_dir: None,
+            debug_ipc: None,
+            ipc_socket_path: None,
             policy: Default::default(),
         }
     };
@@ -61,13 +75,63 @@ async fn main() -> anyhow::Result<()> {
     if let Some(data_dir) = args.data_dir {
         cfg.data_dir = Some(data_dir);
     }
+    if args.debug_ipc {
+        cfg.debug_ipc = Some(true);
+    }
+    if let Some(ipc_socket) = args.ipc_socket {
+        cfg.ipc_socket_path = Some(ipc_socket);
+    }
+
+    let device_id = cfg.device_id();
+    let debug_ipc = cfg.debug_ipc.unwrap_or(false);
+    let ipc_socket_path = cfg.ipc_socket_path();
 
     info!(
         server_url = %cfg.server_url,
-        device_id = %cfg.device_id(),
+        device_id = %device_id,
         max_concurrent_jobs = cfg.max_concurrent_jobs.unwrap_or(8),
+        debug_ipc,
         "ahandd starting"
     );
 
-    client::run(cfg).await
+    // Shared resources: registry, store, policy.
+    let max_jobs = cfg.max_concurrent_jobs.unwrap_or(8);
+    let registry = Arc::new(registry::JobRegistry::new(max_jobs));
+
+    let store_opt = match cfg.data_dir() {
+        Some(dir) => match store::RunStore::new(&dir) {
+            Ok(s) => {
+                info!(data_dir = %dir.display(), "run store initialised");
+                Some(Arc::new(s))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to initialise run store, persistence disabled");
+                None
+            }
+        },
+        None => None,
+    };
+
+    let policy = Arc::new(policy::PolicyChecker::new(&cfg.policy));
+
+    if debug_ipc {
+        let ipc_handle = tokio::spawn(ipc::serve_ipc(
+            ipc_socket_path,
+            Arc::clone(&registry),
+            store_opt.clone(),
+            Arc::clone(&policy),
+            device_id.clone(),
+        ));
+
+        // Run WS client and IPC server concurrently.
+        tokio::select! {
+            r = client::run(cfg, device_id, registry, store_opt, policy) => r,
+            r = ipc_handle => {
+                r??;
+                Ok(())
+            }
+        }
+    } else {
+        client::run(cfg, device_id, registry, store_opt, policy).await
+    }
 }

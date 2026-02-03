@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ahand_protocol::{envelope, Envelope, Hello, JobRejected};
+use ahand_protocol::{envelope, Envelope, Hello, JobFinished, JobRejected};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::mpsc;
@@ -9,37 +9,37 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::executor;
+use crate::outbox::{prepare_outbound, Outbox};
 use crate::policy::PolicyChecker;
-use crate::registry::JobRegistry;
+use crate::registry::{IsKnown, JobRegistry};
 use crate::store::{Direction, RunStore};
 
-pub async fn run(config: Config) -> anyhow::Result<()> {
-    let device_id = config.device_id();
-    let policy = PolicyChecker::new(&config.policy);
+pub async fn run(
+    config: Config,
+    device_id: String,
+    registry: Arc<JobRegistry>,
+    store: Option<Arc<RunStore>>,
+    policy: Arc<PolicyChecker>,
+) -> anyhow::Result<()> {
 
-    let max_jobs = config.max_concurrent_jobs.unwrap_or(8);
-    let registry = Arc::new(JobRegistry::new(max_jobs));
-
-    let store = match config.data_dir() {
-        Some(dir) => match RunStore::new(&dir) {
-            Ok(s) => {
-                info!(data_dir = %dir.display(), "run store initialised");
-                Some(Arc::new(s))
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to initialise run store, persistence disabled");
-                None
-            }
-        },
-        None => None,
-    };
+    // Outbox survives across reconnects.
+    let outbox = Arc::new(tokio::sync::Mutex::new(Outbox::new(10_000)));
 
     let mut backoff = 1u64;
 
     loop {
         info!(url = %config.server_url, "connecting to cloud");
 
-        match connect(&config.server_url, &device_id, &policy, &registry, &store).await {
+        match connect(
+            &config.server_url,
+            &device_id,
+            &policy,
+            &registry,
+            &store,
+            &outbox,
+        )
+        .await
+        {
             Ok(()) => {
                 info!("disconnected from cloud");
                 backoff = 1;
@@ -59,16 +59,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 async fn connect(
     url: &str,
     device_id: &str,
-    policy: &PolicyChecker,
+    policy: &Arc<PolicyChecker>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
+    outbox: &Arc<tokio::sync::Mutex<Outbox>>,
 ) -> anyhow::Result<()> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
     let (mut sink, mut stream) = ws_stream.split();
 
-    info!("connected, sending Hello");
+    let last_ack = outbox.lock().await.local_ack();
+    info!(last_ack, "connected, sending Hello");
 
-    // Send Hello envelope.
+    // Send Hello envelope — Hello is NOT stamped (seq=0), it's a connection signal.
     let hello = Envelope {
         device_id: device_id.to_string(),
         msg_id: "hello-0".to_string(),
@@ -80,6 +82,7 @@ async fn connect(
                 .to_string(),
             os: std::env::consts::OS.to_string(),
             capabilities: vec!["exec".to_string()],
+            last_ack,
         })),
         ..Default::default()
     };
@@ -89,19 +92,33 @@ async fn connect(
     }
     sink.send(tungstenite::Message::Binary(data.into())).await?;
 
-    // Channel for sending responses back through the WebSocket.
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Replay unacked messages from previous connection.
+    let unacked = outbox.lock().await.drain_unacked();
+    if !unacked.is_empty() {
+        info!(count = unacked.len(), "replaying unacked messages");
+        for data in unacked {
+            sink.send(tungstenite::Message::Binary(data.into()))
+                .await?;
+        }
+    }
+
+    // Channel: executor sends Envelope objects, send task stamps + encodes + sends.
+    let (tx, mut rx) = mpsc::unbounded_channel::<Envelope>();
 
     let store_send = store.clone();
+    let outbox_send = Arc::clone(outbox);
 
-    // Task: forward outgoing messages to the WebSocket sink.
+    // Task: receive Envelope from executors, stamp with outbox, encode, send over WS.
     let send_handle = tokio::spawn(async move {
-        while let Some(data) = rx.recv().await {
+        while let Some(mut envelope) = rx.recv().await {
+            let data = {
+                let mut ob = outbox_send.lock().await;
+                prepare_outbound(&mut ob, &mut envelope)
+            };
+
             // Log outbound envelopes to trace.
             if let Some(s) = &store_send {
-                if let Ok(env) = Envelope::decode(data.as_slice()) {
-                    s.log_envelope(&env, Direction::Outbound).await;
-                }
+                s.log_envelope(&envelope, Direction::Outbound).await;
             }
             if sink
                 .send(tungstenite::Message::Binary(data.into()))
@@ -142,8 +159,44 @@ async fn connect(
             s.log_envelope(&envelope, Direction::Inbound).await;
         }
 
+        // Update outbox with peer's seq and ack.
+        {
+            let mut ob = outbox.lock().await;
+            if envelope.seq > 0 {
+                ob.on_recv(envelope.seq);
+            }
+            if envelope.ack > 0 {
+                ob.on_peer_ack(envelope.ack);
+            }
+        }
+
         match envelope.payload {
             Some(envelope::Payload::JobRequest(req)) => {
+                // Idempotency check: skip if already running or completed.
+                match registry.is_known(&req.job_id).await {
+                    IsKnown::Running => {
+                        warn!(job_id = %req.job_id, "duplicate job_id, already running — ignoring");
+                        continue;
+                    }
+                    IsKnown::Completed(c) => {
+                        info!(job_id = %req.job_id, "duplicate job_id, returning cached result");
+                        let finished_env = Envelope {
+                            device_id: device_id.to_string(),
+                            msg_id: new_msg_id(),
+                            ts_ms: now_ms(),
+                            payload: Some(envelope::Payload::JobFinished(JobFinished {
+                                job_id: req.job_id.clone(),
+                                exit_code: c.exit_code,
+                                error: c.error,
+                            })),
+                            ..Default::default()
+                        };
+                        let _ = tx.send(finished_env);
+                        continue;
+                    }
+                    IsKnown::Unknown => {}
+                }
+
                 // Check policy.
                 if let Err(reason) = policy.check(&req) {
                     warn!(job_id = %req.job_id, reason = %reason, "job rejected by policy");
@@ -157,7 +210,7 @@ async fn connect(
                         })),
                         ..Default::default()
                     };
-                    let _ = tx.send(reject_env.encode_to_vec());
+                    let _ = tx.send(reject_env);
                 } else {
                     let job_id = req.job_id.clone();
                     let tx_clone = tx.clone();
@@ -175,8 +228,10 @@ async fn connect(
                     // Spawn the job — acquire permit first (may wait if at capacity).
                     tokio::spawn(async move {
                         let _permit = reg.acquire_permit().await;
-                        executor::run_job(did, req, tx_clone, cancel_rx, st).await;
+                        let (exit_code, error) =
+                            executor::run_job(did, req, tx_clone, cancel_rx, st).await;
                         reg.remove(&job_id).await;
+                        reg.mark_completed(job_id, exit_code, error).await;
                     });
                 }
             }

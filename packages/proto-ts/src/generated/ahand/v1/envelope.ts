@@ -31,6 +31,8 @@ export interface Hello {
   hostname: string;
   os: string;
   capabilities: string[];
+  /** on reconnect, the highest seq received from peer */
+  lastAck: number;
 }
 
 /** JobRequest - cloud asks local to execute a tool. */
@@ -375,7 +377,7 @@ export const Envelope: MessageFns<Envelope> = {
 };
 
 function createBaseHello(): Hello {
-  return { version: "", hostname: "", os: "", capabilities: [] };
+  return { version: "", hostname: "", os: "", capabilities: [], lastAck: 0 };
 }
 
 export const Hello: MessageFns<Hello> = {
@@ -391,6 +393,9 @@ export const Hello: MessageFns<Hello> = {
     }
     for (const v of message.capabilities) {
       writer.uint32(34).string(v!);
+    }
+    if (message.lastAck !== 0) {
+      writer.uint32(40).uint64(message.lastAck);
     }
     return writer;
   },
@@ -434,6 +439,14 @@ export const Hello: MessageFns<Hello> = {
           message.capabilities.push(reader.string());
           continue;
         }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.lastAck = longToNumber(reader.uint64());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -451,6 +464,11 @@ export const Hello: MessageFns<Hello> = {
       capabilities: globalThis.Array.isArray(object?.capabilities)
         ? object.capabilities.map((e: any) => globalThis.String(e))
         : [],
+      lastAck: isSet(object.lastAck)
+        ? globalThis.Number(object.lastAck)
+        : isSet(object.last_ack)
+        ? globalThis.Number(object.last_ack)
+        : 0,
     };
   },
 
@@ -468,6 +486,9 @@ export const Hello: MessageFns<Hello> = {
     if (message.capabilities?.length) {
       obj.capabilities = message.capabilities;
     }
+    if (message.lastAck !== 0) {
+      obj.lastAck = Math.round(message.lastAck);
+    }
     return obj;
   },
 
@@ -480,6 +501,7 @@ export const Hello: MessageFns<Hello> = {
     message.hostname = object.hostname ?? "";
     message.os = object.os ?? "";
     message.capabilities = object.capabilities?.map((e) => e) || [];
+    message.lastAck = object.lastAck ?? 0;
     return message;
   },
 };

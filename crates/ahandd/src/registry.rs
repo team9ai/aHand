@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
@@ -9,10 +9,30 @@ struct JobHandle {
     cancel_tx: mpsc::Sender<()>,
 }
 
-/// Tracks running jobs and enforces concurrency limits.
+/// Cached result for a completed job (for idempotency).
+#[derive(Clone)]
+pub struct CompletedJob {
+    pub exit_code: i32,
+    pub error: String,
+}
+
+/// Result of checking whether a job_id is known.
+pub enum IsKnown {
+    /// Job is currently running.
+    Running,
+    /// Job already completed with this result.
+    Completed(CompletedJob),
+    /// Job is unknown (safe to start).
+    Unknown,
+}
+
+/// Tracks running jobs, enforces concurrency limits, and caches completed
+/// job results for idempotency.
 pub struct JobRegistry {
     jobs: Mutex<HashMap<String, JobHandle>>,
     semaphore: Arc<Semaphore>,
+    completed: Mutex<VecDeque<(String, CompletedJob)>>,
+    max_completed: usize,
 }
 
 impl JobRegistry {
@@ -20,6 +40,8 @@ impl JobRegistry {
         Self {
             jobs: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            completed: Mutex::new(VecDeque::new()),
+            max_completed: 1000,
         }
     }
 
@@ -52,10 +74,38 @@ impl JobRegistry {
         }
     }
 
-    /// Remove a completed job from the registry.
+    /// Remove a completed job from the running set.
     pub async fn remove(&self, job_id: &str) {
         let mut jobs = self.jobs.lock().await;
         jobs.remove(job_id);
+    }
+
+    /// Check if a job_id is already known (running or completed).
+    pub async fn is_known(&self, job_id: &str) -> IsKnown {
+        let jobs = self.jobs.lock().await;
+        if jobs.contains_key(job_id) {
+            return IsKnown::Running;
+        }
+        drop(jobs);
+
+        let completed = self.completed.lock().await;
+        for (id, result) in completed.iter() {
+            if id == job_id {
+                return IsKnown::Completed(result.clone());
+            }
+        }
+
+        IsKnown::Unknown
+    }
+
+    /// Record a completed job for idempotency. Evicts the oldest entry
+    /// when over capacity.
+    pub async fn mark_completed(&self, job_id: String, exit_code: i32, error: String) {
+        let mut completed = self.completed.lock().await;
+        completed.push_back((job_id, CompletedJob { exit_code, error }));
+        while completed.len() > self.max_completed {
+            completed.pop_front();
+        }
     }
 
     /// Number of currently running jobs.
