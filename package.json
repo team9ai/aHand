@@ -1,0 +1,23 @@
+{
+  "name": "ahand",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloud AI's local execution gateway",
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "test": "turbo test",
+    "lint": "turbo lint"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.25.0",
+  "pnpm": {
+    "onlyBuiltDependencies": ["@bufbuild/buf", "esbuild"]
+  },
+  "devDependencies": {
+    "turbo": "^2.8.2",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package ahand.v1;
+
+// Envelope wraps all messages on the wire (WS and IPC).
+message Envelope {
+  string device_id = 1;
+  string trace_id  = 2;
+  string msg_id    = 3;
+  uint64 seq       = 4;
+  uint64 ack       = 5;
+  uint64 ts_ms     = 6;
+
+  oneof payload {
+    Hello       hello        = 10;
+    JobRequest  job_request  = 11;
+    JobEvent    job_event    = 12;
+    JobFinished job_finished = 13;
+    JobRejected job_rejected = 14;
+  }
+}
+
+// Hello - initial handshake after WS connection.
+message Hello {
+  string version    = 1;
+  string hostname   = 2;
+  string os         = 3;
+  repeated string capabilities = 4;
+}
+
+// JobRequest - cloud asks local to execute a tool.
+message JobRequest {
+  string job_id = 1;
+  string tool   = 2;  // executable name, e.g. "rg", "git"
+  repeated string args = 3;
+  string cwd    = 4;
+  map<string, string> env = 5;
+  uint64 timeout_ms = 6;
+}
+
+// JobEvent - streaming output from a running job.
+message JobEvent {
+  string job_id = 1;
+
+  oneof event {
+    bytes  stdout_chunk = 2;
+    bytes  stderr_chunk = 3;
+    uint32 progress     = 4;  // 0-100
+  }
+}
+
+// JobFinished - job completed (success or failure).
+message JobFinished {
+  string job_id    = 1;
+  int32  exit_code = 2;
+  string error     = 3;  // empty on success
+}
+
+// JobRejected - local policy rejected the job.
+message JobRejected {
+  string job_id = 1;
+  string reason = 2;
+}

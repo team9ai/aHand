@@ -1,0 +1,24 @@
+{
+  "name": "@ahand/sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AHand cloud control plane SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@ahand/proto": "workspace:*",
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "vitest": "^4.0.18"
+  }
+}
