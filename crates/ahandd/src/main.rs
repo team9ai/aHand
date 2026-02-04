@@ -1,3 +1,4 @@
+mod approval;
 mod client;
 mod config;
 mod executor;
@@ -10,6 +11,7 @@ mod store;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use ahand_protocol::Envelope;
 use clap::Parser;
 use tracing::info;
 
@@ -47,7 +49,9 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let mut cfg = if let Some(path) = &args.config {
+    let config_path = args.config.clone();
+
+    let mut cfg = if let Some(path) = &config_path {
         config::Config::load(path)?
     } else {
         // Build a minimal config from CLI args.
@@ -61,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
             data_dir: None,
             debug_ipc: None,
             ipc_socket_path: None,
+            ipc_socket_mode: None,
             policy: Default::default(),
         }
     };
@@ -85,6 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let device_id = cfg.device_id();
     let debug_ipc = cfg.debug_ipc.unwrap_or(false);
     let ipc_socket_path = cfg.ipc_socket_path();
+    let ipc_socket_mode = cfg.ipc_socket_mode();
 
     info!(
         server_url = %cfg.server_url,
@@ -94,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         "ahandd starting"
     );
 
-    // Shared resources: registry, store, policy.
+    // Shared resources.
     let max_jobs = cfg.max_concurrent_jobs.unwrap_or(8);
     let registry = Arc::new(registry::JobRegistry::new(max_jobs));
 
@@ -113,25 +119,35 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let policy = Arc::new(policy::PolicyChecker::new(&cfg.policy));
+    let approval_mgr = Arc::new(approval::ApprovalManager::new(
+        cfg.policy.approval_timeout_secs,
+    ));
+
+    // Broadcast channel for pushing approval requests to all IPC clients.
+    let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
 
     if debug_ipc {
         let ipc_handle = tokio::spawn(ipc::serve_ipc(
             ipc_socket_path,
+            ipc_socket_mode,
             Arc::clone(&registry),
             store_opt.clone(),
             Arc::clone(&policy),
+            Arc::clone(&approval_mgr),
+            approval_broadcast_tx.clone(),
             device_id.clone(),
+            config_path.clone(),
         ));
 
         // Run WS client and IPC server concurrently.
         tokio::select! {
-            r = client::run(cfg, device_id, registry, store_opt, policy) => r,
+            r = client::run(cfg, device_id, registry, store_opt, policy, approval_mgr, approval_broadcast_tx, config_path) => r,
             r = ipc_handle => {
                 r??;
                 Ok(())
             }
         }
     } else {
-        client::run(cfg, device_id, registry, store_opt, policy).await
+        client::run(cfg, device_id, registry, store_opt, policy, approval_mgr, approval_broadcast_tx, config_path).await
     }
 }

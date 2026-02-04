@@ -1,8 +1,10 @@
-use ahand_protocol::{envelope, CancelJob, Envelope, Hello, JobRequest};
+use ahand_protocol::{
+    envelope, ApprovalResponse, CancelJob, Envelope, Hello, JobRequest, PolicyQuery, PolicyUpdate,
+};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite;
 use tracing::info;
 
@@ -37,6 +39,54 @@ enum Cmd {
     },
     /// Ping the server (connect, send Hello, disconnect)
     Ping,
+    /// Listen for approval requests and respond interactively
+    Approve,
+    /// Query or update the daemon's policy
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// Show current policy
+    Show,
+    /// Add tools to the allowlist
+    AllowTool {
+        /// Tool names to allow
+        tools: Vec<String>,
+    },
+    /// Remove tools from the allowlist
+    DisallowTool {
+        /// Tool names to remove from allowlist
+        tools: Vec<String>,
+    },
+    /// Add tools to the denylist
+    DenyTool {
+        /// Tool names to deny
+        tools: Vec<String>,
+    },
+    /// Remove tools from the denylist
+    UndenyTool {
+        /// Tool names to remove from denylist
+        tools: Vec<String>,
+    },
+    /// Add domains to the allowlist
+    AllowDomain {
+        /// Domain names to allow
+        domains: Vec<String>,
+    },
+    /// Remove domains from the allowlist
+    DisallowDomain {
+        /// Domain names to remove from allowlist
+        domains: Vec<String>,
+    },
+    /// Set approval timeout in seconds
+    SetTimeout {
+        /// Timeout in seconds (0 = no change)
+        seconds: u64,
+    },
 }
 
 #[tokio::main]
@@ -57,6 +107,12 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("Ping is not supported in IPC mode");
                 std::process::exit(1);
             }
+            Cmd::Approve => {
+                ipc_approve(ipc_path).await?;
+            }
+            Cmd::Policy { action } => {
+                ipc_policy(ipc_path, action).await?;
+            }
         }
     } else {
         // WS mode.
@@ -69,6 +125,13 @@ async fn main() -> anyhow::Result<()> {
             }
             Cmd::Ping => {
                 ws_ping(&args.url).await?;
+            }
+            Cmd::Approve => {
+                eprintln!("Approve is only supported in IPC mode (use --ipc <socket>)");
+                std::process::exit(1);
+            }
+            Cmd::Policy { action } => {
+                ws_policy(&args.url, action).await?;
             }
         }
     }
@@ -173,6 +236,16 @@ async fn ipc_exec(socket_path: &str, tool: &str, args: &[String]) -> anyhow::Res
                 eprintln!("[rejected] {}", rej.reason);
                 std::process::exit(1);
             }
+            Some(envelope::Payload::ApprovalRequest(req)) => {
+                if req.job_id != job_id {
+                    continue;
+                }
+                eprintln!("[needs-approval] Job requires approval: {}", req.reason);
+                if !req.detected_domains.is_empty() {
+                    eprintln!("  Detected domains: {}", req.detected_domains.join(", "));
+                }
+                eprintln!("  Run `ahandctl --ipc <socket> approve` in another terminal to approve.");
+            }
             _ => {}
         }
     }
@@ -212,15 +285,15 @@ async fn ipc_cancel(socket_path: &str, job_id: &str) -> anyhow::Result<()> {
 
         let envelope = Envelope::decode(data.as_slice())?;
 
-        if let Some(envelope::Payload::JobFinished(fin)) = envelope.payload {
-            if fin.job_id == job_id {
-                if fin.error.is_empty() {
-                    eprintln!("[finished] exit_code={}", fin.exit_code);
-                } else {
-                    eprintln!("[finished] exit_code={} error={}", fin.exit_code, fin.error);
-                }
-                break;
+        if let Some(envelope::Payload::JobFinished(fin)) = envelope.payload
+            && fin.job_id == job_id
+        {
+            if fin.error.is_empty() {
+                eprintln!("[finished] exit_code={}", fin.exit_code);
+            } else {
+                eprintln!("[finished] exit_code={} error={}", fin.exit_code, fin.error);
             }
+            break;
         }
     }
 
@@ -266,7 +339,7 @@ async fn connect_and_hello(
         ..Default::default()
     };
 
-    sink.send(tungstenite::Message::Binary(hello.encode_to_vec().into()))
+    sink.send(tungstenite::Message::Binary(hello.encode_to_vec()))
         .await?;
 
     Ok((sink, stream, device_id))
@@ -290,7 +363,7 @@ async fn ws_exec(url: &str, tool: &str, args: &[String]) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    sink.send(tungstenite::Message::Binary(req.encode_to_vec().into()))
+    sink.send(tungstenite::Message::Binary(req.encode_to_vec()))
         .await?;
 
     info!(job_id = %job_id, "job submitted, waiting for output...");
@@ -363,7 +436,7 @@ async fn ws_cancel(url: &str, job_id: &str) -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    sink.send(tungstenite::Message::Binary(cancel_env.encode_to_vec().into()))
+    sink.send(tungstenite::Message::Binary(cancel_env.encode_to_vec()))
         .await?;
 
     eprintln!("[cancel] sent cancel request for job {job_id}");
@@ -379,15 +452,15 @@ async fn ws_cancel(url: &str, job_id: &str) -> anyhow::Result<()> {
 
         let envelope = Envelope::decode(data.as_ref())?;
 
-        if let Some(envelope::Payload::JobFinished(fin)) = envelope.payload {
-            if fin.job_id == job_id {
-                if fin.error.is_empty() {
-                    eprintln!("[finished] exit_code={}", fin.exit_code);
-                } else {
-                    eprintln!("[finished] exit_code={} error={}", fin.exit_code, fin.error);
-                }
-                break;
+        if let Some(envelope::Payload::JobFinished(fin)) = envelope.payload
+            && fin.job_id == job_id
+        {
+            if fin.error.is_empty() {
+                eprintln!("[finished] exit_code={}", fin.exit_code);
+            } else {
+                eprintln!("[finished] exit_code={} error={}", fin.exit_code, fin.error);
             }
+            break;
         }
     }
 
@@ -401,6 +474,272 @@ async fn ws_ping(url: &str) -> anyhow::Result<()> {
     sink.close().await?;
     println!("disconnected");
     Ok(())
+}
+
+// ── IPC approve ──────────────────────────────────────────────────────
+
+async fn ipc_approve(socket_path: &str) -> anyhow::Result<()> {
+    let stream = tokio::net::UnixStream::connect(socket_path).await?;
+    let (mut reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(&mut reader);
+
+    let device_id = format!("ctl-{}", std::process::id());
+    eprintln!("[approve] Connected as {device_id}. Listening for approval requests...");
+
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut stdin_lines = stdin.lines();
+
+    loop {
+        let data = match read_frame(&mut reader).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                eprintln!("[approve] Connection closed.");
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let envelope = Envelope::decode(data.as_slice())?;
+
+        if let Some(envelope::Payload::ApprovalRequest(req)) = envelope.payload {
+            eprintln!();
+            eprintln!("[approval] Job {} (from {}) wants to run: {} {}", req.job_id, req.caller_uid, req.tool, req.args.join(" "));
+            if !req.cwd.is_empty() {
+                eprintln!("  Working directory: {}", req.cwd);
+            }
+            eprintln!("  Reason: {}", req.reason);
+            if !req.detected_domains.is_empty() {
+                eprintln!("  Detected domains: {}", req.detected_domains.join(", "));
+            }
+            if req.expires_ms > 0 {
+                let remaining = req.expires_ms.saturating_sub(now_ms());
+                eprintln!("  Expires in: {}s", remaining / 1000);
+            }
+            eprint!("Approve? [y/N/r(emember)]: ");
+
+            // Flush stderr to ensure prompt is visible.
+            let _ = tokio::io::stderr().flush().await;
+
+            let line = match stdin_lines.next_line().await? {
+                Some(l) => l,
+                None => break,
+            };
+            let choice = line.trim().to_lowercase();
+
+            let (approved, remember) = match choice.as_str() {
+                "y" | "yes" => (true, false),
+                "r" | "remember" => (true, true),
+                _ => (false, false),
+            };
+
+            let resp_env = Envelope {
+                device_id: device_id.clone(),
+                msg_id: format!("approve-{}", now_ms()),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::ApprovalResponse(ApprovalResponse {
+                    job_id: req.job_id.clone(),
+                    approved,
+                    remember,
+                })),
+                ..Default::default()
+            };
+            write_frame(&mut writer, &resp_env.encode_to_vec()).await?;
+
+            if approved {
+                eprintln!("[approval] Approved job {}{}", req.job_id, if remember { " (remembered)" } else { "" });
+            } else {
+                eprintln!("[approval] Denied job {}", req.job_id);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ── IPC policy ───────────────────────────────────────────────────────
+
+async fn ipc_policy(socket_path: &str, action: PolicyAction) -> anyhow::Result<()> {
+    let stream = tokio::net::UnixStream::connect(socket_path).await?;
+    let (mut reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(&mut reader);
+
+    let device_id = format!("ctl-{}", std::process::id());
+
+    let request_env = match &action {
+        PolicyAction::Show => Envelope {
+            device_id: device_id.clone(),
+            msg_id: "policy-query-0".to_string(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::PolicyQuery(PolicyQuery {})),
+            ..Default::default()
+        },
+        _ => {
+            let update = build_policy_update(&action);
+            Envelope {
+                device_id: device_id.clone(),
+                msg_id: "policy-update-0".to_string(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::PolicyUpdate(update)),
+                ..Default::default()
+            }
+        }
+    };
+
+    write_frame(&mut writer, &request_env.encode_to_vec()).await?;
+
+    // Wait for PolicyState response.
+    loop {
+        let data = match read_frame(&mut reader).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                eprintln!("[policy] Connection closed before receiving response.");
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let envelope = Envelope::decode(data.as_slice())?;
+
+        if let Some(envelope::Payload::PolicyState(state)) = envelope.payload {
+            print_policy_state(&state);
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+// ── WS policy ────────────────────────────────────────────────────────
+
+async fn ws_policy(url: &str, action: PolicyAction) -> anyhow::Result<()> {
+    let (mut sink, mut stream, device_id) = connect_and_hello(url).await?;
+
+    let request_env = match &action {
+        PolicyAction::Show => Envelope {
+            device_id: device_id.clone(),
+            msg_id: "policy-query-0".to_string(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::PolicyQuery(PolicyQuery {})),
+            ..Default::default()
+        },
+        _ => {
+            let update = build_policy_update(&action);
+            Envelope {
+                device_id: device_id.clone(),
+                msg_id: "policy-update-0".to_string(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::PolicyUpdate(update)),
+                ..Default::default()
+            }
+        }
+    };
+
+    sink.send(tungstenite::Message::Binary(
+        request_env.encode_to_vec(),
+    ))
+    .await?;
+
+    // Wait for PolicyState response.
+    while let Some(msg) = stream.next().await {
+        let msg = msg?;
+        let data = match msg {
+            tungstenite::Message::Binary(b) => b,
+            tungstenite::Message::Close(_) => break,
+            _ => continue,
+        };
+
+        let envelope = Envelope::decode(data.as_ref())?;
+
+        if let Some(envelope::Payload::PolicyState(state)) = envelope.payload {
+            print_policy_state(&state);
+            break;
+        }
+    }
+
+    sink.close().await?;
+    Ok(())
+}
+
+// ── Policy helpers ───────────────────────────────────────────────────
+
+fn build_policy_update(action: &PolicyAction) -> PolicyUpdate {
+    match action {
+        PolicyAction::Show => unreachable!(),
+        PolicyAction::AllowTool { tools } => PolicyUpdate {
+            add_allowed_tools: tools.clone(),
+            ..Default::default()
+        },
+        PolicyAction::DisallowTool { tools } => PolicyUpdate {
+            remove_allowed_tools: tools.clone(),
+            ..Default::default()
+        },
+        PolicyAction::DenyTool { tools } => PolicyUpdate {
+            add_denied_tools: tools.clone(),
+            ..Default::default()
+        },
+        PolicyAction::UndenyTool { tools } => PolicyUpdate {
+            remove_denied_tools: tools.clone(),
+            ..Default::default()
+        },
+        PolicyAction::AllowDomain { domains } => PolicyUpdate {
+            add_allowed_domains: domains.clone(),
+            ..Default::default()
+        },
+        PolicyAction::DisallowDomain { domains } => PolicyUpdate {
+            remove_allowed_domains: domains.clone(),
+            ..Default::default()
+        },
+        PolicyAction::SetTimeout { seconds } => PolicyUpdate {
+            approval_timeout_secs: *seconds,
+            ..Default::default()
+        },
+    }
+}
+
+fn print_policy_state(state: &ahand_protocol::PolicyState) {
+    println!("Policy:");
+    println!("  Allowed tools:   {}", format_list(&state.allowed_tools));
+    println!("  Denied tools:    {}", format_list(&state.denied_tools));
+    println!("  Denied paths:    {}", format_list(&state.denied_paths));
+    println!("  Allowed domains: {}", format_list(&state.allowed_domains));
+    println!(
+        "  Approval timeout: {}s ({})",
+        state.approval_timeout_secs,
+        humanize_duration(state.approval_timeout_secs)
+    );
+}
+
+fn format_list(items: &[String]) -> String {
+    if items.is_empty() {
+        "(none)".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
+fn humanize_duration(secs: u64) -> String {
+    if secs >= 86400 {
+        let days = secs / 86400;
+        let hours = (secs % 86400) / 3600;
+        if hours > 0 {
+            format!("{days}d {hours}h")
+        } else {
+            format!("{days}d")
+        }
+    } else if secs >= 3600 {
+        let hours = secs / 3600;
+        let mins = (secs % 3600) / 60;
+        if mins > 0 {
+            format!("{hours}h {mins}m")
+        } else {
+            format!("{hours}h")
+        }
+    } else if secs >= 60 {
+        let mins = secs / 60;
+        format!("{mins}m")
+    } else {
+        format!("{secs}s")
+    }
 }
 
 fn now_ms() -> u64 {

@@ -78,6 +78,7 @@ impl Outbox {
     }
 
     /// Number of buffered (unacked) messages.
+    #[allow(dead_code)]
     pub fn pending_count(&self) -> usize {
         self.buffer.len()
     }

@@ -1,0 +1,13 @@
+{
+  "name": "@ahand/ctl",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AHand CLI control tool",
+  "scripts": {
+    "build": "cargo build -p ahandctl",
+    "build:release": "cargo build -p ahandctl --release",
+    "start": "cargo run -p ahandctl --release",
+    "lint": "cargo clippy -p ahandctl -- -D warnings",
+    "test": "cargo test -p ahandctl"
+  }
+}

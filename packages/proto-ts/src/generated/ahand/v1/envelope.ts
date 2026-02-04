@@ -23,6 +23,11 @@ export interface Envelope {
   jobFinished?: JobFinished | undefined;
   jobRejected?: JobRejected | undefined;
   cancelJob?: CancelJob | undefined;
+  approvalRequest?: ApprovalRequest | undefined;
+  approvalResponse?: ApprovalResponse | undefined;
+  policyQuery?: PolicyQuery | undefined;
+  policyState?: PolicyState | undefined;
+  policyUpdate?: PolicyUpdate | undefined;
 }
 
 /** Hello - initial handshake after WS connection. */
@@ -81,6 +86,55 @@ export interface CancelJob {
   jobId: string;
 }
 
+/** ApprovalRequest - daemon asks user to approve a job that is not in the allowlist. */
+export interface ApprovalRequest {
+  jobId: string;
+  tool: string;
+  args: string[];
+  cwd: string;
+  reason: string;
+  detectedDomains: string[];
+  /** absolute timestamp when this request expires */
+  expiresMs: number;
+  /** who submitted the job (IPC="uid:N", WS="cloud") */
+  callerUid: string;
+}
+
+/** ApprovalResponse - user responds to an approval request. */
+export interface ApprovalResponse {
+  jobId: string;
+  approved: boolean;
+  /** if true, remember approval for this user's session */
+  remember: boolean;
+}
+
+/** PolicyQuery - request the current policy configuration. */
+export interface PolicyQuery {
+}
+
+/** PolicyState - snapshot of the current policy (response to query or update). */
+export interface PolicyState {
+  allowedTools: string[];
+  deniedTools: string[];
+  deniedPaths: string[];
+  allowedDomains: string[];
+  approvalTimeoutSecs: number;
+}
+
+/** PolicyUpdate - incremental policy modification. Empty lists = no change. */
+export interface PolicyUpdate {
+  addAllowedTools: string[];
+  removeAllowedTools: string[];
+  addDeniedTools: string[];
+  removeDeniedTools: string[];
+  addAllowedDomains: string[];
+  removeAllowedDomains: string[];
+  addDeniedPaths: string[];
+  removeDeniedPaths: string[];
+  /** 0 = don't change */
+  approvalTimeoutSecs: number;
+}
+
 function createBaseEnvelope(): Envelope {
   return {
     deviceId: "",
@@ -95,6 +149,11 @@ function createBaseEnvelope(): Envelope {
     jobFinished: undefined,
     jobRejected: undefined,
     cancelJob: undefined,
+    approvalRequest: undefined,
+    approvalResponse: undefined,
+    policyQuery: undefined,
+    policyState: undefined,
+    policyUpdate: undefined,
   };
 }
 
@@ -135,6 +194,21 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.cancelJob !== undefined) {
       CancelJob.encode(message.cancelJob, writer.uint32(122).fork()).join();
+    }
+    if (message.approvalRequest !== undefined) {
+      ApprovalRequest.encode(message.approvalRequest, writer.uint32(130).fork()).join();
+    }
+    if (message.approvalResponse !== undefined) {
+      ApprovalResponse.encode(message.approvalResponse, writer.uint32(138).fork()).join();
+    }
+    if (message.policyQuery !== undefined) {
+      PolicyQuery.encode(message.policyQuery, writer.uint32(146).fork()).join();
+    }
+    if (message.policyState !== undefined) {
+      PolicyState.encode(message.policyState, writer.uint32(154).fork()).join();
+    }
+    if (message.policyUpdate !== undefined) {
+      PolicyUpdate.encode(message.policyUpdate, writer.uint32(162).fork()).join();
     }
     return writer;
   },
@@ -242,6 +316,46 @@ export const Envelope: MessageFns<Envelope> = {
           message.cancelJob = CancelJob.decode(reader, reader.uint32());
           continue;
         }
+        case 16: {
+          if (tag !== 130) {
+            break;
+          }
+
+          message.approvalRequest = ApprovalRequest.decode(reader, reader.uint32());
+          continue;
+        }
+        case 17: {
+          if (tag !== 138) {
+            break;
+          }
+
+          message.approvalResponse = ApprovalResponse.decode(reader, reader.uint32());
+          continue;
+        }
+        case 18: {
+          if (tag !== 146) {
+            break;
+          }
+
+          message.policyQuery = PolicyQuery.decode(reader, reader.uint32());
+          continue;
+        }
+        case 19: {
+          if (tag !== 154) {
+            break;
+          }
+
+          message.policyState = PolicyState.decode(reader, reader.uint32());
+          continue;
+        }
+        case 20: {
+          if (tag !== 162) {
+            break;
+          }
+
+          message.policyUpdate = PolicyUpdate.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -301,6 +415,31 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.cancel_job)
         ? CancelJob.fromJSON(object.cancel_job)
         : undefined,
+      approvalRequest: isSet(object.approvalRequest)
+        ? ApprovalRequest.fromJSON(object.approvalRequest)
+        : isSet(object.approval_request)
+        ? ApprovalRequest.fromJSON(object.approval_request)
+        : undefined,
+      approvalResponse: isSet(object.approvalResponse)
+        ? ApprovalResponse.fromJSON(object.approvalResponse)
+        : isSet(object.approval_response)
+        ? ApprovalResponse.fromJSON(object.approval_response)
+        : undefined,
+      policyQuery: isSet(object.policyQuery)
+        ? PolicyQuery.fromJSON(object.policyQuery)
+        : isSet(object.policy_query)
+        ? PolicyQuery.fromJSON(object.policy_query)
+        : undefined,
+      policyState: isSet(object.policyState)
+        ? PolicyState.fromJSON(object.policyState)
+        : isSet(object.policy_state)
+        ? PolicyState.fromJSON(object.policy_state)
+        : undefined,
+      policyUpdate: isSet(object.policyUpdate)
+        ? PolicyUpdate.fromJSON(object.policyUpdate)
+        : isSet(object.policy_update)
+        ? PolicyUpdate.fromJSON(object.policy_update)
+        : undefined,
     };
   },
 
@@ -342,6 +481,21 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.cancelJob !== undefined) {
       obj.cancelJob = CancelJob.toJSON(message.cancelJob);
     }
+    if (message.approvalRequest !== undefined) {
+      obj.approvalRequest = ApprovalRequest.toJSON(message.approvalRequest);
+    }
+    if (message.approvalResponse !== undefined) {
+      obj.approvalResponse = ApprovalResponse.toJSON(message.approvalResponse);
+    }
+    if (message.policyQuery !== undefined) {
+      obj.policyQuery = PolicyQuery.toJSON(message.policyQuery);
+    }
+    if (message.policyState !== undefined) {
+      obj.policyState = PolicyState.toJSON(message.policyState);
+    }
+    if (message.policyUpdate !== undefined) {
+      obj.policyUpdate = PolicyUpdate.toJSON(message.policyUpdate);
+    }
     return obj;
   },
 
@@ -371,6 +525,21 @@ export const Envelope: MessageFns<Envelope> = {
       : undefined;
     message.cancelJob = (object.cancelJob !== undefined && object.cancelJob !== null)
       ? CancelJob.fromPartial(object.cancelJob)
+      : undefined;
+    message.approvalRequest = (object.approvalRequest !== undefined && object.approvalRequest !== null)
+      ? ApprovalRequest.fromPartial(object.approvalRequest)
+      : undefined;
+    message.approvalResponse = (object.approvalResponse !== undefined && object.approvalResponse !== null)
+      ? ApprovalResponse.fromPartial(object.approvalResponse)
+      : undefined;
+    message.policyQuery = (object.policyQuery !== undefined && object.policyQuery !== null)
+      ? PolicyQuery.fromPartial(object.policyQuery)
+      : undefined;
+    message.policyState = (object.policyState !== undefined && object.policyState !== null)
+      ? PolicyState.fromPartial(object.policyState)
+      : undefined;
+    message.policyUpdate = (object.policyUpdate !== undefined && object.policyUpdate !== null)
+      ? PolicyUpdate.fromPartial(object.policyUpdate)
       : undefined;
     return message;
   },
@@ -1115,6 +1284,711 @@ export const CancelJob: MessageFns<CancelJob> = {
   fromPartial(object: DeepPartial<CancelJob>): CancelJob {
     const message = createBaseCancelJob();
     message.jobId = object.jobId ?? "";
+    return message;
+  },
+};
+
+function createBaseApprovalRequest(): ApprovalRequest {
+  return { jobId: "", tool: "", args: [], cwd: "", reason: "", detectedDomains: [], expiresMs: 0, callerUid: "" };
+}
+
+export const ApprovalRequest: MessageFns<ApprovalRequest> = {
+  encode(message: ApprovalRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.jobId !== "") {
+      writer.uint32(10).string(message.jobId);
+    }
+    if (message.tool !== "") {
+      writer.uint32(18).string(message.tool);
+    }
+    for (const v of message.args) {
+      writer.uint32(26).string(v!);
+    }
+    if (message.cwd !== "") {
+      writer.uint32(34).string(message.cwd);
+    }
+    if (message.reason !== "") {
+      writer.uint32(42).string(message.reason);
+    }
+    for (const v of message.detectedDomains) {
+      writer.uint32(50).string(v!);
+    }
+    if (message.expiresMs !== 0) {
+      writer.uint32(56).uint64(message.expiresMs);
+    }
+    if (message.callerUid !== "") {
+      writer.uint32(66).string(message.callerUid);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ApprovalRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseApprovalRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.jobId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.tool = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.args.push(reader.string());
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.cwd = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.reason = reader.string();
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.detectedDomains.push(reader.string());
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.expiresMs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.callerUid = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ApprovalRequest {
+    return {
+      jobId: isSet(object.jobId)
+        ? globalThis.String(object.jobId)
+        : isSet(object.job_id)
+        ? globalThis.String(object.job_id)
+        : "",
+      tool: isSet(object.tool) ? globalThis.String(object.tool) : "",
+      args: globalThis.Array.isArray(object?.args) ? object.args.map((e: any) => globalThis.String(e)) : [],
+      cwd: isSet(object.cwd) ? globalThis.String(object.cwd) : "",
+      reason: isSet(object.reason) ? globalThis.String(object.reason) : "",
+      detectedDomains: globalThis.Array.isArray(object?.detectedDomains)
+        ? object.detectedDomains.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.detected_domains)
+        ? object.detected_domains.map((e: any) => globalThis.String(e))
+        : [],
+      expiresMs: isSet(object.expiresMs)
+        ? globalThis.Number(object.expiresMs)
+        : isSet(object.expires_ms)
+        ? globalThis.Number(object.expires_ms)
+        : 0,
+      callerUid: isSet(object.callerUid)
+        ? globalThis.String(object.callerUid)
+        : isSet(object.caller_uid)
+        ? globalThis.String(object.caller_uid)
+        : "",
+    };
+  },
+
+  toJSON(message: ApprovalRequest): unknown {
+    const obj: any = {};
+    if (message.jobId !== "") {
+      obj.jobId = message.jobId;
+    }
+    if (message.tool !== "") {
+      obj.tool = message.tool;
+    }
+    if (message.args?.length) {
+      obj.args = message.args;
+    }
+    if (message.cwd !== "") {
+      obj.cwd = message.cwd;
+    }
+    if (message.reason !== "") {
+      obj.reason = message.reason;
+    }
+    if (message.detectedDomains?.length) {
+      obj.detectedDomains = message.detectedDomains;
+    }
+    if (message.expiresMs !== 0) {
+      obj.expiresMs = Math.round(message.expiresMs);
+    }
+    if (message.callerUid !== "") {
+      obj.callerUid = message.callerUid;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ApprovalRequest>): ApprovalRequest {
+    return ApprovalRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ApprovalRequest>): ApprovalRequest {
+    const message = createBaseApprovalRequest();
+    message.jobId = object.jobId ?? "";
+    message.tool = object.tool ?? "";
+    message.args = object.args?.map((e) => e) || [];
+    message.cwd = object.cwd ?? "";
+    message.reason = object.reason ?? "";
+    message.detectedDomains = object.detectedDomains?.map((e) => e) || [];
+    message.expiresMs = object.expiresMs ?? 0;
+    message.callerUid = object.callerUid ?? "";
+    return message;
+  },
+};
+
+function createBaseApprovalResponse(): ApprovalResponse {
+  return { jobId: "", approved: false, remember: false };
+}
+
+export const ApprovalResponse: MessageFns<ApprovalResponse> = {
+  encode(message: ApprovalResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.jobId !== "") {
+      writer.uint32(10).string(message.jobId);
+    }
+    if (message.approved !== false) {
+      writer.uint32(16).bool(message.approved);
+    }
+    if (message.remember !== false) {
+      writer.uint32(24).bool(message.remember);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ApprovalResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseApprovalResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.jobId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.approved = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.remember = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ApprovalResponse {
+    return {
+      jobId: isSet(object.jobId)
+        ? globalThis.String(object.jobId)
+        : isSet(object.job_id)
+        ? globalThis.String(object.job_id)
+        : "",
+      approved: isSet(object.approved) ? globalThis.Boolean(object.approved) : false,
+      remember: isSet(object.remember) ? globalThis.Boolean(object.remember) : false,
+    };
+  },
+
+  toJSON(message: ApprovalResponse): unknown {
+    const obj: any = {};
+    if (message.jobId !== "") {
+      obj.jobId = message.jobId;
+    }
+    if (message.approved !== false) {
+      obj.approved = message.approved;
+    }
+    if (message.remember !== false) {
+      obj.remember = message.remember;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ApprovalResponse>): ApprovalResponse {
+    return ApprovalResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ApprovalResponse>): ApprovalResponse {
+    const message = createBaseApprovalResponse();
+    message.jobId = object.jobId ?? "";
+    message.approved = object.approved ?? false;
+    message.remember = object.remember ?? false;
+    return message;
+  },
+};
+
+function createBasePolicyQuery(): PolicyQuery {
+  return {};
+}
+
+export const PolicyQuery: MessageFns<PolicyQuery> = {
+  encode(_: PolicyQuery, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PolicyQuery {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePolicyQuery();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(_: any): PolicyQuery {
+    return {};
+  },
+
+  toJSON(_: PolicyQuery): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create(base?: DeepPartial<PolicyQuery>): PolicyQuery {
+    return PolicyQuery.fromPartial(base ?? {});
+  },
+  fromPartial(_: DeepPartial<PolicyQuery>): PolicyQuery {
+    const message = createBasePolicyQuery();
+    return message;
+  },
+};
+
+function createBasePolicyState(): PolicyState {
+  return { allowedTools: [], deniedTools: [], deniedPaths: [], allowedDomains: [], approvalTimeoutSecs: 0 };
+}
+
+export const PolicyState: MessageFns<PolicyState> = {
+  encode(message: PolicyState, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.allowedTools) {
+      writer.uint32(10).string(v!);
+    }
+    for (const v of message.deniedTools) {
+      writer.uint32(18).string(v!);
+    }
+    for (const v of message.deniedPaths) {
+      writer.uint32(26).string(v!);
+    }
+    for (const v of message.allowedDomains) {
+      writer.uint32(34).string(v!);
+    }
+    if (message.approvalTimeoutSecs !== 0) {
+      writer.uint32(40).uint64(message.approvalTimeoutSecs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PolicyState {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePolicyState();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.allowedTools.push(reader.string());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.deniedTools.push(reader.string());
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.deniedPaths.push(reader.string());
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.allowedDomains.push(reader.string());
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.approvalTimeoutSecs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PolicyState {
+    return {
+      allowedTools: globalThis.Array.isArray(object?.allowedTools)
+        ? object.allowedTools.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.allowed_tools)
+        ? object.allowed_tools.map((e: any) => globalThis.String(e))
+        : [],
+      deniedTools: globalThis.Array.isArray(object?.deniedTools)
+        ? object.deniedTools.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.denied_tools)
+        ? object.denied_tools.map((e: any) => globalThis.String(e))
+        : [],
+      deniedPaths: globalThis.Array.isArray(object?.deniedPaths)
+        ? object.deniedPaths.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.denied_paths)
+        ? object.denied_paths.map((e: any) => globalThis.String(e))
+        : [],
+      allowedDomains: globalThis.Array.isArray(object?.allowedDomains)
+        ? object.allowedDomains.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.allowed_domains)
+        ? object.allowed_domains.map((e: any) => globalThis.String(e))
+        : [],
+      approvalTimeoutSecs: isSet(object.approvalTimeoutSecs)
+        ? globalThis.Number(object.approvalTimeoutSecs)
+        : isSet(object.approval_timeout_secs)
+        ? globalThis.Number(object.approval_timeout_secs)
+        : 0,
+    };
+  },
+
+  toJSON(message: PolicyState): unknown {
+    const obj: any = {};
+    if (message.allowedTools?.length) {
+      obj.allowedTools = message.allowedTools;
+    }
+    if (message.deniedTools?.length) {
+      obj.deniedTools = message.deniedTools;
+    }
+    if (message.deniedPaths?.length) {
+      obj.deniedPaths = message.deniedPaths;
+    }
+    if (message.allowedDomains?.length) {
+      obj.allowedDomains = message.allowedDomains;
+    }
+    if (message.approvalTimeoutSecs !== 0) {
+      obj.approvalTimeoutSecs = Math.round(message.approvalTimeoutSecs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PolicyState>): PolicyState {
+    return PolicyState.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PolicyState>): PolicyState {
+    const message = createBasePolicyState();
+    message.allowedTools = object.allowedTools?.map((e) => e) || [];
+    message.deniedTools = object.deniedTools?.map((e) => e) || [];
+    message.deniedPaths = object.deniedPaths?.map((e) => e) || [];
+    message.allowedDomains = object.allowedDomains?.map((e) => e) || [];
+    message.approvalTimeoutSecs = object.approvalTimeoutSecs ?? 0;
+    return message;
+  },
+};
+
+function createBasePolicyUpdate(): PolicyUpdate {
+  return {
+    addAllowedTools: [],
+    removeAllowedTools: [],
+    addDeniedTools: [],
+    removeDeniedTools: [],
+    addAllowedDomains: [],
+    removeAllowedDomains: [],
+    addDeniedPaths: [],
+    removeDeniedPaths: [],
+    approvalTimeoutSecs: 0,
+  };
+}
+
+export const PolicyUpdate: MessageFns<PolicyUpdate> = {
+  encode(message: PolicyUpdate, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.addAllowedTools) {
+      writer.uint32(10).string(v!);
+    }
+    for (const v of message.removeAllowedTools) {
+      writer.uint32(18).string(v!);
+    }
+    for (const v of message.addDeniedTools) {
+      writer.uint32(26).string(v!);
+    }
+    for (const v of message.removeDeniedTools) {
+      writer.uint32(34).string(v!);
+    }
+    for (const v of message.addAllowedDomains) {
+      writer.uint32(42).string(v!);
+    }
+    for (const v of message.removeAllowedDomains) {
+      writer.uint32(50).string(v!);
+    }
+    for (const v of message.addDeniedPaths) {
+      writer.uint32(58).string(v!);
+    }
+    for (const v of message.removeDeniedPaths) {
+      writer.uint32(66).string(v!);
+    }
+    if (message.approvalTimeoutSecs !== 0) {
+      writer.uint32(72).uint64(message.approvalTimeoutSecs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PolicyUpdate {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePolicyUpdate();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.addAllowedTools.push(reader.string());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.removeAllowedTools.push(reader.string());
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.addDeniedTools.push(reader.string());
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.removeDeniedTools.push(reader.string());
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.addAllowedDomains.push(reader.string());
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.removeAllowedDomains.push(reader.string());
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.addDeniedPaths.push(reader.string());
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.removeDeniedPaths.push(reader.string());
+          continue;
+        }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.approvalTimeoutSecs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PolicyUpdate {
+    return {
+      addAllowedTools: globalThis.Array.isArray(object?.addAllowedTools)
+        ? object.addAllowedTools.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.add_allowed_tools)
+        ? object.add_allowed_tools.map((e: any) => globalThis.String(e))
+        : [],
+      removeAllowedTools: globalThis.Array.isArray(object?.removeAllowedTools)
+        ? object.removeAllowedTools.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.remove_allowed_tools)
+        ? object.remove_allowed_tools.map((e: any) => globalThis.String(e))
+        : [],
+      addDeniedTools: globalThis.Array.isArray(object?.addDeniedTools)
+        ? object.addDeniedTools.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.add_denied_tools)
+        ? object.add_denied_tools.map((e: any) => globalThis.String(e))
+        : [],
+      removeDeniedTools: globalThis.Array.isArray(object?.removeDeniedTools)
+        ? object.removeDeniedTools.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.remove_denied_tools)
+        ? object.remove_denied_tools.map((e: any) => globalThis.String(e))
+        : [],
+      addAllowedDomains: globalThis.Array.isArray(object?.addAllowedDomains)
+        ? object.addAllowedDomains.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.add_allowed_domains)
+        ? object.add_allowed_domains.map((e: any) => globalThis.String(e))
+        : [],
+      removeAllowedDomains: globalThis.Array.isArray(object?.removeAllowedDomains)
+        ? object.removeAllowedDomains.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.remove_allowed_domains)
+        ? object.remove_allowed_domains.map((e: any) => globalThis.String(e))
+        : [],
+      addDeniedPaths: globalThis.Array.isArray(object?.addDeniedPaths)
+        ? object.addDeniedPaths.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.add_denied_paths)
+        ? object.add_denied_paths.map((e: any) => globalThis.String(e))
+        : [],
+      removeDeniedPaths: globalThis.Array.isArray(object?.removeDeniedPaths)
+        ? object.removeDeniedPaths.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.remove_denied_paths)
+        ? object.remove_denied_paths.map((e: any) => globalThis.String(e))
+        : [],
+      approvalTimeoutSecs: isSet(object.approvalTimeoutSecs)
+        ? globalThis.Number(object.approvalTimeoutSecs)
+        : isSet(object.approval_timeout_secs)
+        ? globalThis.Number(object.approval_timeout_secs)
+        : 0,
+    };
+  },
+
+  toJSON(message: PolicyUpdate): unknown {
+    const obj: any = {};
+    if (message.addAllowedTools?.length) {
+      obj.addAllowedTools = message.addAllowedTools;
+    }
+    if (message.removeAllowedTools?.length) {
+      obj.removeAllowedTools = message.removeAllowedTools;
+    }
+    if (message.addDeniedTools?.length) {
+      obj.addDeniedTools = message.addDeniedTools;
+    }
+    if (message.removeDeniedTools?.length) {
+      obj.removeDeniedTools = message.removeDeniedTools;
+    }
+    if (message.addAllowedDomains?.length) {
+      obj.addAllowedDomains = message.addAllowedDomains;
+    }
+    if (message.removeAllowedDomains?.length) {
+      obj.removeAllowedDomains = message.removeAllowedDomains;
+    }
+    if (message.addDeniedPaths?.length) {
+      obj.addDeniedPaths = message.addDeniedPaths;
+    }
+    if (message.removeDeniedPaths?.length) {
+      obj.removeDeniedPaths = message.removeDeniedPaths;
+    }
+    if (message.approvalTimeoutSecs !== 0) {
+      obj.approvalTimeoutSecs = Math.round(message.approvalTimeoutSecs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PolicyUpdate>): PolicyUpdate {
+    return PolicyUpdate.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PolicyUpdate>): PolicyUpdate {
+    const message = createBasePolicyUpdate();
+    message.addAllowedTools = object.addAllowedTools?.map((e) => e) || [];
+    message.removeAllowedTools = object.removeAllowedTools?.map((e) => e) || [];
+    message.addDeniedTools = object.addDeniedTools?.map((e) => e) || [];
+    message.removeDeniedTools = object.removeDeniedTools?.map((e) => e) || [];
+    message.addAllowedDomains = object.addAllowedDomains?.map((e) => e) || [];
+    message.removeAllowedDomains = object.removeAllowedDomains?.map((e) => e) || [];
+    message.addDeniedPaths = object.addDeniedPaths?.map((e) => e) || [];
+    message.removeDeniedPaths = object.removeDeniedPaths?.map((e) => e) || [];
+    message.approvalTimeoutSecs = object.approvalTimeoutSecs ?? 0;
     return message;
   },
 };

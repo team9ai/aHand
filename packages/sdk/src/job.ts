@@ -3,6 +3,7 @@ import type {
   Envelope as EnvelopeMsg,
   JobFinished as JobFinishedMsg,
   JobRejected as JobRejectedMsg,
+  ApprovalRequest as ApprovalRequestMsg,
 } from "@ahand/proto";
 
 export interface JobResult {
@@ -64,5 +65,10 @@ export class Job extends EventEmitter {
   _onRejected(msg: JobRejectedMsg): void {
     this.emit("rejected", msg.reason);
     this._resolve({ exitCode: -1, error: msg.reason });
+  }
+
+  /** @internal Called when the job needs approval. */
+  _onApprovalRequest(msg: ApprovalRequestMsg): void {
+    this.emit("approvalRequest", msg);
   }
 }

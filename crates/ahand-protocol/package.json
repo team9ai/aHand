@@ -1,0 +1,11 @@
+{
+  "name": "@ahand/protocol",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rust protobuf types for ahand protocol (prost)",
+  "scripts": {
+    "build": "cargo build -p ahand-protocol",
+    "lint": "cargo clippy -p ahand-protocol -- -D warnings",
+    "test": "cargo test -p ahand-protocol"
+  }
+}

@@ -138,6 +138,11 @@ fn describe_payload(envelope: &Envelope) -> &'static str {
         Some(Payload::JobFinished(_)) => "JobFinished",
         Some(Payload::JobRejected(_)) => "JobRejected",
         Some(Payload::CancelJob(_)) => "CancelJob",
+        Some(Payload::ApprovalRequest(_)) => "ApprovalRequest",
+        Some(Payload::ApprovalResponse(_)) => "ApprovalResponse",
+        Some(Payload::PolicyQuery(_)) => "PolicyQuery",
+        Some(Payload::PolicyState(_)) => "PolicyState",
+        Some(Payload::PolicyUpdate(_)) => "PolicyUpdate",
         None => "none",
     }
 }

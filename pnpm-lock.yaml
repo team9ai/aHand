@@ -43,6 +43,12 @@ importers:
         specifier: ^4.21.0
         version: 4.21.0
 
+  crates/ahand-protocol: {}
+
+  crates/ahandctl: {}
+
+  crates/ahandd: {}
+
   packages/proto-ts:
     dependencies:
       '@bufbuild/protobuf':

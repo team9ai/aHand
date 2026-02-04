@@ -1,0 +1,14 @@
+{
+  "name": "@ahand/daemon",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AHand local execution daemon",
+  "scripts": {
+    "build": "cargo build -p ahandd",
+    "build:release": "cargo build -p ahandd --release",
+    "dev": "cargo run -p ahandd",
+    "start": "cargo run -p ahandd --release",
+    "lint": "cargo clippy -p ahandd -- -D warnings",
+    "test": "cargo test -p ahandd"
+  }
+}

@@ -1,5 +1,10 @@
+import { EventEmitter } from "node:events";
 import type WebSocket from "ws";
-import type { Hello as HelloMsg, Envelope as EnvelopeMsg } from "@ahand/proto";
+import type {
+  Hello as HelloMsg,
+  Envelope as EnvelopeMsg,
+  PolicyUpdate as PolicyUpdateMsg,
+} from "@ahand/proto";
 import { makeEnvelope, decodeEnvelope } from "./codec.ts";
 import { Job } from "./job.ts";
 import { Outbox, prepareOutbound } from "./outbox.ts";
@@ -10,7 +15,7 @@ export interface ExecOptions {
   timeoutMs?: number;
 }
 
-export class DeviceConnection {
+export class DeviceConnection extends EventEmitter {
   readonly deviceId: string;
   readonly hello: HelloMsg;
   private readonly _ws: WebSocket;
@@ -24,6 +29,7 @@ export class DeviceConnection {
     ws: WebSocket,
     outbox?: Outbox,
   ) {
+    super();
     this.deviceId = deviceId;
     this.hello = hello;
     this._ws = ws;
@@ -89,6 +95,30 @@ export class DeviceConnection {
     this._ws.close();
   }
 
+  /** Send an approval response for a pending job. */
+  approveJob(jobId: string, approved: boolean, remember = false): void {
+    const envelope = makeEnvelope(this.deviceId, {
+      approvalResponse: { jobId, approved, remember },
+    });
+    this._send(envelope);
+  }
+
+  /** Request the current policy state. Listen for the "policyState" event. */
+  queryPolicy(): void {
+    const envelope = makeEnvelope(this.deviceId, {
+      policyQuery: {},
+    });
+    this._send(envelope);
+  }
+
+  /** Send a policy update. The daemon responds with a "policyState" event. */
+  updatePolicy(update: PolicyUpdateMsg): void {
+    const envelope = makeEnvelope(this.deviceId, {
+      policyUpdate: update,
+    });
+    this._send(envelope);
+  }
+
   toJSON(): object {
     return {
       deviceId: this.deviceId,
@@ -136,6 +166,12 @@ export class DeviceConnection {
         job._onRejected(envelope.jobRejected);
         this._jobs.delete(envelope.jobRejected.jobId);
       }
+    } else if (envelope.approvalRequest) {
+      const job = this._jobs.get(envelope.approvalRequest.jobId);
+      job?._onApprovalRequest(envelope.approvalRequest);
+      this.emit("approvalRequest", envelope.approvalRequest);
+    } else if (envelope.policyState) {
+      this.emit("policyState", envelope.policyState);
     }
   }
 }

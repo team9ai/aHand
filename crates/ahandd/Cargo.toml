@@ -20,3 +20,4 @@ futures-util = "0.3"
 gethostname = "1"
 dirs = "6"
 clap = { version = "4", features = ["derive", "env"] }
+url = "2"

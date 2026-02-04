@@ -6,6 +6,11 @@ export {
   JobFinished,
   JobRejected,
   CancelJob,
+  ApprovalRequest,
+  ApprovalResponse,
+  PolicyQuery,
+  PolicyState,
+  PolicyUpdate,
 } from "./generated/ahand/v1/envelope.ts";
 
 export type {

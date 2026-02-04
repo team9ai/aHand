@@ -12,12 +12,17 @@ message Envelope {
   uint64 ts_ms     = 6;
 
   oneof payload {
-    Hello       hello        = 10;
-    JobRequest  job_request  = 11;
-    JobEvent    job_event    = 12;
-    JobFinished job_finished = 13;
-    JobRejected job_rejected = 14;
-    CancelJob   cancel_job   = 15;
+    Hello            hello             = 10;
+    JobRequest       job_request       = 11;
+    JobEvent         job_event         = 12;
+    JobFinished      job_finished      = 13;
+    JobRejected      job_rejected      = 14;
+    CancelJob        cancel_job        = 15;
+    ApprovalRequest  approval_request  = 16;
+    ApprovalResponse approval_response = 17;
+    PolicyQuery      policy_query      = 18;
+    PolicyState      policy_state      = 19;
+    PolicyUpdate     policy_update     = 20;
   }
 }
 
@@ -67,4 +72,48 @@ message JobRejected {
 // CancelJob - request to cancel a running job.
 message CancelJob {
   string job_id = 1;
+}
+
+// ApprovalRequest - daemon asks user to approve a job that is not in the allowlist.
+message ApprovalRequest {
+  string job_id  = 1;
+  string tool    = 2;
+  repeated string args = 3;
+  string cwd     = 4;
+  string reason  = 5;
+  repeated string detected_domains = 6;
+  uint64 expires_ms  = 7;  // absolute timestamp when this request expires
+  string caller_uid  = 8;  // who submitted the job (IPC="uid:N", WS="cloud")
+}
+
+// ApprovalResponse - user responds to an approval request.
+message ApprovalResponse {
+  string job_id   = 1;
+  bool   approved = 2;
+  bool   remember = 3;  // if true, remember approval for this user's session
+}
+
+// PolicyQuery - request the current policy configuration.
+message PolicyQuery {}
+
+// PolicyState - snapshot of the current policy (response to query or update).
+message PolicyState {
+  repeated string allowed_tools = 1;
+  repeated string denied_tools  = 2;
+  repeated string denied_paths  = 3;
+  repeated string allowed_domains = 4;
+  uint64 approval_timeout_secs = 5;
+}
+
+// PolicyUpdate - incremental policy modification. Empty lists = no change.
+message PolicyUpdate {
+  repeated string add_allowed_tools      = 1;
+  repeated string remove_allowed_tools   = 2;
+  repeated string add_denied_tools       = 3;
+  repeated string remove_denied_tools    = 4;
+  repeated string add_allowed_domains    = 5;
+  repeated string remove_allowed_domains = 6;
+  repeated string add_denied_paths       = 7;
+  repeated string remove_denied_paths    = 8;
+  uint64 approval_timeout_secs = 9;  // 0 = don't change
 }

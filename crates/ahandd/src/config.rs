@@ -1,7 +1,7 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     /// WebSocket server URL (e.g. "ws://localhost:3000/ws")
     pub server_url: String,
@@ -22,19 +22,40 @@ pub struct Config {
     /// Custom path for the IPC Unix socket. Defaults to ~/.ahand/ahandd.sock.
     pub ipc_socket_path: Option<String>,
 
+    /// Unix permission mode for the IPC socket (e.g. 0o660 for group access).
+    /// Defaults to 0o660.
+    pub ipc_socket_mode: Option<u32>,
+
     #[serde(default)]
     pub policy: PolicyConfig,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct PolicyConfig {
-    /// If non-empty, only these tools are allowed.
+    /// If non-empty, only these tools are allowed without approval.
     #[serde(default)]
     pub allowed_tools: Vec<String>,
 
-    /// Working directories that are denied.
+    /// Working directories that are denied (hard reject, no approval).
     #[serde(default)]
     pub denied_paths: Vec<String>,
+
+    /// Tools that are always denied (hard reject, no approval opportunity).
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+
+    /// Domains that are allowed without approval for network tools.
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+
+    /// How long to wait for user approval before rejecting (seconds).
+    /// Defaults to 86400 (24 hours).
+    #[serde(default = "default_approval_timeout")]
+    pub approval_timeout_secs: u64,
+}
+
+fn default_approval_timeout() -> u64 {
+    86400
 }
 
 impl Config {
@@ -44,10 +65,17 @@ impl Config {
         Ok(config)
     }
 
+    /// Serialize and write the config back to a TOML file.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let content = toml::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+
     pub fn device_id(&self) -> String {
         self.device_id
             .clone()
-            .unwrap_or_else(|| uuid_v4())
+            .unwrap_or_else(uuid_v4)
     }
 
     /// Resolve the IPC socket path. Default: ~/.ahand/ahandd.sock.
@@ -59,6 +87,11 @@ impl Config {
                 .join(".ahand")
                 .join("ahandd.sock"),
         }
+    }
+
+    /// Get the IPC socket permission mode. Default: 0o660.
+    pub fn ipc_socket_mode(&self) -> u32 {
+        self.ipc_socket_mode.unwrap_or(0o660)
     }
 
     /// Resolve the data directory path. Returns `None` only if explicitly

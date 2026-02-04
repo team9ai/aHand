@@ -215,10 +215,8 @@ fn make_event_envelope(
             job_id: job_id.to_string(),
             event: if let Some(data) = stdout_chunk {
                 Some(job_event::Event::StdoutChunk(data))
-            } else if let Some(data) = stderr_chunk {
-                Some(job_event::Event::StderrChunk(data))
             } else {
-                None
+                stderr_chunk.map(job_event::Event::StderrChunk)
             },
         })),
         ..Default::default()
