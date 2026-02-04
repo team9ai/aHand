@@ -4,9 +4,7 @@
   "private": true,
   "description": "Cloud AI's local execution gateway",
   "scripts": {
-    "dev": "turbo dev",
-    "dev:cloud": "turbo dev --filter=@ahand/dev-cloud",
-    "dev:daemon": "turbo dev --filter=@ahand/daemon",
+    "dev": "turbo @ahand/dashboard#dev @ahand/dev-cloud#dev @ahand/daemon#dev",
     "build": "turbo build",
     "build:ts": "turbo build --filter=@ahand/proto --filter=@ahand/sdk --filter=@ahand/dev-cloud",
     "build:rust": "turbo build --filter=@ahand/protocol --filter=@ahand/daemon --filter=@ahand/ctl",

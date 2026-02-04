@@ -1,5 +1,6 @@
 {
   "$schema": "https://turbo.build/schema.json",
+  "ui": "tui",
   "tasks": {
     "build": {
       "dependsOn": ["^build"],
@@ -34,11 +35,23 @@
     },
     "@ahand/daemon#dev": {
       "cache": false,
-      "persistent": true
+      "persistent": true,
     },
     "@ahand/ctl#build": {
       "cache": false,
       "outputs": []
+    },
+    "@ahand/dashboard#build": {
+      "dependsOn": [
+        "@ahand/dev-cloud#build"
+      ],
+      "outputs": [
+        "dist/**"
+      ]
+    },
+    "@ahand/dashboard#dev": {
+      "cache": false,
+      "persistent": true
     }
   }
 }

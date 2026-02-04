@@ -26,11 +26,14 @@ pub struct Config {
     /// Defaults to 0o660.
     pub ipc_socket_mode: Option<u32>,
 
+    /// Default trust timeout in minutes for Trust mode. Defaults to 60.
+    pub trust_timeout_mins: Option<u64>,
+
     #[serde(default)]
     pub policy: PolicyConfig,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct PolicyConfig {
     /// If non-empty, only these tools are allowed without approval.
     #[serde(default)]
@@ -52,6 +55,18 @@ pub struct PolicyConfig {
     /// Defaults to 86400 (24 hours).
     #[serde(default = "default_approval_timeout")]
     pub approval_timeout_secs: u64,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            allowed_tools: Vec::new(),
+            denied_paths: Vec::new(),
+            denied_tools: Vec::new(),
+            allowed_domains: Vec::new(),
+            approval_timeout_secs: default_approval_timeout(),
+        }
+    }
 }
 
 fn default_approval_timeout() -> u64 {

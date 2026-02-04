@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use ahand_protocol::{envelope, Envelope, Hello, JobFinished, JobRejected};
@@ -12,8 +11,8 @@ use crate::approval::ApprovalManager;
 use crate::config::Config;
 use crate::executor;
 use crate::outbox::{prepare_outbound, Outbox};
-use crate::policy::{PolicyChecker, PolicyDecision};
 use crate::registry::{IsKnown, JobRegistry};
+use crate::session::{SessionDecision, SessionManager};
 use crate::store::{Direction, RunStore};
 
 #[allow(clippy::too_many_arguments)]
@@ -22,10 +21,9 @@ pub async fn run(
     device_id: String,
     registry: Arc<JobRegistry>,
     store: Option<Arc<RunStore>>,
-    policy: Arc<PolicyChecker>,
+    session_mgr: Arc<SessionManager>,
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
-    config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
 
     // Outbox survives across reconnects.
@@ -39,13 +37,12 @@ pub async fn run(
         match connect(
             &config.server_url,
             &device_id,
-            &policy,
+            &session_mgr,
             &registry,
             &store,
             &outbox,
             &approval_mgr,
             &approval_broadcast_tx,
-            &config_path,
         )
         .await
         {
@@ -69,13 +66,12 @@ pub async fn run(
 async fn connect(
     url: &str,
     device_id: &str,
-    policy: &Arc<PolicyChecker>,
+    session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
     outbox: &Arc<tokio::sync::Mutex<Outbox>>,
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
-    config_path: &Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
     let (mut sink, mut stream) = ws_stream.split();
@@ -145,6 +141,9 @@ async fn connect(
 
     let caller_uid = "cloud";
 
+    // Register the cloud caller so session queries return it.
+    session_mgr.register_caller(caller_uid).await;
+
     // Process incoming messages.
     while let Some(msg) = stream.next().await {
         let msg = match msg {
@@ -192,7 +191,7 @@ async fn connect(
                     device_id,
                     caller_uid,
                     &tx,
-                    policy,
+                    session_mgr,
                     registry,
                     store,
                     approval_mgr,
@@ -206,13 +205,22 @@ async fn connect(
             }
             Some(envelope::Payload::ApprovalResponse(resp)) => {
                 info!(job_id = %resp.job_id, approved = resp.approved, "received approval response from cloud");
-                approval_mgr.resolve(&resp).await;
+                // Record refusal if reason is provided.
+                if !resp.approved && !resp.reason.is_empty() {
+                    if let Some((req, _)) = approval_mgr.resolve(&resp).await {
+                        session_mgr
+                            .record_refusal(caller_uid, &req.tool, &resp.reason)
+                            .await;
+                    }
+                } else {
+                    approval_mgr.resolve(&resp).await;
+                }
             }
-            Some(envelope::Payload::PolicyQuery(_)) => {
-                handle_policy_query(device_id, policy, &tx).await;
+            Some(envelope::Payload::SetSessionMode(msg)) => {
+                handle_set_session_mode(device_id, session_mgr, &msg, &tx).await;
             }
-            Some(envelope::Payload::PolicyUpdate(update)) => {
-                handle_policy_update(device_id, policy, &update, &tx, config_path).await;
+            Some(envelope::Payload::SessionQuery(query)) => {
+                handle_session_query(device_id, session_mgr, &query, &tx).await;
             }
             _ => {}
         }
@@ -225,14 +233,14 @@ async fn connect(
     Ok(())
 }
 
-/// Handle an incoming JobRequest with idempotency + three-way policy check.
+/// Handle an incoming JobRequest with idempotency + session mode check.
 #[allow(clippy::too_many_arguments)]
 async fn handle_job_request(
     req: ahand_protocol::JobRequest,
     device_id: &str,
     caller_uid: &str,
     tx: &mpsc::UnboundedSender<Envelope>,
-    policy: &Arc<PolicyChecker>,
+    session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
     approval_mgr: &Arc<ApprovalManager>,
@@ -263,10 +271,10 @@ async fn handle_job_request(
         IsKnown::Unknown => {}
     }
 
-    // Three-way policy check.
-    match policy.check(&req, caller_uid).await {
-        PolicyDecision::Deny(reason) => {
-            warn!(job_id = %req.job_id, reason = %reason, "job rejected by policy");
+    // Session mode check.
+    match session_mgr.check(&req, caller_uid).await {
+        SessionDecision::Deny(reason) => {
+            warn!(job_id = %req.job_id, reason = %reason, "job rejected by session mode");
             let reject_env = Envelope {
                 device_id: device_id.to_string(),
                 msg_id: new_msg_id(),
@@ -279,14 +287,14 @@ async fn handle_job_request(
             };
             let _ = tx.send(reject_env);
         }
-        PolicyDecision::Allow => {
+        SessionDecision::Allow => {
             spawn_job(device_id, req, tx, registry, store).await;
         }
-        PolicyDecision::NeedsApproval { reason, detected_domains } => {
-            info!(job_id = %req.job_id, reason = %reason, "job needs approval");
+        SessionDecision::NeedsApproval { reason, previous_refusals } => {
+            info!(job_id = %req.job_id, reason = %reason, "job needs approval (strict mode)");
 
             let (approval_req, approval_rx) = approval_mgr
-                .submit(req.clone(), caller_uid, reason, detected_domains)
+                .submit(req.clone(), caller_uid, reason, previous_refusals)
                 .await;
 
             // Send ApprovalRequest to cloud via WS.
@@ -308,7 +316,7 @@ async fn handle_job_request(
             let reg = Arc::clone(registry);
             let st = store.clone();
             let amgr = Arc::clone(approval_mgr);
-            let pol = Arc::clone(policy);
+            let smgr = Arc::clone(session_mgr);
             let timeout = amgr.default_timeout();
             let job_id = req.job_id.clone();
             let cuid = caller_uid.to_string();
@@ -318,18 +326,14 @@ async fn handle_job_request(
                 match result {
                     Ok(Ok(resp)) if resp.approved => {
                         info!(job_id = %job_id, "approval granted");
-                        if resp.remember {
-                            pol.remember_approval(
-                                &cuid,
-                                &req.tool,
-                                &approval_req.detected_domains,
-                            )
-                            .await;
-                        }
                         spawn_job(&did, req, &tx_clone, &reg, &st).await;
                     }
-                    _ => {
-                        info!(job_id = %job_id, "approval denied or timed out");
+                    Ok(Ok(resp)) => {
+                        // Denied — record refusal if reason provided.
+                        info!(job_id = %job_id, "approval denied");
+                        if !resp.reason.is_empty() {
+                            smgr.record_refusal(&cuid, &req.tool, &resp.reason).await;
+                        }
                         amgr.expire(&job_id).await;
                         let reject_env = Envelope {
                             device_id: did,
@@ -337,7 +341,26 @@ async fn handle_job_request(
                             ts_ms: now_ms(),
                             payload: Some(envelope::Payload::JobRejected(JobRejected {
                                 job_id,
-                                reason: "approval denied or timed out".to_string(),
+                                reason: if resp.reason.is_empty() {
+                                    "approval denied".to_string()
+                                } else {
+                                    format!("approval denied: {}", resp.reason)
+                                },
+                            })),
+                            ..Default::default()
+                        };
+                        let _ = tx_clone.send(reject_env);
+                    }
+                    _ => {
+                        info!(job_id = %job_id, "approval timed out");
+                        amgr.expire(&job_id).await;
+                        let reject_env = Envelope {
+                            device_id: did,
+                            msg_id: new_msg_id(),
+                            ts_ms: now_ms(),
+                            payload: Some(envelope::Payload::JobRejected(JobRejected {
+                                job_id,
+                                reason: "approval timed out".to_string(),
                             })),
                             ..Default::default()
                         };
@@ -378,52 +401,45 @@ async fn spawn_job(
     });
 }
 
-async fn handle_policy_query(
+async fn handle_set_session_mode(
     device_id: &str,
-    policy: &Arc<PolicyChecker>,
+    session_mgr: &Arc<SessionManager>,
+    msg: &ahand_protocol::SetSessionMode,
     tx: &mpsc::UnboundedSender<Envelope>,
 ) {
-    info!("received policy query");
-    let state = policy.get_state().await;
+    let mode = ahand_protocol::SessionMode::try_from(msg.mode).unwrap_or(ahand_protocol::SessionMode::Inactive);
+    info!(caller_uid = %msg.caller_uid, ?mode, "received set session mode");
+    let state = session_mgr
+        .set_mode(&msg.caller_uid, mode, msg.trust_timeout_mins)
+        .await;
     let state_env = Envelope {
         device_id: device_id.to_string(),
         msg_id: new_msg_id(),
         ts_ms: now_ms(),
-        payload: Some(envelope::Payload::PolicyState(state)),
+        payload: Some(envelope::Payload::SessionState(state)),
         ..Default::default()
     };
     let _ = tx.send(state_env);
 }
 
-async fn handle_policy_update(
+async fn handle_session_query(
     device_id: &str,
-    policy: &Arc<PolicyChecker>,
-    update: &ahand_protocol::PolicyUpdate,
+    session_mgr: &Arc<SessionManager>,
+    query: &ahand_protocol::SessionQuery,
     tx: &mpsc::UnboundedSender<Envelope>,
-    config_path: &Option<PathBuf>,
 ) {
-    info!("received policy update");
-    policy.apply_update(update).await;
-
-    // Persist to config file if available.
-    if let Some(path) = config_path
-        && let Ok(mut existing) = Config::load(path)
-    {
-        existing.policy = policy.config_snapshot().await;
-        if let Err(e) = existing.save(path) {
-            warn!(error = %e, "failed to persist policy update to config file");
-        }
+    info!(caller_uid = %query.caller_uid, "received session query");
+    let states = session_mgr.query_sessions(&query.caller_uid).await;
+    for state in states {
+        let state_env = Envelope {
+            device_id: device_id.to_string(),
+            msg_id: new_msg_id(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::SessionState(state)),
+            ..Default::default()
+        };
+        let _ = tx.send(state_env);
     }
-
-    let state = policy.get_state().await;
-    let state_env = Envelope {
-        device_id: device_id.to_string(),
-        msg_id: new_msg_id(),
-        ts_ms: now_ms(),
-        payload: Some(envelope::Payload::PolicyState(state)),
-        ..Default::default()
-    };
-    let _ = tx.send(state_env);
 }
 
 fn now_ms() -> u64 {

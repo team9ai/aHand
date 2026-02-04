@@ -1,3 +1,6 @@
+// Reserved for Mode 5 (preset) — not currently called.
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 
 use ahand_protocol::{JobRequest, PolicyState, PolicyUpdate};

@@ -6,6 +6,7 @@ mod ipc;
 mod outbox;
 mod policy;
 mod registry;
+mod session;
 mod store;
 
 use std::path::PathBuf;
@@ -66,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
             debug_ipc: None,
             ipc_socket_path: None,
             ipc_socket_mode: None,
+            trust_timeout_mins: None,
             policy: Default::default(),
         }
     };
@@ -118,10 +120,15 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let policy = Arc::new(policy::PolicyChecker::new(&cfg.policy));
+    let session_mgr = Arc::new(session::SessionManager::new(
+        cfg.trust_timeout_mins.unwrap_or(60),
+    ));
     let approval_mgr = Arc::new(approval::ApprovalManager::new(
         cfg.policy.approval_timeout_secs,
     ));
+
+    // PolicyChecker preserved for future Mode 5 (preset) use.
+    let _policy = Arc::new(policy::PolicyChecker::new(&cfg.policy));
 
     // Broadcast channel for pushing approval requests to all IPC clients.
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
@@ -132,22 +139,21 @@ async fn main() -> anyhow::Result<()> {
             ipc_socket_mode,
             Arc::clone(&registry),
             store_opt.clone(),
-            Arc::clone(&policy),
+            Arc::clone(&session_mgr),
             Arc::clone(&approval_mgr),
             approval_broadcast_tx.clone(),
             device_id.clone(),
-            config_path.clone(),
         ));
 
         // Run WS client and IPC server concurrently.
         tokio::select! {
-            r = client::run(cfg, device_id, registry, store_opt, policy, approval_mgr, approval_broadcast_tx, config_path) => r,
+            r = client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx) => r,
             r = ipc_handle => {
                 r??;
                 Ok(())
             }
         }
     } else {
-        client::run(cfg, device_id, registry, store_opt, policy, approval_mgr, approval_broadcast_tx, config_path).await
+        client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx).await
     }
 }

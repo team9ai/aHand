@@ -143,6 +143,9 @@ fn describe_payload(envelope: &Envelope) -> &'static str {
         Some(Payload::PolicyQuery(_)) => "PolicyQuery",
         Some(Payload::PolicyState(_)) => "PolicyState",
         Some(Payload::PolicyUpdate(_)) => "PolicyUpdate",
+        Some(Payload::SetSessionMode(_)) => "SetSessionMode",
+        Some(Payload::SessionState(_)) => "SessionState",
+        Some(Payload::SessionQuery(_)) => "SessionQuery",
         None => "none",
     }
 }

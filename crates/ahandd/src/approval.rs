@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use ahand_protocol::{ApprovalRequest, ApprovalResponse, JobRequest};
+use ahand_protocol::{ApprovalRequest, ApprovalResponse, JobRequest, RefusalContext};
 use tokio::sync::{oneshot, Mutex};
 use tracing::info;
 
@@ -35,7 +35,7 @@ impl ApprovalManager {
         req: JobRequest,
         caller_uid: &str,
         reason: String,
-        detected_domains: Vec<String>,
+        previous_refusals: Vec<RefusalContext>,
     ) -> (ApprovalRequest, oneshot::Receiver<ApprovalResponse>) {
         let (tx, rx) = oneshot::channel();
         let expires_ms = now_ms() + self.default_timeout.as_millis() as u64;
@@ -46,9 +46,10 @@ impl ApprovalManager {
             args: req.args.clone(),
             cwd: req.cwd.clone(),
             reason,
-            detected_domains,
+            detected_domains: Vec::new(),
             expires_ms,
             caller_uid: caller_uid.to_string(),
+            previous_refusals,
         };
 
         let entry = PendingApproval {

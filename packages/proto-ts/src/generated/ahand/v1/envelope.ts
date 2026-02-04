@@ -9,6 +9,56 @@ import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 
 export const protobufPackage = "ahand.v1";
 
+/** Session mode controls how commands from a specific caller are handled. */
+export enum SessionMode {
+  /** SESSION_MODE_INACTIVE - default — reject all, prompt user to activate */
+  SESSION_MODE_INACTIVE = 0,
+  /** SESSION_MODE_STRICT - every command requires manual approval */
+  SESSION_MODE_STRICT = 1,
+  /** SESSION_MODE_TRUST - auto-approve, with inactivity timeout */
+  SESSION_MODE_TRUST = 2,
+  /** SESSION_MODE_AUTO_ACCEPT - auto-approve, no timeout */
+  SESSION_MODE_AUTO_ACCEPT = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function sessionModeFromJSON(object: any): SessionMode {
+  switch (object) {
+    case 0:
+    case "SESSION_MODE_INACTIVE":
+      return SessionMode.SESSION_MODE_INACTIVE;
+    case 1:
+    case "SESSION_MODE_STRICT":
+      return SessionMode.SESSION_MODE_STRICT;
+    case 2:
+    case "SESSION_MODE_TRUST":
+      return SessionMode.SESSION_MODE_TRUST;
+    case 3:
+    case "SESSION_MODE_AUTO_ACCEPT":
+      return SessionMode.SESSION_MODE_AUTO_ACCEPT;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return SessionMode.UNRECOGNIZED;
+  }
+}
+
+export function sessionModeToJSON(object: SessionMode): string {
+  switch (object) {
+    case SessionMode.SESSION_MODE_INACTIVE:
+      return "SESSION_MODE_INACTIVE";
+    case SessionMode.SESSION_MODE_STRICT:
+      return "SESSION_MODE_STRICT";
+    case SessionMode.SESSION_MODE_TRUST:
+      return "SESSION_MODE_TRUST";
+    case SessionMode.SESSION_MODE_AUTO_ACCEPT:
+      return "SESSION_MODE_AUTO_ACCEPT";
+    case SessionMode.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Envelope wraps all messages on the wire (WS and IPC). */
 export interface Envelope {
   deviceId: string;
@@ -24,10 +74,22 @@ export interface Envelope {
   jobRejected?: JobRejected | undefined;
   cancelJob?: CancelJob | undefined;
   approvalRequest?: ApprovalRequest | undefined;
-  approvalResponse?: ApprovalResponse | undefined;
-  policyQuery?: PolicyQuery | undefined;
-  policyState?: PolicyState | undefined;
+  approvalResponse?:
+    | ApprovalResponse
+    | undefined;
+  /** reserved for Mode 5 (preset) */
+  policyQuery?:
+    | PolicyQuery
+    | undefined;
+  /** reserved for Mode 5 (preset) */
+  policyState?:
+    | PolicyState
+    | undefined;
+  /** reserved for Mode 5 (preset) */
   policyUpdate?: PolicyUpdate | undefined;
+  setSessionMode?: SetSessionMode | undefined;
+  sessionState?: SessionState | undefined;
+  sessionQuery?: SessionQuery | undefined;
 }
 
 /** Hello - initial handshake after WS connection. */
@@ -86,7 +148,7 @@ export interface CancelJob {
   jobId: string;
 }
 
-/** ApprovalRequest - daemon asks user to approve a job that is not in the allowlist. */
+/** ApprovalRequest - daemon asks user to approve a job (strict mode). */
 export interface ApprovalRequest {
   jobId: string;
   tool: string;
@@ -98,14 +160,18 @@ export interface ApprovalRequest {
   expiresMs: number;
   /** who submitted the job (IPC="uid:N", WS="cloud") */
   callerUid: string;
+  /** recent refusals for the same tool (24h context) */
+  previousRefusals: RefusalContext[];
 }
 
 /** ApprovalResponse - user responds to an approval request. */
 export interface ApprovalResponse {
   jobId: string;
   approved: boolean;
-  /** if true, remember approval for this user's session */
+  /** reserved for Mode 5 (preset) */
   remember: boolean;
+  /** refusal reason (stored for 24h as context) */
+  reason: string;
 }
 
 /** PolicyQuery - request the current policy configuration. */
@@ -121,7 +187,10 @@ export interface PolicyState {
   approvalTimeoutSecs: number;
 }
 
-/** PolicyUpdate - incremental policy modification. Empty lists = no change. */
+/**
+ * PolicyUpdate - incremental policy modification. Empty lists = no change.
+ * Reserved for Mode 5 (preset).
+ */
 export interface PolicyUpdate {
   addAllowedTools: string[];
   removeAllowedTools: string[];
@@ -133,6 +202,36 @@ export interface PolicyUpdate {
   removeDeniedPaths: string[];
   /** 0 = don't change */
   approvalTimeoutSecs: number;
+}
+
+/** SetSessionMode - set the mode for a specific caller (cloud → daemon). */
+export interface SetSessionMode {
+  callerUid: string;
+  mode: SessionMode;
+  /** 0 = use default (60 min) */
+  trustTimeoutMins: number;
+}
+
+/** SessionState - current session state for a caller (daemon → cloud). */
+export interface SessionState {
+  callerUid: string;
+  mode: SessionMode;
+  /** absolute timestamp, 0 = not applicable */
+  trustExpiresMs: number;
+  trustTimeoutMins: number;
+}
+
+/** SessionQuery - request session state (cloud → daemon). */
+export interface SessionQuery {
+  /** empty = query all sessions */
+  callerUid: string;
+}
+
+/** RefusalContext - context from a recent refusal of the same tool. */
+export interface RefusalContext {
+  tool: string;
+  reason: string;
+  refusedAtMs: number;
 }
 
 function createBaseEnvelope(): Envelope {
@@ -154,6 +253,9 @@ function createBaseEnvelope(): Envelope {
     policyQuery: undefined,
     policyState: undefined,
     policyUpdate: undefined,
+    setSessionMode: undefined,
+    sessionState: undefined,
+    sessionQuery: undefined,
   };
 }
 
@@ -209,6 +311,15 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.policyUpdate !== undefined) {
       PolicyUpdate.encode(message.policyUpdate, writer.uint32(162).fork()).join();
+    }
+    if (message.setSessionMode !== undefined) {
+      SetSessionMode.encode(message.setSessionMode, writer.uint32(170).fork()).join();
+    }
+    if (message.sessionState !== undefined) {
+      SessionState.encode(message.sessionState, writer.uint32(178).fork()).join();
+    }
+    if (message.sessionQuery !== undefined) {
+      SessionQuery.encode(message.sessionQuery, writer.uint32(186).fork()).join();
     }
     return writer;
   },
@@ -356,6 +467,30 @@ export const Envelope: MessageFns<Envelope> = {
           message.policyUpdate = PolicyUpdate.decode(reader, reader.uint32());
           continue;
         }
+        case 21: {
+          if (tag !== 170) {
+            break;
+          }
+
+          message.setSessionMode = SetSessionMode.decode(reader, reader.uint32());
+          continue;
+        }
+        case 22: {
+          if (tag !== 178) {
+            break;
+          }
+
+          message.sessionState = SessionState.decode(reader, reader.uint32());
+          continue;
+        }
+        case 23: {
+          if (tag !== 186) {
+            break;
+          }
+
+          message.sessionQuery = SessionQuery.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -440,6 +575,21 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.policy_update)
         ? PolicyUpdate.fromJSON(object.policy_update)
         : undefined,
+      setSessionMode: isSet(object.setSessionMode)
+        ? SetSessionMode.fromJSON(object.setSessionMode)
+        : isSet(object.set_session_mode)
+        ? SetSessionMode.fromJSON(object.set_session_mode)
+        : undefined,
+      sessionState: isSet(object.sessionState)
+        ? SessionState.fromJSON(object.sessionState)
+        : isSet(object.session_state)
+        ? SessionState.fromJSON(object.session_state)
+        : undefined,
+      sessionQuery: isSet(object.sessionQuery)
+        ? SessionQuery.fromJSON(object.sessionQuery)
+        : isSet(object.session_query)
+        ? SessionQuery.fromJSON(object.session_query)
+        : undefined,
     };
   },
 
@@ -496,6 +646,15 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.policyUpdate !== undefined) {
       obj.policyUpdate = PolicyUpdate.toJSON(message.policyUpdate);
     }
+    if (message.setSessionMode !== undefined) {
+      obj.setSessionMode = SetSessionMode.toJSON(message.setSessionMode);
+    }
+    if (message.sessionState !== undefined) {
+      obj.sessionState = SessionState.toJSON(message.sessionState);
+    }
+    if (message.sessionQuery !== undefined) {
+      obj.sessionQuery = SessionQuery.toJSON(message.sessionQuery);
+    }
     return obj;
   },
 
@@ -540,6 +699,15 @@ export const Envelope: MessageFns<Envelope> = {
       : undefined;
     message.policyUpdate = (object.policyUpdate !== undefined && object.policyUpdate !== null)
       ? PolicyUpdate.fromPartial(object.policyUpdate)
+      : undefined;
+    message.setSessionMode = (object.setSessionMode !== undefined && object.setSessionMode !== null)
+      ? SetSessionMode.fromPartial(object.setSessionMode)
+      : undefined;
+    message.sessionState = (object.sessionState !== undefined && object.sessionState !== null)
+      ? SessionState.fromPartial(object.sessionState)
+      : undefined;
+    message.sessionQuery = (object.sessionQuery !== undefined && object.sessionQuery !== null)
+      ? SessionQuery.fromPartial(object.sessionQuery)
       : undefined;
     return message;
   },
@@ -1289,7 +1457,17 @@ export const CancelJob: MessageFns<CancelJob> = {
 };
 
 function createBaseApprovalRequest(): ApprovalRequest {
-  return { jobId: "", tool: "", args: [], cwd: "", reason: "", detectedDomains: [], expiresMs: 0, callerUid: "" };
+  return {
+    jobId: "",
+    tool: "",
+    args: [],
+    cwd: "",
+    reason: "",
+    detectedDomains: [],
+    expiresMs: 0,
+    callerUid: "",
+    previousRefusals: [],
+  };
 }
 
 export const ApprovalRequest: MessageFns<ApprovalRequest> = {
@@ -1317,6 +1495,9 @@ export const ApprovalRequest: MessageFns<ApprovalRequest> = {
     }
     if (message.callerUid !== "") {
       writer.uint32(66).string(message.callerUid);
+    }
+    for (const v of message.previousRefusals) {
+      RefusalContext.encode(v!, writer.uint32(74).fork()).join();
     }
     return writer;
   },
@@ -1392,6 +1573,14 @@ export const ApprovalRequest: MessageFns<ApprovalRequest> = {
           message.callerUid = reader.string();
           continue;
         }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.previousRefusals.push(RefusalContext.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1427,6 +1616,11 @@ export const ApprovalRequest: MessageFns<ApprovalRequest> = {
         : isSet(object.caller_uid)
         ? globalThis.String(object.caller_uid)
         : "",
+      previousRefusals: globalThis.Array.isArray(object?.previousRefusals)
+        ? object.previousRefusals.map((e: any) => RefusalContext.fromJSON(e))
+        : globalThis.Array.isArray(object?.previous_refusals)
+        ? object.previous_refusals.map((e: any) => RefusalContext.fromJSON(e))
+        : [],
     };
   },
 
@@ -1456,6 +1650,9 @@ export const ApprovalRequest: MessageFns<ApprovalRequest> = {
     if (message.callerUid !== "") {
       obj.callerUid = message.callerUid;
     }
+    if (message.previousRefusals?.length) {
+      obj.previousRefusals = message.previousRefusals.map((e) => RefusalContext.toJSON(e));
+    }
     return obj;
   },
 
@@ -1472,12 +1669,13 @@ export const ApprovalRequest: MessageFns<ApprovalRequest> = {
     message.detectedDomains = object.detectedDomains?.map((e) => e) || [];
     message.expiresMs = object.expiresMs ?? 0;
     message.callerUid = object.callerUid ?? "";
+    message.previousRefusals = object.previousRefusals?.map((e) => RefusalContext.fromPartial(e)) || [];
     return message;
   },
 };
 
 function createBaseApprovalResponse(): ApprovalResponse {
-  return { jobId: "", approved: false, remember: false };
+  return { jobId: "", approved: false, remember: false, reason: "" };
 }
 
 export const ApprovalResponse: MessageFns<ApprovalResponse> = {
@@ -1490,6 +1688,9 @@ export const ApprovalResponse: MessageFns<ApprovalResponse> = {
     }
     if (message.remember !== false) {
       writer.uint32(24).bool(message.remember);
+    }
+    if (message.reason !== "") {
+      writer.uint32(34).string(message.reason);
     }
     return writer;
   },
@@ -1525,6 +1726,14 @@ export const ApprovalResponse: MessageFns<ApprovalResponse> = {
           message.remember = reader.bool();
           continue;
         }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.reason = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1543,6 +1752,7 @@ export const ApprovalResponse: MessageFns<ApprovalResponse> = {
         : "",
       approved: isSet(object.approved) ? globalThis.Boolean(object.approved) : false,
       remember: isSet(object.remember) ? globalThis.Boolean(object.remember) : false,
+      reason: isSet(object.reason) ? globalThis.String(object.reason) : "",
     };
   },
 
@@ -1557,6 +1767,9 @@ export const ApprovalResponse: MessageFns<ApprovalResponse> = {
     if (message.remember !== false) {
       obj.remember = message.remember;
     }
+    if (message.reason !== "") {
+      obj.reason = message.reason;
+    }
     return obj;
   },
 
@@ -1568,6 +1781,7 @@ export const ApprovalResponse: MessageFns<ApprovalResponse> = {
     message.jobId = object.jobId ?? "";
     message.approved = object.approved ?? false;
     message.remember = object.remember ?? false;
+    message.reason = object.reason ?? "";
     return message;
   },
 };
@@ -1989,6 +2203,386 @@ export const PolicyUpdate: MessageFns<PolicyUpdate> = {
     message.addDeniedPaths = object.addDeniedPaths?.map((e) => e) || [];
     message.removeDeniedPaths = object.removeDeniedPaths?.map((e) => e) || [];
     message.approvalTimeoutSecs = object.approvalTimeoutSecs ?? 0;
+    return message;
+  },
+};
+
+function createBaseSetSessionMode(): SetSessionMode {
+  return { callerUid: "", mode: 0, trustTimeoutMins: 0 };
+}
+
+export const SetSessionMode: MessageFns<SetSessionMode> = {
+  encode(message: SetSessionMode, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.callerUid !== "") {
+      writer.uint32(10).string(message.callerUid);
+    }
+    if (message.mode !== 0) {
+      writer.uint32(16).int32(message.mode);
+    }
+    if (message.trustTimeoutMins !== 0) {
+      writer.uint32(24).uint64(message.trustTimeoutMins);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SetSessionMode {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSetSessionMode();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.callerUid = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.mode = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.trustTimeoutMins = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SetSessionMode {
+    return {
+      callerUid: isSet(object.callerUid)
+        ? globalThis.String(object.callerUid)
+        : isSet(object.caller_uid)
+        ? globalThis.String(object.caller_uid)
+        : "",
+      mode: isSet(object.mode) ? sessionModeFromJSON(object.mode) : 0,
+      trustTimeoutMins: isSet(object.trustTimeoutMins)
+        ? globalThis.Number(object.trustTimeoutMins)
+        : isSet(object.trust_timeout_mins)
+        ? globalThis.Number(object.trust_timeout_mins)
+        : 0,
+    };
+  },
+
+  toJSON(message: SetSessionMode): unknown {
+    const obj: any = {};
+    if (message.callerUid !== "") {
+      obj.callerUid = message.callerUid;
+    }
+    if (message.mode !== 0) {
+      obj.mode = sessionModeToJSON(message.mode);
+    }
+    if (message.trustTimeoutMins !== 0) {
+      obj.trustTimeoutMins = Math.round(message.trustTimeoutMins);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SetSessionMode>): SetSessionMode {
+    return SetSessionMode.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SetSessionMode>): SetSessionMode {
+    const message = createBaseSetSessionMode();
+    message.callerUid = object.callerUid ?? "";
+    message.mode = object.mode ?? 0;
+    message.trustTimeoutMins = object.trustTimeoutMins ?? 0;
+    return message;
+  },
+};
+
+function createBaseSessionState(): SessionState {
+  return { callerUid: "", mode: 0, trustExpiresMs: 0, trustTimeoutMins: 0 };
+}
+
+export const SessionState: MessageFns<SessionState> = {
+  encode(message: SessionState, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.callerUid !== "") {
+      writer.uint32(10).string(message.callerUid);
+    }
+    if (message.mode !== 0) {
+      writer.uint32(16).int32(message.mode);
+    }
+    if (message.trustExpiresMs !== 0) {
+      writer.uint32(24).uint64(message.trustExpiresMs);
+    }
+    if (message.trustTimeoutMins !== 0) {
+      writer.uint32(32).uint64(message.trustTimeoutMins);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SessionState {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSessionState();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.callerUid = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.mode = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.trustExpiresMs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.trustTimeoutMins = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SessionState {
+    return {
+      callerUid: isSet(object.callerUid)
+        ? globalThis.String(object.callerUid)
+        : isSet(object.caller_uid)
+        ? globalThis.String(object.caller_uid)
+        : "",
+      mode: isSet(object.mode) ? sessionModeFromJSON(object.mode) : 0,
+      trustExpiresMs: isSet(object.trustExpiresMs)
+        ? globalThis.Number(object.trustExpiresMs)
+        : isSet(object.trust_expires_ms)
+        ? globalThis.Number(object.trust_expires_ms)
+        : 0,
+      trustTimeoutMins: isSet(object.trustTimeoutMins)
+        ? globalThis.Number(object.trustTimeoutMins)
+        : isSet(object.trust_timeout_mins)
+        ? globalThis.Number(object.trust_timeout_mins)
+        : 0,
+    };
+  },
+
+  toJSON(message: SessionState): unknown {
+    const obj: any = {};
+    if (message.callerUid !== "") {
+      obj.callerUid = message.callerUid;
+    }
+    if (message.mode !== 0) {
+      obj.mode = sessionModeToJSON(message.mode);
+    }
+    if (message.trustExpiresMs !== 0) {
+      obj.trustExpiresMs = Math.round(message.trustExpiresMs);
+    }
+    if (message.trustTimeoutMins !== 0) {
+      obj.trustTimeoutMins = Math.round(message.trustTimeoutMins);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SessionState>): SessionState {
+    return SessionState.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SessionState>): SessionState {
+    const message = createBaseSessionState();
+    message.callerUid = object.callerUid ?? "";
+    message.mode = object.mode ?? 0;
+    message.trustExpiresMs = object.trustExpiresMs ?? 0;
+    message.trustTimeoutMins = object.trustTimeoutMins ?? 0;
+    return message;
+  },
+};
+
+function createBaseSessionQuery(): SessionQuery {
+  return { callerUid: "" };
+}
+
+export const SessionQuery: MessageFns<SessionQuery> = {
+  encode(message: SessionQuery, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.callerUid !== "") {
+      writer.uint32(10).string(message.callerUid);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SessionQuery {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSessionQuery();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.callerUid = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SessionQuery {
+    return {
+      callerUid: isSet(object.callerUid)
+        ? globalThis.String(object.callerUid)
+        : isSet(object.caller_uid)
+        ? globalThis.String(object.caller_uid)
+        : "",
+    };
+  },
+
+  toJSON(message: SessionQuery): unknown {
+    const obj: any = {};
+    if (message.callerUid !== "") {
+      obj.callerUid = message.callerUid;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SessionQuery>): SessionQuery {
+    return SessionQuery.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SessionQuery>): SessionQuery {
+    const message = createBaseSessionQuery();
+    message.callerUid = object.callerUid ?? "";
+    return message;
+  },
+};
+
+function createBaseRefusalContext(): RefusalContext {
+  return { tool: "", reason: "", refusedAtMs: 0 };
+}
+
+export const RefusalContext: MessageFns<RefusalContext> = {
+  encode(message: RefusalContext, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.tool !== "") {
+      writer.uint32(10).string(message.tool);
+    }
+    if (message.reason !== "") {
+      writer.uint32(18).string(message.reason);
+    }
+    if (message.refusedAtMs !== 0) {
+      writer.uint32(24).uint64(message.refusedAtMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RefusalContext {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRefusalContext();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.tool = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.reason = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.refusedAtMs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RefusalContext {
+    return {
+      tool: isSet(object.tool) ? globalThis.String(object.tool) : "",
+      reason: isSet(object.reason) ? globalThis.String(object.reason) : "",
+      refusedAtMs: isSet(object.refusedAtMs)
+        ? globalThis.Number(object.refusedAtMs)
+        : isSet(object.refused_at_ms)
+        ? globalThis.Number(object.refused_at_ms)
+        : 0,
+    };
+  },
+
+  toJSON(message: RefusalContext): unknown {
+    const obj: any = {};
+    if (message.tool !== "") {
+      obj.tool = message.tool;
+    }
+    if (message.reason !== "") {
+      obj.reason = message.reason;
+    }
+    if (message.refusedAtMs !== 0) {
+      obj.refusedAtMs = Math.round(message.refusedAtMs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RefusalContext>): RefusalContext {
+    return RefusalContext.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RefusalContext>): RefusalContext {
+    const message = createBaseRefusalContext();
+    message.tool = object.tool ?? "";
+    message.reason = object.reason ?? "";
+    message.refusedAtMs = object.refusedAtMs ?? 0;
     return message;
   },
 };

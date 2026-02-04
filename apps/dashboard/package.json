@@ -1,0 +1,21 @@
+{
+  "name": "@ahand/dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "aHand testing dashboard",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "hono": "^4.7.11",
+    "solid-js": "^1.9.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^6.0.0",
+    "vite-plugin-solid": "^2.11.0"
+  }
+}

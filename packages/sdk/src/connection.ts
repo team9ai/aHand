@@ -96,9 +96,9 @@ export class DeviceConnection extends EventEmitter {
   }
 
   /** Send an approval response for a pending job. */
-  approveJob(jobId: string, approved: boolean, remember = false): void {
+  approveJob(jobId: string, approved: boolean, remember = false, reason = ""): void {
     const envelope = makeEnvelope(this.deviceId, {
-      approvalResponse: { jobId, approved, remember },
+      approvalResponse: { jobId, approved, remember, reason },
     });
     this._send(envelope);
   }
@@ -115,6 +115,22 @@ export class DeviceConnection extends EventEmitter {
   updatePolicy(update: PolicyUpdateMsg): void {
     const envelope = makeEnvelope(this.deviceId, {
       policyUpdate: update,
+    });
+    this._send(envelope);
+  }
+
+  /** Set session mode for a caller. The daemon responds with a "sessionState" event. */
+  setSessionMode(callerUid: string, mode: number, trustTimeoutMins = 0): void {
+    const envelope = makeEnvelope(this.deviceId, {
+      setSessionMode: { callerUid, mode, trustTimeoutMins },
+    });
+    this._send(envelope);
+  }
+
+  /** Query session state. Empty callerUid = query all sessions. */
+  querySession(callerUid = ""): void {
+    const envelope = makeEnvelope(this.deviceId, {
+      sessionQuery: { callerUid },
     });
     this._send(envelope);
   }
@@ -155,16 +171,20 @@ export class DeviceConnection extends EventEmitter {
       const job = this._jobs.get(envelope.jobEvent.jobId);
       job?._onEvent(envelope);
     } else if (envelope.jobFinished) {
-      const job = this._jobs.get(envelope.jobFinished.jobId);
+      const jf = envelope.jobFinished;
+      const job = this._jobs.get(jf.jobId);
+      console.log(`[sdk] jobFinished jobId=${jf.jobId} found=${!!job} exit=${jf.exitCode} err=${jf.error}`);
       if (job) {
-        job._onFinished(envelope.jobFinished);
-        this._jobs.delete(envelope.jobFinished.jobId);
+        job._onFinished(jf);
+        this._jobs.delete(jf.jobId);
       }
     } else if (envelope.jobRejected) {
-      const job = this._jobs.get(envelope.jobRejected.jobId);
+      const jr = envelope.jobRejected;
+      const job = this._jobs.get(jr.jobId);
+      console.log(`[sdk] jobRejected jobId=${jr.jobId} found=${!!job} reason=${jr.reason}`);
       if (job) {
-        job._onRejected(envelope.jobRejected);
-        this._jobs.delete(envelope.jobRejected.jobId);
+        job._onRejected(jr);
+        this._jobs.delete(jr.jobId);
       }
     } else if (envelope.approvalRequest) {
       const job = this._jobs.get(envelope.approvalRequest.jobId);
@@ -172,6 +192,8 @@ export class DeviceConnection extends EventEmitter {
       this.emit("approvalRequest", envelope.approvalRequest);
     } else if (envelope.policyState) {
       this.emit("policyState", envelope.policyState);
+    } else if (envelope.sessionState) {
+      this.emit("sessionState", envelope.sessionState);
     }
   }
 }

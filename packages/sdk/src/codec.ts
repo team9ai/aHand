@@ -34,5 +34,13 @@ export function makeEnvelope(
     jobFinished: payload.jobFinished,
     jobRejected: payload.jobRejected,
     cancelJob: payload.cancelJob,
+    approvalRequest: payload.approvalRequest,
+    approvalResponse: payload.approvalResponse,
+    policyQuery: payload.policyQuery,
+    policyState: payload.policyState,
+    policyUpdate: payload.policyUpdate,
+    setSessionMode: payload.setSessionMode,
+    sessionState: payload.sessionState,
+    sessionQuery: payload.sessionQuery,
   };
 }

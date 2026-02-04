@@ -3,13 +3,31 @@ import { serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import type WebSocket from "ws";
 import { AHandServer } from "@ahand/sdk";
+import { DashboardState } from "./dashboard/state.ts";
+import { DashboardBroadcaster } from "./dashboard/broadcaster.ts";
+import { createDashboardRoutes } from "./dashboard/routes.ts";
+import { logger } from "hono/logger";
 
 const app = new Hono();
+app.use(logger())
+
 const ahand = new AHandServer();
 
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 
-// ── WebSocket endpoint ──────────────────────────────────────────────
+// ── Dashboard infrastructure ─────────────────────────────────────
+const dashState = new DashboardState();
+const dashBroadcaster = new DashboardBroadcaster(ahand, dashState);
+
+const dashRoutes = createDashboardRoutes(
+  ahand,
+  dashBroadcaster,
+  dashState,
+  upgradeWebSocket as never,
+);
+app.route("/", dashRoutes);
+
+// ── WebSocket endpoint (device connections) ──────────────────────
 app.get(
   "/ws",
   upgradeWebSocket((_c) => ({
@@ -22,7 +40,7 @@ app.get(
   })),
 );
 
-// ── REST API ────────────────────────────────────────────────────────
+// ── REST API (legacy, kept for backward compat) ──────────────────
 app.get("/devices", (c) => {
   return c.json(ahand.devices().map((d) => d.toJSON()));
 });
@@ -37,7 +55,6 @@ app.post("/exec", async (c) => {
     timeout?: number;
   }>();
 
-  // If no deviceId, pick the first connected device.
   const device = body.deviceId
     ? ahand.device(body.deviceId)
     : ahand.devices()[0];
@@ -74,7 +91,7 @@ app.post("/cancel", async (c) => {
   return c.json({ ok: true, jobId: body.jobId });
 });
 
-// ── SDK events ──────────────────────────────────────────────────────
+// ── SDK events ──────────────────────────────────────────────────
 ahand.onDevice((conn) => {
   console.log(
     `[device] connected: ${conn.hostname} (${conn.deviceId}) os=${conn.os}`,
@@ -85,15 +102,18 @@ ahand.on("deviceDisconnected", (conn) => {
   console.log(`[device] disconnected: ${conn.hostname} (${conn.deviceId})`);
 });
 
-// ── Start server ────────────────────────────────────────────────────
+// ── Start server ────────────────────────────────────────────────
 const PORT = Number(process.env.PORT) || 3000;
 
 const server = serve({ fetch: app.fetch, port: PORT }, () => {
   console.log(`dev-cloud listening on http://localhost:${PORT}`);
-  console.log(`  WebSocket: ws://localhost:${PORT}/ws`);
-  console.log(`  Devices:   http://localhost:${PORT}/devices`);
-  console.log(`  Exec:      POST http://localhost:${PORT}/exec`);
-  console.log(`  Cancel:    POST http://localhost:${PORT}/cancel`);
+  console.log(`  WebSocket:  ws://localhost:${PORT}/ws`);
+  console.log(`  Dashboard:  ws://localhost:${PORT}/dashboard/ws`);
+  console.log(`  API:        http://localhost:${PORT}/api/*`);
+  console.log(`  Devices:    http://localhost:${PORT}/devices`);
 });
 
 injectWebSocket(server);
+
+// Export the route type for Hono RPC client.
+export type AppType = typeof dashRoutes;

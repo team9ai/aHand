@@ -1,5 +1,6 @@
 use ahand_protocol::{
     envelope, ApprovalResponse, CancelJob, Envelope, Hello, JobRequest, PolicyQuery, PolicyUpdate,
+    SessionQuery, SetSessionMode,
 };
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
@@ -46,6 +47,11 @@ enum Cmd {
         #[command(subcommand)]
         action: PolicyAction,
     },
+    /// Query or set session mode
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -89,6 +95,27 @@ enum PolicyAction {
     },
 }
 
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Show current session state for all callers
+    Show {
+        /// Filter by caller UID (empty = all)
+        #[arg(long, default_value = "")]
+        caller: String,
+    },
+    /// Set session mode for a caller
+    Set {
+        /// Session mode: inactive, strict, trust, auto_accept
+        mode: String,
+        /// Caller UID
+        #[arg(long, default_value = "cloud")]
+        caller: String,
+        /// Trust timeout in minutes (only for trust mode)
+        #[arg(long, default_value = "0")]
+        timeout: u64,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -113,6 +140,9 @@ async fn main() -> anyhow::Result<()> {
             Cmd::Policy { action } => {
                 ipc_policy(ipc_path, action).await?;
             }
+            Cmd::Session { action } => {
+                ipc_session(ipc_path, action).await?;
+            }
         }
     } else {
         // WS mode.
@@ -132,6 +162,9 @@ async fn main() -> anyhow::Result<()> {
             }
             Cmd::Policy { action } => {
                 ws_policy(&args.url, action).await?;
+            }
+            Cmd::Session { action } => {
+                ws_session(&args.url, action).await?;
             }
         }
     }
@@ -526,10 +559,18 @@ async fn ipc_approve(socket_path: &str) -> anyhow::Result<()> {
             };
             let choice = line.trim().to_lowercase();
 
-            let (approved, remember) = match choice.as_str() {
-                "y" | "yes" => (true, false),
-                "r" | "remember" => (true, true),
-                _ => (false, false),
+            let (approved, remember, reason) = match choice.as_str() {
+                "y" | "yes" => (true, false, String::new()),
+                "r" | "remember" => (true, true, String::new()),
+                _ => {
+                    // If the input is longer than a single char, treat it as a refusal reason.
+                    let reason = if choice.len() > 1 && choice != "n" && choice != "no" {
+                        choice.clone()
+                    } else {
+                        String::new()
+                    };
+                    (false, false, reason)
+                }
             };
 
             let resp_env = Envelope {
@@ -540,6 +581,7 @@ async fn ipc_approve(socket_path: &str) -> anyhow::Result<()> {
                     job_id: req.job_id.clone(),
                     approved,
                     remember,
+                    reason: reason.clone(),
                 })),
                 ..Default::default()
             };
@@ -547,8 +589,10 @@ async fn ipc_approve(socket_path: &str) -> anyhow::Result<()> {
 
             if approved {
                 eprintln!("[approval] Approved job {}{}", req.job_id, if remember { " (remembered)" } else { "" });
-            } else {
+            } else if reason.is_empty() {
                 eprintln!("[approval] Denied job {}", req.job_id);
+            } else {
+                eprintln!("[approval] Denied job {} with reason: {}", req.job_id, reason);
             }
         }
     }
@@ -658,6 +702,124 @@ async fn ws_policy(url: &str, action: PolicyAction) -> anyhow::Result<()> {
 
     sink.close().await?;
     Ok(())
+}
+
+// ── IPC session ─────────────────────────────────────────────────────
+
+async fn ipc_session(socket_path: &str, action: SessionAction) -> anyhow::Result<()> {
+    let stream = tokio::net::UnixStream::connect(socket_path).await?;
+    let (mut reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(&mut reader);
+
+    let device_id = format!("ctl-{}", std::process::id());
+
+    let request_env = build_session_envelope(&device_id, &action);
+    write_frame(&mut writer, &request_env.encode_to_vec()).await?;
+
+    // Wait for SessionState response(s).
+    loop {
+        let data = match read_frame(&mut reader).await {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        };
+
+        let envelope = Envelope::decode(data.as_slice())?;
+
+        if let Some(envelope::Payload::SessionState(state)) = envelope.payload {
+            print_session_state(&state);
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+// ── WS session ──────────────────────────────────────────────────────
+
+async fn ws_session(url: &str, action: SessionAction) -> anyhow::Result<()> {
+    let (mut sink, mut stream, device_id) = connect_and_hello(url).await?;
+
+    let request_env = build_session_envelope(&device_id, &action);
+    sink.send(tungstenite::Message::Binary(request_env.encode_to_vec()))
+        .await?;
+
+    // Wait for SessionState response(s).
+    while let Some(msg) = stream.next().await {
+        let msg = msg?;
+        let data = match msg {
+            tungstenite::Message::Binary(b) => b,
+            tungstenite::Message::Close(_) => break,
+            _ => continue,
+        };
+
+        let envelope = Envelope::decode(data.as_ref())?;
+
+        if let Some(envelope::Payload::SessionState(state)) = envelope.payload {
+            print_session_state(&state);
+            break;
+        }
+    }
+
+    sink.close().await?;
+    Ok(())
+}
+
+// ── Session helpers ─────────────────────────────────────────────────
+
+fn build_session_envelope(device_id: &str, action: &SessionAction) -> Envelope {
+    match action {
+        SessionAction::Show { caller } => Envelope {
+            device_id: device_id.to_string(),
+            msg_id: "session-query-0".to_string(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::SessionQuery(SessionQuery {
+                caller_uid: caller.clone(),
+            })),
+            ..Default::default()
+        },
+        SessionAction::Set { mode, caller, timeout } => {
+            let mode_val = match mode.as_str() {
+                "inactive" => 0,
+                "strict" => 1,
+                "trust" => 2,
+                "auto_accept" | "auto" => 3,
+                other => {
+                    eprintln!("Unknown mode: {other}. Use: inactive, strict, trust, auto_accept");
+                    std::process::exit(1);
+                }
+            };
+            Envelope {
+                device_id: device_id.to_string(),
+                msg_id: "session-set-0".to_string(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::SetSessionMode(SetSessionMode {
+                    caller_uid: caller.clone(),
+                    mode: mode_val,
+                    trust_timeout_mins: *timeout,
+                })),
+                ..Default::default()
+            }
+        }
+    }
+}
+
+fn print_session_state(state: &ahand_protocol::SessionState) {
+    let mode_name = match state.mode {
+        0 => "inactive",
+        1 => "strict",
+        2 => "trust",
+        3 => "auto_accept",
+        _ => "unknown",
+    };
+    println!("Session: caller={} mode={}", state.caller_uid, mode_name);
+    if state.trust_expires_ms > 0 {
+        let remaining = state.trust_expires_ms.saturating_sub(now_ms());
+        println!("  Trust expires in: {}s", remaining / 1000);
+    }
+    if state.trust_timeout_mins > 0 {
+        println!("  Trust timeout: {}min", state.trust_timeout_mins);
+    }
 }
 
 // ── Policy helpers ───────────────────────────────────────────────────

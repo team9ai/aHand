@@ -20,9 +20,12 @@ message Envelope {
     CancelJob        cancel_job        = 15;
     ApprovalRequest  approval_request  = 16;
     ApprovalResponse approval_response = 17;
-    PolicyQuery      policy_query      = 18;
-    PolicyState      policy_state      = 19;
-    PolicyUpdate     policy_update     = 20;
+    PolicyQuery      policy_query      = 18;  // reserved for Mode 5 (preset)
+    PolicyState      policy_state      = 19;  // reserved for Mode 5 (preset)
+    PolicyUpdate     policy_update     = 20;  // reserved for Mode 5 (preset)
+    SetSessionMode   set_session_mode  = 21;
+    SessionState     session_state     = 22;
+    SessionQuery     session_query     = 23;
   }
 }
 
@@ -74,7 +77,7 @@ message CancelJob {
   string job_id = 1;
 }
 
-// ApprovalRequest - daemon asks user to approve a job that is not in the allowlist.
+// ApprovalRequest - daemon asks user to approve a job (strict mode).
 message ApprovalRequest {
   string job_id  = 1;
   string tool    = 2;
@@ -84,13 +87,15 @@ message ApprovalRequest {
   repeated string detected_domains = 6;
   uint64 expires_ms  = 7;  // absolute timestamp when this request expires
   string caller_uid  = 8;  // who submitted the job (IPC="uid:N", WS="cloud")
+  repeated RefusalContext previous_refusals = 9;  // recent refusals for the same tool (24h context)
 }
 
 // ApprovalResponse - user responds to an approval request.
 message ApprovalResponse {
   string job_id   = 1;
   bool   approved = 2;
-  bool   remember = 3;  // if true, remember approval for this user's session
+  bool   remember = 3;  // reserved for Mode 5 (preset)
+  string reason   = 4;  // refusal reason (stored for 24h as context)
 }
 
 // PolicyQuery - request the current policy configuration.
@@ -106,6 +111,7 @@ message PolicyState {
 }
 
 // PolicyUpdate - incremental policy modification. Empty lists = no change.
+// Reserved for Mode 5 (preset).
 message PolicyUpdate {
   repeated string add_allowed_tools      = 1;
   repeated string remove_allowed_tools   = 2;
@@ -116,4 +122,41 @@ message PolicyUpdate {
   repeated string add_denied_paths       = 7;
   repeated string remove_denied_paths    = 8;
   uint64 approval_timeout_secs = 9;  // 0 = don't change
+}
+
+// ── Session Mode System ─────────────────────────────────────────
+
+// Session mode controls how commands from a specific caller are handled.
+enum SessionMode {
+  SESSION_MODE_INACTIVE    = 0;  // default — reject all, prompt user to activate
+  SESSION_MODE_STRICT      = 1;  // every command requires manual approval
+  SESSION_MODE_TRUST       = 2;  // auto-approve, with inactivity timeout
+  SESSION_MODE_AUTO_ACCEPT = 3;  // auto-approve, no timeout
+}
+
+// SetSessionMode - set the mode for a specific caller (cloud → daemon).
+message SetSessionMode {
+  string caller_uid        = 1;
+  SessionMode mode         = 2;
+  uint64 trust_timeout_mins = 3;  // 0 = use default (60 min)
+}
+
+// SessionState - current session state for a caller (daemon → cloud).
+message SessionState {
+  string caller_uid        = 1;
+  SessionMode mode         = 2;
+  uint64 trust_expires_ms  = 3;  // absolute timestamp, 0 = not applicable
+  uint64 trust_timeout_mins = 4;
+}
+
+// SessionQuery - request session state (cloud → daemon).
+message SessionQuery {
+  string caller_uid = 1;  // empty = query all sessions
+}
+
+// RefusalContext - context from a recent refusal of the same tool.
+message RefusalContext {
+  string tool          = 1;
+  string reason        = 2;
+  uint64 refused_at_ms = 3;
 }

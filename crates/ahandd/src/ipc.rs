@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ahand_protocol::{envelope, Envelope, JobFinished, JobRejected};
+use ahand_protocol::{envelope, Envelope, JobFinished, JobRejected, SessionMode};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -9,10 +9,9 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use crate::approval::ApprovalManager;
-use crate::config::Config;
 use crate::executor;
-use crate::policy::{PolicyChecker, PolicyDecision};
 use crate::registry::{IsKnown, JobRegistry};
+use crate::session::{SessionDecision, SessionManager};
 use crate::store::RunStore;
 
 /// Start the IPC server on the given Unix socket path.
@@ -22,11 +21,10 @@ pub async fn serve_ipc(
     socket_mode: u32,
     registry: Arc<JobRegistry>,
     store: Option<Arc<RunStore>>,
-    policy: Arc<PolicyChecker>,
+    session_mgr: Arc<SessionManager>,
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     device_id: String,
-    config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     // Remove stale socket file if it exists.
     let _ = std::fs::remove_file(&socket_path);
@@ -57,14 +55,13 @@ pub async fn serve_ipc(
 
                 let reg = Arc::clone(&registry);
                 let st = store.clone();
-                let pol = Arc::clone(&policy);
+                let smgr = Arc::clone(&session_mgr);
                 let amgr = Arc::clone(&approval_mgr);
                 let bcast = approval_broadcast_tx.clone();
                 let did = device_id.clone();
-                let cfgp = config_path.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_ipc_conn(
-                        stream, reg, st, pol, amgr, bcast, did, caller_uid, cfgp,
+                        stream, reg, st, smgr, amgr, bcast, did, caller_uid,
                     )
                     .await
                     {
@@ -84,17 +81,19 @@ async fn handle_ipc_conn(
     stream: UnixStream,
     registry: Arc<JobRegistry>,
     store: Option<Arc<RunStore>>,
-    policy: Arc<PolicyChecker>,
+    session_mgr: Arc<SessionManager>,
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     device_id: String,
     caller_uid: String,
-    config_path: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
 
     info!(caller_uid = %caller_uid, "IPC: new connection");
+
+    // Register the IPC caller so session queries return it.
+    session_mgr.register_caller(&caller_uid).await;
 
     // Channel for sending responses back through the IPC stream.
     let (tx, mut rx) = mpsc::unbounded_channel::<Envelope>();
@@ -185,10 +184,10 @@ async fn handle_ipc_conn(
                     IsKnown::Unknown => {}
                 }
 
-                // Three-way policy check.
-                match policy.check(&req, &caller_uid).await {
-                    PolicyDecision::Deny(reason) => {
-                        warn!(job_id = %req.job_id, reason = %reason, "IPC: job rejected by policy");
+                // Session mode check.
+                match session_mgr.check(&req, &caller_uid).await {
+                    SessionDecision::Deny(reason) => {
+                        warn!(job_id = %req.job_id, reason = %reason, "IPC: job rejected by session mode");
                         let reject_env = Envelope {
                             device_id: device_id.clone(),
                             msg_id: new_msg_id(),
@@ -201,7 +200,7 @@ async fn handle_ipc_conn(
                         };
                         let _ = tx.send(reject_env);
                     }
-                    PolicyDecision::Allow => {
+                    SessionDecision::Allow => {
                         let job_id = req.job_id.clone();
                         let tx_clone = tx.clone();
                         let did = device_id.clone();
@@ -222,11 +221,11 @@ async fn handle_ipc_conn(
                             reg.mark_completed(job_id, exit_code, error).await;
                         });
                     }
-                    PolicyDecision::NeedsApproval { reason, detected_domains } => {
-                        info!(job_id = %req.job_id, reason = %reason, "IPC: job needs approval");
+                    SessionDecision::NeedsApproval { reason, previous_refusals } => {
+                        info!(job_id = %req.job_id, reason = %reason, "IPC: job needs approval (strict mode)");
 
                         let (approval_req, approval_rx) = approval_mgr
-                            .submit(req.clone(), &caller_uid, reason, detected_domains)
+                            .submit(req.clone(), &caller_uid, reason, previous_refusals)
                             .await;
 
                         // Send ApprovalRequest to this IPC client.
@@ -241,8 +240,7 @@ async fn handle_ipc_conn(
                         };
                         let _ = tx.send(approval_env.clone());
 
-                        // Also broadcast to other IPC clients (the broadcast channel
-                        // is also received by the WS client for cloud notification).
+                        // Also broadcast to other IPC clients.
                         let _ = approval_broadcast_tx.send(approval_env);
 
                         // Spawn a task to wait for approval.
@@ -251,7 +249,7 @@ async fn handle_ipc_conn(
                         let reg = Arc::clone(&registry);
                         let st = store.clone();
                         let amgr = Arc::clone(&approval_mgr);
-                        let pol = Arc::clone(&policy);
+                        let smgr = Arc::clone(&session_mgr);
                         let timeout = amgr.default_timeout();
                         let job_id = req.job_id.clone();
                         let cuid = caller_uid.clone();
@@ -261,14 +259,6 @@ async fn handle_ipc_conn(
                             match result {
                                 Ok(Ok(resp)) if resp.approved => {
                                     info!(job_id = %job_id, "IPC: approval granted");
-                                    if resp.remember {
-                                        pol.remember_approval(
-                                            &cuid,
-                                            &req.tool,
-                                            &approval_req.detected_domains,
-                                        )
-                                        .await;
-                                    }
                                     let (cancel_tx, cancel_rx) = mpsc::channel(1);
                                     reg.register(job_id.clone(), cancel_tx).await;
                                     let _permit = reg.acquire_permit().await;
@@ -277,8 +267,11 @@ async fn handle_ipc_conn(
                                     reg.remove(&job_id).await;
                                     reg.mark_completed(job_id, exit_code, error).await;
                                 }
-                                _ => {
-                                    info!(job_id = %job_id, "IPC: approval denied or timed out");
+                                Ok(Ok(resp)) => {
+                                    info!(job_id = %job_id, "IPC: approval denied");
+                                    if !resp.reason.is_empty() {
+                                        smgr.record_refusal(&cuid, &req.tool, &resp.reason).await;
+                                    }
                                     amgr.expire(&job_id).await;
                                     let reject_env = Envelope {
                                         device_id: did,
@@ -287,7 +280,28 @@ async fn handle_ipc_conn(
                                         payload: Some(envelope::Payload::JobRejected(
                                             JobRejected {
                                                 job_id,
-                                                reason: "approval denied or timed out".to_string(),
+                                                reason: if resp.reason.is_empty() {
+                                                    "approval denied".to_string()
+                                                } else {
+                                                    format!("approval denied: {}", resp.reason)
+                                                },
+                                            },
+                                        )),
+                                        ..Default::default()
+                                    };
+                                    let _ = tx_clone.send(reject_env);
+                                }
+                                _ => {
+                                    info!(job_id = %job_id, "IPC: approval timed out");
+                                    amgr.expire(&job_id).await;
+                                    let reject_env = Envelope {
+                                        device_id: did,
+                                        msg_id: new_msg_id(),
+                                        ts_ms: now_ms(),
+                                        payload: Some(envelope::Payload::JobRejected(
+                                            JobRejected {
+                                                job_id,
+                                                reason: "approval timed out".to_string(),
                                             },
                                         )),
                                         ..Default::default()
@@ -305,43 +319,45 @@ async fn handle_ipc_conn(
             }
             Some(envelope::Payload::ApprovalResponse(resp)) => {
                 info!(job_id = %resp.job_id, approved = resp.approved, "IPC: received approval response");
-                approval_mgr.resolve(&resp).await;
-            }
-            Some(envelope::Payload::PolicyQuery(_)) => {
-                info!("IPC: received policy query");
-                let state = policy.get_state().await;
-                let state_env = Envelope {
-                    device_id: device_id.clone(),
-                    msg_id: new_msg_id(),
-                    ts_ms: now_ms(),
-                    payload: Some(envelope::Payload::PolicyState(state)),
-                    ..Default::default()
-                };
-                let _ = tx.send(state_env);
-            }
-            Some(envelope::Payload::PolicyUpdate(update)) => {
-                info!("IPC: received policy update");
-                policy.apply_update(&update).await;
-
-                // Persist to config file if available.
-                if let Some(path) = &config_path
-                    && let Ok(mut existing) = Config::load(path)
-                {
-                    existing.policy = policy.config_snapshot().await;
-                    if let Err(e) = existing.save(path) {
-                        warn!(error = %e, "IPC: failed to persist policy update to config file");
+                if !resp.approved && !resp.reason.is_empty() {
+                    if let Some((req, _)) = approval_mgr.resolve(&resp).await {
+                        session_mgr
+                            .record_refusal(&caller_uid, &req.tool, &resp.reason)
+                            .await;
                     }
+                } else {
+                    approval_mgr.resolve(&resp).await;
                 }
-
-                let state = policy.get_state().await;
+            }
+            Some(envelope::Payload::SetSessionMode(msg)) => {
+                let mode = SessionMode::try_from(msg.mode)
+                    .unwrap_or(SessionMode::Inactive);
+                info!(caller_uid = %msg.caller_uid, ?mode, "IPC: received set session mode");
+                let state = session_mgr
+                    .set_mode(&msg.caller_uid, mode, msg.trust_timeout_mins)
+                    .await;
                 let state_env = Envelope {
                     device_id: device_id.clone(),
                     msg_id: new_msg_id(),
                     ts_ms: now_ms(),
-                    payload: Some(envelope::Payload::PolicyState(state)),
+                    payload: Some(envelope::Payload::SessionState(state)),
                     ..Default::default()
                 };
                 let _ = tx.send(state_env);
+            }
+            Some(envelope::Payload::SessionQuery(query)) => {
+                info!(caller_uid = %query.caller_uid, "IPC: received session query");
+                let states = session_mgr.query_sessions(&query.caller_uid).await;
+                for state in states {
+                    let state_env = Envelope {
+                        device_id: device_id.clone(),
+                        msg_id: new_msg_id(),
+                        ts_ms: now_ms(),
+                        payload: Some(envelope::Payload::SessionState(state)),
+                        ..Default::default()
+                    };
+                    let _ = tx.send(state_env);
+                }
             }
             _ => {}
         }
