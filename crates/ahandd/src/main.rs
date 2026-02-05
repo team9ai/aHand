@@ -1,8 +1,9 @@
+mod ahand_client;
 mod approval;
-mod client;
 mod config;
 mod executor;
 mod ipc;
+mod openclaw;
 mod outbox;
 mod policy;
 mod registry;
@@ -14,12 +15,17 @@ use std::sync::Arc;
 
 use ahand_protocol::Envelope;
 use clap::Parser;
+use config::ConnectionMode;
 use tracing::info;
 
 #[derive(Parser)]
 #[command(name = "ahandd", about = "AHand local execution daemon")]
 struct Args {
-    /// Cloud WebSocket URL (e.g. ws://localhost:3000/ws)
+    /// Connection mode: "ahand-cloud" (default) or "openclaw-gateway"
+    #[arg(long, env = "AHAND_MODE")]
+    mode: Option<String>,
+
+    /// Cloud WebSocket URL (e.g. ws://localhost:3000/ws) - for ahand-cloud mode
     #[arg(long, env = "AHAND_URL")]
     url: Option<String>,
 
@@ -42,6 +48,35 @@ struct Args {
     /// Custom path for the IPC Unix socket
     #[arg(long, env = "AHAND_IPC_SOCKET")]
     ipc_socket: Option<String>,
+
+    // OpenClaw Gateway options
+    /// OpenClaw Gateway host
+    #[arg(long, env = "OPENCLAW_GATEWAY_HOST")]
+    gateway_host: Option<String>,
+
+    /// OpenClaw Gateway port
+    #[arg(long, env = "OPENCLAW_GATEWAY_PORT")]
+    gateway_port: Option<u16>,
+
+    /// Use TLS for OpenClaw Gateway connection
+    #[arg(long, env = "OPENCLAW_GATEWAY_TLS")]
+    gateway_tls: bool,
+
+    /// OpenClaw node ID
+    #[arg(long, env = "OPENCLAW_NODE_ID")]
+    node_id: Option<String>,
+
+    /// OpenClaw node display name
+    #[arg(long, env = "OPENCLAW_DISPLAY_NAME")]
+    display_name: Option<String>,
+
+    /// OpenClaw Gateway authentication token
+    #[arg(long, env = "OPENCLAW_GATEWAY_TOKEN")]
+    gateway_token: Option<String>,
+
+    /// OpenClaw Gateway authentication password
+    #[arg(long, env = "OPENCLAW_GATEWAY_PASSWORD")]
+    gateway_password: Option<String>,
 }
 
 #[tokio::main]
@@ -57,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         // Build a minimal config from CLI args.
         config::Config {
+            mode: args.mode.clone(),
             server_url: args
                 .url
                 .clone()
@@ -69,10 +105,14 @@ async fn main() -> anyhow::Result<()> {
             ipc_socket_mode: None,
             trust_timeout_mins: None,
             policy: Default::default(),
+            openclaw: None,
         }
     };
 
     // CLI args override config file values.
+    if let Some(mode) = args.mode {
+        cfg.mode = Some(mode);
+    }
     if let Some(url) = args.url {
         cfg.server_url = url;
     }
@@ -89,18 +129,45 @@ async fn main() -> anyhow::Result<()> {
         cfg.ipc_socket_path = Some(ipc_socket);
     }
 
+    // OpenClaw args override config file values
+    if args.gateway_host.is_some()
+        || args.gateway_port.is_some()
+        || args.gateway_tls
+        || args.node_id.is_some()
+        || args.display_name.is_some()
+        || args.gateway_token.is_some()
+        || args.gateway_password.is_some()
+    {
+        let mut oc = cfg.openclaw.take().unwrap_or_default();
+        if let Some(host) = args.gateway_host {
+            oc.gateway_host = Some(host);
+        }
+        if let Some(port) = args.gateway_port {
+            oc.gateway_port = Some(port);
+        }
+        if args.gateway_tls {
+            oc.gateway_tls = Some(true);
+        }
+        if let Some(node_id) = args.node_id {
+            oc.node_id = Some(node_id);
+        }
+        if let Some(display_name) = args.display_name {
+            oc.display_name = Some(display_name);
+        }
+        if let Some(token) = args.gateway_token {
+            oc.auth_token = Some(token);
+        }
+        if let Some(password) = args.gateway_password {
+            oc.auth_password = Some(password);
+        }
+        cfg.openclaw = Some(oc);
+    }
+
+    let connection_mode = cfg.connection_mode();
     let device_id = cfg.device_id();
     let debug_ipc = cfg.debug_ipc.unwrap_or(false);
     let ipc_socket_path = cfg.ipc_socket_path();
     let ipc_socket_mode = cfg.ipc_socket_mode();
-
-    info!(
-        server_url = %cfg.server_url,
-        device_id = %device_id,
-        max_concurrent_jobs = cfg.max_concurrent_jobs.unwrap_or(8),
-        debug_ipc,
-        "ahandd starting"
-    );
 
     // Shared resources.
     let max_jobs = cfg.max_concurrent_jobs.unwrap_or(8);
@@ -133,27 +200,95 @@ async fn main() -> anyhow::Result<()> {
     // Broadcast channel for pushing approval requests to all IPC clients.
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
 
-    if debug_ipc {
-        let ipc_handle = tokio::spawn(ipc::serve_ipc(
-            ipc_socket_path,
-            ipc_socket_mode,
-            Arc::clone(&registry),
-            store_opt.clone(),
-            Arc::clone(&session_mgr),
-            Arc::clone(&approval_mgr),
-            approval_broadcast_tx.clone(),
-            device_id.clone(),
-        ));
+    match connection_mode {
+        ConnectionMode::AHandCloud => {
+            info!(
+                server_url = %cfg.server_url,
+                device_id = %device_id,
+                max_concurrent_jobs = max_jobs,
+                debug_ipc,
+                "ahandd starting in ahand-cloud mode"
+            );
 
-        // Run WS client and IPC server concurrently.
-        tokio::select! {
-            r = client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx) => r,
-            r = ipc_handle => {
-                r??;
-                Ok(())
+            if debug_ipc {
+                let ipc_handle = tokio::spawn(ipc::serve_ipc(
+                    ipc_socket_path,
+                    ipc_socket_mode,
+                    Arc::clone(&registry),
+                    store_opt.clone(),
+                    Arc::clone(&session_mgr),
+                    Arc::clone(&approval_mgr),
+                    approval_broadcast_tx.clone(),
+                    device_id.clone(),
+                ));
+
+                // Run WS client and IPC server concurrently.
+                tokio::select! {
+                    r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx) => r,
+                    r = ipc_handle => {
+                        r??;
+                        Ok(())
+                    }
+                }
+            } else {
+                ahand_client::run(
+                    cfg,
+                    device_id,
+                    registry,
+                    store_opt,
+                    session_mgr,
+                    approval_mgr,
+                    approval_broadcast_tx,
+                )
+                .await
             }
         }
-    } else {
-        client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx).await
+        ConnectionMode::OpenClawGateway => {
+            let oc_config = cfg.openclaw_config();
+            let host = oc_config.gateway_host.as_deref().unwrap_or("127.0.0.1");
+            let port = oc_config.gateway_port.unwrap_or(18789);
+
+            info!(
+                gateway_host = %host,
+                gateway_port = port,
+                node_id = ?oc_config.node_id,
+                display_name = ?oc_config.display_name,
+                max_concurrent_jobs = max_jobs,
+                debug_ipc,
+                "ahandd starting in openclaw-gateway mode"
+            );
+
+            let client = openclaw::OpenClawClient::new(
+                oc_config,
+                Arc::clone(&registry),
+                Arc::clone(&session_mgr),
+                Arc::clone(&approval_mgr),
+                store_opt.clone(),
+            );
+
+            if debug_ipc {
+                let ipc_handle = tokio::spawn(ipc::serve_ipc(
+                    ipc_socket_path,
+                    ipc_socket_mode,
+                    Arc::clone(&registry),
+                    store_opt.clone(),
+                    Arc::clone(&session_mgr),
+                    Arc::clone(&approval_mgr),
+                    approval_broadcast_tx.clone(),
+                    device_id.clone(),
+                ));
+
+                // Run OpenClaw client and IPC server concurrently.
+                tokio::select! {
+                    r = client.run() => r,
+                    r = ipc_handle => {
+                        r??;
+                        Ok(())
+                    }
+                }
+            } else {
+                client.run().await
+            }
+        }
     }
 }

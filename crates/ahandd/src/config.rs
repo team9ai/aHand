@@ -1,9 +1,33 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Connection mode for ahandd
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConnectionMode {
+    /// Connect to aHand Cloud (default)
+    #[default]
+    AHandCloud,
+    /// Connect to OpenClaw Gateway as a node
+    OpenClawGateway,
+}
+
+impl ConnectionMode {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "openclaw-gateway" | "openclaw" => Self::OpenClawGateway,
+            _ => Self::AHandCloud,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
-    /// WebSocket server URL (e.g. "ws://localhost:3000/ws")
+    /// Connection mode: "ahand-cloud" (default) or "openclaw-gateway"
+    #[serde(default)]
+    pub mode: Option<String>,
+
+    /// WebSocket server URL (e.g. "ws://localhost:3000/ws") - for ahand-cloud mode
+    #[serde(default = "default_server_url")]
     pub server_url: String,
 
     /// Unique device identifier. Auto-generated if omitted.
@@ -31,6 +55,42 @@ pub struct Config {
 
     #[serde(default)]
     pub policy: PolicyConfig,
+
+    /// OpenClaw Gateway configuration (when mode = "openclaw-gateway")
+    #[serde(default)]
+    pub openclaw: Option<OpenClawConfig>,
+}
+
+/// OpenClaw Gateway connection configuration
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct OpenClawConfig {
+    /// Gateway host (e.g., "127.0.0.1")
+    pub gateway_host: Option<String>,
+
+    /// Gateway port (default: 18789)
+    pub gateway_port: Option<u16>,
+
+    /// Use TLS (wss://)
+    #[serde(default)]
+    pub gateway_tls: Option<bool>,
+
+    /// TLS certificate fingerprint for pinning
+    pub gateway_tls_fingerprint: Option<String>,
+
+    /// Node ID (auto-generated if not set)
+    pub node_id: Option<String>,
+
+    /// Display name for this node
+    pub display_name: Option<String>,
+
+    /// Authentication token
+    pub auth_token: Option<String>,
+
+    /// Authentication password
+    pub auth_password: Option<String>,
+
+    /// Path to exec-approvals.json
+    pub exec_approvals_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -73,11 +133,28 @@ fn default_approval_timeout() -> u64 {
     86400
 }
 
+fn default_server_url() -> String {
+    "ws://localhost:3000/ws".to_string()
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Get the connection mode
+    pub fn connection_mode(&self) -> ConnectionMode {
+        self.mode
+            .as_ref()
+            .map(|s| ConnectionMode::from_str(s))
+            .unwrap_or_default()
+    }
+
+    /// Get OpenClaw config, creating default if needed
+    pub fn openclaw_config(&self) -> OpenClawConfig {
+        self.openclaw.clone().unwrap_or_default()
     }
 
     /// Serialize and write the config back to a TOML file.
