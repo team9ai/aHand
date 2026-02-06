@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ahand_protocol::{envelope, Envelope, JobFinished, JobRejected, SessionMode};
+use ahand_protocol::{envelope, BrowserResponse, Envelope, JobFinished, JobRejected, SessionMode};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -9,6 +9,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use crate::approval::ApprovalManager;
+use crate::browser::BrowserManager;
 use crate::executor;
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
@@ -25,6 +26,7 @@ pub async fn serve_ipc(
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     device_id: String,
+    browser_mgr: Arc<BrowserManager>,
 ) -> anyhow::Result<()> {
     // Remove stale socket file if it exists.
     let _ = std::fs::remove_file(&socket_path);
@@ -59,9 +61,10 @@ pub async fn serve_ipc(
                 let amgr = Arc::clone(&approval_mgr);
                 let bcast = approval_broadcast_tx.clone();
                 let did = device_id.clone();
+                let bmgr = Arc::clone(&browser_mgr);
                 tokio::spawn(async move {
                     if let Err(e) = handle_ipc_conn(
-                        stream, reg, st, smgr, amgr, bcast, did, caller_uid,
+                        stream, reg, st, smgr, amgr, bcast, did, caller_uid, bmgr,
                     )
                     .await
                     {
@@ -86,6 +89,7 @@ async fn handle_ipc_conn(
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     device_id: String,
     caller_uid: String,
+    browser_mgr: Arc<BrowserManager>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
@@ -357,6 +361,83 @@ async fn handle_ipc_conn(
                         ..Default::default()
                     };
                     let _ = tx.send(state_env);
+                }
+            }
+            Some(envelope::Payload::BrowserRequest(req)) => {
+                info!(
+                    request_id = %req.request_id,
+                    action = %req.action,
+                    "IPC: received browser request"
+                );
+
+                if !browser_mgr.is_enabled() {
+                    let resp_env = Envelope {
+                        device_id: device_id.clone(),
+                        msg_id: new_msg_id(),
+                        ts_ms: now_ms(),
+                        payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
+                            request_id: req.request_id.clone(),
+                            session_id: req.session_id.clone(),
+                            success: false,
+                            error: "browser capabilities not enabled".to_string(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    };
+                    let _ = tx.send(resp_env);
+                } else if let Err(reason) = browser_mgr.check_domain(&req.action, &req.params_json) {
+                    let resp_env = Envelope {
+                        device_id: device_id.clone(),
+                        msg_id: new_msg_id(),
+                        ts_ms: now_ms(),
+                        payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
+                            request_id: req.request_id.clone(),
+                            session_id: req.session_id.clone(),
+                            success: false,
+                            error: reason,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    };
+                    let _ = tx.send(resp_env);
+                } else {
+                    let bmgr = Arc::clone(&browser_mgr);
+                    let did = device_id.clone();
+                    let tx_clone = tx.clone();
+                    tokio::spawn(async move {
+                        let result = bmgr
+                            .execute(&req.session_id, &req.action, &req.params_json, req.timeout_ms)
+                            .await;
+                        let resp = match result {
+                            Ok(r) => BrowserResponse {
+                                request_id: req.request_id.clone(),
+                                session_id: req.session_id.clone(),
+                                success: r.success,
+                                result_json: r.result_json,
+                                error: r.error,
+                                binary_data: r.binary_data,
+                                binary_mime: r.binary_mime,
+                            },
+                            Err(e) => BrowserResponse {
+                                request_id: req.request_id.clone(),
+                                session_id: req.session_id.clone(),
+                                success: false,
+                                error: format!("browser command failed: {}", e),
+                                ..Default::default()
+                            },
+                        };
+                        if req.action == "close" {
+                            bmgr.release_session(&req.session_id).await;
+                        }
+                        let resp_env = Envelope {
+                            device_id: did,
+                            msg_id: new_msg_id(),
+                            ts_ms: now_ms(),
+                            payload: Some(envelope::Payload::BrowserResponse(resp)),
+                            ..Default::default()
+                        };
+                        let _ = tx_clone.send(resp_env);
+                    });
                 }
             }
             _ => {}

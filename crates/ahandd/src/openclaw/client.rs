@@ -13,6 +13,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
 use crate::approval::ApprovalManager;
+use crate::browser::BrowserManager;
 use crate::config::OpenClawConfig;
 use crate::registry::JobRegistry;
 use crate::session::SessionManager;
@@ -38,6 +39,7 @@ pub struct OpenClawClient {
     session_mgr: Arc<SessionManager>,
     approval_mgr: Arc<ApprovalManager>,
     store: Option<Arc<RunStore>>,
+    browser_mgr: Arc<BrowserManager>,
 }
 
 impl OpenClawClient {
@@ -47,6 +49,7 @@ impl OpenClawClient {
         session_mgr: Arc<SessionManager>,
         approval_mgr: Arc<ApprovalManager>,
         store: Option<Arc<RunStore>>,
+        browser_mgr: Arc<BrowserManager>,
     ) -> Self {
         Self {
             config,
@@ -54,6 +57,7 @@ impl OpenClawClient {
             session_mgr,
             approval_mgr,
             store,
+            browser_mgr,
         }
     }
 
@@ -148,6 +152,7 @@ impl OpenClawClient {
             Arc::clone(&self.approval_mgr),
             self.store.clone(),
             self.config.exec_approvals_path.as_ref().map(PathBuf::from),
+            Arc::clone(&self.browser_mgr),
         );
 
         // Create channel for sending responses
@@ -395,6 +400,18 @@ impl OpenClawClient {
             nonce: nonce.map(|s| s.to_string()),
         };
 
+        let mut caps = vec!["system".to_string()];
+        let mut commands = vec![
+            "system.run".to_string(),
+            "system.which".to_string(),
+            "system.execApprovals.get".to_string(),
+            "system.execApprovals.set".to_string(),
+        ];
+        if self.browser_mgr.is_enabled() {
+            caps.push("browser".to_string());
+            commands.push("browser.proxy".to_string());
+        }
+
         let params = ConnectParams {
             min_protocol: PROTOCOL_VERSION,
             max_protocol: PROTOCOL_VERSION,
@@ -406,13 +423,8 @@ impl OpenClawClient {
                 mode: "node".to_string(),
                 instance_id: Some(node_id.to_string()),
             },
-            caps: Some(vec!["system".to_string()]),
-            commands: Some(vec![
-                "system.run".to_string(),
-                "system.which".to_string(),
-                "system.execApprovals.get".to_string(),
-                "system.execApprovals.set".to_string(),
-            ]),
+            caps: Some(caps),
+            commands: Some(commands),
             permissions: None,
             path_env: std::env::var("PATH").ok(),
             role: Some(role.to_string()),
@@ -454,18 +466,25 @@ impl OpenClawClient {
             commands: Vec<String>,
         }
 
+        let mut caps = vec!["system".to_string()];
+        let mut commands = vec![
+            "system.run".to_string(),
+            "system.which".to_string(),
+            "system.execApprovals.get".to_string(),
+            "system.execApprovals.set".to_string(),
+        ];
+        if self.browser_mgr.is_enabled() {
+            caps.push("browser".to_string());
+            commands.push("browser.proxy".to_string());
+        }
+
         let params = PairRequestParams {
             node_id: device_id.to_string(),
             display_name: display_name.clone(),
             platform: std::env::consts::OS.to_string(),
             version: VERSION.to_string(),
-            caps: vec!["system".to_string()],
-            commands: vec![
-                "system.run".to_string(),
-                "system.which".to_string(),
-                "system.execApprovals.get".to_string(),
-                "system.execApprovals.set".to_string(),
-            ],
+            caps,
+            commands,
         };
 
         let frame = RequestFrame::new(

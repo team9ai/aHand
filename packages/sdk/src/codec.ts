@@ -42,5 +42,7 @@ export function makeEnvelope(
     setSessionMode: payload.setSessionMode,
     sessionState: payload.sessionState,
     sessionQuery: payload.sessionQuery,
+    browserRequest: payload.browserRequest,
+    browserResponse: payload.browserResponse,
   };
 }

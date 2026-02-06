@@ -6,6 +6,7 @@
 
 /* eslint-disable */
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
+import { BrowserRequest, BrowserResponse } from "./browser";
 
 export const protobufPackage = "ahand.v1";
 
@@ -90,6 +91,8 @@ export interface Envelope {
   setSessionMode?: SetSessionMode | undefined;
   sessionState?: SessionState | undefined;
   sessionQuery?: SessionQuery | undefined;
+  browserRequest?: BrowserRequest | undefined;
+  browserResponse?: BrowserResponse | undefined;
 }
 
 /** Hello - initial handshake after WS connection. */
@@ -256,6 +259,8 @@ function createBaseEnvelope(): Envelope {
     setSessionMode: undefined,
     sessionState: undefined,
     sessionQuery: undefined,
+    browserRequest: undefined,
+    browserResponse: undefined,
   };
 }
 
@@ -320,6 +325,12 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.sessionQuery !== undefined) {
       SessionQuery.encode(message.sessionQuery, writer.uint32(186).fork()).join();
+    }
+    if (message.browserRequest !== undefined) {
+      BrowserRequest.encode(message.browserRequest, writer.uint32(194).fork()).join();
+    }
+    if (message.browserResponse !== undefined) {
+      BrowserResponse.encode(message.browserResponse, writer.uint32(202).fork()).join();
     }
     return writer;
   },
@@ -491,6 +502,22 @@ export const Envelope: MessageFns<Envelope> = {
           message.sessionQuery = SessionQuery.decode(reader, reader.uint32());
           continue;
         }
+        case 24: {
+          if (tag !== 194) {
+            break;
+          }
+
+          message.browserRequest = BrowserRequest.decode(reader, reader.uint32());
+          continue;
+        }
+        case 25: {
+          if (tag !== 202) {
+            break;
+          }
+
+          message.browserResponse = BrowserResponse.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -590,6 +617,16 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.session_query)
         ? SessionQuery.fromJSON(object.session_query)
         : undefined,
+      browserRequest: isSet(object.browserRequest)
+        ? BrowserRequest.fromJSON(object.browserRequest)
+        : isSet(object.browser_request)
+        ? BrowserRequest.fromJSON(object.browser_request)
+        : undefined,
+      browserResponse: isSet(object.browserResponse)
+        ? BrowserResponse.fromJSON(object.browserResponse)
+        : isSet(object.browser_response)
+        ? BrowserResponse.fromJSON(object.browser_response)
+        : undefined,
     };
   },
 
@@ -655,6 +692,12 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.sessionQuery !== undefined) {
       obj.sessionQuery = SessionQuery.toJSON(message.sessionQuery);
     }
+    if (message.browserRequest !== undefined) {
+      obj.browserRequest = BrowserRequest.toJSON(message.browserRequest);
+    }
+    if (message.browserResponse !== undefined) {
+      obj.browserResponse = BrowserResponse.toJSON(message.browserResponse);
+    }
     return obj;
   },
 
@@ -708,6 +751,12 @@ export const Envelope: MessageFns<Envelope> = {
       : undefined;
     message.sessionQuery = (object.sessionQuery !== undefined && object.sessionQuery !== null)
       ? SessionQuery.fromPartial(object.sessionQuery)
+      : undefined;
+    message.browserRequest = (object.browserRequest !== undefined && object.browserRequest !== null)
+      ? BrowserRequest.fromPartial(object.browserRequest)
+      : undefined;
+    message.browserResponse = (object.browserResponse !== undefined && object.browserResponse !== null)
+      ? BrowserResponse.fromPartial(object.browserResponse)
       : undefined;
     return message;
   },

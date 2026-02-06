@@ -1,5 +1,6 @@
 mod ahand_client;
 mod approval;
+mod browser;
 mod config;
 mod executor;
 mod ipc;
@@ -106,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
             trust_timeout_mins: None,
             policy: Default::default(),
             openclaw: None,
+            browser: None,
         }
     };
 
@@ -197,6 +199,8 @@ async fn main() -> anyhow::Result<()> {
     // PolicyChecker preserved for future Mode 5 (preset) use.
     let _policy = Arc::new(policy::PolicyChecker::new(&cfg.policy));
 
+    let browser_mgr = Arc::new(browser::BrowserManager::new(cfg.browser_config()));
+
     // Broadcast channel for pushing approval requests to all IPC clients.
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
 
@@ -220,11 +224,12 @@ async fn main() -> anyhow::Result<()> {
                     Arc::clone(&approval_mgr),
                     approval_broadcast_tx.clone(),
                     device_id.clone(),
+                    Arc::clone(&browser_mgr),
                 ));
 
                 // Run WS client and IPC server concurrently.
                 tokio::select! {
-                    r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx) => r,
+                    r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx, Arc::clone(&browser_mgr)) => r,
                     r = ipc_handle => {
                         r??;
                         Ok(())
@@ -239,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
                     session_mgr,
                     approval_mgr,
                     approval_broadcast_tx,
+                    browser_mgr,
                 )
                 .await
             }
@@ -264,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&session_mgr),
                 Arc::clone(&approval_mgr),
                 store_opt.clone(),
+                Arc::clone(&browser_mgr),
             );
 
             if debug_ipc {
@@ -276,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
                     Arc::clone(&approval_mgr),
                     approval_broadcast_tx.clone(),
                     device_id.clone(),
+                    Arc::clone(&browser_mgr),
                 ));
 
                 // Run OpenClaw client and IPC server concurrently.

@@ -15,11 +15,24 @@ export interface ExecOptions {
   timeoutMs?: number;
 }
 
+export interface BrowserResult {
+  success: boolean;
+  data: unknown;
+  error?: string;
+  binaryData?: Buffer;
+  binaryMime?: string;
+}
+
 export class DeviceConnection extends EventEmitter {
   readonly deviceId: string;
   readonly hello: HelloMsg;
   private readonly _ws: WebSocket;
   private readonly _jobs = new Map<string, Job>();
+  /** Pending browser request callbacks keyed by requestId. */
+  private readonly _browserPending = new Map<
+    string,
+    { resolve: (r: BrowserResult) => void; reject: (e: Error) => void }
+  >();
   /** Outbox for seq/ack tracking. Injected by AHandServer on reconnect. */
   private _outbox: Outbox;
 
@@ -135,6 +148,64 @@ export class DeviceConnection extends EventEmitter {
     this._send(envelope);
   }
 
+  /** Send a browser command and wait for the response. */
+  browser(
+    sessionId: string,
+    action: string,
+    params?: Record<string, unknown>,
+    opts?: { timeoutMs?: number },
+  ): Promise<BrowserResult> {
+    const requestId = crypto.randomUUID();
+    const envelope = makeEnvelope(this.deviceId, {
+      browserRequest: {
+        requestId,
+        sessionId,
+        action,
+        paramsJson: params ? JSON.stringify(params) : "",
+        timeoutMs: opts?.timeoutMs ?? 0,
+      },
+    });
+
+    return new Promise<BrowserResult>((resolve, reject) => {
+      this._browserPending.set(requestId, { resolve, reject });
+      this._send(envelope);
+    });
+  }
+
+  /** Open a URL in a browser session. */
+  browserOpen(sessionId: string, url: string): Promise<BrowserResult> {
+    return this.browser(sessionId, "open", { url });
+  }
+
+  /** Take an accessibility snapshot of the page. */
+  browserSnapshot(sessionId: string): Promise<BrowserResult> {
+    return this.browser(sessionId, "snapshot");
+  }
+
+  /** Click an element by selector. */
+  browserClick(sessionId: string, selector: string): Promise<BrowserResult> {
+    return this.browser(sessionId, "click", { selector });
+  }
+
+  /** Fill a form field. */
+  browserFill(
+    sessionId: string,
+    selector: string,
+    value: string,
+  ): Promise<BrowserResult> {
+    return this.browser(sessionId, "fill", { selector, value });
+  }
+
+  /** Take a screenshot. */
+  browserScreenshot(sessionId: string): Promise<BrowserResult> {
+    return this.browser(sessionId, "screenshot");
+  }
+
+  /** Close a browser session. */
+  browserClose(sessionId: string): Promise<BrowserResult> {
+    return this.browser(sessionId, "close");
+  }
+
   toJSON(): object {
     return {
       deviceId: this.deviceId,
@@ -194,6 +265,23 @@ export class DeviceConnection extends EventEmitter {
       this.emit("policyState", envelope.policyState);
     } else if (envelope.sessionState) {
       this.emit("sessionState", envelope.sessionState);
+    } else if (envelope.browserResponse) {
+      const br = envelope.browserResponse;
+      const pending = this._browserPending.get(br.requestId);
+      if (pending) {
+        this._browserPending.delete(br.requestId);
+        const resultData = br.resultJson
+          ? JSON.parse(br.resultJson)
+          : undefined;
+        pending.resolve({
+          success: br.success,
+          data: resultData,
+          error: br.error || undefined,
+          binaryData: br.binaryData?.length ? Buffer.from(br.binaryData) : undefined,
+          binaryMime: br.binaryMime || undefined,
+        });
+      }
+      this.emit("browserResponse", br);
     }
   }
 }

@@ -146,6 +146,8 @@ fn describe_payload(envelope: &Envelope) -> &'static str {
         Some(Payload::SetSessionMode(_)) => "SetSessionMode",
         Some(Payload::SessionState(_)) => "SessionState",
         Some(Payload::SessionQuery(_)) => "SessionQuery",
+        Some(Payload::BrowserRequest(_)) => "BrowserRequest",
+        Some(Payload::BrowserResponse(_)) => "BrowserResponse",
         None => "none",
     }
 }

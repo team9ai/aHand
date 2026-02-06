@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+package ahand.v1;
+
+// BrowserRequest - cloud asks local to execute a browser command.
+message BrowserRequest {
+  string request_id  = 1;
+  string session_id  = 2;  // maps to agent-browser --session parameter
+  string action      = 3;  // "open", "click", "snapshot" etc. (maps directly to CLI commands)
+  string params_json = 4;  // extra parameters as JSON (e.g. {"selector":"@e2","value":"hello"})
+  uint64 timeout_ms  = 5;  // 0 = default 30s
+}
+
+// BrowserResponse - result of a browser command.
+message BrowserResponse {
+  string request_id  = 1;
+  string session_id  = 2;
+  bool   success     = 3;
+  string result_json = 4;  // data field from agent-browser --json output
+  string error       = 5;
+  bytes  binary_data = 6;  // screenshot/PDF binary data
+  string binary_mime = 7;  // MIME type for binary_data (e.g. "image/png")
+}

@@ -37,6 +37,14 @@ const sessionModeSchema = z.object({
   trustTimeoutMins: z.number().optional(),
 });
 
+const browserSchema = z.object({
+  deviceId: z.string().optional(),
+  sessionId: z.string(),
+  action: z.string(),
+  params: z.record(z.string(), z.unknown()).optional(),
+  timeoutMs: z.number().optional(),
+});
+
 const policyUpdateSchema = z.object({
   addAllowedTools: z.array(z.string()).optional(),
   removeAllowedTools: z.array(z.string()).optional(),
@@ -243,7 +251,33 @@ export function createDashboardRoutes(
 
         return c.json({ ok: true, message: "policy update sent" });
       },
-    );
+    )
+
+    // ── POST /api/browser ────────────────────────────────────────
+    .post("/api/browser", zValidator("json", browserSchema), async (c) => {
+      const body = c.req.valid("json");
+
+      const device = body.deviceId
+        ? ahand.device(body.deviceId)
+        : ahand.devices()[0];
+
+      if (!device) {
+        return c.json({ success: false, error: "no device connected" }, 404);
+      }
+
+      try {
+        const result = await device.browser(
+          body.sessionId,
+          body.action,
+          body.params,
+          { timeoutMs: body.timeoutMs },
+        );
+        return c.json(result);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return c.json({ success: false, error: msg }, 500);
+      }
+    });
 
   return routes;
 }

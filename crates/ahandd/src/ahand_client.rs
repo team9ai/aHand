@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ahand_protocol::{envelope, Envelope, Hello, JobFinished, JobRejected};
+use ahand_protocol::{envelope, BrowserResponse, Envelope, Hello, JobFinished, JobRejected};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::{broadcast, mpsc};
@@ -8,6 +8,7 @@ use tokio_tungstenite::tungstenite;
 use tracing::{error, info, warn};
 
 use crate::approval::ApprovalManager;
+use crate::browser::BrowserManager;
 use crate::config::Config;
 use crate::executor;
 use crate::outbox::{prepare_outbound, Outbox};
@@ -24,6 +25,7 @@ pub async fn run(
     session_mgr: Arc<SessionManager>,
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
+    browser_mgr: Arc<BrowserManager>,
 ) -> anyhow::Result<()> {
 
     // Outbox survives across reconnects.
@@ -43,6 +45,7 @@ pub async fn run(
             &outbox,
             &approval_mgr,
             &approval_broadcast_tx,
+            &browser_mgr,
         )
         .await
         {
@@ -72,6 +75,7 @@ async fn connect(
     outbox: &Arc<tokio::sync::Mutex<Outbox>>,
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
+    browser_mgr: &Arc<BrowserManager>,
 ) -> anyhow::Result<()> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
     let (mut sink, mut stream) = ws_stream.split();
@@ -80,6 +84,10 @@ async fn connect(
     info!(last_ack, "connected, sending Hello");
 
     // Send Hello envelope — Hello is NOT stamped (seq=0), it's a connection signal.
+    let mut capabilities = vec!["exec".to_string()];
+    if browser_mgr.is_enabled() {
+        capabilities.push("browser".to_string());
+    }
     let hello = Envelope {
         device_id: device_id.to_string(),
         msg_id: "hello-0".to_string(),
@@ -90,7 +98,7 @@ async fn connect(
                 .to_string_lossy()
                 .to_string(),
             os: std::env::consts::OS.to_string(),
-            capabilities: vec!["exec".to_string()],
+            capabilities,
             last_ack,
         })),
         ..Default::default()
@@ -221,6 +229,17 @@ async fn connect(
             }
             Some(envelope::Payload::SessionQuery(query)) => {
                 handle_session_query(device_id, session_mgr, &query, &tx).await;
+            }
+            Some(envelope::Payload::BrowserRequest(req)) => {
+                handle_browser_request(
+                    device_id,
+                    caller_uid,
+                    &req,
+                    &tx,
+                    session_mgr,
+                    browser_mgr,
+                )
+                .await;
             }
             _ => {}
         }
@@ -439,6 +458,132 @@ async fn handle_session_query(
             ..Default::default()
         };
         let _ = tx.send(state_env);
+    }
+}
+
+async fn handle_browser_request(
+    device_id: &str,
+    caller_uid: &str,
+    req: &ahand_protocol::BrowserRequest,
+    tx: &mpsc::UnboundedSender<Envelope>,
+    session_mgr: &Arc<SessionManager>,
+    browser_mgr: &Arc<BrowserManager>,
+) {
+    info!(
+        request_id = %req.request_id,
+        session_id = %req.session_id,
+        action = %req.action,
+        "received browser request"
+    );
+
+    if !browser_mgr.is_enabled() {
+        let resp_env = Envelope {
+            device_id: device_id.to_string(),
+            msg_id: new_msg_id(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
+                request_id: req.request_id.clone(),
+                session_id: req.session_id.clone(),
+                success: false,
+                error: "browser capabilities not enabled".to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let _ = tx.send(resp_env);
+        return;
+    }
+
+    // Session mode check using a synthetic JobRequest.
+    let synthetic_req = ahand_protocol::JobRequest {
+        job_id: req.request_id.clone(),
+        tool: "browser".to_string(),
+        args: vec![req.action.clone()],
+        ..Default::default()
+    };
+
+    match session_mgr.check(&synthetic_req, caller_uid).await {
+        crate::session::SessionDecision::Deny(reason) => {
+            warn!(request_id = %req.request_id, reason = %reason, "browser request rejected by session mode");
+            let resp_env = Envelope {
+                device_id: device_id.to_string(),
+                msg_id: new_msg_id(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
+                    request_id: req.request_id.clone(),
+                    session_id: req.session_id.clone(),
+                    success: false,
+                    error: reason,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let _ = tx.send(resp_env);
+        }
+        crate::session::SessionDecision::Allow
+        | crate::session::SessionDecision::NeedsApproval { .. } => {
+            // Domain check.
+            if let Err(reason) = browser_mgr.check_domain(&req.action, &req.params_json) {
+                let resp_env = Envelope {
+                    device_id: device_id.to_string(),
+                    msg_id: new_msg_id(),
+                    ts_ms: now_ms(),
+                    payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
+                        request_id: req.request_id.clone(),
+                        session_id: req.session_id.clone(),
+                        success: false,
+                        error: reason,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let _ = tx.send(resp_env);
+                return;
+            }
+
+            // Execute browser command.
+            let result = browser_mgr
+                .execute(
+                    &req.session_id,
+                    &req.action,
+                    &req.params_json,
+                    req.timeout_ms,
+                )
+                .await;
+
+            let resp = match result {
+                Ok(r) => BrowserResponse {
+                    request_id: req.request_id.clone(),
+                    session_id: req.session_id.clone(),
+                    success: r.success,
+                    result_json: r.result_json,
+                    error: r.error,
+                    binary_data: r.binary_data,
+                    binary_mime: r.binary_mime,
+                },
+                Err(e) => BrowserResponse {
+                    request_id: req.request_id.clone(),
+                    session_id: req.session_id.clone(),
+                    success: false,
+                    error: format!("browser command failed: {}", e),
+                    ..Default::default()
+                },
+            };
+
+            // Release session tracking on close.
+            if req.action == "close" {
+                browser_mgr.release_session(&req.session_id).await;
+            }
+
+            let resp_env = Envelope {
+                device_id: device_id.to_string(),
+                msg_id: new_msg_id(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::BrowserResponse(resp)),
+                ..Default::default()
+            };
+            let _ = tx.send(resp_env);
+        }
     }
 }
 

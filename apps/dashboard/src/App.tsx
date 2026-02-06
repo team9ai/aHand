@@ -6,12 +6,14 @@ import ExecPanel from "./panels/ExecPanel";
 import ApprovalsPanel from "./panels/ApprovalsPanel";
 import SessionPanel from "./panels/SessionPanel";
 import EventLogPanel from "./panels/EventLogPanel";
+import BrowserPanel from "./panels/BrowserPanel";
 
-type PanelId = "devices" | "exec" | "approvals" | "sessions" | "events";
+type PanelId = "devices" | "exec" | "browser" | "approvals" | "sessions" | "events";
 
 const panels: { id: PanelId; label: string }[] = [
   { id: "devices", label: "Devices" },
   { id: "exec", label: "Execute" },
+  { id: "browser", label: "Browser" },
   { id: "approvals", label: "Approvals" },
   { id: "sessions", label: "Sessions" },
   { id: "events", label: "Event Log" },
@@ -63,6 +65,9 @@ const App: Component = () => {
         </div>
         <div class={`panel ${activePanel() === "exec" ? "active" : ""}`}>
           <ExecPanel />
+        </div>
+        <div class={`panel ${activePanel() === "browser" ? "active" : ""}`}>
+          <BrowserPanel />
         </div>
         <div
           class={`panel ${activePanel() === "approvals" ? "active" : ""}`}

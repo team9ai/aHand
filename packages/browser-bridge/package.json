@@ -1,0 +1,15 @@
+{
+  "name": "@ahand/browser-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ncc-bundled daemon for agent-browser (browser automation bridge)",
+  "scripts": {
+    "build": "ncc build node_modules/agent-browser/dist/daemon.js -o dist && node postbuild.js"
+  },
+  "dependencies": {
+    "agent-browser": "*"
+  },
+  "devDependencies": {
+    "@vercel/ncc": "^0.38.0"
+  }
+}

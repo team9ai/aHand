@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package ahand.v1;
 
+import "ahand/v1/browser.proto";
+
 // Envelope wraps all messages on the wire (WS and IPC).
 message Envelope {
   string device_id = 1;
@@ -26,6 +28,8 @@ message Envelope {
     SetSessionMode   set_session_mode  = 21;
     SessionState     session_state     = 22;
     SessionQuery     session_query     = 23;
+    BrowserRequest   browser_request   = 24;
+    BrowserResponse  browser_response  = 25;
   }
 }
 

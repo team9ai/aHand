@@ -59,6 +59,10 @@ pub struct Config {
     /// OpenClaw Gateway configuration (when mode = "openclaw-gateway")
     #[serde(default)]
     pub openclaw: Option<OpenClawConfig>,
+
+    /// Browser control configuration (agent-browser integration)
+    #[serde(default)]
+    pub browser: Option<BrowserConfig>,
 }
 
 /// OpenClaw Gateway connection configuration
@@ -91,6 +95,46 @@ pub struct OpenClawConfig {
 
     /// Path to exec-approvals.json
     pub exec_approvals_path: Option<String>,
+}
+
+/// Browser control configuration (agent-browser CLI integration).
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct BrowserConfig {
+    /// Enable browser capabilities (default: false).
+    pub enabled: Option<bool>,
+
+    /// Path to the agent-browser CLI binary (default: ~/.ahand/bin/agent-browser).
+    pub binary_path: Option<String>,
+
+    /// Browser executable path (e.g. system Chrome). Auto-detected if omitted.
+    pub executable_path: Option<String>,
+
+    /// AGENT_BROWSER_HOME — directory where daemon.js is located (default: ~/.ahand/browser).
+    pub home_dir: Option<String>,
+
+    /// AGENT_BROWSER_SOCKET_DIR — directory for daemon socket files (default: ~/.ahand/browser/sockets).
+    pub socket_dir: Option<String>,
+
+    /// PLAYWRIGHT_BROWSERS_PATH — Chromium fallback install directory (default: ~/.ahand/browser/browsers).
+    pub browsers_path: Option<String>,
+
+    /// Default command timeout in milliseconds (default: 30000).
+    pub default_timeout_ms: Option<u64>,
+
+    /// Maximum number of concurrent browser sessions (default: 4).
+    pub max_sessions: Option<usize>,
+
+    /// Allowed domains (empty = allow all).
+    #[serde(default)]
+    pub allowed_domains: Vec<String>,
+
+    /// Denied domains (checked before allowed_domains).
+    #[serde(default)]
+    pub denied_domains: Vec<String>,
+
+    /// Show browser window instead of headless (default: false).
+    #[serde(default)]
+    pub headed: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -155,6 +199,11 @@ impl Config {
     /// Get OpenClaw config, creating default if needed
     pub fn openclaw_config(&self) -> OpenClawConfig {
         self.openclaw.clone().unwrap_or_default()
+    }
+
+    /// Get browser config, creating default if needed
+    pub fn browser_config(&self) -> BrowserConfig {
+        self.browser.clone().unwrap_or_default()
     }
 
     /// Serialize and write the config back to a TOML file.

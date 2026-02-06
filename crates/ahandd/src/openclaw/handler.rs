@@ -9,11 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::Deserialize;
+
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tracing::debug;
 
 use crate::approval::ApprovalManager;
+use crate::browser::BrowserManager;
 use crate::registry::JobRegistry;
 use crate::session::SessionManager;
 use crate::store::RunStore;
@@ -36,6 +39,7 @@ pub struct OpenClawHandler {
     approval_mgr: Arc<ApprovalManager>,
     store: Option<Arc<RunStore>>,
     exec_approvals_path: PathBuf,
+    browser_mgr: Arc<BrowserManager>,
 }
 
 impl OpenClawHandler {
@@ -46,6 +50,7 @@ impl OpenClawHandler {
         approval_mgr: Arc<ApprovalManager>,
         store: Option<Arc<RunStore>>,
         exec_approvals_path: Option<PathBuf>,
+        browser_mgr: Arc<BrowserManager>,
     ) -> Self {
         Self {
             node_id,
@@ -55,6 +60,7 @@ impl OpenClawHandler {
             store,
             exec_approvals_path: exec_approvals_path
                 .unwrap_or_else(default_exec_approvals_path),
+            browser_mgr,
         }
     }
 
@@ -83,6 +89,10 @@ impl OpenClawHandler {
             }
             "system.execApprovals.set" => {
                 let result = self.handle_exec_approvals_set(&invoke).await;
+                (result, None)
+            }
+            "browser.proxy" => {
+                let result = self.handle_browser_proxy(&invoke).await;
                 (result, None)
             }
             _ => {
@@ -389,6 +399,119 @@ impl OpenClawHandler {
                 ok: false,
                 payload_json: None,
                 error: Some(InvokeError::invalid_request(e.to_string())),
+            },
+        }
+    }
+
+    /// Handle browser.proxy command
+    async fn handle_browser_proxy(&self, invoke: &NodeInvokeRequest) -> NodeInvokeResult {
+        if !self.browser_mgr.is_enabled() {
+            return NodeInvokeResult {
+                id: invoke.id.clone(),
+                node_id: self.node_id.clone(),
+                ok: false,
+                payload_json: None,
+                error: Some(InvokeError::unavailable("browser not enabled")),
+            };
+        }
+
+        #[derive(Deserialize)]
+        struct BrowserProxyParams {
+            session_id: String,
+            action: String,
+            #[serde(default)]
+            params_json: Option<String>,
+            #[serde(default)]
+            timeout_ms: Option<u64>,
+        }
+
+        let params: BrowserProxyParams = match decode_params(&invoke.params_json) {
+            Ok(p) => p,
+            Err(e) => {
+                return NodeInvokeResult {
+                    id: invoke.id.clone(),
+                    node_id: self.node_id.clone(),
+                    ok: false,
+                    payload_json: None,
+                    error: Some(e),
+                };
+            }
+        };
+
+        let params_json = params.params_json.as_deref().unwrap_or("{}");
+
+        // Check domain restrictions for navigation actions.
+        if let Err(msg) = self.browser_mgr.check_domain(&params.action, params_json) {
+            return NodeInvokeResult {
+                id: invoke.id.clone(),
+                node_id: self.node_id.clone(),
+                ok: false,
+                payload_json: None,
+                error: Some(InvokeError::new("PERMISSION_DENIED", msg)),
+            };
+        }
+
+        let timeout_ms = params.timeout_ms.unwrap_or(0);
+
+        match self
+            .browser_mgr
+            .execute(&params.session_id, &params.action, params_json, timeout_ms)
+            .await
+        {
+            Ok(result) => {
+                // Release session on "close" action.
+                if params.action == "close" {
+                    self.browser_mgr.release_session(&params.session_id).await;
+                }
+
+                #[derive(serde::Serialize)]
+                struct BrowserProxyResult {
+                    success: bool,
+                    #[serde(skip_serializing_if = "String::is_empty")]
+                    result_json: String,
+                    #[serde(skip_serializing_if = "String::is_empty")]
+                    error: String,
+                    #[serde(
+                        skip_serializing_if = "Vec::is_empty",
+                        serialize_with = "serialize_base64"
+                    )]
+                    binary_data: Vec<u8>,
+                    #[serde(skip_serializing_if = "String::is_empty")]
+                    binary_mime: String,
+                }
+
+                fn serialize_base64<S: serde::Serializer>(
+                    data: &Vec<u8>,
+                    s: S,
+                ) -> Result<S::Ok, S::Error> {
+                    use base64::Engine;
+                    s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(data))
+                }
+
+                let proxy_result = BrowserProxyResult {
+                    success: result.success,
+                    result_json: result.result_json,
+                    error: result.error,
+                    binary_data: result.binary_data,
+                    binary_mime: result.binary_mime,
+                };
+
+                NodeInvokeResult {
+                    id: invoke.id.clone(),
+                    node_id: self.node_id.clone(),
+                    ok: true,
+                    payload_json: Some(
+                        serde_json::to_string(&proxy_result).unwrap_or_default(),
+                    ),
+                    error: None,
+                }
+            }
+            Err(e) => NodeInvokeResult {
+                id: invoke.id.clone(),
+                node_id: self.node_id.clone(),
+                ok: false,
+                payload_json: None,
+                error: Some(InvokeError::new("INTERNAL", e.to_string())),
             },
         }
     }
