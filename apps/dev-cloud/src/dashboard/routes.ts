@@ -272,7 +272,17 @@ export function createDashboardRoutes(
           body.params,
           { timeoutMs: body.timeoutMs },
         );
-        return c.json(result);
+        // Convert Node.js Buffer to base64 for JSON serialization.
+        const binaryData = result.binaryData
+          ? Buffer.from(result.binaryData).toString("base64")
+          : undefined;
+        return c.json({
+          success: result.success,
+          data: result.data,
+          error: result.error,
+          binaryData,
+          binaryMime: result.binaryMime,
+        });
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return c.json({ success: false, error: msg }, 500);

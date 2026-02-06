@@ -48,6 +48,56 @@ impl BrowserManager {
         self.config.enabled.unwrap_or(false)
     }
 
+    /// Resolve the downloads directory (for download/pdf output files).
+    fn downloads_dir(&self, session_id: &str) -> PathBuf {
+        let base = match &self.config.downloads_dir {
+            Some(p) => PathBuf::from(p),
+            None => dirs::home_dir()
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .join(".ahand")
+                .join("browser")
+                .join("downloads"),
+        };
+        base.join(session_id)
+    }
+
+    /// Generate a default output path when the caller doesn't provide one.
+    fn default_output_path(&self, session_id: &str, action: &str, ext: &str) -> PathBuf {
+        let dir = self.downloads_dir(session_id);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        dir.join(format!("{}_{}.{}", ts, action, ext))
+    }
+
+    /// Ensure the downloads directory exists for a session.
+    async fn ensure_downloads_dir(&self, session_id: &str) -> anyhow::Result<()> {
+        let dir = self.downloads_dir(session_id);
+        tokio::fs::create_dir_all(&dir).await?;
+        Ok(())
+    }
+
+    /// Inject a default output path into params if the caller didn't provide one.
+    fn inject_default_path(&self, session_id: &str, action: &str, params_json: &str) -> String {
+        let mut params: serde_json::Value =
+            serde_json::from_str(params_json).unwrap_or(serde_json::Value::Object(Default::default()));
+
+        if params.get("path").and_then(|v| v.as_str()).is_none() {
+            let ext = match action {
+                "pdf" => "pdf",
+                _ => "bin",
+            };
+            let path = self.default_output_path(session_id, action, ext);
+            params.as_object_mut().unwrap().insert(
+                "path".to_string(),
+                serde_json::Value::String(path.to_string_lossy().into_owned()),
+            );
+        }
+
+        serde_json::to_string(&params).unwrap_or_else(|_| params_json.to_string())
+    }
+
     /// Log warnings for missing prerequisites at startup.
     fn check_prerequisites(&self) {
         let bin = self.binary_path();
@@ -118,7 +168,15 @@ impl BrowserManager {
             sessions.insert(session_id.to_string());
         }
 
-        let args = self.build_cli_args(session_id, action, params_json);
+        // For download/pdf, ensure output directory and inject default path if needed.
+        let params_json = if matches!(action, "download" | "pdf") {
+            self.ensure_downloads_dir(session_id).await.ok();
+            self.inject_default_path(session_id, action, params_json)
+        } else {
+            params_json.to_string()
+        };
+
+        let args = self.build_cli_args(session_id, action, &params_json);
         let envs = self.build_env_vars();
 
         let timeout = if timeout_ms > 0 {
@@ -385,10 +443,10 @@ impl BrowserManager {
 
         let error = resp.error.unwrap_or_default();
 
-        // For screenshot commands, read the binary data from the file path in the response.
+        // For commands that produce files, read binary data from the path in the response.
         let (binary_data, binary_mime) =
-            if action == "screenshot" && resp.success {
-                self.read_screenshot_data(&resp.data).await
+            if matches!(action, "screenshot" | "download" | "pdf") && resp.success {
+                self.read_file_data(&resp.data).await
             } else {
                 (Vec::new(), String::new())
             };
@@ -402,8 +460,8 @@ impl BrowserManager {
         })
     }
 
-    /// Read screenshot file from the path returned by agent-browser.
-    async fn read_screenshot_data(
+    /// Read a file produced by agent-browser (screenshot, download, pdf) and detect MIME type.
+    async fn read_file_data(
         &self,
         data: &Option<serde_json::Value>,
     ) -> (Vec<u8>, String) {
@@ -418,21 +476,12 @@ impl BrowserManager {
 
         match tokio::fs::read(path).await {
             Ok(bytes) => {
-                let mime = if path.ends_with(".png") {
-                    "image/png"
-                } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
-                    "image/jpeg"
-                } else if path.ends_with(".webp") {
-                    "image/webp"
-                } else if path.ends_with(".pdf") {
-                    "application/pdf"
-                } else {
-                    "application/octet-stream"
-                };
+                let mime = mime_from_extension(path);
+                info!(path, mime, bytes = bytes.len(), "read file data");
                 (bytes, mime.to_string())
             }
             Err(e) => {
-                warn!(path, error = %e, "failed to read screenshot file");
+                warn!(path, error = %e, "failed to read file");
                 (Vec::new(), String::new())
             }
         }
@@ -478,6 +527,24 @@ fn params_to_cli_args(
             }
         }
         "screenshot" => {
+            if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
+                args.push(path.to_string());
+            }
+            if params.get("fullPage").and_then(|v| v.as_bool()) == Some(true) {
+                args.push("--full-page".to_string());
+            }
+        }
+        "download" => {
+            // download <selector> [path]
+            if let Some(sel) = params.get("selector").and_then(|v| v.as_str()) {
+                args.push(sel.to_string());
+            }
+            if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
+                args.push(path.to_string());
+            }
+        }
+        "pdf" => {
+            // pdf [path] [--full-page]
             if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
                 args.push(path.to_string());
             }
@@ -536,6 +603,46 @@ fn params_to_cli_args(
     }
 
     args
+}
+
+/// Detect MIME type from file extension.
+fn mime_from_extension(path: &str) -> &'static str {
+    let lower = path.to_lowercase();
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".svg") {
+        "image/svg+xml"
+    } else if lower.ends_with(".pdf") {
+        "application/pdf"
+    } else if lower.ends_with(".json") {
+        "application/json"
+    } else if lower.ends_with(".csv") {
+        "text/csv"
+    } else if lower.ends_with(".txt") || lower.ends_with(".log") {
+        "text/plain"
+    } else if lower.ends_with(".html") || lower.ends_with(".htm") {
+        "text/html"
+    } else if lower.ends_with(".xml") {
+        "application/xml"
+    } else if lower.ends_with(".zip") {
+        "application/zip"
+    } else if lower.ends_with(".xlsx") {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    } else if lower.ends_with(".docx") {
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    } else if lower.ends_with(".xls") {
+        "application/vnd.ms-excel"
+    } else if lower.ends_with(".doc") {
+        "application/msword"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 /// Extract domain from a URL string.
@@ -612,5 +719,30 @@ mod tests {
         assert!(args.contains(&"--compact".to_string()));
         assert!(args.contains(&"--depth".to_string()));
         assert!(args.contains(&"3".to_string()));
+    }
+
+    #[test]
+    fn test_params_to_cli_args_download() {
+        let params: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"selector":"a.download-btn","path":"/tmp/file.zip"}"#).unwrap();
+        let args = params_to_cli_args("download", &params);
+        assert_eq!(args, vec!["a.download-btn", "/tmp/file.zip"]);
+    }
+
+    #[test]
+    fn test_params_to_cli_args_pdf() {
+        let params: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(r#"{"path":"/tmp/page.pdf","fullPage":true}"#).unwrap();
+        let args = params_to_cli_args("pdf", &params);
+        assert_eq!(args, vec!["/tmp/page.pdf", "--full-page"]);
+    }
+
+    #[test]
+    fn test_mime_from_extension() {
+        assert_eq!(mime_from_extension("/tmp/shot.png"), "image/png");
+        assert_eq!(mime_from_extension("/tmp/doc.PDF"), "application/pdf");
+        assert_eq!(mime_from_extension("/tmp/data.csv"), "text/csv");
+        assert_eq!(mime_from_extension("/tmp/report.xlsx"), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+        assert_eq!(mime_from_extension("/tmp/unknown.xyz"), "application/octet-stream");
     }
 }

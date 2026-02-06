@@ -9,6 +9,8 @@ interface BrowserLogEntry {
   success?: boolean;
   data?: unknown;
   error?: string;
+  binaryData?: string; // base64
+  binaryMime?: string;
   loading: boolean;
   ts: number;
 }
@@ -35,7 +37,7 @@ const BrowserPanel: Component = () => {
     return id;
   };
 
-  const updateEntry = (id: number, result: { success?: boolean; data?: unknown; error?: string }) => {
+  const updateEntry = (id: number, result: { success?: boolean; data?: unknown; error?: string; binaryData?: string; binaryMime?: string }) => {
     setLog((prev) =>
       prev.map((e) => (e.id === id ? { ...e, ...result, loading: false } : e)),
     );
@@ -52,8 +54,8 @@ const BrowserPanel: Component = () => {
           deviceId: deviceId() || undefined,
         },
       });
-      const data = await res.json();
-      updateEntry(entryId, data as { success?: boolean; data?: unknown; error?: string });
+      const data = await res.json() as { success?: boolean; data?: unknown; error?: string; binaryData?: string; binaryMime?: string };
+      updateEntry(entryId, data);
     } catch (e) {
       updateEntry(entryId, { success: false, error: e instanceof Error ? e.message : String(e) });
     }
@@ -78,6 +80,13 @@ const BrowserPanel: Component = () => {
 
   const handleScreenshot = () => send("screenshot");
 
+  const handleDownload = () => {
+    if (!selector().trim()) return;
+    send("download", { selector: selector().trim() });
+  };
+
+  const handlePdf = () => send("pdf");
+
   const handleClose = () => send("close");
 
   const handleCustom = () => {
@@ -89,6 +98,24 @@ const BrowserPanel: Component = () => {
       const entryId = addEntry(customAction().trim());
       updateEntry(entryId, { success: false, error: "Invalid JSON in params" });
     }
+  };
+
+  /** Create a blob download URL from base64 + mime. */
+  const makeBlobUrl = (base64: string, mime: string): string => {
+    const raw = atob(base64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    return URL.createObjectURL(new Blob([bytes], { type: mime }));
+  };
+
+  /** Extract a filename from the data.path field, or generate a fallback. */
+  const extractFilename = (entry: BrowserLogEntry): string => {
+    const path = (entry.data as Record<string, unknown>)?.path;
+    if (typeof path === "string") {
+      const parts = path.split("/");
+      return parts[parts.length - 1] || `${entry.action}-result`;
+    }
+    return `${entry.action}-result`;
   };
 
   const clearLog = () => setLog([]);
@@ -171,6 +198,8 @@ const BrowserPanel: Component = () => {
           <button class="btn btn-sm" onClick={handleClick} disabled={!selector().trim()}>Click</button>
           <button class="btn btn-sm" onClick={handleFill} disabled={!selector().trim()}>Fill</button>
           <button class="btn btn-sm" onClick={handleScreenshot}>Screenshot</button>
+          <button class="btn btn-sm" onClick={handleDownload} disabled={!selector().trim()}>Download</button>
+          <button class="btn btn-sm" onClick={handlePdf}>PDF</button>
           <button class="btn btn-sm btn-danger" onClick={handleClose}>Close</button>
         </div>
       </div>
@@ -252,6 +281,27 @@ const BrowserPanel: Component = () => {
                   </Show>
                   <Show when={entry.error}>
                     <span class="text-danger"> {entry.error}</span>
+                  </Show>
+                  {/* Binary data preview */}
+                  <Show when={entry.binaryData && entry.binaryMime}>
+                    <div class="mt-2">
+                      <Show when={entry.binaryMime?.startsWith("image/")}>
+                        <img
+                          class="browser-preview-img"
+                          src={`data:${entry.binaryMime};base64,${entry.binaryData}`}
+                          alt={extractFilename(entry)}
+                        />
+                      </Show>
+                      <Show when={!entry.binaryMime?.startsWith("image/")}>
+                        <a
+                          class="browser-download-link"
+                          href={makeBlobUrl(entry.binaryData!, entry.binaryMime!)}
+                          download={extractFilename(entry)}
+                        >
+                          Download {extractFilename(entry)} ({entry.binaryMime})
+                        </a>
+                      </Show>
+                    </div>
                   </Show>
                   <Show when={entry.data !== undefined && entry.data !== null}>
                     <pre class="browser-log-data">

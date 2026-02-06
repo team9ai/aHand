@@ -415,3 +415,29 @@ button {
   word-break: break-all;
   color: #d4d4d4;
 }
+
+.browser-preview-img {
+  max-width: 100%;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  margin-top: 6px;
+}
+
+.browser-download-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  margin-top: 6px;
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 12px;
+  text-decoration: none;
+  transition: background 0.15s;
+}
+
+.browser-download-link:hover {
+  background: var(--bg-input);
+}

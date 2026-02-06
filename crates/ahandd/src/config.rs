@@ -132,6 +132,9 @@ pub struct BrowserConfig {
     #[serde(default)]
     pub denied_domains: Vec<String>,
 
+    /// Directory for download/pdf output files (default: ~/.ahand/browser/downloads).
+    pub downloads_dir: Option<String>,
+
     /// Show browser window instead of headless (default: false).
     #[serde(default)]
     pub headed: Option<bool>,

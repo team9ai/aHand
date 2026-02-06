@@ -201,6 +201,23 @@ export class DeviceConnection extends EventEmitter {
     return this.browser(sessionId, "screenshot");
   }
 
+  /** Download a file by clicking a selector. */
+  browserDownload(
+    sessionId: string,
+    selector: string,
+    path?: string,
+  ): Promise<BrowserResult> {
+    return this.browser(sessionId, "download", { selector, ...(path ? { path } : {}) });
+  }
+
+  /** Export the page as PDF. */
+  browserPdf(sessionId: string, path?: string, fullPage?: boolean): Promise<BrowserResult> {
+    return this.browser(sessionId, "pdf", {
+      ...(path ? { path } : {}),
+      ...(fullPage ? { fullPage: true } : {}),
+    });
+  }
+
   /** Close a browser session. */
   browserClose(sessionId: string): Promise<BrowserResult> {
     return this.browser(sessionId, "close");
