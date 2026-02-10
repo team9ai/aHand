@@ -79,11 +79,11 @@ rm -f "$BROWSER_DIR/sockets/"*.sock 2>/dev/null || true
 
 # ── Resolve release version ──────────────────────────────────────────
 if [ "$FROM_RELEASE" = true ] && [ -z "$RELEASE_VERSION" ]; then
-  echo "Fetching latest release version..."
-  RELEASE_VERSION=$(curl -s "https://api.github.com/repos/$GITHUB_REPO/releases/latest" \
-    | grep '"tag_name"' | head -1 | sed 's/.*"v\?\([^"]*\)".*/\1/')
+  echo "Fetching latest browser release version..."
+  RELEASE_VERSION=$(curl -s "https://api.github.com/repos/$GITHUB_REPO/releases" \
+    | grep '"tag_name"' | grep 'browser-v' | head -1 | sed 's/.*"browser-v\([^"]*\)".*/\1/')
   if [ -z "$RELEASE_VERSION" ]; then
-    echo "Error: Could not determine latest release version"
+    echo "Error: Could not determine latest browser release version"
     exit 1
   fi
   echo "  Latest version: $RELEASE_VERSION"
@@ -96,7 +96,7 @@ if [ "$FROM_RELEASE" = true ]; then
   # Download from GitHub releases
   BINARY="agent-browser-${OS}-${ARCH}"
   echo "  Downloading agent-browser ($AGENT_BROWSER_VERSION) (${OS}-${ARCH})..."
-  curl -fSL "https://github.com/$GITHUB_REPO/releases/download/v${RELEASE_VERSION}/${BINARY}" \
+  curl -fSL "https://github.com/$GITHUB_REPO/releases/download/browser-v${RELEASE_VERSION}/${BINARY}" \
     -o "$BIN_DIR/agent-browser" 2>&1 || {
     echo "  Warning: Could not download agent-browser from release, trying npm..."
     npm install -g "agent-browser@${AGENT_BROWSER_VERSION}" 2>/dev/null || true
@@ -139,7 +139,7 @@ if [ "$FROM_RELEASE" = true ]; then
   # Download from GitHub releases
   echo "  Downloading daemon bundle..."
   TMP_BUNDLE="/tmp/ahand-daemon-bundle-$$.tar.gz"
-  curl -fSL "https://github.com/$GITHUB_REPO/releases/download/v${RELEASE_VERSION}/daemon-bundle.tar.gz" \
+  curl -fSL "https://github.com/$GITHUB_REPO/releases/download/browser-v${RELEASE_VERSION}/daemon-bundle.tar.gz" \
     -o "$TMP_BUNDLE" 2>&1 || {
     echo "  Warning: Could not download daemon bundle from release"
     echo "  Browser daemon may not work without daemon.js"

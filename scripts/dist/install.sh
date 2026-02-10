@@ -1,6 +1,6 @@
 #!/bin/bash
 # One-line installer for aHand.
-# Usage: curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.sh | bash
 #
 # Environment variables:
 #   AHAND_VERSION — install a specific version (default: latest)
@@ -41,14 +41,19 @@ detect_platform() {
 }
 
 # ── Resolve version ───────────────────────────────────────────────
+# Each component has its own tag (rust-v*, admin-v*, browser-v*).
+# AHAND_VERSION sets the shared version number; tags are derived.
 
 resolve_version() {
   if [ -n "$AHAND_VERSION" ]; then
     VERSION="$AHAND_VERSION"
   else
     echo "Fetching latest release..."
-    VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
-      | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+    # Use rust release as the canonical version (first released component)
+    local tag
+    tag=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases" \
+      | grep '"tag_name"' | grep 'rust-v' | head -1 | sed 's/.*"rust-v\([^"]*\)".*/\1/')
+    VERSION="$tag"
   fi
 
   if [ -z "$VERSION" ]; then
@@ -77,7 +82,9 @@ main() {
   detect_platform
   resolve_version
 
-  RELEASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}"
+  RUST_URL="https://github.com/${GITHUB_REPO}/releases/download/rust-v${VERSION}"
+  ADMIN_URL="https://github.com/${GITHUB_REPO}/releases/download/admin-v${VERSION}"
+  BROWSER_URL="https://github.com/${GITHUB_REPO}/releases/download/browser-v${VERSION}"
 
   # Create directories
   mkdir -p "$BIN_DIR"
@@ -86,27 +93,23 @@ main() {
   # Download Rust binaries
   echo
   echo "==> Downloading binaries..."
-  download "${RELEASE_URL}/ahandd-${SUFFIX}" "$BIN_DIR/ahandd"
+  download "${RUST_URL}/ahandd-${SUFFIX}" "$BIN_DIR/ahandd"
   chmod +x "$BIN_DIR/ahandd"
-  download "${RELEASE_URL}/ahandctl-${SUFFIX}" "$BIN_DIR/ahandctl"
+  download "${RUST_URL}/ahandctl-${SUFFIX}" "$BIN_DIR/ahandctl"
   chmod +x "$BIN_DIR/ahandctl"
 
   # Download admin SPA
   echo
   echo "==> Downloading admin panel..."
-  download "${RELEASE_URL}/admin-spa.tar.gz" "/tmp/ahand-admin-spa.tar.gz"
+  download "${ADMIN_URL}/admin-spa.tar.gz" "/tmp/ahand-admin-spa.tar.gz"
   tar xzf /tmp/ahand-admin-spa.tar.gz -C "$INSTALL_DIR/admin/dist/"
   rm /tmp/ahand-admin-spa.tar.gz
 
   # Download scripts
   echo
   echo "==> Downloading scripts..."
-  download "${RELEASE_URL}/setup-browser.sh" "$BIN_DIR/setup-browser.sh"
+  download "${BROWSER_URL}/setup-browser.sh" "$BIN_DIR/setup-browser.sh"
   chmod +x "$BIN_DIR/setup-browser.sh"
-
-  # Download upgrade script if available
-  download "${RELEASE_URL}/upgrade.sh" "$BIN_DIR/upgrade.sh" 2>/dev/null || true
-  [ -f "$BIN_DIR/upgrade.sh" ] && chmod +x "$BIN_DIR/upgrade.sh"
 
   # Write version marker
   echo "$VERSION" > "$INSTALL_DIR/version"

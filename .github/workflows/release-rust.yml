@@ -3,11 +3,11 @@ name: Release Rust Binaries
 on:
   push:
     tags:
-      - "v*"
+      - "rust-v*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0)"
+        description: "Release tag (e.g. rust-v0.1.0)"
         required: true
 
 permissions:
@@ -36,6 +36,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
