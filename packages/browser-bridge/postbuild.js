@@ -49,4 +49,14 @@ fs.writeFileSync(
   JSON.stringify({ type: "module" }, null, 2) + "\n",
 );
 
+// 3. Copy license files into dist/ for Apache-2.0 compliance.
+const notices = path.join(__dirname, "THIRD-PARTY-NOTICES.txt");
+if (fs.existsSync(notices)) {
+  fs.copyFileSync(notices, path.join(distDir, "THIRD-PARTY-NOTICES.txt"));
+}
+const agentBrowserLicense = path.join(__dirname, "node_modules", "agent-browser", "LICENSE");
+if (fs.existsSync(agentBrowserLicense)) {
+  fs.copyFileSync(agentBrowserLicense, path.join(distDir, "LICENSE-agent-browser"));
+}
+
 console.log("postbuild: dist/daemon.js ready (ESM polyfill injected, clean package.json)");

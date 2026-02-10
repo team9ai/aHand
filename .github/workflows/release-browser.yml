@@ -1,0 +1,57 @@
+name: Release Browser Bundle
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build browser-bridge daemon bundle
+        run: pnpm --filter browser-bridge build
+
+      - name: Package artifacts
+        run: |
+          cd packages/browser-bridge/dist
+          tar czf ../../../daemon-bundle.tar.gz .
+          cd ../../..
+          cp scripts/dist/setup-browser.sh setup-browser.sh
+          shasum -a 256 daemon-bundle.tar.gz setup-browser.sh > checksums-browser.txt
+
+      - name: Get tag
+        id: tag
+        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            daemon-bundle.tar.gz
+            setup-browser.sh
+            checksums-browser.txt
+          fail_on_unmatched_files: false

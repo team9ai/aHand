@@ -1,0 +1,15 @@
+This bundle includes the following third-party software:
+
+================================================================================
+agent-browser
+================================================================================
+
+Copyright 2025 Vercel Inc.
+License: Apache-2.0
+Repository: https://github.com/vercel-labs/agent-browser
+
+Full license text: see LICENSE-agent-browser in this bundle.
+
+Modifications:
+- Bundled with @vercel/ncc into a single-file ESM module
+- Prepended __dirname/__filename polyfill for ESM compatibility

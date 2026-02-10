@@ -1,0 +1,55 @@
+name: Release Admin SPA
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build admin SPA
+        run: pnpm --filter admin build
+
+      - name: Package artifact
+        run: |
+          cd apps/admin/dist
+          tar czf ../../../admin-spa.tar.gz .
+          cd ../../..
+          shasum -a 256 admin-spa.tar.gz > checksums-admin.txt
+
+      - name: Get tag
+        id: tag
+        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            admin-spa.tar.gz
+            checksums-admin.txt
+          fail_on_unmatched_files: false

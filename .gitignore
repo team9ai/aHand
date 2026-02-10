@@ -23,6 +23,7 @@ target
 # Node.js
 node_modules/
 dist/
+!scripts/dist/
 *.tsbuildinfo
 
 # Turborepo
