@@ -23,8 +23,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR/.."
 
 GITHUB_REPO="team9ai/aHand"
+AGENT_BROWSER_REPO="vercel-labs/agent-browser"
 # Pinned agent-browser version (from Vercel Labs)
-AGENT_BROWSER_VERSION="0.1.0"
+AGENT_BROWSER_VERSION="0.9.1"
 
 FROM_RELEASE=false
 RELEASE_VERSION=""
@@ -95,10 +96,10 @@ mkdir -p "$BIN_DIR"
 if [ "$FROM_RELEASE" = true ]; then
   # Download from GitHub releases
   BINARY="agent-browser-${OS}-${ARCH}"
-  echo "  Downloading agent-browser ($AGENT_BROWSER_VERSION) (${OS}-${ARCH})..."
-  curl -fSL "https://github.com/$GITHUB_REPO/releases/download/browser-v${RELEASE_VERSION}/${BINARY}" \
+  echo "  Downloading agent-browser v${AGENT_BROWSER_VERSION} (${OS}-${ARCH})..."
+  curl -fSL "https://github.com/${AGENT_BROWSER_REPO}/releases/download/v${AGENT_BROWSER_VERSION}/${BINARY}" \
     -o "$BIN_DIR/agent-browser" 2>&1 || {
-    echo "  Warning: Could not download agent-browser from release, trying npm..."
+    echo "  Warning: Could not download agent-browser binary, trying npm..."
     npm install -g "agent-browser@${AGENT_BROWSER_VERSION}" 2>/dev/null || true
     LOCAL_BIN=$(command -v agent-browser 2>/dev/null || true)
     if [ -n "$LOCAL_BIN" ] && [ -x "$LOCAL_BIN" ]; then
@@ -123,9 +124,8 @@ else
   else
     # Fallback: download from GitHub releases.
     BINARY="agent-browser-${OS}-${ARCH}"
-    VERSION=$(npm view agent-browser version 2>/dev/null || echo "$AGENT_BROWSER_VERSION")
-    echo "  Downloading agent-browser ${VERSION} (${OS}-${ARCH})..."
-    curl -fSL "https://github.com/anthropics/agent-browser/releases/download/v${VERSION}/${BINARY}" \
+    echo "  Downloading agent-browser v${AGENT_BROWSER_VERSION} (${OS}-${ARCH})..."
+    curl -fSL "https://github.com/${AGENT_BROWSER_REPO}/releases/download/v${AGENT_BROWSER_VERSION}/${BINARY}" \
       -o "$BIN_DIR/agent-browser"
     chmod +x "$BIN_DIR/agent-browser"
     echo "[1/4] CLI binary: downloaded to $BIN_DIR/agent-browser"
