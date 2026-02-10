@@ -1,34 +1,41 @@
 #!/bin/bash
 # ── aHand Browser Setup ──────────────────────────────────────────────
-# Installs agent-browser CLI + daemon bundle for browser automation.
+# Installs browser automation dependencies for aHand.
 #
 # Usage:
-#   ./scripts/setup-browser.sh                     # install from built artifacts (dev)
-#   ./scripts/setup-browser.sh --from-release      # download from GitHub releases
-#   ./scripts/setup-browser.sh --from-release 0.1.0  # specific version
-#   ./scripts/setup-browser.sh --clean             # kill daemons + remove runtime files
+#   setup-browser.sh                          # default install
+#   setup-browser.sh --from-release           # download daemon bundle from GitHub releases
+#   setup-browser.sh --from-release 0.1.0     # specific release version
+#   setup-browser.sh --clean                  # kill daemons + remove runtime files
+#   setup-browser.sh --purge                  # remove entire browser installation
 #
 # What it does:
-#   1. Copies/downloads agent-browser CLI binary to ~/.ahand/bin/
-#   2. Deploys ncc-bundled daemon.js to ~/.ahand/browser/dist/
-#   3. Creates socket directory
-#   4. Detects system Chrome (or installs Chromium as fallback)
-#   5. Kills any stale daemon processes
+#   1. Ensures Node.js >= 20 (installs prebuilt LTS if missing)
+#   2. Downloads agent-browser CLI binary (pinned version from Vercel Labs)
+#   3. Deploys ncc-bundled daemon.js
+#   4. Creates socket directory
+#   5. Detects system Chrome (or installs Chromium as fallback)
+#   6. Kills any stale daemon processes
 set -e
 
 AHAND_DIR="${AHAND_DATA_DIR:-$HOME/.ahand}"
 BROWSER_DIR="$AHAND_DIR/browser"
 BIN_DIR="$AHAND_DIR/bin"
+NODE_DIR="$AHAND_DIR/node"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$SCRIPT_DIR/.."
 
 GITHUB_REPO="team9ai/aHand"
 AGENT_BROWSER_REPO="vercel-labs/agent-browser"
-# Pinned agent-browser version (from Vercel Labs)
+# Pinned versions
 AGENT_BROWSER_VERSION="0.9.1"
+NODE_MIN_VERSION=20
+NODE_LTS_VERSION="24.13.0"
 
 FROM_RELEASE=false
 RELEASE_VERSION=""
+
+STEPS=6
 
 # ── Parse arguments ──────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -90,90 +97,100 @@ if [ "$FROM_RELEASE" = true ] && [ -z "$RELEASE_VERSION" ]; then
   echo "  Latest version: $RELEASE_VERSION"
 fi
 
-# ── 1. Agent-browser CLI binary ──────────────────────────────────────
+# ── 1. Node.js ───────────────────────────────────────────────────────
+# Daemon.js requires Node.js >= 20. Check system node first,
+# then fall back to our locally-installed copy, or install one.
+
+ensure_node() {
+  # Check if we already installed node locally
+  if [ -x "$NODE_DIR/bin/node" ]; then
+    NODE_BIN="$NODE_DIR/bin/node"
+    NPX_BIN="$NODE_DIR/bin/npx"
+    local ver
+    ver=$("$NODE_BIN" -v 2>/dev/null | sed 's/v//' | cut -d. -f1)
+    if [ "$ver" -ge "$NODE_MIN_VERSION" ] 2>/dev/null; then
+      echo "[1/$STEPS] Node.js: $("$NODE_BIN" -v) (local: $NODE_DIR)"
+      return 0
+    fi
+  fi
+
+  # Check system node
+  local sys_node
+  sys_node=$(command -v node 2>/dev/null || true)
+  if [ -n "$sys_node" ]; then
+    local ver
+    ver=$("$sys_node" -v 2>/dev/null | sed 's/v//' | cut -d. -f1)
+    if [ "$ver" -ge "$NODE_MIN_VERSION" ] 2>/dev/null; then
+      NODE_BIN="$sys_node"
+      NPX_BIN=$(command -v npx 2>/dev/null || true)
+      echo "[1/$STEPS] Node.js: $("$NODE_BIN" -v) (system)"
+      return 0
+    fi
+    echo "  System node is v$("$sys_node" -v), need >= v${NODE_MIN_VERSION}"
+  fi
+
+  # Install prebuilt Node.js LTS
+  echo "  Installing Node.js v${NODE_LTS_VERSION}..."
+  local node_arch="$ARCH"
+  local tarball="node-v${NODE_LTS_VERSION}-${OS}-${node_arch}.tar.xz"
+  local url="https://nodejs.org/dist/v${NODE_LTS_VERSION}/${tarball}"
+  local tmp="/tmp/ahand-node-$$.tar.xz"
+
+  curl -fSL "$url" -o "$tmp"
+  mkdir -p "$NODE_DIR"
+  tar xJf "$tmp" -C "$NODE_DIR" --strip-components=1
+  rm -f "$tmp"
+
+  NODE_BIN="$NODE_DIR/bin/node"
+  NPX_BIN="$NODE_DIR/bin/npx"
+  echo "[1/$STEPS] Node.js: $("$NODE_BIN" -v) (installed to $NODE_DIR)"
+}
+
+ensure_node
+
+# ── 2. Agent-browser CLI binary ──────────────────────────────────────
 mkdir -p "$BIN_DIR"
 
-if [ "$FROM_RELEASE" = true ]; then
-  # Download from GitHub releases
-  BINARY="agent-browser-${OS}-${ARCH}"
-  echo "  Downloading agent-browser v${AGENT_BROWSER_VERSION} (${OS}-${ARCH})..."
-  curl -fSL "https://github.com/${AGENT_BROWSER_REPO}/releases/download/v${AGENT_BROWSER_VERSION}/${BINARY}" \
-    -o "$BIN_DIR/agent-browser" 2>&1 || {
-    echo "  Warning: Could not download agent-browser binary, trying npm..."
-    npm install -g "agent-browser@${AGENT_BROWSER_VERSION}" 2>/dev/null || true
-    LOCAL_BIN=$(command -v agent-browser 2>/dev/null || true)
-    if [ -n "$LOCAL_BIN" ] && [ -x "$LOCAL_BIN" ]; then
-      cp "$LOCAL_BIN" "$BIN_DIR/agent-browser"
-    fi
-  }
-  chmod +x "$BIN_DIR/agent-browser" 2>/dev/null || true
-  echo "[1/4] CLI binary: installed to $BIN_DIR/agent-browser"
-else
-  # Source mode: prefer locally-installed binary (from npm/pnpm).
-  LOCAL_BIN=$(find "$PROJECT_ROOT/node_modules/.pnpm" -name "agent-browser" -path "*/bin/*" -type f 2>/dev/null | head -1)
-  if [ -z "$LOCAL_BIN" ]; then
-    LOCAL_BIN=$(command -v agent-browser 2>/dev/null || true)
-  fi
+BINARY="agent-browser-${OS}-${ARCH}"
+echo "  Downloading agent-browser v${AGENT_BROWSER_VERSION} (${OS}-${ARCH})..."
+curl -fSL "https://github.com/${AGENT_BROWSER_REPO}/releases/download/v${AGENT_BROWSER_VERSION}/${BINARY}" \
+  -o "$BIN_DIR/agent-browser"
+chmod +x "$BIN_DIR/agent-browser"
+echo "[2/$STEPS] CLI binary: $BIN_DIR/agent-browser"
 
-  if [ -n "$LOCAL_BIN" ] && [ -x "$LOCAL_BIN" ]; then
-    cp "$LOCAL_BIN" "$BIN_DIR/agent-browser"
-    chmod +x "$BIN_DIR/agent-browser"
-    echo "[1/4] CLI binary: copied from $LOCAL_BIN"
-  elif [ -x "$BIN_DIR/agent-browser" ]; then
-    echo "[1/4] CLI binary: already installed at $BIN_DIR/agent-browser"
-  else
-    # Fallback: download from GitHub releases.
-    BINARY="agent-browser-${OS}-${ARCH}"
-    echo "  Downloading agent-browser v${AGENT_BROWSER_VERSION} (${OS}-${ARCH})..."
-    curl -fSL "https://github.com/${AGENT_BROWSER_REPO}/releases/download/v${AGENT_BROWSER_VERSION}/${BINARY}" \
-      -o "$BIN_DIR/agent-browser"
-    chmod +x "$BIN_DIR/agent-browser"
-    echo "[1/4] CLI binary: downloaded to $BIN_DIR/agent-browser"
-  fi
-fi
-
-# ── 2. Daemon bundle (ncc-built) ─────────────────────────────────────
+# ── 3. Daemon bundle (ncc-built) ─────────────────────────────────────
 mkdir -p "$BROWSER_DIR/dist"
 
 if [ "$FROM_RELEASE" = true ]; then
-  # Download from GitHub releases
   echo "  Downloading daemon bundle..."
   TMP_BUNDLE="/tmp/ahand-daemon-bundle-$$.tar.gz"
   curl -fSL "https://github.com/$GITHUB_REPO/releases/download/browser-v${RELEASE_VERSION}/daemon-bundle.tar.gz" \
-    -o "$TMP_BUNDLE" 2>&1 || {
-    echo "  Warning: Could not download daemon bundle from release"
-    echo "  Browser daemon may not work without daemon.js"
-  }
-  if [ -f "$TMP_BUNDLE" ]; then
-    tar xzf "$TMP_BUNDLE" -C "$BROWSER_DIR/dist/"
-    rm -f "$TMP_BUNDLE"
-    echo '{"type":"module"}' > "$BROWSER_DIR/dist/package.json"
-    echo "[2/4] Daemon bundle: deployed to $BROWSER_DIR/dist/"
-  fi
+    -o "$TMP_BUNDLE"
+  tar xzf "$TMP_BUNDLE" -C "$BROWSER_DIR/dist/"
+  rm -f "$TMP_BUNDLE"
+  echo '{"type":"module"}' > "$BROWSER_DIR/dist/package.json"
+  echo "[3/$STEPS] Daemon bundle: $BROWSER_DIR/dist/"
 else
-  # Source mode: copy from local build artifacts
   BRIDGE_DIST="$PROJECT_ROOT/packages/browser-bridge/dist/daemon.js"
   if [ -f "$BRIDGE_DIST" ]; then
     cp "$BRIDGE_DIST" "$BROWSER_DIR/dist/daemon.js"
-    # Copy chunks that daemon.js might dynamically import.
     for chunk in "$PROJECT_ROOT/packages/browser-bridge/dist/"*.index.js; do
       [ -f "$chunk" ] && cp "$chunk" "$BROWSER_DIR/dist/"
     done
-    # Write clean package.json for ESM loading.
     echo '{"type":"module"}' > "$BROWSER_DIR/dist/package.json"
-    echo "[2/4] Daemon bundle: deployed to $BROWSER_DIR/dist/"
+    echo "[3/$STEPS] Daemon bundle: $BROWSER_DIR/dist/ (from local build)"
   else
-    echo "[2/4] Daemon bundle: NOT FOUND at $BRIDGE_DIST"
+    echo "[3/$STEPS] Daemon bundle: NOT FOUND at $BRIDGE_DIST"
     echo "      Run: cd packages/browser-bridge && pnpm install && pnpm build"
     echo "      Then re-run this script."
   fi
 fi
 
-# ── 3. Socket directory ──────────────────────────────────────────────
+# ── 4. Socket directory ──────────────────────────────────────────────
 mkdir -p "$BROWSER_DIR/sockets"
-echo "[3/4] Socket directory: $BROWSER_DIR/sockets"
+echo "[4/$STEPS] Socket directory: $BROWSER_DIR/sockets"
 
-# ── 4. Browser detection ─────────────────────────────────────────────
+# ── 5. Browser detection ─────────────────────────────────────────────
 CHROME_PATH=""
 if [ "$(uname -s)" = "Darwin" ]; then
   for candidate in \
@@ -200,17 +217,30 @@ else
 fi
 
 if [ -n "$CHROME_PATH" ]; then
-  echo "[4/4] Browser: $CHROME_PATH (system)"
+  echo "[5/$STEPS] Browser: $CHROME_PATH (system)"
 else
-  echo "[4/4] Browser: no system Chrome found — installing Chromium..."
+  echo "[5/$STEPS] Browser: no system Chrome found — installing Chromium..."
   mkdir -p "$BROWSER_DIR/browsers"
-  PLAYWRIGHT_BROWSERS_PATH="$BROWSER_DIR/browsers" npx playwright install chromium
+  PLAYWRIGHT_BROWSERS_PATH="$BROWSER_DIR/browsers" "$NPX_BIN" playwright install chromium
   echo "      Chromium installed to $BROWSER_DIR/browsers"
 fi
+
+# ── 6. Write runtime config ──────────────────────────────────────────
+# Save resolved paths so the daemon knows where to find node/chrome.
+cat > "$BROWSER_DIR/env.sh" <<ENVEOF
+# Auto-generated by setup-browser.sh — do not edit.
+NODE_BIN="$NODE_BIN"
+AGENT_BROWSER_BIN="$BIN_DIR/agent-browser"
+AGENT_BROWSER_VERSION="$AGENT_BROWSER_VERSION"
+CHROME_PATH="${CHROME_PATH:-}"
+BROWSER_DIR="$BROWSER_DIR"
+ENVEOF
+echo "[6/$STEPS] Runtime config: $BROWSER_DIR/env.sh"
 
 # ── Summary ──────────────────────────────────────────────────────────
 echo ""
 echo "Setup complete!"
+echo "  Node.js:  $("$NODE_BIN" -v) ($NODE_BIN)"
 echo "  Binary:   $BIN_DIR/agent-browser"
 echo "  Daemon:   $BROWSER_DIR/dist/daemon.js"
 echo "  Sockets:  $BROWSER_DIR/sockets"
