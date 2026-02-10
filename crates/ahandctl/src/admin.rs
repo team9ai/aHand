@@ -111,14 +111,27 @@ pub async fn serve(port: u16, config_path: Option<String>, no_open: bool) -> Res
             tokio::signal::ctrl_c()
                 .await
                 .expect("Failed to listen for Ctrl-C");
+            println!("\nShutting down...");
         });
 
     println!("Server running at http://{}", addr);
     println!("Press Ctrl-C to stop");
     println!();
 
-    server.await;
-    println!("\nServer stopped");
+    // Graceful shutdown with timeout — force exit if connections linger.
+    tokio::select! {
+        _ = server => {}
+        _ = async {
+            tokio::signal::ctrl_c().await.ok();
+            // Second Ctrl+C or timeout: force exit
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        } => {
+            eprintln!("Force shutdown (timeout)");
+            std::process::exit(0);
+        }
+    }
+
+    println!("Server stopped");
     Ok(())
 }
 
