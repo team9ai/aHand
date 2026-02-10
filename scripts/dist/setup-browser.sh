@@ -136,7 +136,7 @@ ensure_node() {
   local url="https://nodejs.org/dist/v${NODE_LTS_VERSION}/${tarball}"
   local tmp="/tmp/ahand-node-$$.tar.xz"
 
-  curl -fSL "$url" -o "$tmp"
+  curl -fsSL "$url" -o "$tmp"
   mkdir -p "$NODE_DIR"
   tar xJf "$tmp" -C "$NODE_DIR" --strip-components=1
   rm -f "$tmp"
@@ -153,7 +153,7 @@ mkdir -p "$BIN_DIR"
 
 BINARY="agent-browser-${OS}-${ARCH}"
 echo "  Downloading agent-browser v${AGENT_BROWSER_VERSION} (${OS}-${ARCH})..."
-curl -fSL "https://github.com/${AGENT_BROWSER_REPO}/releases/download/v${AGENT_BROWSER_VERSION}/${BINARY}" \
+curl -fsSL "https://github.com/${AGENT_BROWSER_REPO}/releases/download/v${AGENT_BROWSER_VERSION}/${BINARY}" \
   -o "$BIN_DIR/agent-browser"
 chmod +x "$BIN_DIR/agent-browser"
 echo "[2/$STEPS] CLI binary: $BIN_DIR/agent-browser"
@@ -164,7 +164,7 @@ mkdir -p "$BROWSER_DIR/dist"
 if [ "$FROM_RELEASE" = true ]; then
   echo "  Downloading daemon bundle..."
   TMP_BUNDLE="/tmp/ahand-daemon-bundle-$$.tar.gz"
-  curl -fSL "https://github.com/$GITHUB_REPO/releases/download/browser-v${RELEASE_VERSION}/daemon-bundle.tar.gz" \
+  curl -fsSL "https://github.com/$GITHUB_REPO/releases/download/browser-v${RELEASE_VERSION}/daemon-bundle.tar.gz" \
     -o "$TMP_BUNDLE"
   tar xzf "$TMP_BUNDLE" -C "$BROWSER_DIR/dist/"
   rm -f "$TMP_BUNDLE"

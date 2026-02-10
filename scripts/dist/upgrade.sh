@@ -83,7 +83,7 @@ download() {
   local url="$1"
   local dest="$2"
   echo "  Downloading $(basename "$dest")..."
-  curl -fSL "$url" -o "$dest"
+  curl -fsSL "$url" -o "$dest"
 }
 
 # ── Main ─────────────────────────────────────────────────────────

@@ -322,6 +322,19 @@ impl BrowserManager {
     fn build_env_vars(&self) -> Vec<(String, String)> {
         let mut envs = Vec::new();
 
+        // Prepend our locally-installed Node.js to PATH so agent-browser can
+        // find `node` when spawning daemon.js.
+        if let Some(home) = dirs::home_dir() {
+            let node_bin_dir = home.join(".ahand").join("node").join("bin");
+            if node_bin_dir.is_dir() {
+                let system_path = std::env::var("PATH").unwrap_or_default();
+                envs.push((
+                    "PATH".into(),
+                    format!("{}:{}", node_bin_dir.to_string_lossy(), system_path),
+                ));
+            }
+        }
+
         if let Some(dir) = &self.config.socket_dir {
             envs.push(("AGENT_BROWSER_SOCKET_DIR".into(), dir.clone()));
         } else {
