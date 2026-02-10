@@ -9,6 +9,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite;
 use tracing::info;
 
+mod admin;
+mod browser_init;
+mod upgrade;
+
 #[derive(Parser)]
 #[command(name = "ahandctl", about = "AHand CLI debug tool")]
 struct Args {
@@ -51,6 +55,33 @@ enum Cmd {
     Session {
         #[command(subcommand)]
         action: SessionAction,
+    },
+    /// Start local admin panel HTTP server
+    Configure {
+        /// HTTP server port
+        #[arg(long, default_value = "9800")]
+        port: u16,
+        /// Config file path (defaults to ~/.ahand/config.toml)
+        #[arg(long)]
+        config: Option<String>,
+        /// Don't automatically open browser
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// Initialize browser automation dependencies
+    BrowserInit {
+        /// Force reinstall (clean existing installation first)
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check for updates or upgrade to the latest version
+    Upgrade {
+        /// Only check for updates, don't install
+        #[arg(long)]
+        check: bool,
+        /// Upgrade to a specific version
+        #[arg(long)]
+        version: Option<String>,
     },
 }
 
@@ -121,6 +152,22 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
+    // Commands that don't use IPC/WS, handle early
+    match &args.command {
+        Cmd::Configure { .. } => {
+            if let Cmd::Configure { port, config, no_open } = args.command {
+                return admin::serve(port, config, no_open).await;
+            }
+        }
+        Cmd::BrowserInit { force } => {
+            return browser_init::run(*force).await;
+        }
+        Cmd::Upgrade { check, version } => {
+            return upgrade::run(*check, version.clone()).await;
+        }
+        _ => {}
+    }
+
     if let Some(ipc_path) = &args.ipc {
         // IPC mode — connect via Unix socket.
         match args.command {
@@ -142,6 +189,9 @@ async fn main() -> anyhow::Result<()> {
             }
             Cmd::Session { action } => {
                 ipc_session(ipc_path, action).await?;
+            }
+            Cmd::Configure { .. } | Cmd::BrowserInit { .. } | Cmd::Upgrade { .. } => {
+                unreachable!("Handled early, should not reach here");
             }
         }
     } else {
@@ -165,6 +215,9 @@ async fn main() -> anyhow::Result<()> {
             }
             Cmd::Session { action } => {
                 ws_session(&args.url, action).await?;
+            }
+            Cmd::Configure { .. } | Cmd::BrowserInit { .. } | Cmd::Upgrade { .. } => {
+                unreachable!("Handled early, should not reach here");
             }
         }
     }

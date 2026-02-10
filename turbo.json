@@ -52,6 +52,15 @@
     "@ahand/dashboard#dev": {
       "cache": false,
       "persistent": true
+    },
+    "@ahand/admin#build": {
+      "outputs": [
+        "dist/**"
+      ]
+    },
+    "@ahand/admin#dev": {
+      "cache": false,
+      "persistent": true
     }
   }
 }

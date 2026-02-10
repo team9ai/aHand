@@ -39,6 +39,8 @@ pub struct SessionManager {
     sessions: Mutex<HashMap<String, CallerSession>>,
     refusal_log: Mutex<Vec<RefusalEntry>>,
     default_trust_timeout_mins: u64,
+    /// Default mode applied to new callers on registration.
+    default_mode: Mutex<SessionMode>,
 }
 
 impl SessionManager {
@@ -47,18 +49,32 @@ impl SessionManager {
             sessions: Mutex::new(HashMap::new()),
             refusal_log: Mutex::new(Vec::new()),
             default_trust_timeout_mins,
+            default_mode: Mutex::new(SessionMode::Inactive),
         }
     }
 
-    /// Register a caller with default Inactive mode (no-op if already registered).
+    /// Set the default session mode for all new callers.
+    pub async fn set_default_mode(&self, mode: SessionMode) {
+        info!(mode = ?mode, "setting default session mode for new callers");
+        *self.default_mode.lock().await = mode;
+    }
+
+    /// Register a caller with the configured default mode (no-op if already registered).
     pub async fn register_caller(&self, caller_uid: &str) {
+        let default_mode = *self.default_mode.lock().await;
+        let default_timeout = self.default_trust_timeout_mins;
         let mut sessions = self.sessions.lock().await;
         sessions.entry(caller_uid.to_string()).or_insert_with(|| {
-            info!(caller_uid, "registering new caller (inactive)");
+            let trust_expires = if default_mode == SessionMode::Trust {
+                Some(Instant::now() + Duration::from_secs(default_timeout * 60))
+            } else {
+                None
+            };
+            info!(caller_uid, mode = ?default_mode, "registering new caller");
             CallerSession {
-                mode: SessionMode::Inactive,
-                trust_expires: None,
-                trust_timeout_mins: self.default_trust_timeout_mins,
+                mode: default_mode,
+                trust_expires,
+                trust_timeout_mins: default_timeout,
             }
         });
     }

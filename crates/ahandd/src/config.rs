@@ -53,6 +53,10 @@ pub struct Config {
     /// Default trust timeout in minutes for Trust mode. Defaults to 60.
     pub trust_timeout_mins: Option<u64>,
 
+    /// Default session mode for all callers on startup.
+    /// "auto_accept" = trust all, "strict" = require approval, "inactive" = deny all (default).
+    pub default_session_mode: Option<String>,
+
     #[serde(default)]
     pub policy: PolicyConfig,
 

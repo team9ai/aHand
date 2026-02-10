@@ -105,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
             ipc_socket_path: None,
             ipc_socket_mode: None,
             trust_timeout_mins: None,
+            default_session_mode: None,
             policy: Default::default(),
             openclaw: None,
             browser: None,
@@ -192,6 +193,18 @@ async fn main() -> anyhow::Result<()> {
     let session_mgr = Arc::new(session::SessionManager::new(
         cfg.trust_timeout_mins.unwrap_or(60),
     ));
+
+    // Apply default session mode from config.
+    if let Some(mode_str) = &cfg.default_session_mode {
+        let mode = match mode_str.as_str() {
+            "auto_accept" | "auto" => ahand_protocol::SessionMode::AutoAccept,
+            "trust" => ahand_protocol::SessionMode::Trust,
+            "strict" => ahand_protocol::SessionMode::Strict,
+            _ => ahand_protocol::SessionMode::Inactive,
+        };
+        session_mgr.set_default_mode(mode).await;
+    }
+
     let approval_mgr = Arc::new(approval::ApprovalManager::new(
         cfg.policy.approval_timeout_secs,
     ));

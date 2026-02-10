@@ -104,7 +104,7 @@ impl BrowserManager {
         if !bin.exists() {
             warn!(
                 path = %bin.display(),
-                "agent-browser CLI not found — run: ./scripts/setup-browser.sh"
+                "agent-browser CLI not found — run: ahandctl browser-init"
             );
         } else {
             info!(path = %bin.display(), "agent-browser CLI found");
@@ -115,7 +115,7 @@ impl BrowserManager {
         if !daemon.exists() {
             warn!(
                 path = %daemon.display(),
-                "daemon.js not found — run: ./scripts/setup-browser.sh"
+                "daemon.js not found — run: ahandctl browser-init"
             );
         }
 
@@ -124,7 +124,7 @@ impl BrowserManager {
         } else {
             let browsers_dir = home.join("browsers");
             if !browsers_dir.exists() || browsers_dir.read_dir().map(|mut d| d.next().is_none()).unwrap_or(true) {
-                warn!("no system browser found and no Chromium installed — run: ./scripts/setup-browser.sh");
+                warn!("no system browser found and no Chromium installed — run: ahandctl browser-init");
             }
         }
 
