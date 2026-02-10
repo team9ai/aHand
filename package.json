@@ -23,6 +23,7 @@
     "test": "turbo test",
     "test:ts": "turbo @ahand/sdk#test",
     "test:rust": "turbo @ahand/daemon#test @ahand/ctl#test @ahand/protocol#test",
+    "test:e2e:scripts": "bash e2e/scripts/run.sh",
     "lint": "turbo lint",
     "lint:ts": "turbo @ahand/proto#lint @ahand/sdk#lint @ahand/dev-cloud#lint",
     "lint:rust": "turbo @ahand/protocol#lint @ahand/daemon#lint @ahand/ctl#lint",

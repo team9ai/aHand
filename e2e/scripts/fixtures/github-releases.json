@@ -1,0 +1,22 @@
+[
+  {
+    "tag_name": "rust-v0.3.0",
+    "name": "Rust Binaries v0.3.0",
+    "prerelease": false
+  },
+  {
+    "tag_name": "admin-v0.3.0",
+    "name": "Admin SPA v0.3.0",
+    "prerelease": false
+  },
+  {
+    "tag_name": "browser-v0.3.0",
+    "name": "Browser Bundle v0.3.0",
+    "prerelease": false
+  },
+  {
+    "tag_name": "rust-v0.2.0",
+    "name": "Rust Binaries v0.2.0",
+    "prerelease": false
+  }
+]

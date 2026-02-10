@@ -1,0 +1,69 @@
+#!/bin/bash
+# Mock curl — routes URLs to fixture files.
+# Env: MOCK_CURL_FIXTURE_DIR, MOCK_CURL_LOG, MOCK_CURL_FAIL_PATTERN
+
+OUTPUT_FILE=""
+URL=""
+
+# Parse args: skip flags, capture -o and the URL.
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o)       OUTPUT_FILE="$2"; shift 2 ;;
+    -fsSL|-fSL|-fsS|-s|-f|-S|-L) shift ;;
+    -*)       shift ;;   # skip unknown flags
+    *)        URL="$1"; shift ;;
+  esac
+done
+
+FIXTURE_DIR="${MOCK_CURL_FIXTURE_DIR:?MOCK_CURL_FIXTURE_DIR not set}"
+
+# Log the call.
+echo "$URL" >> "${MOCK_CURL_LOG:-/dev/null}"
+
+# Optional: fail for URLs matching a pattern.
+if [ -n "$MOCK_CURL_FAIL_PATTERN" ]; then
+  if echo "$URL" | grep -q "$MOCK_CURL_FAIL_PATTERN"; then
+    exit 22
+  fi
+fi
+
+# Map URL to fixture.
+resolve_fixture() {
+  local url="$1"
+  case "$url" in
+    *api.github.com/repos/*/releases*)
+      echo "$FIXTURE_DIR/github-releases.json" ;;
+    *checksums-rust.txt)
+      echo "$FIXTURE_DIR/checksums-rust.txt" ;;
+    *checksums-browser.txt)
+      echo "$FIXTURE_DIR/checksums-browser.txt" ;;
+    *admin-spa.tar.gz)
+      echo "$FIXTURE_DIR/admin-spa.tar.gz" ;;
+    *daemon-bundle.tar.gz)
+      echo "$FIXTURE_DIR/daemon-bundle.tar.gz" ;;
+    *setup-browser.sh)
+      echo "$FIXTURE_DIR/setup-browser-fake.sh" ;;
+    *ahandd-*)
+      echo "$FIXTURE_DIR/ahandd-fake" ;;
+    *ahandctl-*)
+      echo "$FIXTURE_DIR/ahandctl-fake" ;;
+    *agent-browser-*)
+      echo "$FIXTURE_DIR/agent-browser-fake" ;;
+    *node-v*-*.tar.xz)
+      echo "$FIXTURE_DIR/node-fake.tar.xz" ;;
+    *)
+      return 22 ;;
+  esac
+}
+
+fixture=$(resolve_fixture "$URL")
+rc=$?
+if [ $rc -ne 0 ] || [ ! -f "$fixture" ]; then
+  exit 22
+fi
+
+if [ -n "$OUTPUT_FILE" ]; then
+  cp "$fixture" "$OUTPUT_FILE"
+else
+  cat "$fixture"
+fi

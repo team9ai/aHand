@@ -1,0 +1,7 @@
+#!/bin/bash
+# Mock uname — returns values from MOCK_UNAME_S / MOCK_UNAME_M.
+case "$1" in
+  -s) echo "${MOCK_UNAME_S:-Darwin}" ;;
+  -m) echo "${MOCK_UNAME_M:-arm64}" ;;
+  *)  echo "${MOCK_UNAME_S:-Darwin}" ;;
+esac

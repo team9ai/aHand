@@ -1,0 +1,4 @@
+#!/bin/bash
+# Mock kill — logs calls, always succeeds.
+echo "kill $*" >> "${MOCK_KILL_LOG:-/dev/null}"
+exit 0

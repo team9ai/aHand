@@ -1,0 +1,4 @@
+#!/bin/bash
+# Mock npx — no-op. Logs calls for assertions.
+echo "npx $*" >> "${MOCK_NPX_LOG:-/dev/null}"
+exit 0

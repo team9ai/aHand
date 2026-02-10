@@ -1,0 +1,9 @@
+#!/bin/bash
+# Mock node — configurable version or absent.
+if [ "${MOCK_NODE_ABSENT:-}" = "true" ]; then
+  exit 127
+fi
+case "$1" in
+  -v) echo "v${MOCK_NODE_VERSION:-22.0.0}" ;;
+  *)  echo "node-mock $*" ;;
+esac

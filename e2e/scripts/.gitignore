@@ -1,0 +1,8 @@
+# bats-core (cloned by bootstrap.sh)
+.bats/
+
+# Generated fixtures
+fixtures/admin-spa.tar.gz
+fixtures/daemon-bundle.tar.gz
+fixtures/node-fake.tar.xz
+fixtures/checksums-rust.txt

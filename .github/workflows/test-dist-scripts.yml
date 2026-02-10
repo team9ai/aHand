@@ -1,0 +1,29 @@
+name: Test Distribution Scripts
+
+on:
+  pull_request:
+    paths:
+      - "scripts/dist/**"
+      - "e2e/scripts/**"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/dist/**"
+      - "e2e/scripts/**"
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install perl SHA module (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdigest-sha-perl
+
+      - name: Run distribution script tests
+        run: bash e2e/scripts/run.sh

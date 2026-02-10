@@ -1,0 +1,30 @@
+#!/bin/bash
+# Mock shasum — delegates to real shasum unless MOCK_SHASUM_FAIL is set.
+if [ "${MOCK_SHASUM_FAIL:-}" = "true" ]; then
+  # Return a bogus hash.
+  echo "0000000000000000000000000000000000000000000000000000000000000000  $2"
+else
+  # Find real shasum (skip ourselves in PATH).
+  REAL_SHASUM=""
+  IFS=: read -ra dirs <<< "$ORIGINAL_PATH"
+  for d in "${dirs[@]}"; do
+    if [ -x "$d/shasum" ]; then
+      REAL_SHASUM="$d/shasum"
+      break
+    fi
+  done
+  if [ -n "$REAL_SHASUM" ]; then
+    exec "$REAL_SHASUM" "$@"
+  else
+    # Fallback: sha256sum on Linux.
+    IFS=: read -ra dirs <<< "$ORIGINAL_PATH"
+    for d in "${dirs[@]}"; do
+      if [ -x "$d/sha256sum" ]; then
+        exec "$d/sha256sum" "$@"
+        break
+      fi
+    done
+    echo "ERROR: no real shasum found" >&2
+    exit 1
+  fi
+fi

@@ -1,0 +1,5 @@
+#!/bin/bash
+# Mock pkill — no-op, always succeeds.
+# Log the call for assertions.
+echo "pkill $*" >> "${MOCK_PKILL_LOG:-/dev/null}"
+exit 0
