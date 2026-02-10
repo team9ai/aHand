@@ -7,6 +7,7 @@
     "build": "cargo build -p ahandctl",
     "build:release": "cargo build -p ahandctl --release",
     "start": "cargo run -p ahandctl --release",
+    "configure": "cargo run -p ahandctl -- configure",
     "lint": "cargo clippy -p ahandctl -- -D warnings",
     "test": "cargo test -p ahandctl"
   }

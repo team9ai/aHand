@@ -1,10 +1,22 @@
 {
-  "$schema": "https://turbo.build/schema.json",
+  "$schema": "https://turborepo.dev/schema.json",
   "ui": "tui",
+"globalDependencies": [
+  "pnpm-lock.yaml"
+],
   "tasks": {
+    // ── Default task definitions ──────────────────────────────────────
     "build": {
       "dependsOn": ["^build"],
-      "outputs": ["dist/**"]
+      "inputs": [
+        "src/**",
+        "tsconfig.json",
+        "package.json"
+      ],
+      "outputs": [
+        "dist/**"
+      ],
+      "outputLogs": "new-only"
     },
     "dev": {
       "cache": false,
@@ -16,34 +28,91 @@
       "persistent": true
     },
     "test": {
-      "dependsOn": ["build"]
+      "dependsOn": [
+        "build"
+      ],
+      "inputs": [
+        "src/**",
+        "test/**",
+        "tests/**",
+        "vitest.config.*",
+        "package.json"
+      ],
+      "outputLogs": "new-only"
     },
     "lint": {
-      "dependsOn": ["^build"]
+      "dependsOn": [
+        "^build"
+      ],
+      "inputs": [
+        "src/**",
+        "tsconfig.json",
+        "package.json"
+      ],
+      "outputLogs": "new-only"
     },
     "generate": {
+      "inputs": [
+        "proto/**",
+        "buf.gen.yaml",
+        "buf.yaml",
+        "package.json"
+      ],
       "outputs": ["src/generated/**"]
     },
 
-    "@ahand/protocol#build": {
-      "cache": false,
-      "outputs": []
+    // ── Proto (TypeScript) ── source of truth for TS types ───────────
+    //  generate → build, then SDK and dev-cloud depend on it.
+    "@ahand/proto#build": {
+      "dependsOn": [
+        "generate"
+      ],
+      "inputs": [
+        "src/**",
+        "tsconfig.json",
+        "package.json"
+      ],
+      "outputs": [
+        "dist/**"
+      ]
     },
-    "@ahand/daemon#build": {
-      "cache": false,
-      "outputs": []
+    // ── SDK ── depends on proto ──────────────────────────────────────
+    "@ahand/sdk#test": {
+      "dependsOn": [
+        "build"
+      ],
+      "inputs": [
+        "src/**",
+        "test/**",
+        "vitest.config.*",
+        "package.json"
+      ]
     },
-    "@ahand/daemon#dev": {
-      "cache": false,
-      "persistent": true,
+    // ── Dev Cloud ── depends on proto + sdk ──────────────────────────
+    "@ahand/dev-cloud#build": {
+      "dependsOn": [
+        "^build"
+      ],
+      "inputs": [
+        "src/**",
+        "tsconfig.json",
+        "package.json"
+      ],
+      "outputs": [
+        "dist/**"
+      ]
     },
-    "@ahand/ctl#build": {
-      "cache": false,
-      "outputs": []
-    },
+    // ── Dashboard ── depends on dev-cloud (for API types at dev time)
     "@ahand/dashboard#build": {
       "dependsOn": [
         "@ahand/dev-cloud#build"
+      ],
+      "inputs": [
+        "src/**",
+        "index.html",
+        "vite.config.*",
+        "tsconfig.json",
+        "package.json"
       ],
       "outputs": [
         "dist/**"
@@ -53,14 +122,140 @@
       "cache": false,
       "persistent": true
     },
+    // ── Admin Panel ── standalone Solid.js SPA ───────────────────────
     "@ahand/admin#build": {
+      "inputs": [
+        "src/**",
+        "index.html",
+        "vite.config.*",
+        "tsconfig.json",
+        "package.json"
+      ],
       "outputs": [
         "dist/**"
       ]
     },
+    "@ahand/admin#deploy": {
+      "dependsOn": [
+        "build"
+      ],
+    },
     "@ahand/admin#dev": {
       "cache": false,
       "persistent": true
+    },
+    // ── Browser Bridge ── bundles agent-browser via ncc ──────────────
+    "@ahand/browser-bridge#build": {
+      "inputs": [
+        "postbuild.js",
+        "THIRD-PARTY-NOTICES.txt",
+        "package.json"
+      ],
+      "outputs": [
+        "dist/**"
+      ]
+    },
+    // ── Rust crates ── cargo manages its own caching ─────────────────
+    //  turbo orchestrates task ordering but skips caching.
+    "@ahand/protocol#build": {
+      "inputs": [
+        "src/**",
+        "build.rs",
+        "Cargo.toml",
+        "$TURBO_ROOT$/Cargo.lock"
+      ],
+      "cache": false,
+      "outputs": []
+    },
+    "@ahand/daemon#build": {
+      "dependsOn": [
+        "@ahand/protocol#build"
+      ],
+      "inputs": [
+        "src/**",
+        "Cargo.toml",
+        "$TURBO_ROOT$/Cargo.lock"
+      ],
+      "cache": false,
+      "outputs": []
+    },
+    "@ahand/daemon#dev": {
+      "dependsOn": [
+        "@ahand/protocol#build"
+      ],
+      "cache": false,
+      "persistent": true
+    },
+    "@ahand/ctl#build": {
+      "dependsOn": [
+        "@ahand/protocol#build"
+      ],
+      "inputs": [
+        "src/**",
+        "Cargo.toml",
+        "$TURBO_ROOT$/Cargo.lock"
+      ],
+      "cache": false,
+      "outputs": []
+    },
+    "@ahand/ctl#configure": {
+      "dependsOn": [
+        "@ahand/ctl#build",
+        "@ahand/admin#deploy"
+      ],
+      "cache": false,
+      "persistent": true
+    },
+    // ── Rust lint + test ────────────────────────────────────────────
+    "@ahand/protocol#lint": {
+      "dependsOn": [
+        "build"
+      ],
+      "inputs": [
+        "src/**",
+        "Cargo.toml"
+      ],
+      "cache": false
+    },
+    "@ahand/daemon#lint": {
+      "dependsOn": [
+        "@ahand/protocol#build"
+      ],
+      "inputs": [
+        "src/**",
+        "Cargo.toml"
+      ],
+      "cache": false
+    },
+    "@ahand/ctl#lint": {
+      "dependsOn": [
+        "@ahand/protocol#build"
+      ],
+      "inputs": [
+        "src/**",
+        "Cargo.toml"
+      ],
+      "cache": false
+    },
+    "@ahand/daemon#test": {
+      "dependsOn": [
+        "@ahand/protocol#build"
+      ],
+      "inputs": [
+        "src/**",
+        "Cargo.toml"
+      ],
+      "cache": false
+    },
+    "@ahand/ctl#test": {
+      "dependsOn": [
+        "@ahand/protocol#build"
+      ],
+      "inputs": [
+        "src/**",
+        "Cargo.toml"
+      ],
+      "cache": false
     }
   }
 }
