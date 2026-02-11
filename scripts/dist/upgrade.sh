@@ -187,6 +187,12 @@ chmod +x "$BIN_DIR/ahandd"
 cp "$TMP_DIR/ahandctl" "$BIN_DIR/ahandctl"
 chmod +x "$BIN_DIR/ahandctl"
 
+# Remove macOS quarantine attribute (Gatekeeper)
+if [ "$OS" = "darwin" ]; then
+  xattr -d com.apple.quarantine "$BIN_DIR/ahandd" 2>/dev/null || true
+  xattr -d com.apple.quarantine "$BIN_DIR/ahandctl" 2>/dev/null || true
+fi
+
 # Install admin SPA
 if [ -f "$TMP_DIR/admin-spa.tar.gz" ]; then
   echo "==> Installing admin panel..."

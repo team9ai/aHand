@@ -99,6 +99,12 @@ main() {
   download "${RUST_URL}/ahandctl-${SUFFIX}" "$BIN_DIR/ahandctl"
   chmod +x "$BIN_DIR/ahandctl"
 
+  # Remove macOS quarantine attribute (Gatekeeper)
+  if [ "$OS" = "darwin" ]; then
+    xattr -d com.apple.quarantine "$BIN_DIR/ahandd" 2>/dev/null || true
+    xattr -d com.apple.quarantine "$BIN_DIR/ahandctl" 2>/dev/null || true
+  fi
+
   # Download admin SPA (optional — skip if no admin release exists)
   if [ -n "$ADMIN_VERSION" ]; then
     ADMIN_URL="https://github.com/${GITHUB_REPO}/releases/download/admin-v${ADMIN_VERSION}"
