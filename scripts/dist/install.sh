@@ -131,15 +131,44 @@ main() {
   echo
   echo "==> aHand installed successfully!"
   echo
-  echo "Installation directory: $INSTALL_DIR"
-  echo "Binaries:              $BIN_DIR"
+  echo "Get started:"
   echo
-  echo "Add to your PATH:"
-  echo "  export PATH=\"$BIN_DIR:\$PATH\""
+
+  # Detect shell and output appropriate PATH command
+  case "${SHELL:-}" in
+    */zsh)
+      echo "  1. Add to PATH (paste and run):"
+      echo
+      echo "     echo 'export PATH=\"\$HOME/.ahand/bin:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
+      ;;
+    */bash)
+      if [ "$OS" = "darwin" ]; then
+        SHELL_RC="~/.bash_profile"
+      else
+        SHELL_RC="~/.bashrc"
+      fi
+      echo "  1. Add to PATH (paste and run):"
+      echo
+      echo "     echo 'export PATH=\"\$HOME/.ahand/bin:\$PATH\"' >> ${SHELL_RC} && source ${SHELL_RC}"
+      ;;
+    */fish)
+      echo "  1. Add to PATH (paste and run):"
+      echo
+      echo "     fish_add_path ~/.ahand/bin"
+      ;;
+    *)
+      echo "  1. Add to PATH:"
+      echo
+      echo "     export PATH=\"$BIN_DIR:\$PATH\""
+      echo
+      echo "     Add the line above to your shell profile to make it permanent."
+      ;;
+  esac
+
   echo
-  echo "Then run:"
-  echo "  ahandctl configure    # Open admin panel"
-  echo "  ahandctl browser-init # Install browser automation deps"
+  echo "  2. Start setup:"
+  echo
+  echo "     ahandctl configure"
   echo
 }
 

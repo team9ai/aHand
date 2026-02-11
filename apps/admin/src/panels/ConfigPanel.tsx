@@ -1,4 +1,4 @@
-import { createResource, createSignal, Show } from "solid-js";
+import { createEffect, createResource, createSignal, Show } from "solid-js";
 import { api, getToken } from "../lib/api";
 
 interface ConfigData {
@@ -74,6 +74,14 @@ export default function ConfigPanel() {
       });
     }
   };
+
+  // Auto-sync config resource to form state when it resolves
+  createEffect(() => {
+    const data = config();
+    if (data) {
+      initForm();
+    }
+  });
 
   function handleEditJson() {
     const current = config();
@@ -199,7 +207,7 @@ export default function ConfigPanel() {
 
   function SimpleForm() {
     return (
-      <div class="config-form" onMount={initForm}>
+      <div class="config-form">
         <section class="config-section">
           <h3>OpenClaw Gateway</h3>
           <div class="form-grid">
@@ -293,7 +301,7 @@ export default function ConfigPanel() {
 
   function AdvancedForm() {
     return (
-      <div class="config-form" onMount={initForm}>
+      <div class="config-form">
         <div class="view-toggle">
           <button class="toggle-link" onClick={() => setViewMode("simple")}>
             Back to Simple Mode

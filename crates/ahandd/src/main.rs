@@ -91,24 +91,62 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = if let Some(path) = &config_path {
         config::Config::load(path)?
     } else {
-        // Build a minimal config from CLI args.
-        config::Config {
-            mode: args.mode.clone(),
-            server_url: args
-                .url
-                .clone()
-                .unwrap_or_else(|| "ws://localhost:3000/ws".to_string()),
-            device_id: None,
-            max_concurrent_jobs: None,
-            data_dir: None,
-            debug_ipc: None,
-            ipc_socket_path: None,
-            ipc_socket_mode: None,
-            trust_timeout_mins: None,
-            default_session_mode: None,
-            policy: Default::default(),
-            openclaw: None,
-            browser: None,
+        // No --config given: try default path, or fall back to CLI args.
+        let default_path = dirs::home_dir()
+            .map(|h| h.join(".ahand").join("config.toml"));
+
+        if let Some(ref path) = default_path {
+            if path.exists() {
+                tracing::info!("Loading config from {}", path.display());
+                config::Config::load(path)?
+            } else if args.url.is_none() {
+                // No config file and no --url: guide the user.
+                eprintln!("No config file found at {}", path.display());
+                eprintln!();
+                eprintln!("Run 'ahandctl configure' to set up your configuration.");
+                eprintln!("Or specify a config file:  ahandd --config <path>");
+                eprintln!("Or connect directly:       ahandd --url ws://host/ws");
+                std::process::exit(1);
+            } else {
+                // --url provided without config: build minimal config for quick testing.
+                config::Config {
+                    mode: args.mode.clone(),
+                    server_url: args.url.clone().unwrap(),
+                    device_id: None,
+                    max_concurrent_jobs: None,
+                    data_dir: None,
+                    debug_ipc: None,
+                    ipc_socket_path: None,
+                    ipc_socket_mode: None,
+                    trust_timeout_mins: None,
+                    default_session_mode: None,
+                    policy: Default::default(),
+                    openclaw: None,
+                    browser: None,
+                }
+            }
+        } else {
+            // Cannot determine home dir — require explicit --url.
+            if args.url.is_none() {
+                eprintln!("Cannot determine home directory. Please specify:");
+                eprintln!("  ahandd --config <path>  or  ahandd --url ws://host/ws");
+                std::process::exit(1);
+            }
+            config::Config {
+                mode: args.mode.clone(),
+                server_url: args.url.clone().unwrap(),
+                device_id: None,
+                max_concurrent_jobs: None,
+                data_dir: None,
+                debug_ipc: None,
+                ipc_socket_path: None,
+                ipc_socket_mode: None,
+                trust_timeout_mins: None,
+                default_session_mode: None,
+                policy: Default::default(),
+                openclaw: None,
+                browser: None,
+            }
         }
     };
 
