@@ -75,7 +75,7 @@ export default function SetupPanel(props: { onComplete: () => void }) {
             <p>Your config has been written to <code>~/.ahand/config.toml</code></p>
             <div class="setup-next">
               <p>Next, start the daemon:</p>
-              <pre>ahandd</pre>
+              <pre>ahandctl start</pre>
             </div>
             <button class="btn-primary" onClick={props.onComplete}>
               Open Admin Panel

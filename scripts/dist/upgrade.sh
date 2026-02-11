@@ -215,4 +215,4 @@ echo "==> Upgrade complete!"
 echo "  ${CURRENT_VERSION} -> ${LATEST_VERSION}"
 echo
 echo "Restart the daemon to use the new version:"
-echo "  ahandd --config ~/.ahand/config.toml"
+echo "  ahandctl restart"

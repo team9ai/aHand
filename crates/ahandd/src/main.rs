@@ -17,6 +17,7 @@ use std::sync::Arc;
 use ahand_protocol::Envelope;
 use clap::Parser;
 use config::ConnectionMode;
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
 
 #[derive(Parser)]
@@ -104,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("No config file found at {}", path.display());
                 eprintln!();
                 eprintln!("Run 'ahandctl configure' to set up your configuration.");
+                eprintln!("Then start with:           ahandctl start");
                 eprintln!("Or specify a config file:  ahandd --config <path>");
                 eprintln!("Or connect directly:       ahandd --url ws://host/ws");
                 std::process::exit(1);
@@ -228,6 +230,12 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    // Write PID file so ahandctl can detect whether daemon is running.
+    let pid_path = write_pid_file(&cfg.data_dir());
+    if let Some(ref p) = pid_path {
+        info!(pid = std::process::id(), path = %p.display(), "wrote PID file");
+    }
+
     let session_mgr = Arc::new(session::SessionManager::new(
         cfg.trust_timeout_mins.unwrap_or(60),
     ));
@@ -255,99 +263,145 @@ async fn main() -> anyhow::Result<()> {
     // Broadcast channel for pushing approval requests to all IPC clients.
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
 
-    match connection_mode {
-        ConnectionMode::AHandCloud => {
-            info!(
-                server_url = %cfg.server_url,
-                device_id = %device_id,
-                max_concurrent_jobs = max_jobs,
-                debug_ipc,
-                "ahandd starting in ahand-cloud mode"
-            );
+    // Set up signal handlers for graceful shutdown.
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
 
-            if debug_ipc {
-                let ipc_handle = tokio::spawn(ipc::serve_ipc(
-                    ipc_socket_path,
-                    ipc_socket_mode,
+    let main_future = async {
+        match connection_mode {
+            ConnectionMode::AHandCloud => {
+                info!(
+                    server_url = %cfg.server_url,
+                    device_id = %device_id,
+                    max_concurrent_jobs = max_jobs,
+                    debug_ipc,
+                    "ahandd starting in ahand-cloud mode"
+                );
+
+                if debug_ipc {
+                    let ipc_handle = tokio::spawn(ipc::serve_ipc(
+                        ipc_socket_path,
+                        ipc_socket_mode,
+                        Arc::clone(&registry),
+                        store_opt.clone(),
+                        Arc::clone(&session_mgr),
+                        Arc::clone(&approval_mgr),
+                        approval_broadcast_tx.clone(),
+                        device_id.clone(),
+                        Arc::clone(&browser_mgr),
+                    ));
+
+                    tokio::select! {
+                        r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx, Arc::clone(&browser_mgr)) => r,
+                        r = ipc_handle => {
+                            r??;
+                            Ok(())
+                        }
+                    }
+                } else {
+                    ahand_client::run(
+                        cfg,
+                        device_id,
+                        registry,
+                        store_opt,
+                        session_mgr,
+                        approval_mgr,
+                        approval_broadcast_tx,
+                        browser_mgr,
+                    )
+                    .await
+                }
+            }
+            ConnectionMode::OpenClawGateway => {
+                let oc_config = cfg.openclaw_config();
+                let host = oc_config.gateway_host.as_deref().unwrap_or("127.0.0.1");
+                let port = oc_config.gateway_port.unwrap_or(18789);
+
+                info!(
+                    gateway_host = %host,
+                    gateway_port = port,
+                    node_id = ?oc_config.node_id,
+                    display_name = ?oc_config.display_name,
+                    max_concurrent_jobs = max_jobs,
+                    debug_ipc,
+                    "ahandd starting in openclaw-gateway mode"
+                );
+
+                let client = openclaw::OpenClawClient::new(
+                    oc_config,
                     Arc::clone(&registry),
-                    store_opt.clone(),
                     Arc::clone(&session_mgr),
                     Arc::clone(&approval_mgr),
-                    approval_broadcast_tx.clone(),
-                    device_id.clone(),
+                    store_opt.clone(),
                     Arc::clone(&browser_mgr),
-                ));
+                );
 
-                // Run WS client and IPC server concurrently.
-                tokio::select! {
-                    r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx, Arc::clone(&browser_mgr)) => r,
-                    r = ipc_handle => {
-                        r??;
-                        Ok(())
+                if debug_ipc {
+                    let ipc_handle = tokio::spawn(ipc::serve_ipc(
+                        ipc_socket_path,
+                        ipc_socket_mode,
+                        Arc::clone(&registry),
+                        store_opt.clone(),
+                        Arc::clone(&session_mgr),
+                        Arc::clone(&approval_mgr),
+                        approval_broadcast_tx.clone(),
+                        device_id.clone(),
+                        Arc::clone(&browser_mgr),
+                    ));
+
+                    tokio::select! {
+                        r = client.run() => r,
+                        r = ipc_handle => {
+                            r??;
+                            Ok(())
+                        }
                     }
+                } else {
+                    client.run().await
                 }
-            } else {
-                ahand_client::run(
-                    cfg,
-                    device_id,
-                    registry,
-                    store_opt,
-                    session_mgr,
-                    approval_mgr,
-                    approval_broadcast_tx,
-                    browser_mgr,
-                )
-                .await
             }
         }
-        ConnectionMode::OpenClawGateway => {
-            let oc_config = cfg.openclaw_config();
-            let host = oc_config.gateway_host.as_deref().unwrap_or("127.0.0.1");
-            let port = oc_config.gateway_port.unwrap_or(18789);
+    };
 
-            info!(
-                gateway_host = %host,
-                gateway_port = port,
-                node_id = ?oc_config.node_id,
-                display_name = ?oc_config.display_name,
-                max_concurrent_jobs = max_jobs,
-                debug_ipc,
-                "ahandd starting in openclaw-gateway mode"
-            );
+    // Race main event loop against shutdown signals.
+    let result = tokio::select! {
+        r = main_future => r,
+        _ = sigterm.recv() => {
+            info!("received SIGTERM, shutting down");
+            Ok(())
+        }
+        _ = sigint.recv() => {
+            info!("received SIGINT, shutting down");
+            Ok(())
+        }
+    };
 
-            let client = openclaw::OpenClawClient::new(
-                oc_config,
-                Arc::clone(&registry),
-                Arc::clone(&session_mgr),
-                Arc::clone(&approval_mgr),
-                store_opt.clone(),
-                Arc::clone(&browser_mgr),
-            );
+    // Clean up PID file on exit.
+    cleanup_pid_file(&pid_path);
 
-            if debug_ipc {
-                let ipc_handle = tokio::spawn(ipc::serve_ipc(
-                    ipc_socket_path,
-                    ipc_socket_mode,
-                    Arc::clone(&registry),
-                    store_opt.clone(),
-                    Arc::clone(&session_mgr),
-                    Arc::clone(&approval_mgr),
-                    approval_broadcast_tx.clone(),
-                    device_id.clone(),
-                    Arc::clone(&browser_mgr),
-                ));
+    result
+}
 
-                // Run OpenClaw client and IPC server concurrently.
-                tokio::select! {
-                    r = client.run() => r,
-                    r = ipc_handle => {
-                        r??;
-                        Ok(())
-                    }
-                }
-            } else {
-                client.run().await
-            }
+fn write_pid_file(data_dir: &Option<PathBuf>) -> Option<PathBuf> {
+    let dir = data_dir.as_ref()?;
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, "failed to create data dir for PID file");
+        return None;
+    }
+    let pid_path = dir.join("daemon.pid");
+    if let Err(e) = std::fs::write(&pid_path, std::process::id().to_string()) {
+        tracing::warn!(error = %e, "failed to write PID file");
+        return None;
+    }
+    Some(pid_path)
+}
+
+fn cleanup_pid_file(pid_path: &Option<PathBuf>) {
+    if let Some(path) = pid_path {
+        if let Err(e) = std::fs::remove_file(path) {
+            tracing::warn!(error = %e, path = %path.display(), "failed to remove PID file");
+        } else {
+            tracing::info!(path = %path.display(), "removed PID file");
         }
     }
 }

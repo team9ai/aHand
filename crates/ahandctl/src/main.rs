@@ -11,6 +11,7 @@ use tracing::info;
 
 mod admin;
 mod browser_init;
+mod daemon;
 mod upgrade;
 
 #[derive(Parser)]
@@ -83,6 +84,22 @@ enum Cmd {
         #[arg(long)]
         version: Option<String>,
     },
+    /// Start the ahandd daemon in the background
+    Start {
+        /// Path to config file (defaults to ~/.ahand/config.toml)
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Stop the running ahandd daemon
+    Stop,
+    /// Restart the ahandd daemon (stop + start)
+    Restart {
+        /// Path to config file (defaults to ~/.ahand/config.toml)
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Show daemon status
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -165,6 +182,18 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Upgrade { check, version } => {
             return upgrade::run(*check, version.clone()).await;
         }
+        Cmd::Start { config } => {
+            return daemon::start(config.clone()).await;
+        }
+        Cmd::Stop => {
+            return daemon::stop().await;
+        }
+        Cmd::Restart { config } => {
+            return daemon::restart(config.clone()).await;
+        }
+        Cmd::Status => {
+            return daemon::status().await;
+        }
         _ => {}
     }
 
@@ -190,7 +219,8 @@ async fn main() -> anyhow::Result<()> {
             Cmd::Session { action } => {
                 ipc_session(ipc_path, action).await?;
             }
-            Cmd::Configure { .. } | Cmd::BrowserInit { .. } | Cmd::Upgrade { .. } => {
+            Cmd::Configure { .. } | Cmd::BrowserInit { .. } | Cmd::Upgrade { .. }
+            | Cmd::Start { .. } | Cmd::Stop | Cmd::Restart { .. } | Cmd::Status => {
                 unreachable!("Handled early, should not reach here");
             }
         }
@@ -216,7 +246,8 @@ async fn main() -> anyhow::Result<()> {
             Cmd::Session { action } => {
                 ws_session(&args.url, action).await?;
             }
-            Cmd::Configure { .. } | Cmd::BrowserInit { .. } | Cmd::Upgrade { .. } => {
+            Cmd::Configure { .. } | Cmd::BrowserInit { .. } | Cmd::Upgrade { .. }
+            | Cmd::Start { .. } | Cmd::Stop | Cmd::Restart { .. } | Cmd::Status => {
                 unreachable!("Handled early, should not reach here");
             }
         }
