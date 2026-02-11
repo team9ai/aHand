@@ -1,6 +1,6 @@
 {
   "name": "@ahand/sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "AHand cloud control plane SDK",
   "main": "dist/index.js",

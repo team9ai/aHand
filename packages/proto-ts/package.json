@@ -1,6 +1,6 @@
 {
   "name": "@ahand/proto",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "ts-proto generated types for ahand protocol",
   "main": "dist/index.js",
