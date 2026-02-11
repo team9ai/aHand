@@ -40,28 +40,32 @@ detect_platform() {
   echo "Platform: ${SUFFIX}"
 }
 
-# ── Resolve version ───────────────────────────────────────────────
+# ── Resolve versions ──────────────────────────────────────────────
 # Each component has its own tag (rust-v*, admin-v*, browser-v*).
-# AHAND_VERSION sets the shared version number; tags are derived.
+# AHAND_VERSION pins all components to a single version;
+# otherwise each component resolves its own latest independently.
 
-resolve_version() {
+resolve_versions() {
   if [ -n "$AHAND_VERSION" ]; then
-    VERSION="$AHAND_VERSION"
+    RUST_VERSION="$AHAND_VERSION"
+    ADMIN_VERSION="$AHAND_VERSION"
+    BROWSER_VERSION="$AHAND_VERSION"
   else
-    echo "Fetching latest release..."
-    # Use rust release as the canonical version (first released component)
-    local tag
-    tag=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases" \
-      | grep '"tag_name"' | grep 'rust-v' | head -1 | sed 's/.*"rust-v\([^"]*\)".*/\1/')
-    VERSION="$tag"
+    echo "Fetching latest releases..."
+    local releases
+    releases=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases")
+
+    RUST_VERSION=$(echo "$releases" | grep '"tag_name"' | grep 'rust-v' | head -1 | sed 's/.*"rust-v\([^"]*\)".*/\1/')
+    ADMIN_VERSION=$(echo "$releases" | grep '"tag_name"' | grep 'admin-v' | head -1 | sed 's/.*"admin-v\([^"]*\)".*/\1/')
+    BROWSER_VERSION=$(echo "$releases" | grep '"tag_name"' | grep 'browser-v' | head -1 | sed 's/.*"browser-v\([^"]*\)".*/\1/')
   fi
 
-  if [ -z "$VERSION" ]; then
-    echo "ERROR: Could not determine version"
+  if [ -z "$RUST_VERSION" ]; then
+    echo "ERROR: Could not determine Rust release version"
     exit 1
   fi
 
-  echo "Version: ${VERSION}"
+  echo "Versions: rust=${RUST_VERSION} admin=${ADMIN_VERSION:-none} browser=${BROWSER_VERSION:-none}"
 }
 
 # ── Download helper ───────────────────────────────────────────────
@@ -80,39 +84,43 @@ main() {
   echo
 
   detect_platform
-  resolve_version
+  resolve_versions
 
-  RUST_URL="https://github.com/${GITHUB_REPO}/releases/download/rust-v${VERSION}"
-  ADMIN_URL="https://github.com/${GITHUB_REPO}/releases/download/admin-v${VERSION}"
-  BROWSER_URL="https://github.com/${GITHUB_REPO}/releases/download/browser-v${VERSION}"
+  RUST_URL="https://github.com/${GITHUB_REPO}/releases/download/rust-v${RUST_VERSION}"
 
   # Create directories
   mkdir -p "$BIN_DIR"
-  mkdir -p "$INSTALL_DIR/admin/dist"
 
-  # Download Rust binaries
+  # Download Rust binaries (required)
   echo
-  echo "==> Downloading binaries..."
+  echo "==> Downloading binaries (rust-v${RUST_VERSION})..."
   download "${RUST_URL}/ahandd-${SUFFIX}" "$BIN_DIR/ahandd"
   chmod +x "$BIN_DIR/ahandd"
   download "${RUST_URL}/ahandctl-${SUFFIX}" "$BIN_DIR/ahandctl"
   chmod +x "$BIN_DIR/ahandctl"
 
-  # Download admin SPA
-  echo
-  echo "==> Downloading admin panel..."
-  download "${ADMIN_URL}/admin-spa.tar.gz" "/tmp/ahand-admin-spa.tar.gz"
-  tar xzf /tmp/ahand-admin-spa.tar.gz -C "$INSTALL_DIR/admin/dist/"
-  rm /tmp/ahand-admin-spa.tar.gz
+  # Download admin SPA (optional — skip if no admin release exists)
+  if [ -n "$ADMIN_VERSION" ]; then
+    ADMIN_URL="https://github.com/${GITHUB_REPO}/releases/download/admin-v${ADMIN_VERSION}"
+    echo
+    echo "==> Downloading admin panel (admin-v${ADMIN_VERSION})..."
+    mkdir -p "$INSTALL_DIR/admin/dist"
+    download "${ADMIN_URL}/admin-spa.tar.gz" "/tmp/ahand-admin-spa.tar.gz"
+    tar xzf /tmp/ahand-admin-spa.tar.gz -C "$INSTALL_DIR/admin/dist/"
+    rm /tmp/ahand-admin-spa.tar.gz
+  fi
 
-  # Download scripts
-  echo
-  echo "==> Downloading scripts..."
-  download "${BROWSER_URL}/setup-browser.sh" "$BIN_DIR/setup-browser.sh"
-  chmod +x "$BIN_DIR/setup-browser.sh"
+  # Download scripts (optional — skip if no browser release exists)
+  if [ -n "$BROWSER_VERSION" ]; then
+    BROWSER_URL="https://github.com/${GITHUB_REPO}/releases/download/browser-v${BROWSER_VERSION}"
+    echo
+    echo "==> Downloading scripts (browser-v${BROWSER_VERSION})..."
+    download "${BROWSER_URL}/setup-browser.sh" "$BIN_DIR/setup-browser.sh"
+    chmod +x "$BIN_DIR/setup-browser.sh"
+  fi
 
-  # Write version marker
-  echo "$VERSION" > "$INSTALL_DIR/version"
+  # Write version marker (rust version is canonical)
+  echo "$RUST_VERSION" > "$INSTALL_DIR/version"
 
   echo
   echo "==> aHand installed successfully!"

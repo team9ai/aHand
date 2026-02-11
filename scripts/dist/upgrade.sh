@@ -60,15 +60,22 @@ get_current_version() {
   fi
 }
 
-# ── Get latest version ───────────────────────────────────────────
-# Uses rust release as canonical version source.
+# ── Get latest versions ──────────────────────────────────────────
+# Each component resolves its own latest version independently.
+# --version pins all components to a single version.
 
-get_latest_version() {
+get_latest_versions() {
   if [ -n "$TARGET_VERSION" ]; then
     LATEST_VERSION="$TARGET_VERSION"
+    LATEST_ADMIN_VERSION="$TARGET_VERSION"
+    LATEST_BROWSER_VERSION="$TARGET_VERSION"
   else
-    LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases" \
-      | grep '"tag_name"' | grep 'rust-v' | head -1 | sed 's/.*"rust-v\([^"]*\)".*/\1/')
+    local releases
+    releases=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases")
+
+    LATEST_VERSION=$(echo "$releases" | grep '"tag_name"' | grep 'rust-v' | head -1 | sed 's/.*"rust-v\([^"]*\)".*/\1/')
+    LATEST_ADMIN_VERSION=$(echo "$releases" | grep '"tag_name"' | grep 'admin-v' | head -1 | sed 's/.*"admin-v\([^"]*\)".*/\1/')
+    LATEST_BROWSER_VERSION=$(echo "$releases" | grep '"tag_name"' | grep 'browser-v' | head -1 | sed 's/.*"browser-v\([^"]*\)".*/\1/')
   fi
 
   if [ -z "$LATEST_VERSION" ]; then
@@ -90,10 +97,10 @@ download() {
 
 detect_platform
 get_current_version
-get_latest_version
+get_latest_versions
 
 echo "Current version: ${CURRENT_VERSION}"
-echo "Latest version:  ${LATEST_VERSION}"
+echo "Latest version:  rust=${LATEST_VERSION} admin=${LATEST_ADMIN_VERSION:-none} browser=${LATEST_BROWSER_VERSION:-none}"
 echo "Platform:        ${SUFFIX}"
 echo
 
@@ -112,8 +119,6 @@ echo "Upgrading: ${CURRENT_VERSION} -> ${LATEST_VERSION}"
 echo
 
 RUST_URL="https://github.com/${GITHUB_REPO}/releases/download/rust-v${LATEST_VERSION}"
-ADMIN_URL="https://github.com/${GITHUB_REPO}/releases/download/admin-v${LATEST_VERSION}"
-BROWSER_URL="https://github.com/${GITHUB_REPO}/releases/download/browser-v${LATEST_VERSION}"
 TMP_DIR=$(mktemp -d)
 trap "rm -rf $TMP_DIR" EXIT
 
@@ -121,18 +126,24 @@ trap "rm -rf $TMP_DIR" EXIT
 echo "==> Downloading checksums..."
 download "${RUST_URL}/checksums-rust.txt" "$TMP_DIR/checksums-rust.txt" 2>/dev/null || true
 
-# Download binaries
-echo "==> Downloading binaries..."
+# Download binaries (required)
+echo "==> Downloading binaries (rust-v${LATEST_VERSION})..."
 download "${RUST_URL}/ahandd-${SUFFIX}" "$TMP_DIR/ahandd"
 download "${RUST_URL}/ahandctl-${SUFFIX}" "$TMP_DIR/ahandctl"
 
-# Download admin SPA
-echo "==> Downloading admin panel..."
-download "${ADMIN_URL}/admin-spa.tar.gz" "$TMP_DIR/admin-spa.tar.gz"
+# Download admin SPA (optional)
+if [ -n "$LATEST_ADMIN_VERSION" ]; then
+  ADMIN_URL="https://github.com/${GITHUB_REPO}/releases/download/admin-v${LATEST_ADMIN_VERSION}"
+  echo "==> Downloading admin panel (admin-v${LATEST_ADMIN_VERSION})..."
+  download "${ADMIN_URL}/admin-spa.tar.gz" "$TMP_DIR/admin-spa.tar.gz"
+fi
 
-# Download scripts
-echo "==> Downloading scripts..."
-download "${BROWSER_URL}/setup-browser.sh" "$TMP_DIR/setup-browser.sh" 2>/dev/null || true
+# Download scripts (optional)
+if [ -n "$LATEST_BROWSER_VERSION" ]; then
+  BROWSER_URL="https://github.com/${GITHUB_REPO}/releases/download/browser-v${LATEST_BROWSER_VERSION}"
+  echo "==> Downloading scripts (browser-v${LATEST_BROWSER_VERSION})..."
+  download "${BROWSER_URL}/setup-browser.sh" "$TMP_DIR/setup-browser.sh" 2>/dev/null || true
+fi
 
 # Verify checksums if available
 if [ -f "$TMP_DIR/checksums-rust.txt" ]; then
@@ -177,10 +188,12 @@ cp "$TMP_DIR/ahandctl" "$BIN_DIR/ahandctl"
 chmod +x "$BIN_DIR/ahandctl"
 
 # Install admin SPA
-echo "==> Installing admin panel..."
-mkdir -p "$INSTALL_DIR/admin/dist"
-rm -rf "$INSTALL_DIR/admin/dist/*"
-tar xzf "$TMP_DIR/admin-spa.tar.gz" -C "$INSTALL_DIR/admin/dist/"
+if [ -f "$TMP_DIR/admin-spa.tar.gz" ]; then
+  echo "==> Installing admin panel..."
+  mkdir -p "$INSTALL_DIR/admin/dist"
+  rm -rf "$INSTALL_DIR/admin/dist/*"
+  tar xzf "$TMP_DIR/admin-spa.tar.gz" -C "$INSTALL_DIR/admin/dist/"
+fi
 
 # Install scripts
 if [ -f "$TMP_DIR/setup-browser.sh" ]; then
