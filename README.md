@@ -21,7 +21,7 @@ Cloud (WS server)  ←──  WebSocket (protobuf)  ──→  Local daemon (WS 
 
 ## Quick Start
 
-### Install
+### 1. Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.sh | bash
@@ -32,6 +32,25 @@ This installs `ahandd`, `ahandctl`, the admin panel, and browser setup script to
 Environment variables:
 - `AHAND_VERSION` — install a specific version (default: latest)
 - `AHAND_DIR` — install directory (default: `~/.ahand`)
+
+### 2. Configure
+
+```bash
+ahandctl configure          # open admin panel in browser to set up config
+```
+
+The admin panel guides you through initial setup (connection mode, gateway host, etc.) and writes `~/.ahand/config.toml`.
+
+### 3. Start the Daemon
+
+```bash
+ahandctl start              # start daemon in background
+ahandctl status             # check if daemon is running
+ahandctl stop               # stop the daemon
+ahandctl restart             # restart the daemon
+```
+
+Logs are written to `~/.ahand/data/daemon.log`.
 
 ### Upgrade
 
@@ -47,12 +66,6 @@ ahandctl browser-init       # install browser automation dependencies
 ```
 
 This sets up [agent-browser](https://github.com/AHand-Project/agent-browser), a local Node.js runtime (if needed), and detects/installs Chrome/Chromium.
-
-### Admin Panel
-
-```bash
-ahandctl configure          # open the admin panel in browser
-```
 
 ## Session Modes
 

@@ -112,7 +112,7 @@ teardown() {
   # Copy other fixtures so the script doesn't fail for other reasons.
   run bash "$DIST_DIR/install.sh"
   assert_failure
-  assert_output --partial "Could not determine version"
+  assert_output --partial "Could not determine Rust release version"
 }
 
 @test "install: cleans up temp tar file" {

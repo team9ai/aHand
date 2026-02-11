@@ -30,13 +30,13 @@ teardown() {
 @test "upgrade: fetches latest version from API" {
   echo "0.2.0" > "$TEST_INSTALL_DIR/version"
   run bash "$DIST_DIR/upgrade.sh"
-  assert_output --partial "Latest version:  0.3.0"
+  assert_output --partial "Latest version:  rust=0.3.0"
 }
 
 @test "upgrade: --version flag overrides API" {
   echo "0.2.0" > "$TEST_INSTALL_DIR/version"
   run bash "$DIST_DIR/upgrade.sh" --version 0.2.5
-  assert_output --partial "Latest version:  0.2.5"
+  assert_output --partial "Latest version:  rust=0.2.5"
 }
 
 # ── Check mode ───────────────────────────────────────────────────
