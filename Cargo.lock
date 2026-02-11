@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "ahand-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "prost",
  "prost-build",
@@ -12,7 +12,7 @@ dependencies = [
 
 [[package]]
 name = "ahandctl"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahand-protocol",
  "anyhow",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "ahandd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahand-protocol",
  "anyhow",
