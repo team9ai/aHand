@@ -1,4 +1,4 @@
-# Team9 × aHand 集成实施计划（修订版 v3）
+# Team9 × aHand 集成实施计划（修订版 v4）
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
@@ -10,7 +10,17 @@
 
 ---
 
-## v3 相对 v2 的主要修订
+## v4 相对 v3 的主要修订
+
+| 问题 | v3 错误 | v4 修正 |
+|------|---------|---------|
+| **[Critical] gateway URL 获取** | 读 `app.secrets.instanceResult.access_url`，但 `getVerifiedApp()` 返回 `SafeInstalledApplication`（无 `secrets` 字段），TypeScript 编译报错 | 改用 `openclawService.getInstance(instancesId)` 直接从 OpenClaw 获取实例访问 URL |
+| **aHand 集成方式** | 要求用户手动安装 aHand，仅查 `~/.ahand/bin/ahandd` | 改用 **Tauri Sidecar**：将 `ahandd` 打包进 Team9 客户端安装包，用户无需单独安装；`find_binary()` 优先查 sidecar 路径 |
+| **node_id 生成** | 仅用时间戳，高并发或同机多实例可能碰撞 | 混入进程 ID，增强唯一性 |
+| **Tauri 2 环境检测** | 使用 `window.__TAURI__`（Tauri v1 API） | 改用 `window.__TAURI_INTERNALS__`（Tauri v2 正式 API）或 `@tauri-apps/api/core` 的 `isTauri()` |
+| **Phase 4 状态** | 标记为"需要验证" | 代码检查已确认 `SenderId`/`SenderName` 完整实现，**Phase 4 无需任何修改** |
+
+## v3 相对 v2 的主要修订（历史）
 
 | 问题 | v2 错误 | v3 修正 |
 |------|---------|---------|
@@ -101,9 +111,18 @@ async getOpenClawGatewayInfo(
     throw new NotFoundException('No instance configured for this application');
   }
 
-  // access_url is stored in secrets after installation
-  const secrets = (app.secrets as { instanceResult?: { access_url?: string } }) ?? {};
-  const accessUrl = secrets.instanceResult?.access_url;
+  // Fetch instance info directly from OpenClaw to get the access URL.
+  // NOTE: getVerifiedApp() returns SafeInstalledApplication (no secrets field),
+  // so we cannot read app.secrets here. Use openclawService.getInstance() instead.
+  const instance = await this.openclawService.getInstance(instancesId);
+  if (!instance) {
+    throw new ServiceUnavailableException('OpenClaw instance not found or not running');
+  }
+
+  // TODO: verify the exact field name on the Instance type before implementing.
+  // Check openclaw.service.ts getInstance() return type for: access_url / url / endpoint / host.
+  const accessUrl: string | undefined =
+    (instance as any).access_url ?? (instance as any).url;
 
   if (!accessUrl) {
     throw new ServiceUnavailableException('Gateway URL not available yet');
@@ -124,11 +143,17 @@ async getOpenClawGatewayInfo(
 }
 ```
 
-> **注意：** `app.secrets` 的结构依赖 OpenClaw 安装流程写入的字段。实现前先检查一条已安装记录确认 `secrets.instanceResult.access_url` 存在：
+> **[v4 修正说明]** `getVerifiedApp()` 返回 `SafeInstalledApplication` 类型，该类型**不含 `secrets` 字段**（设计上禁止 secrets 流向前端）。之前 v3 版本的 `app.secrets.instanceResult?.access_url` 会在 TypeScript 编译时报错。
+>
+> 修正方案：通过 `openclawService.getInstance(instancesId)` 直接从 OpenClaw 获取实例信息。
+>
+> **实现前必须验证：**
 > ```bash
-> # 在 team9/apps/server 目录执行，查看已安装 openclaw 应用的 secrets 字段结构
-> cd team9/apps/server && pnpm repl  # 或查询数据库
+> # 在 openclaw.service.ts 中找到 getInstance 的返回类型定义
+> grep -n "getInstance\|Instance\b" \
+>   team9/apps/server/apps/gateway/src/openclaw/openclaw.service.ts | head -20
 > ```
+> 确认 Instance 类型中 URL 字段的正确名称（可能是 `access_url`、`url`、`endpoint` 等），然后替换上方代码中的 `(instance as any).access_url` 为确切字段名。
 
 **Step 1:** 启动 Team9 服务，调用接口验证返回格式：
 ```bash
@@ -245,6 +270,79 @@ git commit -m "feat(client): add getOpenClawGatewayInfo and selfApproveOpenClawD
 
 ## Phase 2：Team9 Tauri 客户端 — 自动管理 aHand daemon
 
+### Task 2.0：配置 Tauri Sidecar（将 ahandd 打包进客户端安装包）
+
+> **[v4 新增]** v3 计划依赖用户手动安装 aHand（`~/.ahand/bin/ahandd`），体验差且容易出错。
+> 改用 Tauri 官方的 **External Binary / Sidecar** 机制：将 `ahandd` 直接打包进 Team9 安装包，用户安装 Team9 即自动获得 aHand 能力，无需任何手动步骤。
+
+#### 集成方式对比
+
+| 方式 | 优点 | 缺点 | 结论 |
+|------|------|------|------|
+| 拷贝 aHand 代码进 team9 | 单仓库 | 维护两份代码，版本混乱 | ❌ 不推荐 |
+| Cargo 库依赖链接 | 编译时集成 | aHand 需要重构为库 API，team9 构建复杂度骤增 | ❌ 不推荐 |
+| 用户手动安装（v3 方案） | 版本独立 | 用户须手动安装，首次体验差 | ⚠️ 可用但不佳 |
+| **Tauri Sidecar（v4 方案）** | 打包进安装包，零配置；Tauri 官方支持 | 发版时需为各平台准备对应的 `ahandd` 二进制 | ✅ 推荐 |
+
+#### Part A：tauri.conf.json — 声明外部二进制
+
+**Files:**
+- Modify: `team9/apps/client/src-tauri/tauri.conf.json`
+
+在 `bundle` 配置块中加入 `externalBin`：
+
+```json
+{
+  "bundle": {
+    "externalBin": [
+      "binaries/ahandd"
+    ]
+  }
+}
+```
+
+#### Part B：放置 ahandd 二进制
+
+Tauri 要求 sidecar 二进制按 `<name>-<target-triple>` 命名，放在 `src-tauri/binaries/` 目录：
+
+```
+team9/apps/client/src-tauri/binaries/
+├── ahandd-x86_64-apple-darwin        # macOS Intel
+├── ahandd-aarch64-apple-darwin       # macOS Apple Silicon
+├── ahandd-x86_64-unknown-linux-gnu   # Linux x64
+└── ahandd-x86_64-pc-windows-msvc.exe # Windows
+```
+
+**开发阶段（本地测试）：** 直接从 aHand 编译产物复制过来：
+```bash
+# 在 aHand 仓库编译
+cd /Users/jiangtao/Desktop/shenjingyuan/aHand
+cargo build --release -p ahandd
+
+# 复制到 team9 sidecar 目录（macOS Apple Silicon 为例）
+TRIPLE=$(rustc -vV | grep host | awk '{print $2}')
+mkdir -p team9/apps/client/src-tauri/binaries
+cp aHand/target/release/ahandd \
+   team9/apps/client/src-tauri/binaries/ahandd-${TRIPLE}
+```
+
+**CI/CD（生产）：** 在 team9 的 GitHub Actions workflow 中，构建前先 checkout aHand 仓库并编译/下载对应平台的 `ahandd`，再执行 `pnpm tauri build`。
+
+#### Part C：.gitignore
+
+```bash
+# 在 team9/apps/client/src-tauri/ 目录
+echo "binaries/" >> .gitignore
+```
+
+**Commit:**
+```bash
+git add apps/client/src-tauri/tauri.conf.json apps/client/src-tauri/.gitignore
+git commit -m "feat(tauri): configure ahandd sidecar binary bundling"
+```
+
+---
+
 ### Task 2.1：Tauri Cargo.toml 添加依赖
 
 **Files:**
@@ -292,15 +390,32 @@ use std::sync::Mutex;
 
 static DAEMON: Mutex<Option<Child>> = Mutex::new(None);
 
-/// Locate the aHand binary: ~/.ahand/bin/ahandd first, then PATH.
+/// Locate the aHand binary.
+///
+/// Search order:
+/// 1. Tauri sidecar: binaries/ directory next to the app executable (Task 2.0).
+/// 2. User-installed fallback: ~/.ahand/bin/ahandd.
+/// 3. PATH fallback.
 fn find_binary() -> Option<std::path::PathBuf> {
+    // 1. Sidecar binary bundled next to the app executable (Tauri Task 2.0).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("ahandd");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    // 2. User-installed fallback: ~/.ahand/bin/ahandd.
     if let Some(home) = dirs::home_dir() {
         let p = home.join(".ahand").join("bin").join("ahandd");
         if p.exists() {
             return Some(p);
         }
     }
-    // Fallback: check PATH
+
+    // 3. PATH fallback.
     std::env::var_os("PATH").and_then(|paths| {
         std::env::split_paths(&paths).find_map(|dir| {
             let p = dir.join("ahandd");
@@ -325,7 +440,8 @@ pub fn get_or_create_node_id() -> String {
         }
     }
 
-    // Generate a stable ID from current time (good enough for a device identifier).
+    // Generate a stable ID mixing timestamp + PID to avoid collisions
+    // when multiple instances start simultaneously on the same machine.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -334,7 +450,8 @@ pub fn get_or_create_node_id() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos();
-    let id = format!("team9-{secs:016x}{nanos:08x}");
+    let pid = std::process::id();
+    let id = format!("team9-{secs:016x}{pid:08x}{nanos:08x}");
 
     let _ = std::fs::create_dir_all(path.parent().unwrap());
     let _ = std::fs::write(&path, &id);
@@ -537,12 +654,17 @@ import { applicationsApi } from '../services/api/applications.js';
  *
  * This hook is a no-op when not running inside the Tauri desktop app.
  */
+
+// Tauri v2 uses __TAURI_INTERNALS__ instead of Tauri v1's __TAURI__.
+const isTauriApp = () =>
+  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
 export function useAHandAutoConnect() {
   const started = useRef(false);
 
   useEffect(() => {
     // Only run once per session and only in Tauri desktop app.
-    if (started.current || !(window as any).__TAURI__) return;
+    if (started.current || !isTauriApp()) return;
     started.current = true;
 
     void startLocalDevice();
@@ -553,6 +675,7 @@ export function useAHandAutoConnect() {
     };
   }, []);
 }
+
 
 async function findOpenClawAppId(): Promise<string | null> {
   const apps = await applicationsApi.getInstalledApplications();
@@ -648,7 +771,8 @@ onSuccess: () => {
   // ... 现有的 store 清理代码 ...
 
   // Stop aHand daemon on logout (desktop app only).
-  if ((window as any).__TAURI__) {
+  // Use __TAURI_INTERNALS__ for Tauri v2 detection (v1 used __TAURI__).
+  if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
     invoke('ahand_stop').catch(() => {});
   }
 },
@@ -677,6 +801,10 @@ import { invoke } from '@tauri-apps/api/core';
 
 export type AHandStatus = 'connected' | 'disconnected' | 'not-desktop';
 
+// Tauri v2 uses __TAURI_INTERNALS__ instead of Tauri v1's __TAURI__.
+const isTauriApp = () =>
+  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
 /**
  * Polls whether the aHand daemon process is alive.
  *
@@ -688,7 +816,7 @@ export function useAHandStatus(): AHandStatus {
   const [status, setStatus] = useState<AHandStatus>('not-desktop');
 
   useEffect(() => {
-    if (!(window as any).__TAURI__) return;
+    if (!isTauriApp()) return;
 
     const check = async () => {
       try {
@@ -748,30 +876,24 @@ git commit -m "feat(client): add local device connection status indicator"
 
 ## Phase 4：OpenClaw Team9 Extension — senderId 验证
 
-### Task 4.1：验证 senderId 是否已实现
+> **[v4 预验证结论：本 Phase 已完成，无需任何改动。]**
+>
+> 代码检查已确认（`openclaw-hive/openclaw/extensions/team9/src/monitor/prepare.ts`）：
+> - `SenderId: message.senderId` ✅ 已实现
+> - `SenderName: message.senderName || "Unknown"` ✅ 已实现（含 fallback）
+>
+> 跳过本 Phase，直接进入端到端验证。
 
-在执行任何代码改动之前，先验证当前状态：
+### Task 4.1：验证 senderId 是否已实现（历史存档）
 
-**Step 1:** 检查 `prepare.ts` 中 ctxPayload 的构建，确认 `SenderId`/`SenderName` 是否已传入：
+此步骤已由代码检查取代，保留供参考：
+
 ```bash
 grep -n "SenderId\|SenderName\|senderId\|senderName" \
   openclaw-hive/openclaw/extensions/team9/src/monitor/prepare.ts
-```
-
-**Step 2:** 如果上面的 grep 输出包含 `SenderId: message.senderId` 和 `SenderName: message.senderName`，则**本 Phase 已完成**，无需任何改动。
-
-**Step 3（仅在未实现时执行）:** 在 `ctxPayload` 构建块中加入：
-
-```typescript
-// In the ctxPayload construction block, add:
-SenderId: message.senderId,
-SenderName: message.senderName ?? message.senderId,
-```
-
-**Step 4（如有改动）:** 编译验证并 commit：
-```bash
-cd openclaw-hive && npm run build 2>&1 | tail -10
-git commit -m "feat(team9-ext): pass senderId/senderName in message context for AI prompts"
+# 预期输出包含：
+#   SenderName: message.senderName || "Unknown",
+#   SenderId: message.senderId,
 ```
 
 ---
