@@ -1,6 +1,7 @@
 mod ahand_client;
 mod approval;
 mod browser;
+mod browser_init;
 mod config;
 mod executor;
 mod ipc;
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ahand_protocol::Envelope;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use config::ConnectionMode;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
@@ -79,6 +80,19 @@ struct Args {
     /// OpenClaw Gateway authentication password
     #[arg(long, env = "OPENCLAW_GATEWAY_PASSWORD")]
     gateway_password: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Initialize browser automation dependencies
+    BrowserInit {
+        /// Force reinstall (clean existing installation first)
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[tokio::main]
@@ -86,6 +100,15 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    // Handle subcommands that don't need daemon setup.
+    if let Some(cmd) = &args.command {
+        match cmd {
+            Cmd::BrowserInit { force } => {
+                return browser_init::run(*force).await;
+            }
+        }
+    }
 
     let config_path = args.config.clone();
 
