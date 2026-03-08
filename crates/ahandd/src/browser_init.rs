@@ -147,14 +147,21 @@ async fn install_node(dirs: &Dirs) -> Result<()> {
 // Step 2: agent-browser CLI
 
 async fn download_agent_browser(dirs: &Dirs) -> Result<()> {
+    std::fs::create_dir_all(&dirs.bin)?;
+    let dest = dirs.bin.join("agent-browser");
+
+    // Skip download if the binary already exists (unless --force was used,
+    // which cleans the installation before reaching this point).
+    if dest.exists() {
+        println!("[2/6] CLI binary: {} (cached)", dest.display());
+        return Ok(());
+    }
+
     let (os, arch) = platform_info();
     let binary_name = format!("agent-browser-{os}-{arch}");
     let url = format!(
         "https://github.com/{AGENT_BROWSER_REPO}/releases/download/v{AGENT_BROWSER_VERSION}/{binary_name}"
     );
-
-    std::fs::create_dir_all(&dirs.bin)?;
-    let dest = dirs.bin.join("agent-browser");
 
     println!("  Downloading agent-browser v{AGENT_BROWSER_VERSION} ({os}-{arch})...");
     let bytes = download_bytes(&url).await?;
@@ -173,6 +180,15 @@ async fn download_agent_browser(dirs: &Dirs) -> Result<()> {
 // Step 3: daemon.js bundle
 
 async fn download_daemon_bundle(dirs: &Dirs) -> Result<()> {
+    let dist_dir = dirs.browser.join("dist");
+    let daemon_js = dist_dir.join("daemon.js");
+
+    // Skip download if daemon.js already exists.
+    if daemon_js.exists() {
+        println!("[3/6] Daemon bundle: {} (cached)", dist_dir.display());
+        return Ok(());
+    }
+
     let version = fetch_latest_browser_release_version().await?;
     println!("  Downloading daemon bundle v{version}...");
 
@@ -181,7 +197,6 @@ async fn download_daemon_bundle(dirs: &Dirs) -> Result<()> {
     );
     let bytes = download_bytes(&url).await?;
 
-    let dist_dir = dirs.browser.join("dist");
     std::fs::create_dir_all(&dist_dir)?;
 
     let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
