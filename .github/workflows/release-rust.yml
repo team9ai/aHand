@@ -31,9 +31,10 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
             suffix: darwin-x64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            suffix: windows-x64
+          # TODO: Windows support needs cross-platform IPC (see feat/windows-support branch)
+          # - os: windows-latest
+          #   target: x86_64-pc-windows-msvc
+          #   suffix: windows-x64
 
     runs-on: ${{ matrix.os }}
 
@@ -48,11 +49,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      # - name: Install protoc (Windows)
+      #   if: runner.os == 'Windows'
+      #   uses: arduino/setup-protoc@v3
+      #   with:
+      #     repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -71,22 +72,12 @@ jobs:
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }} -p ahandd -p ahandctl
 
-      - name: Prepare artifacts (Unix)
-        if: runner.os != 'Windows'
+      - name: Prepare artifacts
         run: |
           mkdir -p release
           cp target/${{ matrix.target }}/release/ahandd release/ahandd-${{ matrix.suffix }}
           cp target/${{ matrix.target }}/release/ahandctl release/ahandctl-${{ matrix.suffix }}
           cd release && shasum -a 256 * > checksums-rust-${{ matrix.suffix }}.txt
-
-      - name: Prepare artifacts (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p release
-          cp target/${{ matrix.target }}/release/ahandd.exe release/ahandd-${{ matrix.suffix }}.exe
-          cp target/${{ matrix.target }}/release/ahandctl.exe release/ahandctl-${{ matrix.suffix }}.exe
-          cd release && sha256sum * > checksums-rust-${{ matrix.suffix }}.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
