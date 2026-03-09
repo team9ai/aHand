@@ -278,11 +278,36 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> s
     Ok(())
 }
 
+// ── IPC connect (cross-platform) ─────────────────────────────────────
+
+#[cfg(unix)]
+async fn ipc_connect(
+    path: &str,
+) -> anyhow::Result<(
+    impl tokio::io::AsyncRead + Unpin,
+    impl tokio::io::AsyncWrite + Unpin,
+)> {
+    let stream = tokio::net::UnixStream::connect(path).await?;
+    let (r, w) = stream.into_split();
+    Ok((r, w))
+}
+
+#[cfg(windows)]
+async fn ipc_connect(
+    path: &str,
+) -> anyhow::Result<(
+    impl tokio::io::AsyncRead + Unpin,
+    impl tokio::io::AsyncWrite + Unpin,
+)> {
+    let client = tokio::net::windows::named_pipe::ClientOptions::new().open(path)?;
+    let (r, w) = tokio::io::split(client);
+    Ok((r, w))
+}
+
 // ── IPC exec ─────────────────────────────────────────────────────────
 
 async fn ipc_exec(socket_path: &str, tool: &str, args: &[String]) -> anyhow::Result<()> {
-    let stream = tokio::net::UnixStream::connect(socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = ipc_connect(socket_path).await?;
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
     let device_id = format!("ctl-{}", std::process::id());
@@ -373,8 +398,7 @@ async fn ipc_exec(socket_path: &str, tool: &str, args: &[String]) -> anyhow::Res
 // ── IPC cancel ───────────────────────────────────────────────────────
 
 async fn ipc_cancel(socket_path: &str, job_id: &str) -> anyhow::Result<()> {
-    let stream = tokio::net::UnixStream::connect(socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = ipc_connect(socket_path).await?;
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
     let device_id = format!("ctl-{}", std::process::id());
@@ -596,8 +620,7 @@ async fn ws_ping(url: &str) -> anyhow::Result<()> {
 // ── IPC approve ──────────────────────────────────────────────────────
 
 async fn ipc_approve(socket_path: &str) -> anyhow::Result<()> {
-    let stream = tokio::net::UnixStream::connect(socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = ipc_connect(socket_path).await?;
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
     let device_id = format!("ctl-{}", std::process::id());
@@ -687,8 +710,7 @@ async fn ipc_approve(socket_path: &str) -> anyhow::Result<()> {
 // ── IPC policy ───────────────────────────────────────────────────────
 
 async fn ipc_policy(socket_path: &str, action: PolicyAction) -> anyhow::Result<()> {
-    let stream = tokio::net::UnixStream::connect(socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = ipc_connect(socket_path).await?;
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
     let device_id = format!("ctl-{}", std::process::id());
@@ -791,8 +813,7 @@ async fn ws_policy(url: &str, action: PolicyAction) -> anyhow::Result<()> {
 // ── IPC session ─────────────────────────────────────────────────────
 
 async fn ipc_session(socket_path: &str, action: SessionAction) -> anyhow::Result<()> {
-    let stream = tokio::net::UnixStream::connect(socket_path).await?;
-    let (mut reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = ipc_connect(socket_path).await?;
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
     let device_id = format!("ctl-{}", std::process::id());

@@ -18,7 +18,6 @@ use std::sync::Arc;
 use ahand_protocol::Envelope;
 use clap::{Parser, Subcommand};
 use config::ConnectionMode;
-use tokio::signal::unix::{signal, SignalKind};
 use tracing::info;
 
 #[derive(Parser)]
@@ -287,8 +286,10 @@ async fn main() -> anyhow::Result<()> {
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
 
     // Set up signal handlers for graceful shutdown.
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(unix)]
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
 
     let main_future = async {
         match connection_mode {
@@ -387,15 +388,30 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Race main event loop against shutdown signals.
-    let result = tokio::select! {
-        r = main_future => r,
-        _ = sigterm.recv() => {
-            info!("received SIGTERM, shutting down");
-            Ok(())
+    let result = {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                r = main_future => r,
+                _ = sigterm.recv() => {
+                    info!("received SIGTERM, shutting down");
+                    Ok(())
+                }
+                _ = sigint.recv() => {
+                    info!("received SIGINT, shutting down");
+                    Ok(())
+                }
+            }
         }
-        _ = sigint.recv() => {
-            info!("received SIGINT, shutting down");
-            Ok(())
+        #[cfg(windows)]
+        {
+            tokio::select! {
+                r = main_future => r,
+                _ = tokio::signal::ctrl_c() => {
+                    info!("received Ctrl+C, shutting down");
+                    Ok(())
+                }
+            }
         }
     };
 

@@ -61,7 +61,7 @@ fn is_process_running(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), unix))]
 fn is_process_running(pid: u32) -> bool {
     std::process::Command::new("ps")
         .args(["-p", &pid.to_string()])
@@ -72,6 +72,19 @@ fn is_process_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(windows)]
+fn is_process_running(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            output.status.success() && !stdout.contains("No tasks")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
 fn send_signal(pid: u32, sig: &str) -> Result<()> {
     let status = std::process::Command::new("kill")
         .args([sig, &pid.to_string()])
@@ -79,6 +92,18 @@ fn send_signal(pid: u32, sig: &str) -> Result<()> {
         .context("Failed to run kill command")?;
     if !status.success() {
         anyhow::bail!("kill {} {} failed", sig, pid);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn send_signal(pid: u32, _sig: &str) -> Result<()> {
+    let status = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status()
+        .context("Failed to run taskkill command")?;
+    if !status.success() {
+        anyhow::bail!("taskkill /PID {} failed", pid);
     }
     Ok(())
 }

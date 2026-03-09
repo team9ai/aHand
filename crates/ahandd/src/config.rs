@@ -226,14 +226,25 @@ impl Config {
             .unwrap_or_else(uuid_v4)
     }
 
-    /// Resolve the IPC socket path. Default: ~/.ahand/ahandd.sock.
+    /// Resolve the IPC socket path.
+    /// Unix default: ~/.ahand/ahandd.sock
+    /// Windows default: \\.\pipe\ahandd
     pub fn ipc_socket_path(&self) -> PathBuf {
         match &self.ipc_socket_path {
             Some(p) => PathBuf::from(p),
-            None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".ahand")
-                .join("ahandd.sock"),
+            None => {
+                #[cfg(unix)]
+                {
+                    dirs::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("/tmp"))
+                        .join(".ahand")
+                        .join("ahandd.sock")
+                }
+                #[cfg(windows)]
+                {
+                    PathBuf::from(r"\\.\pipe\ahandd")
+                }
+            }
         }
     }
 

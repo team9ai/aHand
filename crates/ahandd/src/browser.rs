@@ -53,7 +53,7 @@ impl BrowserManager {
         let base = match &self.config.downloads_dir {
             Some(p) => PathBuf::from(p),
             None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .unwrap_or_else(|| std::env::temp_dir())
                 .join(".ahand")
                 .join("browser")
                 .join("downloads"),
@@ -138,7 +138,7 @@ impl BrowserManager {
         match &self.config.home_dir {
             Some(p) => PathBuf::from(p),
             None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .unwrap_or_else(|| std::env::temp_dir())
                 .join(".ahand")
                 .join("browser"),
         }
@@ -294,7 +294,7 @@ impl BrowserManager {
         match &self.config.binary_path {
             Some(p) => PathBuf::from(p),
             None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .unwrap_or_else(|| std::env::temp_dir())
                 .join(".ahand")
                 .join("bin")
                 .join("agent-browser"),
@@ -330,7 +330,7 @@ impl BrowserManager {
                 let system_path = std::env::var("PATH").unwrap_or_default();
                 envs.push((
                     "PATH".into(),
-                    format!("{}:{}", node_bin_dir.to_string_lossy(), system_path),
+                    format!("{}{}{}", node_bin_dir.to_string_lossy(), if cfg!(windows) { ";" } else { ":" }, system_path),
                 ));
             }
         }

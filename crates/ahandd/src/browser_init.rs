@@ -57,10 +57,20 @@ pub async fn run(force: bool) -> Result<()> {
 }
 
 async fn clean(dirs: &Dirs) {
-    let _ = tokio::process::Command::new("pkill")
-        .args(["-f", "daemon.js"])
-        .status()
-        .await;
+    #[cfg(unix)]
+    {
+        let _ = tokio::process::Command::new("pkill")
+            .args(["-f", "daemon.js"])
+            .status()
+            .await;
+    }
+    #[cfg(windows)]
+    {
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/F", "/IM", "node.exe", "/FI", "WINDOWTITLE eq daemon.js"])
+            .status()
+            .await;
+    }
 
     let sockets = dirs.browser.join("sockets");
     if sockets.exists() {
