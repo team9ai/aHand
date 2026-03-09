@@ -404,6 +404,13 @@ impl OpenClawHandler {
     }
 
     /// Handle browser.proxy command
+    /// Handle browser.proxy command.
+    ///
+    /// Accepts the OpenClaw HTTP-style proxy protocol:
+    ///   { method, path, query, body, timeoutMs, profile }
+    /// Translates HTTP routes to agent-browser CLI calls via BrowserManager,
+    /// and returns results in the OpenClaw-compatible format:
+    ///   { result, files: [{ path, base64, mimeType }] }
     async fn handle_browser_proxy(&self, invoke: &NodeInvokeRequest) -> NodeInvokeResult {
         if !self.browser_mgr.is_enabled() {
             return NodeInvokeResult {
@@ -416,13 +423,20 @@ impl OpenClawHandler {
         }
 
         #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
         struct BrowserProxyParams {
-            session_id: String,
-            action: String,
             #[serde(default)]
-            params_json: Option<String>,
+            method: Option<String>,
+            #[serde(default)]
+            path: Option<String>,
+            #[serde(default)]
+            query: Option<serde_json::Value>,
+            #[serde(default)]
+            body: Option<serde_json::Value>,
             #[serde(default)]
             timeout_ms: Option<u64>,
+            #[serde(default)]
+            profile: Option<String>,
         }
 
         let params: BrowserProxyParams = match decode_params(&invoke.params_json) {
@@ -438,10 +452,44 @@ impl OpenClawHandler {
             }
         };
 
-        let params_json = params.params_json.as_deref().unwrap_or("{}");
+        let path = params.path.as_deref().unwrap_or("").trim().to_string();
+        if path.is_empty() {
+            return NodeInvokeResult {
+                id: invoke.id.clone(),
+                node_id: self.node_id.clone(),
+                ok: false,
+                payload_json: None,
+                error: Some(InvokeError::invalid_request("path required")),
+            };
+        }
+
+        let method = params
+            .method
+            .as_deref()
+            .unwrap_or("GET")
+            .to_uppercase();
+        let body = params.body.unwrap_or(serde_json::Value::Object(Default::default()));
+        let query = params.query.unwrap_or(serde_json::Value::Object(Default::default()));
+        let session_id = params.profile.as_deref().unwrap_or("default").to_string();
+        let timeout_ms = params.timeout_ms.unwrap_or(0);
+
+        // Translate the HTTP route to a CLI action + params_json for BrowserManager.
+        let translated = translate_http_to_cli(&method, &path, &body, &query);
+        let (action, action_params_json) = match translated {
+            Ok(t) => t,
+            Err(msg) => {
+                return NodeInvokeResult {
+                    id: invoke.id.clone(),
+                    node_id: self.node_id.clone(),
+                    ok: false,
+                    payload_json: None,
+                    error: Some(InvokeError::invalid_request(msg)),
+                };
+            }
+        };
 
         // Check domain restrictions for navigation actions.
-        if let Err(msg) = self.browser_mgr.check_domain(&params.action, params_json) {
+        if let Err(msg) = self.browser_mgr.check_domain(&action, &action_params_json) {
             return NodeInvokeResult {
                 id: invoke.id.clone(),
                 node_id: self.node_id.clone(),
@@ -451,59 +499,74 @@ impl OpenClawHandler {
             };
         }
 
-        let timeout_ms = params.timeout_ms.unwrap_or(0);
-
         match self
             .browser_mgr
-            .execute(&params.session_id, &params.action, params_json, timeout_ms)
+            .execute(&session_id, &action, &action_params_json, timeout_ms)
             .await
         {
             Ok(result) => {
                 // Release session on "close" action.
-                if params.action == "close" {
-                    self.browser_mgr.release_session(&params.session_id).await;
+                if action == "close" {
+                    self.browser_mgr.release_session(&session_id).await;
                 }
 
-                #[derive(serde::Serialize)]
-                struct BrowserProxyResult {
-                    success: bool,
-                    #[serde(skip_serializing_if = "String::is_empty")]
-                    result_json: String,
-                    #[serde(skip_serializing_if = "String::is_empty")]
-                    error: String,
-                    #[serde(
-                        skip_serializing_if = "Vec::is_empty",
-                        serialize_with = "serialize_base64"
-                    )]
-                    binary_data: Vec<u8>,
-                    #[serde(skip_serializing_if = "String::is_empty")]
-                    binary_mime: String,
-                }
-
-                fn serialize_base64<S: serde::Serializer>(
-                    data: &Vec<u8>,
-                    s: S,
-                ) -> Result<S::Ok, S::Error> {
-                    use base64::Engine;
-                    s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(data))
-                }
-
-                let proxy_result = BrowserProxyResult {
-                    success: result.success,
-                    result_json: result.result_json,
-                    error: result.error,
-                    binary_data: result.binary_data,
-                    binary_mime: result.binary_mime,
+                // Build OpenClaw-compatible response: { result, files }
+                let result_value: serde_json::Value = if !result.result_json.is_empty() {
+                    serde_json::from_str(&result.result_json).unwrap_or(serde_json::Value::Null)
+                } else if !result.error.is_empty() {
+                    serde_json::json!({ "error": result.error })
+                } else {
+                    serde_json::Value::Null
                 };
+
+                // Wrap with success status so the caller knows the outcome.
+                let wrapped_result = serde_json::json!({
+                    "success": result.success,
+                    "data": result_value,
+                });
+
+                let mut files = Vec::<serde_json::Value>::new();
+                if !result.binary_data.is_empty() {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD
+                        .encode(&result.binary_data);
+                    // Extract original file path from result data if available.
+                    let file_path = result_value
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("output.bin")
+                        .to_string();
+                    files.push(serde_json::json!({
+                        "path": file_path,
+                        "base64": b64,
+                        "mimeType": result.binary_mime,
+                    }));
+                }
+
+                let proxy_response = serde_json::json!({
+                    "result": wrapped_result,
+                    "files": files,
+                });
 
                 NodeInvokeResult {
                     id: invoke.id.clone(),
                     node_id: self.node_id.clone(),
-                    ok: true,
+                    ok: result.success,
                     payload_json: Some(
-                        serde_json::to_string(&proxy_result).unwrap_or_default(),
+                        serde_json::to_string(&proxy_response).unwrap_or_default(),
                     ),
-                    error: None,
+                    error: if result.success {
+                        None
+                    } else {
+                        Some(InvokeError::new(
+                            "BROWSER_ERROR",
+                            if !result.error.is_empty() {
+                                result.error.clone()
+                            } else {
+                                "browser command failed".to_string()
+                            },
+                        ))
+                    },
                 }
             }
             Err(e) => NodeInvokeResult {
@@ -608,6 +671,257 @@ impl OpenClawHandler {
                 payload_json: None,
                 error: Some(InvokeError::invalid_request(e.to_string())),
             },
+        }
+    }
+}
+
+/// Translate an OpenClaw HTTP-style browser proxy request into a CLI action
+/// and params JSON that `BrowserManager::execute()` understands.
+///
+/// OpenClaw sends `{ method, path, query, body }` matching its internal
+/// browser control HTTP routes.  We map these to the agent-browser CLI
+/// actions that aHand's BrowserManager already supports.
+fn translate_http_to_cli(
+    method: &str,
+    path: &str,
+    body: &serde_json::Value,
+    query: &serde_json::Value,
+) -> Result<(String, String), String> {
+    let path = path.trim_end_matches('/');
+
+    match (method, path) {
+        // --- Page interaction: POST /act ---
+        ("POST", "/act") => {
+            let kind = body
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            translate_act_kind(kind, body)
+        }
+
+        // --- Snapshot: GET /snapshot ---
+        ("GET", "/snapshot") => {
+            let mut params = serde_json::Map::new();
+            if let Some(obj) = query.as_object() {
+                // Forward relevant query params.
+                for key in &[
+                    "compact",
+                    "maxDepth",
+                    "selector",
+                    "format",
+                    "refs",
+                    "mode",
+                    "interactive",
+                    "depth",
+                    "frame",
+                    "labels",
+                    "maxChars",
+                ] {
+                    if let Some(v) = obj.get(*key) {
+                        params.insert(key.to_string(), v.clone());
+                    }
+                }
+                // Map "compact" string to bool.
+                if let Some(v) = params.get("compact").and_then(|v| v.as_str()) {
+                    params.insert(
+                        "compact".to_string(),
+                        serde_json::Value::Bool(v == "true" || v == "1"),
+                    );
+                }
+            }
+            Ok((
+                "snapshot".to_string(),
+                serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()),
+            ))
+        }
+
+        // --- Screenshot: POST /screenshot ---
+        ("POST", "/screenshot") => {
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("screenshot".to_string(), params_str))
+        }
+
+        // --- Navigate: POST /navigate ---
+        ("POST", "/navigate") => {
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("open".to_string(), params_str))
+        }
+
+        // --- PDF: POST /pdf ---
+        ("POST", "/pdf") => {
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("pdf".to_string(), params_str))
+        }
+
+        // --- Tabs: GET /tabs ---
+        ("GET", "/tabs") => Ok(("tabs".to_string(), "{}".to_string())),
+
+        // --- Open tab: POST /tabs/open ---
+        ("POST", "/tabs/open") => {
+            let url = body
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            Ok((
+                "open".to_string(),
+                serde_json::json!({ "url": url }).to_string(),
+            ))
+        }
+
+        // --- Close tab: DELETE /tabs/<targetId> ---
+        ("DELETE", p) if p.starts_with("/tabs/") => {
+            Ok(("close".to_string(), "{}".to_string()))
+        }
+
+        // --- Start browser: POST /start ---
+        ("POST", "/start") => Ok(("start".to_string(), "{}".to_string())),
+
+        // --- Stop browser: POST /stop ---
+        ("POST", "/stop") => Ok(("stop".to_string(), "{}".to_string())),
+
+        // --- Status: GET / ---
+        ("GET", "" | "/") => Ok(("status".to_string(), "{}".to_string())),
+
+        // --- Console: GET /console ---
+        ("GET", "/console") => Ok(("console".to_string(), "{}".to_string())),
+
+        // --- Download: POST /download ---
+        ("POST", "/download") => {
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("download".to_string(), params_str))
+        }
+
+        // --- Wait download: POST /wait/download ---
+        ("POST", "/wait/download") => {
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("download".to_string(), params_str))
+        }
+
+        // --- File chooser (upload): POST /hooks/file-chooser ---
+        ("POST", "/hooks/file-chooser") => {
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("upload".to_string(), params_str))
+        }
+
+        // --- Dialog: POST /hooks/dialog ---
+        ("POST", "/hooks/dialog") => {
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("dialog".to_string(), params_str))
+        }
+
+        // --- Focus tab: POST /tabs/focus ---
+        ("POST", "/tabs/focus") => {
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("focus".to_string(), params_str))
+        }
+
+        // --- Profiles: GET /profiles ---
+        ("GET", "/profiles") => Ok(("profiles".to_string(), "{}".to_string())),
+
+        _ => Err(format!(
+            "unsupported browser proxy route: {} {}",
+            method, path
+        )),
+    }
+}
+
+/// Translate a `POST /act` request with a specific `kind` into a CLI action.
+fn translate_act_kind(
+    kind: &str,
+    body: &serde_json::Value,
+) -> Result<(String, String), String> {
+    match kind {
+        "click" => {
+            let ref_val = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+            let mut params = serde_json::Map::new();
+            params.insert("selector".into(), serde_json::Value::String(ref_val.to_string()));
+            Ok(("click".to_string(), serde_json::to_string(&params).unwrap()))
+        }
+        "type" => {
+            let ref_val = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+            let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let mut params = serde_json::Map::new();
+            params.insert("selector".into(), serde_json::Value::String(ref_val.to_string()));
+            params.insert("value".into(), serde_json::Value::String(text.to_string()));
+            if let Some(submit) = body.get("submit") {
+                params.insert("submit".into(), submit.clone());
+            }
+            Ok(("type".to_string(), serde_json::to_string(&params).unwrap()))
+        }
+        "press" => {
+            let key = body.get("key").and_then(|v| v.as_str()).unwrap_or("");
+            let params = serde_json::json!({ "key": key });
+            Ok(("press".to_string(), params.to_string()))
+        }
+        "hover" => {
+            let ref_val = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+            let params = serde_json::json!({ "selector": ref_val });
+            Ok(("hover".to_string(), params.to_string()))
+        }
+        "scrollIntoView" => {
+            let ref_val = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+            let params = serde_json::json!({ "selector": ref_val });
+            Ok(("scroll".to_string(), params.to_string()))
+        }
+        "select" => {
+            let ref_val = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+            let values = body.get("values").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+            let params = serde_json::json!({ "selector": ref_val, "values": values });
+            Ok(("select".to_string(), params.to_string()))
+        }
+        "fill" => {
+            // OpenClaw sends { fields: [{ref, type, value}, ...] }.
+            // agent-browser CLI fill expects selector + value, so we use the
+            // first field.  Complex multi-field fills may need multiple calls.
+            let fields = body.get("fields").and_then(|v| v.as_array());
+            if let Some(fields) = fields {
+                if let Some(first) = fields.first() {
+                    let ref_val = first.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                    let value = first.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                    let params = serde_json::json!({ "selector": ref_val, "value": value });
+                    return Ok(("fill".to_string(), params.to_string()));
+                }
+            }
+            Ok(("fill".to_string(), "{}".to_string()))
+        }
+        "wait" => {
+            // Forward body directly — keys like text, timeMs, selector etc.
+            // match what agent-browser CLI expects.
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("wait".to_string(), params_str))
+        }
+        "evaluate" => {
+            let expr = body.get("fn").and_then(|v| v.as_str()).unwrap_or("");
+            let params = serde_json::json!({ "expression": expr });
+            Ok(("evaluate".to_string(), params.to_string()))
+        }
+        "close" => Ok(("close".to_string(), "{}".to_string())),
+        "drag" => {
+            // agent-browser may not support drag natively; pass through as-is.
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("drag".to_string(), params_str))
+        }
+        "resize" => {
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok(("resize".to_string(), params_str))
+        }
+        "" => Err("act kind is required".to_string()),
+        other => {
+            // Unknown kind — pass through, let agent-browser handle it.
+            let params_str =
+                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            Ok((other.to_string(), params_str))
         }
     }
 }
