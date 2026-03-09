@@ -31,6 +31,9 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
             suffix: darwin-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x64
 
     runs-on: ${{ matrix.os }}
 
@@ -45,6 +48,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -63,13 +71,22 @@ jobs:
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }} -p ahandd -p ahandctl
 
-      - name: Prepare artifacts
+      - name: Prepare artifacts (Unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p release
           cp target/${{ matrix.target }}/release/ahandd release/ahandd-${{ matrix.suffix }}
           cp target/${{ matrix.target }}/release/ahandctl release/ahandctl-${{ matrix.suffix }}
           cd release && shasum -a 256 * > checksums-rust-${{ matrix.suffix }}.txt
 
+      - name: Prepare artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/ahandd.exe release/ahandd-${{ matrix.suffix }}.exe
+          cp target/${{ matrix.target }}/release/ahandctl.exe release/ahandctl-${{ matrix.suffix }}.exe
+          cd release && sha256sum * > checksums-rust-${{ matrix.suffix }}.txt
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -77,8 +94,37 @@ jobs:
           name: rust-${{ matrix.suffix }}
           path: release/
 
-  release:
+  universal:
     needs: build
+    runs-on: macos-latest
+    steps:
+      - name: Download darwin-arm64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-darwin-arm64
+          path: arm64
+
+      - name: Download darwin-x64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-darwin-x64
+          path: x64
+
+      - name: Create universal binaries
+        run: |
+          mkdir -p release
+          lipo -create arm64/ahandd-darwin-arm64 x64/ahandd-darwin-x64 -output release/ahandd-darwin-universal
+          lipo -create arm64/ahandctl-darwin-arm64 x64/ahandctl-darwin-x64 -output release/ahandctl-darwin-universal
+          cd release && shasum -a 256 * > checksums-rust-darwin-universal.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-darwin-universal
+          path: release/
+
+  release:
+    needs: [build, universal]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
