@@ -72,29 +72,62 @@ async fn clean(dirs: &Dirs) {
 // Step 1: Node.js
 
 async fn ensure_node(dirs: &Dirs) -> Result<PathBuf> {
+    // 1. Check locally installed node (~/.ahand/node/bin/node)
     let local_node = dirs.node.join("bin").join("node");
     if local_node.exists() {
-        if let Some(ver) = node_major_version(&local_node).await {
-            if ver >= NODE_MIN_VERSION {
+        match node_major_version(&local_node).await {
+            Some(ver) if ver >= NODE_MIN_VERSION => {
                 println!("[1/6] Node.js: v{ver}.x (local: {})", dirs.node.display());
                 return Ok(local_node);
             }
+            Some(ver) => {
+                println!("  Local node is v{ver}, need >= v{NODE_MIN_VERSION} — will upgrade");
+            }
+            None => {
+                println!(
+                    "  Local node at {} exists but failed to determine version — will reinstall",
+                    local_node.display()
+                );
+            }
         }
     }
 
+    // 2. Check system node (PATH)
     if let Ok(system_node) = which("node") {
-        if let Some(ver) = node_major_version(&system_node).await {
-            if ver >= NODE_MIN_VERSION {
-                println!("[1/6] Node.js: v{ver}.x (system)");
+        match node_major_version(&system_node).await {
+            Some(ver) if ver >= NODE_MIN_VERSION => {
+                println!("[1/6] Node.js: v{ver}.x (system: {})", system_node.display());
                 return Ok(system_node);
             }
-            println!("  System node is v{ver}, need >= v{NODE_MIN_VERSION}");
+            Some(ver) => {
+                println!(
+                    "  System node is v{ver} (at {}), need >= v{NODE_MIN_VERSION}",
+                    system_node.display()
+                );
+            }
+            None => {
+                println!(
+                    "  Found node at {} but failed to determine version",
+                    system_node.display()
+                );
+            }
         }
     }
 
-    println!("  Installing Node.js v{NODE_LTS_VERSION}...");
-    install_node(dirs).await?;
+    // 3. Auto-install
+    println!("  No suitable Node.js found, installing v{NODE_LTS_VERSION}...");
+    install_node(dirs).await.context(
+        "Failed to auto-install Node.js. You can install Node.js >= 20 manually \
+         (e.g. `brew install node` or https://nodejs.org) and retry.",
+    )?;
     let node_bin = dirs.node.join("bin").join("node");
+    if !node_bin.exists() {
+        anyhow::bail!(
+            "Node.js installation completed but binary not found at {}. \
+             Please install Node.js >= {NODE_MIN_VERSION} manually and retry.",
+            node_bin.display()
+        );
+    }
     println!("[1/6] Node.js: v{NODE_LTS_VERSION} (installed to {})", dirs.node.display());
     Ok(node_bin)
 }
@@ -120,14 +153,19 @@ async fn install_node(dirs: &Dirs) -> Result<()> {
     let tarball = format!("node-v{NODE_LTS_VERSION}-{os}-{arch}.tar.xz");
     let url = format!("https://nodejs.org/dist/v{NODE_LTS_VERSION}/{tarball}");
 
-    let bytes = download_bytes(&url).await?;
+    let bytes = download_bytes(&url).await.context(format!(
+        "Failed to download Node.js from {url} — check your network connection"
+    ))?;
 
-    std::fs::create_dir_all(&dirs.node)?;
+    std::fs::create_dir_all(&dirs.node).context(format!(
+        "Failed to create directory {}: permission denied or disk full",
+        dirs.node.display()
+    ))?;
     let decoder = xz2::read::XzDecoder::new(std::io::Cursor::new(bytes));
     let mut archive = tar::Archive::new(decoder);
     archive.set_preserve_permissions(true);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
+    for entry in archive.entries().context("Failed to read Node.js archive — download may be corrupted")? {
+        let mut entry = entry.context("Corrupted entry in Node.js archive")?;
         let path = entry.path()?.into_owned();
         // Strip first component (e.g. "node-v24.13.0-darwin-arm64/bin/node" -> "bin/node")
         let stripped: PathBuf = path.components().skip(1).collect();
@@ -138,7 +176,10 @@ async fn install_node(dirs: &Dirs) -> Result<()> {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        entry.unpack(&dest)?;
+        entry.unpack(&dest).context(format!(
+            "Failed to extract {} — disk may be full",
+            dest.display()
+        ))?;
     }
 
     Ok(())
