@@ -48,11 +48,12 @@ pub async fn run(force: bool) -> Result<()> {
 }
 
 async fn clean(dirs: &Dirs) {
-    // Uninstall playwright-cli from npm globals
+    // Uninstall playwright-cli from our managed prefix
     let npm = dirs.node.join("bin").join("npm");
     if npm.exists() {
+        let prefix = dirs.node.to_string_lossy().to_string();
         let _ = tokio::process::Command::new(&npm)
-            .args(["uninstall", "-g", "@playwright/cli"])
+            .args(["uninstall", "-g", "--prefix", &prefix, "@playwright/cli"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -64,12 +65,13 @@ async fn clean(dirs: &Dirs) {
 // Step 1: Node.js
 
 async fn ensure_node(dirs: &Dirs) -> Result<PathBuf> {
-    // 1. Check locally installed node (~/.ahand/node/bin/node)
     let local_node = dirs.node.join("bin").join("node");
+
+    // Check if we already have a suitable local node
     if local_node.exists() {
         match node_major_version(&local_node).await {
             Some(ver) if ver >= NODE_MIN_VERSION => {
-                println!("[1/2] Node.js: v{ver}.x (local: {})", dirs.node.display());
+                println!("[1/2] Node.js: v{ver}.x ({})", dirs.node.display());
                 return Ok(local_node);
             }
             Some(ver) => {
@@ -84,44 +86,28 @@ async fn ensure_node(dirs: &Dirs) -> Result<PathBuf> {
         }
     }
 
-    // 2. Check system node (PATH)
-    if let Ok(system_node) = which("node") {
-        match node_major_version(&system_node).await {
-            Some(ver) if ver >= NODE_MIN_VERSION => {
-                println!("[1/2] Node.js: v{ver}.x (system: {})", system_node.display());
-                return Ok(system_node);
-            }
-            Some(ver) => {
-                println!(
-                    "  System node is v{ver} (at {}), need >= v{NODE_MIN_VERSION}",
-                    system_node.display()
-                );
-            }
-            None => {
-                println!(
-                    "  Found node at {} but failed to determine version",
-                    system_node.display()
-                );
-            }
-        }
+    // Always install our own node to ~/.ahand/node for a fully self-contained setup.
+    // This avoids depending on system node/npm which may have incompatible versions,
+    // restrictive .npmrc configs, or require sudo for global installs.
+    //
+    // Remove the old installation first to avoid stale files from a previous
+    // version mixing with the new one (e.g. old npm node_modules).
+    if dirs.node.exists() {
+        let _ = std::fs::remove_dir_all(&dirs.node);
     }
-
-    // 3. Auto-install
-    println!("  No suitable Node.js found, installing v{NODE_LTS_VERSION}...");
+    println!("  Installing Node.js v{NODE_LTS_VERSION} to {}...", dirs.node.display());
     install_node(dirs).await.context(
-        "Failed to auto-install Node.js. You can install Node.js >= 20 manually \
-         (e.g. `brew install node` or https://nodejs.org) and retry.",
+        "Failed to install Node.js. Check your network connection and retry, \
+         or install Node.js >= 20 manually (e.g. `brew install node`).",
     )?;
-    let node_bin = dirs.node.join("bin").join("node");
-    if !node_bin.exists() {
+    if !local_node.exists() {
         anyhow::bail!(
-            "Node.js installation completed but binary not found at {}. \
-             Please install Node.js >= {NODE_MIN_VERSION} manually and retry.",
-            node_bin.display()
+            "Node.js installation completed but binary not found at {}.",
+            local_node.display()
         );
     }
-    println!("[1/2] Node.js: v{NODE_LTS_VERSION} (installed to {})", dirs.node.display());
-    Ok(node_bin)
+    println!("[1/2] Node.js: v{NODE_LTS_VERSION} ({})", dirs.node.display());
+    Ok(local_node)
 }
 
 async fn node_major_version(node_bin: &Path) -> Option<u32> {
@@ -202,21 +188,60 @@ async fn install_playwright_cli(dirs: &Dirs, node_bin: &Path) -> Result<()> {
         }
     }
 
-    println!("  Installing @playwright/cli@{PLAYWRIGHT_CLI_VERSION}...");
+    println!("[2/2] Installing @playwright/cli@{PLAYWRIGHT_CLI_VERSION}...");
 
-    let status = tokio::process::Command::new(&npm)
-        .args(["install", "-g", &format!("@playwright/cli@{PLAYWRIGHT_CLI_VERSION}")])
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
+    // Always install to ~/.ahand/node via --prefix to avoid permission issues
+    // with system npm global prefix (e.g. /usr/local/ requiring sudo).
+    let prefix = dirs.node.to_string_lossy().to_string();
+
+    let output = tokio::process::Command::new(&npm)
+        .args([
+            "install",
+            "-g",
+            "--prefix",
+            &prefix,
+            &format!("@playwright/cli@{PLAYWRIGHT_CLI_VERSION}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
         .await
         .context("failed to run npm install")?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+
+        if stderr.contains("EACCES") || stderr.contains("permission denied") {
+            anyhow::bail!(
+                "Permission denied installing playwright-cli to {prefix}. \
+                 Check directory permissions: chmod -R u+w {prefix}"
+            );
+        }
+        if stderr.contains("ETIMEDOUT")
+            || stderr.contains("ENOTFOUND")
+            || stderr.contains("ECONNREFUSED")
+            || stderr.contains("network")
+            || stderr.contains("fetch failed")
+        {
+            anyhow::bail!(
+                "Network error installing playwright-cli. \
+                 Check your internet connection and proxy settings."
+            );
+        }
+        if stderr.contains("404") || stderr.contains("Not Found") {
+            anyhow::bail!(
+                "Package @playwright/cli@{PLAYWRIGHT_CLI_VERSION} not found on npm registry. \
+                 The version may have been unpublished."
+            );
+        }
         anyhow::bail!(
-            "Failed to install @playwright/cli@{PLAYWRIGHT_CLI_VERSION}. \
-             Try manually: {} install -g @playwright/cli@{PLAYWRIGHT_CLI_VERSION}",
-            npm.display()
+            "Failed to install @playwright/cli@{PLAYWRIGHT_CLI_VERSION} (exit {}):\n{}\n\
+             Try manually: {} install -g --prefix {} @playwright/cli@{PLAYWRIGHT_CLI_VERSION}",
+            output.status.code().unwrap_or(-1),
+            stderr,
+            npm.display(),
+            prefix,
         );
     }
 
@@ -237,9 +262,10 @@ async fn install_playwright_cli(dirs: &Dirs, node_bin: &Path) -> Result<()> {
         } else {
             anyhow::bail!(
                 "playwright-cli was installed but binary not found at {}. \
-                 Try: {} install -g @playwright/cli@{PLAYWRIGHT_CLI_VERSION}",
+                 Try: {} install -g --prefix {} @playwright/cli@{PLAYWRIGHT_CLI_VERSION}",
                 cli_path.display(),
-                npm.display()
+                npm.display(),
+                prefix,
             );
         }
     }
