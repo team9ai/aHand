@@ -29,5 +29,5 @@ base64 = "0.22"
 reqwest = { version = "0.12", features = ["stream", "json"] }
 tar = "0.4"
 flate2 = "1"
-xz2 = "0.1"
+xz2 = { version = "0.1", features = ["static"] }
 tokio-util = { version = "0.7", features = ["io"] }
