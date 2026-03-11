@@ -1,15 +1,14 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use crate::config::BrowserConfig;
 
-/// Result of executing a browser command via agent-browser CLI.
+/// Result of executing a browser command via playwright-cli.
 pub struct BrowserCommandResult {
     pub success: bool,
     pub result_json: String,
@@ -18,12 +17,16 @@ pub struct BrowserCommandResult {
     pub binary_mime: String,
 }
 
-/// Raw JSON response from `agent-browser --json`.
-#[derive(Deserialize)]
-struct CliResponse {
-    success: bool,
-    data: Option<serde_json::Value>,
-    error: Option<String>,
+impl Default for BrowserCommandResult {
+    fn default() -> Self {
+        Self {
+            success: false,
+            result_json: String::new(),
+            error: String::new(),
+            binary_data: Vec::new(),
+            binary_mime: String::new(),
+        }
+    }
 }
 
 pub struct BrowserManager {
@@ -78,54 +81,22 @@ impl BrowserManager {
         Ok(())
     }
 
-    /// Inject a default output path into params if the caller didn't provide one.
-    fn inject_default_path(&self, session_id: &str, action: &str, params_json: &str) -> String {
-        let mut params: serde_json::Value =
-            serde_json::from_str(params_json).unwrap_or(serde_json::Value::Object(Default::default()));
-
-        if params.get("path").and_then(|v| v.as_str()).is_none() {
-            let ext = match action {
-                "pdf" => "pdf",
-                _ => "bin",
-            };
-            let path = self.default_output_path(session_id, action, ext);
-            params.as_object_mut().unwrap().insert(
-                "path".to_string(),
-                serde_json::Value::String(path.to_string_lossy().into_owned()),
-            );
-        }
-
-        serde_json::to_string(&params).unwrap_or_else(|_| params_json.to_string())
-    }
-
     /// Log warnings for missing prerequisites at startup.
     fn check_prerequisites(&self) {
         let bin = self.binary_path();
         if !bin.exists() {
             warn!(
                 path = %bin.display(),
-                "agent-browser CLI not found — run: ahandd browser-init"
+                "playwright-cli not found — run: ahandd browser-init"
             );
         } else {
-            info!(path = %bin.display(), "agent-browser CLI found");
-        }
-
-        let home = self.daemon_home();
-        let daemon = home.join("dist").join("daemon.js");
-        if !daemon.exists() {
-            warn!(
-                path = %daemon.display(),
-                "daemon.js not found — run: ahandd browser-init"
-            );
+            info!(path = %bin.display(), "playwright-cli found");
         }
 
         if let Some(exe) = self.resolve_executable_path() {
             info!(path = %exe, "system browser detected");
         } else {
-            let browsers_dir = home.join("browsers");
-            if !browsers_dir.exists() || browsers_dir.read_dir().map(|mut d| d.next().is_none()).unwrap_or(true) {
-                warn!("no system browser found and no Chromium installed — run: ahandd browser-init");
-            }
+            warn!("no system browser (Chrome/Edge) detected — please install one for browser automation");
         }
 
         if self.config.headed.unwrap_or(false) {
@@ -133,18 +104,7 @@ impl BrowserManager {
         }
     }
 
-    /// Resolve AGENT_BROWSER_HOME directory.
-    fn daemon_home(&self) -> PathBuf {
-        match &self.config.home_dir {
-            Some(p) => PathBuf::from(p),
-            None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".ahand")
-                .join("browser"),
-        }
-    }
-
-    /// Execute a browser command via agent-browser CLI.
+    /// Execute a browser command via playwright-cli.
     pub async fn execute(
         &self,
         session_id: &str,
@@ -159,24 +119,28 @@ impl BrowserManager {
             if !sessions.contains(session_id) && sessions.len() >= max {
                 return Ok(BrowserCommandResult {
                     success: false,
-                    result_json: String::new(),
                     error: format!("max browser sessions ({}) reached", max),
-                    binary_data: Vec::new(),
-                    binary_mime: String::new(),
+                    ..Default::default()
                 });
             }
             sessions.insert(session_id.to_string());
         }
 
-        // For download/pdf, ensure output directory and inject default path if needed.
-        let params_json = if matches!(action, "download" | "pdf") {
+        // Determine output file path for actions that produce files.
+        let output_file = if matches!(action, "screenshot" | "pdf" | "snapshot") {
             self.ensure_downloads_dir(session_id).await.ok();
-            self.inject_default_path(session_id, action, params_json)
+            let ext = match action {
+                "screenshot" => "png",
+                "pdf" => "pdf",
+                "snapshot" => "yaml",
+                _ => "bin",
+            };
+            Some(self.default_output_path(session_id, action, ext))
         } else {
-            params_json.to_string()
+            None
         };
 
-        let args = self.build_cli_args(session_id, action, &params_json);
+        let args = self.build_cli_args(session_id, action, params_json, output_file.as_deref());
         let envs = self.build_env_vars();
 
         let timeout = if timeout_ms > 0 {
@@ -204,10 +168,8 @@ impl BrowserManager {
             Err(e) => {
                 return Ok(BrowserCommandResult {
                     success: false,
-                    result_json: String::new(),
-                    error: format!("failed to spawn agent-browser: {}", e),
-                    binary_data: Vec::new(),
-                    binary_mime: String::new(),
+                    error: format!("failed to spawn playwright-cli: {}", e),
+                    ..Default::default()
                 });
             }
         };
@@ -217,30 +179,191 @@ impl BrowserManager {
             Ok(Err(e)) => {
                 return Ok(BrowserCommandResult {
                     success: false,
-                    result_json: String::new(),
-                    error: format!("agent-browser process error: {}", e),
-                    binary_data: Vec::new(),
-                    binary_mime: String::new(),
+                    error: format!("playwright-cli process error: {}", e),
+                    ..Default::default()
                 });
             }
             Err(_) => {
                 return Ok(BrowserCommandResult {
                     success: false,
-                    result_json: String::new(),
                     error: "browser command timed out".to_string(),
-                    binary_data: Vec::new(),
-                    binary_mime: String::new(),
+                    ..Default::default()
                 });
             }
         };
 
-        self.parse_output(&output, action).await
+        self.parse_output(&output, action, output_file.as_deref()).await
+    }
+
+    /// Execute a single CLI command (used internally by download/wait polling).
+    async fn execute_single(
+        &self,
+        session_id: &str,
+        action: &str,
+        params_json: &str,
+        timeout_ms: u64,
+    ) -> anyhow::Result<BrowserCommandResult> {
+        let args = self.build_cli_args(session_id, action, params_json, None);
+        let envs = self.build_env_vars();
+        let timeout = Duration::from_millis(if timeout_ms > 0 {
+            timeout_ms
+        } else {
+            self.config.default_timeout_ms.unwrap_or(30_000)
+        });
+
+        let child = tokio::process::Command::new(self.binary_path())
+            .args(&args)
+            .envs(envs)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+
+        let child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(BrowserCommandResult {
+                    success: false,
+                    error: format!("failed to spawn playwright-cli: {}", e),
+                    ..Default::default()
+                });
+            }
+        };
+
+        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                return Ok(BrowserCommandResult {
+                    success: false,
+                    error: format!("playwright-cli process error: {}", e),
+                    ..Default::default()
+                });
+            }
+            Err(_) => {
+                return Ok(BrowserCommandResult {
+                    success: false,
+                    error: "browser command timed out".to_string(),
+                    ..Default::default()
+                });
+            }
+        };
+
+        self.parse_output(&output, action, None).await
+    }
+
+    /// Execute a download by clicking a ref and polling the downloads directory.
+    pub async fn execute_download(
+        &self,
+        session_id: &str,
+        ref_selector: &str,
+        timeout_ms: u64,
+    ) -> anyhow::Result<BrowserCommandResult> {
+        self.ensure_downloads_dir(session_id).await.ok();
+        let download_dir = self.downloads_dir(session_id);
+
+        // 1. Snapshot directory before click.
+        let before = list_files(&download_dir).await;
+
+        // 2. Click the download trigger element.
+        let click_params = serde_json::json!({ "ref": ref_selector });
+        let click_result = self
+            .execute_single(session_id, "click", &click_params.to_string(), timeout_ms)
+            .await?;
+        if !click_result.success {
+            return Ok(click_result);
+        }
+
+        // 3. Poll for new completed file.
+        let effective_timeout = if timeout_ms > 0 {
+            timeout_ms
+        } else {
+            self.config.default_timeout_ms.unwrap_or(30_000)
+        };
+        let deadline = Instant::now() + Duration::from_millis(effective_timeout);
+
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if Instant::now() > deadline {
+                return Ok(BrowserCommandResult {
+                    success: false,
+                    error: format!("download timed out after {}ms", effective_timeout),
+                    ..Default::default()
+                });
+            }
+
+            let after = list_files(&download_dir).await;
+            for file in &after {
+                if !before.contains(file) && is_download_complete(file) {
+                    // Found a new completed file.
+                    let path_str = file.to_string_lossy().to_string();
+                    let binary_data = tokio::fs::read(file).await.unwrap_or_default();
+                    let binary_mime = mime_from_extension(&path_str).to_string();
+                    return Ok(BrowserCommandResult {
+                        success: true,
+                        result_json: format!("Downloaded: {}", path_str),
+                        binary_data,
+                        binary_mime,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+
+    /// Wait for text to appear on the page by polling with eval.
+    pub async fn execute_wait_for_text(
+        &self,
+        session_id: &str,
+        text: &str,
+        timeout_ms: u64,
+    ) -> anyhow::Result<BrowserCommandResult> {
+        let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
+        let js_expr = format!(
+            "() => document.body.innerText.includes('{}')",
+            escaped
+        );
+        let params = serde_json::json!({ "expression": js_expr });
+        let params_str = params.to_string();
+
+        let effective_timeout = if timeout_ms > 0 {
+            timeout_ms
+        } else {
+            self.config.default_timeout_ms.unwrap_or(30_000)
+        };
+        let deadline = Instant::now() + Duration::from_millis(effective_timeout);
+        let poll_interval = Duration::from_millis(500);
+
+        loop {
+            let result = self
+                .execute_single(session_id, "eval", &params_str, 10_000)
+                .await?;
+
+            if result.success && result.result_json.trim() == "true" {
+                return Ok(BrowserCommandResult {
+                    success: true,
+                    result_json: format!("Text '{}' found on page", text),
+                    ..Default::default()
+                });
+            }
+
+            if Instant::now() + poll_interval > deadline {
+                return Ok(BrowserCommandResult {
+                    success: false,
+                    error: format!(
+                        "Timeout: text '{}' not found within {}ms",
+                        text, effective_timeout
+                    ),
+                    ..Default::default()
+                });
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Check whether a domain is allowed for navigation actions.
     pub fn check_domain(&self, action: &str, params_json: &str) -> Result<(), String> {
         // Only check for navigation actions.
-        if action != "open" && action != "navigate" {
+        if action != "goto" && action != "open" {
             return Ok(());
         }
 
@@ -293,19 +416,32 @@ impl BrowserManager {
     fn binary_path(&self) -> PathBuf {
         match &self.config.binary_path {
             Some(p) => PathBuf::from(p),
-            None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".ahand")
-                .join("bin")
-                .join("agent-browser"),
+            None => {
+                // Prefer the aHand-managed Node.js installation
+                let ahand_path = dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .join(".ahand")
+                    .join("node")
+                    .join("bin")
+                    .join("playwright-cli");
+                if ahand_path.exists() {
+                    ahand_path
+                } else {
+                    PathBuf::from("playwright-cli") // fallback to PATH
+                }
+            }
         }
     }
 
-    fn build_cli_args(&self, session_id: &str, action: &str, params_json: &str) -> Vec<String> {
+    fn build_cli_args(
+        &self,
+        session_id: &str,
+        action: &str,
+        params_json: &str,
+        output_file: Option<&Path>,
+    ) -> Vec<String> {
         let mut args = vec![
-            "--json".to_string(),
-            "--session".to_string(),
-            session_id.to_string(),
+            format!("-s={}", session_id),
             action.to_string(),
         ];
 
@@ -316,14 +452,19 @@ impl BrowserManager {
             }
         }
 
+        // Inject --filename for actions that produce file output.
+        if let Some(path) = output_file {
+            args.push(format!("--filename={}", path.to_string_lossy()));
+        }
+
         args
     }
 
     fn build_env_vars(&self) -> Vec<(String, String)> {
         let mut envs = Vec::new();
 
-        // Prepend our locally-installed Node.js to PATH so agent-browser can
-        // find `node` when spawning daemon.js.
+        // Prepend our locally-installed Node.js to PATH so playwright-cli
+        // can find dependencies.
         if let Some(home) = dirs::home_dir() {
             let node_bin_dir = home.join(".ahand").join("node").join("bin");
             if node_bin_dir.is_dir() {
@@ -335,54 +476,21 @@ impl BrowserManager {
             }
         }
 
-        if let Some(dir) = &self.config.socket_dir {
-            envs.push(("AGENT_BROWSER_SOCKET_DIR".into(), dir.clone()));
-        } else {
-            // Default socket dir.
-            if let Some(home) = dirs::home_dir() {
-                let dir = home.join(".ahand").join("browser").join("sockets");
-                envs.push((
-                    "AGENT_BROWSER_SOCKET_DIR".into(),
-                    dir.to_string_lossy().into_owned(),
-                ));
-            }
-        }
-
-        if let Some(home) = &self.config.home_dir {
-            envs.push(("AGENT_BROWSER_HOME".into(), home.clone()));
-        } else {
-            if let Some(home) = dirs::home_dir() {
-                let dir = home.join(".ahand").join("browser");
-                envs.push((
-                    "AGENT_BROWSER_HOME".into(),
-                    dir.to_string_lossy().into_owned(),
-                ));
-            }
-        }
-
-        // System Chrome detection — set before PLAYWRIGHT_BROWSERS_PATH so we
-        // can skip the latter when a system browser is found.
+        // System Chrome detection — set PLAYWRIGHT_MCP_EXECUTABLE_PATH
+        // before PLAYWRIGHT_BROWSERS_PATH so we can skip the latter
+        // when a system browser is found.
         let resolved_exe = self.resolve_executable_path();
         if let Some(exe) = &resolved_exe {
-            envs.push(("AGENT_BROWSER_EXECUTABLE_PATH".into(), exe.clone()));
+            envs.push(("PLAYWRIGHT_MCP_EXECUTABLE_PATH".into(), exe.clone()));
         }
 
         if let Some(path) = &self.config.browsers_path {
             envs.push(("PLAYWRIGHT_BROWSERS_PATH".into(), path.clone()));
-        } else if resolved_exe.is_none() {
-            // Only set PLAYWRIGHT_BROWSERS_PATH when no system browser was found
-            // (fallback to locally installed Chromium).
-            if let Some(home) = dirs::home_dir() {
-                let dir = home.join(".ahand").join("browser").join("browsers");
-                envs.push((
-                    "PLAYWRIGHT_BROWSERS_PATH".into(),
-                    dir.to_string_lossy().into_owned(),
-                ));
-            }
         }
 
+        // Headed mode: tell playwright-cli to show the browser window.
         if self.config.headed.unwrap_or(false) {
-            envs.push(("AGENT_BROWSER_HEADED".into(), "1".into()));
+            envs.push(("PLAYWRIGHT_MCP_HEADLESS".into(), "false".into()));
         }
 
         envs
@@ -424,84 +532,51 @@ impl BrowserManager {
         &self,
         output: &std::process::Output,
         action: &str,
+        output_file: Option<&Path>,
     ) -> anyhow::Result<BrowserCommandResult> {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let success = output.status.success();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-        // agent-browser --json outputs one JSON line to stdout.
-        let resp: CliResponse = match serde_json::from_str(stdout.trim()) {
-            Ok(r) => r,
-            Err(e) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!(
-                    exit_code = output.status.code(),
-                    stdout = %stdout,
-                    stderr = %stderr,
-                    "failed to parse agent-browser output"
-                );
-                return Ok(BrowserCommandResult {
-                    success: false,
-                    result_json: String::new(),
-                    error: format!("failed to parse CLI output: {}", e),
-                    binary_data: Vec::new(),
-                    binary_mime: String::new(),
-                });
-            }
-        };
-
-        let result_json = resp
-            .data
-            .as_ref()
-            .map(|d| serde_json::to_string(d).unwrap_or_default())
-            .unwrap_or_default();
-
-        let error = resp.error.unwrap_or_default();
-
-        // For commands that produce files, read binary data from the path in the response.
+        // For screenshot/pdf, read binary file from the --filename path.
         let (binary_data, binary_mime) =
-            if matches!(action, "screenshot" | "download" | "pdf") && resp.success {
-                self.read_file_data(&resp.data).await
+            if matches!(action, "screenshot" | "pdf") && success {
+                if let Some(path) = output_file {
+                    self.read_file_at_path(path).await
+                } else {
+                    (Vec::new(), String::new())
+                }
             } else {
                 (Vec::new(), String::new())
             };
 
         Ok(BrowserCommandResult {
-            success: resp.success,
-            result_json,
-            error,
+            success,
+            result_json: if success { stdout } else { String::new() },
+            error: if success { String::new() } else { stderr },
             binary_data,
             binary_mime,
         })
     }
 
-    /// Read a file produced by agent-browser (screenshot, download, pdf) and detect MIME type.
-    async fn read_file_data(
-        &self,
-        data: &Option<serde_json::Value>,
-    ) -> (Vec<u8>, String) {
-        let path = data
-            .as_ref()
-            .and_then(|d| d.get("path"))
-            .and_then(|p| p.as_str());
-
-        let Some(path) = path else {
-            return (Vec::new(), String::new());
-        };
-
+    /// Read a file produced by playwright-cli and detect MIME type.
+    async fn read_file_at_path(&self, path: &Path) -> (Vec<u8>, String) {
         match tokio::fs::read(path).await {
             Ok(bytes) => {
-                let mime = mime_from_extension(path);
-                info!(path, mime, bytes = bytes.len(), "read file data");
+                let path_str = path.to_string_lossy();
+                let mime = mime_from_extension(&path_str);
+                info!(path = %path_str, mime, bytes = bytes.len(), "read file data");
                 (bytes, mime.to_string())
             }
             Err(e) => {
-                warn!(path, error = %e, "failed to read file");
+                warn!(path = %path.display(), error = %e, "failed to read file");
                 (Vec::new(), String::new())
             }
         }
     }
 }
 
-/// Convert params_json object fields into CLI positional/flag arguments.
+/// Convert params_json object fields into playwright-cli positional/flag arguments.
 fn params_to_cli_args(
     action: &str,
     params: &serde_json::Map<String, serde_json::Value>,
@@ -509,29 +584,42 @@ fn params_to_cli_args(
     let mut args = Vec::new();
 
     match action {
-        "open" | "navigate" => {
+        "goto" => {
             if let Some(url) = params.get("url").and_then(|v| v.as_str()) {
                 args.push(url.to_string());
             }
         }
-        "click" | "hover" | "focus" => {
-            if let Some(sel) = params.get("selector").and_then(|v| v.as_str()) {
+        "open" => {
+            if let Some(url) = params.get("url").and_then(|v| v.as_str()) {
+                args.push(url.to_string());
+            }
+        }
+        "click" | "hover" => {
+            if let Some(sel) = params.get("ref").or(params.get("selector")).and_then(|v| v.as_str()) {
                 args.push(sel.to_string());
             }
         }
-        "fill" | "type" => {
-            if let Some(sel) = params.get("selector").and_then(|v| v.as_str()) {
+        "fill" => {
+            if let Some(sel) = params.get("ref").or(params.get("selector")).and_then(|v| v.as_str()) {
                 args.push(sel.to_string());
             }
-            if let Some(val) = params.get("value").and_then(|v| v.as_str()) {
+            if let Some(val) = params.get("text").or(params.get("value")).and_then(|v| v.as_str()) {
+                args.push(val.to_string());
+            }
+        }
+        "type" => {
+            // playwright-cli `type` has no ref param — types into focused element.
+            if let Some(val) = params.get("text").or(params.get("value")).and_then(|v| v.as_str()) {
                 args.push(val.to_string());
             }
         }
         "select" => {
-            if let Some(sel) = params.get("selector").and_then(|v| v.as_str()) {
+            if let Some(sel) = params.get("ref").or(params.get("selector")).and_then(|v| v.as_str()) {
                 args.push(sel.to_string());
             }
-            if let Some(vals) = params.get("values").and_then(|v| v.as_array()) {
+            if let Some(val) = params.get("value").and_then(|v| v.as_str()) {
+                args.push(val.to_string());
+            } else if let Some(vals) = params.get("values").and_then(|v| v.as_array()) {
                 for val in vals {
                     if let Some(s) = val.as_str() {
                         args.push(s.to_string());
@@ -540,69 +628,78 @@ fn params_to_cli_args(
             }
         }
         "screenshot" => {
-            if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
-                args.push(path.to_string());
-            }
-            if params.get("fullPage").and_then(|v| v.as_bool()) == Some(true) {
-                args.push("--full-page".to_string());
-            }
-        }
-        "download" => {
-            // download <selector> [path]
-            if let Some(sel) = params.get("selector").and_then(|v| v.as_str()) {
+            // screenshot [ref] [--filename=<path>]
+            if let Some(sel) = params.get("ref").and_then(|v| v.as_str()) {
                 args.push(sel.to_string());
-            }
-            if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
-                args.push(path.to_string());
             }
         }
         "pdf" => {
-            // pdf [path] [--full-page]
-            if let Some(path) = params.get("path").and_then(|v| v.as_str()) {
-                args.push(path.to_string());
-            }
-            if params.get("fullPage").and_then(|v| v.as_bool()) == Some(true) {
-                args.push("--full-page".to_string());
-            }
+            // pdf [--filename=<path>] — filename injected by build_cli_args
         }
         "snapshot" => {
-            if params.get("compact").and_then(|v| v.as_bool()) == Some(true) {
-                args.push("--compact".to_string());
-            }
-            if let Some(depth) = params.get("maxDepth").and_then(|v| v.as_i64()) {
-                args.push("--depth".to_string());
-                args.push(depth.to_string());
-            }
-            if let Some(sel) = params.get("selector").and_then(|v| v.as_str()) {
-                args.push("--selector".to_string());
-                args.push(sel.to_string());
-            }
-        }
-        "scroll" => {
-            if let Some(sel) = params.get("selector").and_then(|v| v.as_str()) {
-                args.push(sel.to_string());
-            }
-            if let Some(dir) = params.get("direction").and_then(|v| v.as_str()) {
-                args.push(dir.to_string());
-            }
+            // snapshot [--filename=<path>] — filename injected by build_cli_args
         }
         "press" => {
             if let Some(key) = params.get("key").and_then(|v| v.as_str()) {
                 args.push(key.to_string());
             }
         }
-        "wait" => {
-            if let Some(text) = params.get("text").and_then(|v| v.as_str()) {
-                args.push(text.to_string());
-            }
-            if let Some(ms) = params.get("timeout").and_then(|v| v.as_i64()) {
-                args.push("--timeout".to_string());
-                args.push(ms.to_string());
-            }
-        }
-        "evaluate" => {
+        "eval" => {
             if let Some(expr) = params.get("expression").and_then(|v| v.as_str()) {
                 args.push(expr.to_string());
+            }
+            if let Some(sel) = params.get("ref").and_then(|v| v.as_str()) {
+                args.push(sel.to_string());
+            }
+        }
+        "drag" => {
+            if let Some(start) = params.get("startRef").and_then(|v| v.as_str()) {
+                args.push(start.to_string());
+            }
+            if let Some(end) = params.get("endRef").and_then(|v| v.as_str()) {
+                args.push(end.to_string());
+            }
+        }
+        "resize" => {
+            if let Some(w) = params.get("width").and_then(|v| v.as_i64()) {
+                args.push(w.to_string());
+            }
+            if let Some(h) = params.get("height").and_then(|v| v.as_i64()) {
+                args.push(h.to_string());
+            }
+        }
+        "upload" => {
+            if let Some(file) = params.get("file").and_then(|v| v.as_str()) {
+                args.push(file.to_string());
+            } else if let Some(paths) = params.get("paths").and_then(|v| v.as_array()) {
+                for p in paths {
+                    if let Some(s) = p.as_str() {
+                        args.push(s.to_string());
+                    }
+                }
+            }
+        }
+        "dialog-accept" => {
+            if let Some(text) = params.get("promptText").and_then(|v| v.as_str()) {
+                args.push(text.to_string());
+            }
+        }
+        "dialog-dismiss" => {
+            // No additional args needed.
+        }
+        "tab-new" => {
+            if let Some(url) = params.get("url").and_then(|v| v.as_str()) {
+                args.push(url.to_string());
+            }
+        }
+        "tab-close" => {
+            if let Some(index) = params.get("index").and_then(|v| v.as_i64()) {
+                args.push(index.to_string());
+            }
+        }
+        "tab-select" => {
+            if let Some(index) = params.get("index").and_then(|v| v.as_i64()) {
+                args.push(index.to_string());
             }
         }
         _ => {
@@ -616,6 +713,32 @@ fn params_to_cli_args(
     }
 
     args
+}
+
+/// List files in a directory (non-recursive).
+async fn list_files(dir: &Path) -> HashSet<PathBuf> {
+    let mut files = HashSet::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.is_file() {
+                files.insert(path);
+            }
+        }
+    }
+    files
+}
+
+/// Check if a downloaded file is complete (not a temp/partial file).
+fn is_download_complete(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    !name.ends_with(".crdownload")
+        && !name.ends_with(".part")
+        && !name.ends_with(".tmp")
+        && !name.ends_with(".download")
 }
 
 /// Detect MIME type from file extension.
@@ -709,45 +832,27 @@ mod tests {
     }
 
     #[test]
-    fn test_params_to_cli_args_open() {
+    fn test_params_to_cli_args_goto() {
         let params: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(r#"{"url":"https://example.com"}"#).unwrap();
-        let args = params_to_cli_args("open", &params);
+        let args = params_to_cli_args("goto", &params);
         assert_eq!(args, vec!["https://example.com"]);
     }
 
     #[test]
     fn test_params_to_cli_args_fill() {
         let params: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"selector":"@e3","value":"hello world"}"#).unwrap();
+            serde_json::from_str(r#"{"ref":"@e3","text":"hello world"}"#).unwrap();
         let args = params_to_cli_args("fill", &params);
         assert_eq!(args, vec!["@e3", "hello world"]);
     }
 
     #[test]
-    fn test_params_to_cli_args_snapshot_compact() {
+    fn test_params_to_cli_args_click() {
         let params: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"compact":true,"maxDepth":3}"#).unwrap();
-        let args = params_to_cli_args("snapshot", &params);
-        assert!(args.contains(&"--compact".to_string()));
-        assert!(args.contains(&"--depth".to_string()));
-        assert!(args.contains(&"3".to_string()));
-    }
-
-    #[test]
-    fn test_params_to_cli_args_download() {
-        let params: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"selector":"a.download-btn","path":"/tmp/file.zip"}"#).unwrap();
-        let args = params_to_cli_args("download", &params);
-        assert_eq!(args, vec!["a.download-btn", "/tmp/file.zip"]);
-    }
-
-    #[test]
-    fn test_params_to_cli_args_pdf() {
-        let params: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_str(r#"{"path":"/tmp/page.pdf","fullPage":true}"#).unwrap();
-        let args = params_to_cli_args("pdf", &params);
-        assert_eq!(args, vec!["/tmp/page.pdf", "--full-page"]);
+            serde_json::from_str(r#"{"ref":"@e5"}"#).unwrap();
+        let args = params_to_cli_args("click", &params);
+        assert_eq!(args, vec!["@e5"]);
     }
 
     #[test]
@@ -757,5 +862,13 @@ mod tests {
         assert_eq!(mime_from_extension("/tmp/data.csv"), "text/csv");
         assert_eq!(mime_from_extension("/tmp/report.xlsx"), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
         assert_eq!(mime_from_extension("/tmp/unknown.xyz"), "application/octet-stream");
+    }
+
+    #[test]
+    fn test_is_download_complete() {
+        assert!(is_download_complete(Path::new("/tmp/file.pdf")));
+        assert!(!is_download_complete(Path::new("/tmp/file.crdownload")));
+        assert!(!is_download_complete(Path::new("/tmp/file.part")));
+        assert!(!is_download_complete(Path::new("/tmp/file.tmp")));
     }
 }

@@ -65,7 +65,7 @@ ahandctl upgrade --check    # check for updates without installing
 ahandctl browser-init       # install browser automation dependencies
 ```
 
-This sets up [agent-browser](https://github.com/AHand-Project/agent-browser), a local Node.js runtime (if needed), and detects/installs Chrome/Chromium.
+This sets up [playwright-cli](https://github.com/microsoft/playwright-cli), a local Node.js runtime (if needed), and detects/installs Chrome/Chromium.
 
 ## Session Modes
 
@@ -87,8 +87,7 @@ ahand/
 │  └─ browser.proto            #   browser automation messages
 ├─ packages/
 │  ├─ proto-ts/                # @ahand/proto — ts-proto generated types
-│  ├─ sdk/                     # @ahand/sdk — cloud control plane SDK
-│  └─ browser-bridge/          # ncc-bundled agent-browser daemon
+│  └─ sdk/                     # @ahand/sdk — cloud control plane SDK
 ├─ apps/
 │  ├─ admin/                   # Admin panel (Solid.js SPA)
 │  ├─ dashboard/               # Dashboard UI (dev mode)

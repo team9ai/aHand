@@ -4,17 +4,13 @@ use std::process::Stdio;
 use anyhow::{Context, Result};
 use tracing::info;
 
-const AGENT_BROWSER_VERSION: &str = "0.9.1";
-const AGENT_BROWSER_REPO: &str = "vercel-labs/agent-browser";
-const AHAND_GITHUB_REPO: &str = "team9ai/aHand";
+const PLAYWRIGHT_CLI_VERSION: &str = "0.1.1";
 const NODE_MIN_VERSION: u32 = 20;
 const NODE_LTS_VERSION: &str = "24.13.0";
 
 struct Dirs {
     #[allow(dead_code)]
     ahand: PathBuf,
-    bin: PathBuf,
-    browser: PathBuf,
     node: PathBuf,
 }
 
@@ -23,8 +19,6 @@ impl Dirs {
         let home = dirs::home_dir().context("cannot determine home directory")?;
         let ahand = home.join(".ahand");
         Ok(Self {
-            bin: ahand.join("bin"),
-            browser: ahand.join("browser"),
             node: ahand.join("node"),
             ahand,
         })
@@ -41,32 +35,30 @@ pub async fn run(force: bool) -> Result<()> {
     }
 
     let node_bin = ensure_node(&dirs).await?;
-    download_agent_browser(&dirs).await?;
-    download_daemon_bundle(&dirs).await?;
-
-    let sockets_dir = dirs.browser.join("sockets");
-    std::fs::create_dir_all(&sockets_dir)?;
-    println!("[4/6] Socket directory: {}", sockets_dir.display());
-
-    detect_or_install_browser(&dirs, &node_bin).await?;
-    write_runtime_config(&dirs, &node_bin)?;
+    install_playwright_cli(&dirs, &node_bin).await?;
 
     println!();
-    println!("Browser setup complete!");
+    println!("Setup complete!");
+    println!("  Node.js:        {}", node_bin.display());
+    let cli_path = dirs.node.join("bin").join("playwright-cli");
+    println!("  playwright-cli: {}", cli_path.display());
+    println!();
+    println!("playwright-cli will use the browser installed on your system (Chrome, Edge, etc.).");
     Ok(())
 }
 
 async fn clean(dirs: &Dirs) {
-    let _ = tokio::process::Command::new("pkill")
-        .args(["-f", "daemon.js"])
-        .status()
-        .await;
-
-    let sockets = dirs.browser.join("sockets");
-    if sockets.exists() {
-        let _ = std::fs::remove_dir_all(&sockets);
+    // Uninstall playwright-cli from npm globals
+    let npm = dirs.node.join("bin").join("npm");
+    if npm.exists() {
+        let _ = tokio::process::Command::new(&npm)
+            .args(["uninstall", "-g", "@playwright/cli"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
     }
-    println!("  Cleaned sockets and stale processes.");
+    println!("  Cleaned playwright-cli installation.");
 }
 
 // Step 1: Node.js
@@ -77,7 +69,7 @@ async fn ensure_node(dirs: &Dirs) -> Result<PathBuf> {
     if local_node.exists() {
         match node_major_version(&local_node).await {
             Some(ver) if ver >= NODE_MIN_VERSION => {
-                println!("[1/6] Node.js: v{ver}.x (local: {})", dirs.node.display());
+                println!("[1/2] Node.js: v{ver}.x (local: {})", dirs.node.display());
                 return Ok(local_node);
             }
             Some(ver) => {
@@ -96,7 +88,7 @@ async fn ensure_node(dirs: &Dirs) -> Result<PathBuf> {
     if let Ok(system_node) = which("node") {
         match node_major_version(&system_node).await {
             Some(ver) if ver >= NODE_MIN_VERSION => {
-                println!("[1/6] Node.js: v{ver}.x (system: {})", system_node.display());
+                println!("[1/2] Node.js: v{ver}.x (system: {})", system_node.display());
                 return Ok(system_node);
             }
             Some(ver) => {
@@ -128,7 +120,7 @@ async fn ensure_node(dirs: &Dirs) -> Result<PathBuf> {
             node_bin.display()
         );
     }
-    println!("[1/6] Node.js: v{NODE_LTS_VERSION} (installed to {})", dirs.node.display());
+    println!("[1/2] Node.js: v{NODE_LTS_VERSION} (installed to {})", dirs.node.display());
     Ok(node_bin)
 }
 
@@ -185,177 +177,73 @@ async fn install_node(dirs: &Dirs) -> Result<()> {
     Ok(())
 }
 
-// Step 2: agent-browser CLI
+// Step 2: playwright-cli via npm
 
-async fn download_agent_browser(dirs: &Dirs) -> Result<()> {
-    std::fs::create_dir_all(&dirs.bin)?;
-    let dest = dirs.bin.join("agent-browser");
+async fn install_playwright_cli(dirs: &Dirs, node_bin: &Path) -> Result<()> {
+    let npm = node_bin
+        .parent()
+        .map(|p| p.join("npm"))
+        .unwrap_or_else(|| PathBuf::from("npm"));
 
-    // Skip download if the binary already exists (unless --force was used,
-    // which cleans the installation before reaching this point).
-    if dest.exists() {
-        println!("[2/6] CLI binary: {} (cached)", dest.display());
-        return Ok(());
-    }
-
-    let (os, arch) = platform_info();
-    let binary_name = format!("agent-browser-{os}-{arch}");
-    let url = format!(
-        "https://github.com/{AGENT_BROWSER_REPO}/releases/download/v{AGENT_BROWSER_VERSION}/{binary_name}"
-    );
-
-    println!("  Downloading agent-browser v{AGENT_BROWSER_VERSION} ({os}-{arch})...");
-    let bytes = download_bytes(&url).await?;
-    std::fs::write(&dest, &bytes)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    println!("[2/6] CLI binary: {}", dest.display());
-    Ok(())
-}
-
-// Step 3: daemon.js bundle
-
-async fn download_daemon_bundle(dirs: &Dirs) -> Result<()> {
-    let dist_dir = dirs.browser.join("dist");
-    let daemon_js = dist_dir.join("daemon.js");
-
-    // Skip download if daemon.js already exists.
-    if daemon_js.exists() {
-        println!("[3/6] Daemon bundle: {} (cached)", dist_dir.display());
-        return Ok(());
-    }
-
-    let version = fetch_latest_browser_release_version().await?;
-    println!("  Downloading daemon bundle v{version}...");
-
-    let url = format!(
-        "https://github.com/{AHAND_GITHUB_REPO}/releases/download/browser-v{version}/daemon-bundle.tar.gz"
-    );
-    let bytes = download_bytes(&url).await?;
-
-    std::fs::create_dir_all(&dist_dir)?;
-
-    let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
-    let mut archive = tar::Archive::new(decoder);
-    archive.unpack(&dist_dir)?;
-
-    std::fs::write(dist_dir.join("package.json"), "{\"type\":\"module\"}")?;
-
-    println!("[3/6] Daemon bundle: {}", dist_dir.display());
-    Ok(())
-}
-
-async fn fetch_latest_browser_release_version() -> Result<String> {
-    let url = format!("https://api.github.com/repos/{AHAND_GITHUB_REPO}/releases");
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(&url)
-        .header("User-Agent", "ahandd")
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
-
-    let releases = resp.as_array().context("GitHub releases response is not an array")?;
-    for release in releases {
-        if let Some(tag) = release["tag_name"].as_str() {
-            if let Some(ver) = tag.strip_prefix("browser-v") {
-                return Ok(ver.to_string());
+    // Check if already installed at the correct version
+    let cli_path = dirs.node.join("bin").join("playwright-cli");
+    if cli_path.exists() {
+        // Verify version
+        let output = tokio::process::Command::new(&cli_path)
+            .arg("--version")
+            .output()
+            .await;
+        if let Ok(out) = output {
+            let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if out.status.success() {
+                println!("[2/2] playwright-cli: {ver} ({}) (cached)", cli_path.display());
+                return Ok(());
             }
         }
     }
 
-    anyhow::bail!("no browser-v* release found on GitHub")
-}
+    println!("  Installing @playwright/cli@{PLAYWRIGHT_CLI_VERSION}...");
 
-// Step 5: Browser detection
-
-async fn detect_or_install_browser(dirs: &Dirs, node_bin: &Path) -> Result<()> {
-    if let Some(chrome) = detect_system_chrome() {
-        println!("[5/6] Browser: {chrome} (system)");
-        return Ok(());
-    }
-
-    println!("[5/6] Browser: no system Chrome found — installing Chromium...");
-    let browsers_dir = dirs.browser.join("browsers");
-    std::fs::create_dir_all(&browsers_dir)?;
-
-    let npx = node_bin
-        .parent()
-        .map(|p| p.join("npx"))
-        .unwrap_or_else(|| PathBuf::from("npx"));
-
-    let status = tokio::process::Command::new(&npx)
-        .args(["playwright", "install", "chromium"])
-        .env("PLAYWRIGHT_BROWSERS_PATH", &browsers_dir)
+    let status = tokio::process::Command::new(&npm)
+        .args(["install", "-g", &format!("@playwright/cli@{PLAYWRIGHT_CLI_VERSION}")])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .await
-        .context("failed to run npx playwright install")?;
+        .context("failed to run npm install")?;
 
     if !status.success() {
-        anyhow::bail!("Chromium installation failed");
+        anyhow::bail!(
+            "Failed to install @playwright/cli@{PLAYWRIGHT_CLI_VERSION}. \
+             Try manually: {} install -g @playwright/cli@{PLAYWRIGHT_CLI_VERSION}",
+            npm.display()
+        );
     }
 
-    println!("      Chromium installed to {}", browsers_dir.display());
-    Ok(())
-}
-
-fn detect_system_chrome() -> Option<&'static str> {
-    #[cfg(target_os = "macos")]
-    {
-        for candidate in &[
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            "/Applications/Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev",
-            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-        ] {
-            if Path::new(candidate).exists() {
-                return Some(candidate);
-            }
+    // Verify installation
+    if cli_path.exists() {
+        let version = tokio::process::Command::new(&cli_path)
+            .arg("--version")
+            .output()
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "installed".to_string());
+        println!("[2/2] playwright-cli: {version} ({})", cli_path.display());
+    } else {
+        // Fallback: check if npm linked it somewhere else
+        if let Ok(fallback) = which("playwright-cli") {
+            println!("[2/2] playwright-cli: {} (PATH)", fallback.display());
+        } else {
+            anyhow::bail!(
+                "playwright-cli was installed but binary not found at {}. \
+                 Try: {} install -g @playwright/cli@{PLAYWRIGHT_CLI_VERSION}",
+                cli_path.display(),
+                npm.display()
+            );
         }
     }
-    #[cfg(target_os = "linux")]
-    {
-        for candidate in &[
-            "/usr/bin/google-chrome",
-            "/usr/bin/google-chrome-stable",
-            "/usr/bin/chromium",
-            "/usr/bin/chromium-browser",
-        ] {
-            if Path::new(candidate).exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
 
-// Step 6: Runtime config
-
-fn write_runtime_config(dirs: &Dirs, node_bin: &Path) -> Result<()> {
-    let chrome_path = detect_system_chrome().unwrap_or("");
-    let agent_browser_bin = dirs.bin.join("agent-browser");
-    let content = format!(
-        r#"# Auto-generated by ahandd browser-init — do not edit.
-NODE_BIN="{}"
-AGENT_BROWSER_BIN="{}"
-AGENT_BROWSER_VERSION="{AGENT_BROWSER_VERSION}"
-CHROME_PATH="{chrome_path}"
-BROWSER_DIR="{}"
-"#,
-        node_bin.display(),
-        agent_browser_bin.display(),
-        dirs.browser.display(),
-    );
-    std::fs::write(dirs.browser.join("env.sh"), content)?;
-    println!("[6/6] Runtime config: {}", dirs.browser.join("env.sh").display());
     Ok(())
 }
 

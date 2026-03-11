@@ -64,7 +64,7 @@ pub struct Config {
     #[serde(default)]
     pub openclaw: Option<OpenClawConfig>,
 
-    /// Browser control configuration (agent-browser integration)
+    /// Browser control configuration (playwright-cli integration)
     #[serde(default)]
     pub browser: Option<BrowserConfig>,
 }
@@ -101,25 +101,19 @@ pub struct OpenClawConfig {
     pub exec_approvals_path: Option<String>,
 }
 
-/// Browser control configuration (agent-browser CLI integration).
+/// Browser control configuration (playwright-cli integration).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct BrowserConfig {
     /// Enable browser capabilities (default: false).
     pub enabled: Option<bool>,
 
-    /// Path to the agent-browser CLI binary (default: ~/.ahand/bin/agent-browser).
+    /// Path to the playwright-cli binary (default: ~/.ahand/node/bin/playwright-cli).
     pub binary_path: Option<String>,
 
     /// Browser executable path (e.g. system Chrome). Auto-detected if omitted.
     pub executable_path: Option<String>,
 
-    /// AGENT_BROWSER_HOME — directory where daemon.js is located (default: ~/.ahand/browser).
-    pub home_dir: Option<String>,
-
-    /// AGENT_BROWSER_SOCKET_DIR — directory for daemon socket files (default: ~/.ahand/browser/sockets).
-    pub socket_dir: Option<String>,
-
-    /// PLAYWRIGHT_BROWSERS_PATH — Chromium fallback install directory (default: ~/.ahand/browser/browsers).
+    /// PLAYWRIGHT_BROWSERS_PATH override (optional, for custom browser installs).
     pub browsers_path: Option<String>,
 
     /// Default command timeout in milliseconds (default: 30000).
@@ -142,6 +136,14 @@ pub struct BrowserConfig {
     /// Show browser window instead of headless (default: false).
     #[serde(default)]
     pub headed: Option<bool>,
+
+    /// Use persistent browser context to preserve cookies/storage across restarts (default: true).
+    #[serde(default = "default_persistent")]
+    pub persistent: Option<bool>,
+}
+
+fn default_persistent() -> Option<bool> {
+    Some(true)
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
