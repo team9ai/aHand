@@ -35,6 +35,14 @@ describe("hub dashboard auth server flow", () => {
     expect(response.headers.get("location")).toBe("http://localhost/login");
   });
 
+  it("returns 401 for unauthenticated proxy requests in middleware", async () => {
+    const request = new NextRequest("http://localhost/api/proxy/api/devices");
+    const response = middleware(request);
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
+  });
+
   it("bypasses auth redirects for the login page and auth routes", () => {
     const loginPageResponse = middleware(new NextRequest("http://localhost/login"));
     const authRouteResponse = middleware(new NextRequest("http://localhost/api/auth/login"));
@@ -203,6 +211,21 @@ describe("hub dashboard auth server flow", () => {
       },
       cache: "no-store",
     });
+  });
+
+  it("returns 401 when the proxy route is invoked without a session cookie", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const request = new NextRequest("http://localhost/api/proxy/api/devices");
+
+    const response = await proxyGet(request, {
+      params: Promise.resolve({ path: ["api", "devices"] }),
+    });
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("preserves upstream proxy error statuses", async () => {

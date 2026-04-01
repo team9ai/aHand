@@ -8,6 +8,10 @@ export async function GET(
   const session = request.cookies.get("ahand_hub_session")?.value ?? "";
   const baseUrl = process.env.AHAND_HUB_BASE_URL;
 
+  if (!session) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
+
   if (!baseUrl) {
     return NextResponse.json({ error: "hub_unavailable" }, { status: 503 });
   }
