@@ -6,6 +6,7 @@ import { POST as loginPost } from "@/app/api/auth/login/route";
 import { POST as logoutPost } from "@/app/api/auth/logout/route";
 import { GET as proxyGet } from "@/app/api/proxy/[...path]/route";
 import { middleware } from "@/middleware";
+import nextConfig from "../next.config";
 
 const HUB_BASE_URL = "https://hub.example";
 
@@ -288,5 +289,19 @@ describe("hub dashboard auth server flow", () => {
 
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
+  });
+
+  it("declares a websocket rewrite for /ws/dashboard", async () => {
+    const rewrites = typeof nextConfig.rewrites === "function" ? await nextConfig.rewrites() : [];
+    const routes = Array.isArray(rewrites) ? rewrites : [...rewrites.beforeFiles, ...rewrites.afterFiles, ...rewrites.fallback];
+
+    expect(routes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "/ws/dashboard",
+          destination: `${HUB_BASE_URL}/ws/dashboard`,
+        }),
+      ]),
+    );
   });
 });

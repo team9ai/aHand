@@ -32,6 +32,10 @@ pub struct TestServer {
 }
 
 impl TestServer {
+    pub fn http_base_url(&self) -> &str {
+        &self.base_http_url
+    }
+
     pub fn ws_url(&self, path: &str) -> String {
         format!("{}{}", self.base_ws_url, path)
     }

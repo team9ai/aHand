@@ -6,7 +6,9 @@ use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, is_terminal_status}
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::JobStore;
 use axum::extract::{Json, Path, Query, State};
+use axum::http::header::HeaderName;
 use axum::http::StatusCode;
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, Sse};
 use futures_util::Stream;
 use prost::Message;
@@ -347,6 +349,7 @@ pub async fn cancel_job(
 pub async fn stream_output(
     auth: AuthContextExt,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(job_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     auth.require_read_jobs()?;
@@ -361,7 +364,7 @@ pub async fn stream_output(
     }
     let stream = state
         .output_stream
-        .subscribe(job_id)
+        .subscribe_from(job_id, parse_last_event_id(&headers)?)
         .await
         .map_err(job_error_status)?;
     Ok(Sse::new(stream))
@@ -406,6 +409,15 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<u64>, StatusCode> {
+    let Some(value) = headers.get(HeaderName::from_static("last-event-id")) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let id = value.parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(Some(id))
 }
 
 impl From<Job> for DashboardJobResponse {

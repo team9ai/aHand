@@ -20,14 +20,22 @@ enum OutputItem {
 }
 
 impl OutputItem {
-    fn to_event(&self) -> Event {
+    fn to_event(&self, seq: u64) -> Event {
         match self {
-            Self::Stdout(chunk) => Event::default().event("stdout").data(chunk.clone()),
-            Self::Stderr(chunk) => Event::default().event("stderr").data(chunk.clone()),
+            Self::Stdout(chunk) => Event::default()
+                .id(seq.to_string())
+                .event("stdout")
+                .data(chunk.clone()),
+            Self::Stderr(chunk) => Event::default()
+                .id(seq.to_string())
+                .event("stderr")
+                .data(chunk.clone()),
             Self::Progress(progress) => Event::default()
+                .id(seq.to_string())
                 .event("progress")
                 .data(progress.to_string()),
             Self::Finished { exit_code, error } => Event::default()
+                .id(seq.to_string())
                 .event("finished")
                 .data(serde_json::json!({ "exit_code": exit_code, "error": error }).to_string()),
         }
@@ -88,6 +96,14 @@ impl OutputStream {
         &self,
         job_id: String,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+        self.subscribe_from(job_id, None).await
+    }
+
+    pub async fn subscribe_from(
+        &self,
+        job_id: String,
+        last_event_id: Option<u64>,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
         self.prune_expired();
         let state = self
             .jobs
@@ -97,12 +113,16 @@ impl OutputStream {
         let finished = state.finished.load(Ordering::Relaxed);
         let mut rx = state.tx.subscribe();
         let history = state.history.lock().await.clone();
-        let mut last_seq = history.last().map(|entry| entry.seq).unwrap_or(0);
+        let mut last_seq = last_event_id.unwrap_or(0);
 
         Ok(Box::pin(stream! {
             for item in history {
+                if item.seq <= last_seq {
+                    continue;
+                }
+                last_seq = item.seq;
                 let is_terminal = item.item.is_terminal();
-                yield Ok(item.item.to_event());
+                yield Ok(item.item.to_event(item.seq));
                 if is_terminal {
                     return;
                 }
@@ -118,7 +138,7 @@ impl OutputStream {
                 }
                 last_seq = item.seq;
                 let is_terminal = item.item.is_terminal();
-                yield Ok(item.item.to_event());
+                yield Ok(item.item.to_event(item.seq));
                 if is_terminal {
                     break;
                 }
@@ -260,5 +280,33 @@ mod tests {
 
         let events = subscriber.await.unwrap();
         assert_eq!(events.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn subscribe_resumes_after_last_event_id_without_replaying_history() {
+        let stream = OutputStream::new(Duration::from_secs(60), 16);
+        stream
+            .push_stdout("job-1", b"first\n".to_vec())
+            .await
+            .unwrap();
+        stream
+            .push_stdout("job-1", b"second\n".to_vec())
+            .await
+            .unwrap();
+
+        let mut resumed = stream
+            .subscribe_from("job-1".into(), Some(1))
+            .await
+            .expect("subscription should resume");
+
+        let event = resumed
+            .next()
+            .await
+            .expect("stream should yield resumed event")
+            .expect("stream item should be ok");
+        let debug = format!("{event:?}");
+
+        assert!(debug.contains("second"));
+        assert!(!debug.contains("first"));
     }
 }
