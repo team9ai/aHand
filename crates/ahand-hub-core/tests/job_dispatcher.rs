@@ -1,9 +1,166 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use ahand_hub_core::HubError;
 use ahand_hub_core::audit::{AuditEntry, AuditFilter};
+use ahand_hub_core::device::{Device, NewDevice};
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
+use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
+use async_trait::async_trait;
+use dashmap::DashMap;
+
+struct OnlineDeviceStore {
+    device: Device,
+}
+
+impl OnlineDeviceStore {
+    fn new(device_id: &str) -> Self {
+        Self {
+            device: Device {
+                id: device_id.into(),
+                public_key: None,
+                hostname: "online-device".into(),
+                os: "linux".into(),
+                capabilities: vec!["exec".into()],
+                version: Some("0.1.2".into()),
+                auth_method: "ed25519".into(),
+                online: true,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl DeviceStore for OnlineDeviceStore {
+    async fn insert(&self, _device: NewDevice) -> ahand_hub_core::Result<Device> {
+        Ok(self.device.clone())
+    }
+
+    async fn get(&self, device_id: &str) -> ahand_hub_core::Result<Option<Device>> {
+        Ok((self.device.id == device_id).then(|| self.device.clone()))
+    }
+
+    async fn list(&self) -> ahand_hub_core::Result<Vec<Device>> {
+        Ok(vec![self.device.clone()])
+    }
+
+    async fn delete(&self, _device_id: &str) -> ahand_hub_core::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct MemoryJobStore {
+    jobs: DashMap<String, ahand_hub_core::job::Job>,
+}
+
+#[async_trait]
+impl JobStore for MemoryJobStore {
+    async fn insert(&self, job: NewJob) -> ahand_hub_core::Result<ahand_hub_core::job::Job> {
+        let job = ahand_hub_core::job::Job {
+            id: uuid::Uuid::new_v4(),
+            device_id: job.device_id,
+            tool: job.tool,
+            args: job.args,
+            cwd: job.cwd,
+            env: job.env,
+            timeout_ms: job.timeout_ms,
+            status: JobStatus::Pending,
+            requested_by: job.requested_by,
+        };
+        self.jobs.insert(job.id.to_string(), job.clone());
+        Ok(job)
+    }
+
+    async fn get(&self, job_id: &str) -> ahand_hub_core::Result<Option<ahand_hub_core::job::Job>> {
+        Ok(self.jobs.get(job_id).map(|job| job.clone()))
+    }
+
+    async fn list(
+        &self,
+        filter: JobFilter,
+    ) -> ahand_hub_core::Result<Vec<ahand_hub_core::job::Job>> {
+        let mut jobs = self
+            .jobs
+            .iter()
+            .filter(|entry| {
+                let job = entry.value();
+                filter
+                    .device_id
+                    .as_ref()
+                    .is_none_or(|device_id| &job.device_id == device_id)
+                    && filter.status.is_none_or(|status| job.status == status)
+            })
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        jobs.sort_by_key(|job| job.id);
+        Ok(jobs)
+    }
+
+    async fn update_status(&self, job_id: &str, status: JobStatus) -> ahand_hub_core::Result<()> {
+        let mut job = self
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
+        job.status = status;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingAuditStore {
+    entries: Mutex<Vec<AuditEntry>>,
+}
+
+#[async_trait]
+impl AuditStore for RecordingAuditStore {
+    async fn append(&self, entries: &[AuditEntry]) -> ahand_hub_core::Result<()> {
+        self.entries
+            .lock()
+            .map_err(|err| HubError::Internal(err.to_string()))?
+            .extend(entries.iter().cloned());
+        Ok(())
+    }
+
+    async fn query(&self, filter: AuditFilter) -> ahand_hub_core::Result<Vec<AuditEntry>> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+        Ok(entries
+            .iter()
+            .filter(|entry| {
+                filter
+                    .resource_type
+                    .as_ref()
+                    .is_none_or(|resource_type| &entry.resource_type == resource_type)
+                    && filter
+                        .resource_id
+                        .as_ref()
+                        .is_none_or(|resource_id| &entry.resource_id == resource_id)
+                    && filter
+                        .action
+                        .as_ref()
+                        .is_none_or(|action| &entry.action == action)
+            })
+            .cloned()
+            .collect())
+    }
+}
+
+struct FailingAuditStore;
+
+#[async_trait]
+impl AuditStore for FailingAuditStore {
+    async fn append(&self, _entries: &[AuditEntry]) -> ahand_hub_core::Result<()> {
+        Err(HubError::Internal("audit unavailable".into()))
+    }
+
+    async fn query(&self, _filter: AuditFilter) -> ahand_hub_core::Result<Vec<AuditEntry>> {
+        Ok(vec![])
+    }
+}
 
 #[tokio::test]
 async fn create_job_requires_online_device() {
@@ -24,6 +181,73 @@ async fn create_job_requires_online_device() {
         .unwrap_err();
 
     assert_eq!(err, HubError::DeviceOffline("device-1".into()));
+}
+
+#[tokio::test]
+async fn create_job_writes_audit_entry_for_online_device() {
+    let devices = Arc::new(OnlineDeviceStore::new("device-1"));
+    let jobs = Arc::new(MemoryJobStore::default());
+    let audit = Arc::new(RecordingAuditStore::default());
+    let dispatcher = JobDispatcher::new(devices, jobs.clone(), audit.clone());
+
+    let job = dispatcher
+        .create_job(NewJob {
+            device_id: "device-1".into(),
+            tool: "git".into(),
+            args: vec!["status".into()],
+            cwd: Some("/tmp/demo".into()),
+            env: HashMap::from([("RUST_LOG".into(), "info".into())]),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap();
+
+    let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
+    let audit_entries = audit
+        .query(AuditFilter {
+            resource_type: Some("job".into()),
+            resource_id: Some(job.id.to_string()),
+            action: Some("job.created".into()),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(stored.id, job.id);
+    assert_eq!(stored.tool, "git");
+    assert_eq!(audit_entries.len(), 1);
+    assert_eq!(audit_entries[0].actor, "service:test");
+    assert_eq!(
+        audit_entries[0].detail,
+        serde_json::json!({ "tool": "git" })
+    );
+}
+
+#[tokio::test]
+async fn create_job_does_not_fail_after_job_is_persisted_if_audit_write_fails() {
+    let devices = Arc::new(OnlineDeviceStore::new("device-1"));
+    let jobs = Arc::new(MemoryJobStore::default());
+    let audit = Arc::new(FailingAuditStore);
+    let dispatcher = JobDispatcher::new(devices, jobs.clone(), audit);
+
+    let job = dispatcher
+        .create_job(NewJob {
+            device_id: "device-1".into(),
+            tool: "git".into(),
+            args: vec!["status".into()],
+            cwd: Some("/tmp/demo".into()),
+            env: HashMap::new(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap();
+
+    let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
+    let all_jobs = jobs.list(JobFilter::default()).await.unwrap();
+
+    assert_eq!(stored.id, job.id);
+    assert_eq!(all_jobs.len(), 1);
 }
 
 #[tokio::test]

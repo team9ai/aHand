@@ -33,7 +33,8 @@ impl JobDispatcher {
         }
 
         let job = self.jobs.insert(new_job).await?;
-        self.audit
+        let _ = self
+            .audit
             .append(&[AuditEntry {
                 timestamp: chrono::Utc::now(),
                 action: "job.created".into(),
@@ -43,7 +44,7 @@ impl JobDispatcher {
                 detail: serde_json::json!({ "tool": job.tool }),
                 source_ip: None,
             }])
-            .await?;
+            .await;
         Ok(job)
     }
 
