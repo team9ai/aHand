@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { getJobs } from "@/lib/api";
+import { getJobs, withDashboardSession } from "@/lib/api";
 
 type JobsPageProps = {
   searchParams: Promise<{
@@ -10,10 +10,12 @@ type JobsPageProps = {
 
 export default async function JobsPage({ searchParams }: JobsPageProps) {
   const { status, device } = await searchParams;
-  const jobs = await getJobs({
-    status: status && status !== "all" ? status : undefined,
-    deviceId: device?.trim() || undefined,
-  });
+  const jobs = await withDashboardSession(() =>
+    getJobs({
+      status: status && status !== "all" ? status : undefined,
+      deviceId: device?.trim() || undefined,
+    }),
+  );
   const filteredJobs = jobs.filter((job) => {
     const matchesStatus = !status || status === "all" || job.status.toLowerCase() === status;
     const matchesDevice = !device || device.trim().length === 0 || job.device_id === device.trim();

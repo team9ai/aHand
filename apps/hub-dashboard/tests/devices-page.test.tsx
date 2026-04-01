@@ -5,11 +5,16 @@ import DeviceDetailPage from "@/app/(dashboard)/devices/[id]/page";
 import { Sidebar } from "@/components/sidebar";
 import { getDevice, getDevices, getJobs } from "@/lib/api";
 
-vi.mock("@/lib/api", () => ({
-  getDevices: vi.fn(),
-  getDevice: vi.fn(),
-  getJobs: vi.fn(),
-}));
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    getDevices: vi.fn(),
+    getDevice: vi.fn(),
+    getJobs: vi.fn(),
+    withDashboardSession: actual.withDashboardSession,
+  };
+});
 
 vi.mock("next/navigation", () => ({
   usePathname: () => "/devices",
@@ -82,10 +87,8 @@ describe("devices surfaces", () => {
         tool: "render",
         args: ["scene.blend"],
         cwd: "/srv/work",
-        env: {},
         timeout_ms: 30_000,
-        status: "Running",
-        requested_by: "operator",
+        status: "running",
       },
     ]);
 

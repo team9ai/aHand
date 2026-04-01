@@ -3,9 +3,24 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import DashboardHomePage from "@/app/(dashboard)/page";
 import { getAuditLogs, getDashboardStats } from "@/lib/api";
 
-vi.mock("@/lib/api", () => ({
-  getDashboardStats: vi.fn(),
-  getAuditLogs: vi.fn(),
+const { redirectMock } = vi.hoisted(() => ({
+  redirectMock: vi.fn((path: string) => {
+    throw new Error(`REDIRECT:${path}`);
+  }),
+}));
+
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    getDashboardStats: vi.fn(),
+    getAuditLogs: vi.fn(),
+    withDashboardSession: actual.withDashboardSession,
+  };
+});
+
+vi.mock("next/navigation", () => ({
+  redirect: redirectMock,
 }));
 
 describe("dashboard overview page", () => {
@@ -50,5 +65,11 @@ describe("dashboard overview page", () => {
     render(await DashboardHomePage());
 
     expect(screen.getByText(/no recent activity yet/i)).toBeInTheDocument();
+  });
+
+  it("redirects to login when the dashboard session is invalid", async () => {
+    vi.mocked(getDashboardStats).mockRejectedValue(new Error("api_401"));
+
+    await expect(DashboardHomePage()).rejects.toThrow("REDIRECT:/login");
   });
 });

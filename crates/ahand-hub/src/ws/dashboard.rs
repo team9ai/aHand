@@ -1,30 +1,26 @@
 use ahand_hub_core::auth::Role;
 use axum::{
     extract::{
-        Query, State,
+        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::HeaderMap,
     http::StatusCode,
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::auth::authenticate_token;
+use crate::events::DashboardEvent;
 use crate::state::AppState;
-
-#[derive(Debug, Deserialize)]
-pub struct DashboardSocketQuery {
-    pub token: Option<String>,
-}
 
 pub async fn handle_dashboard_socket(
     ws: WebSocketUpgrade,
-    Query(query): Query<DashboardSocketQuery>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
-    let token = query.token.as_deref().ok_or(StatusCode::UNAUTHORIZED)?;
+    let token = session_cookie_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
     let claims = authenticate_token(&state, token).map_err(|_| StatusCode::UNAUTHORIZED)?;
     match claims.role {
         Role::Admin | Role::DashboardUser => {}
@@ -58,7 +54,10 @@ async fn run_dashboard_socket(socket: WebSocket, state: AppState) -> anyhow::Res
                         let payload = serde_json::to_string(&event)?;
                         sender.send(Message::Text(payload.into())).await?;
                     }
-                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Lagged(_)) => {
+                        let payload = serde_json::to_string(&resync_event("lagged"))?;
+                        sender.send(Message::Text(payload.into())).await?;
+                    }
                     Err(RecvError::Closed) => break,
                 }
             }
@@ -66,4 +65,39 @@ async fn run_dashboard_socket(socket: WebSocket, state: AppState) -> anyhow::Res
     }
 
     Ok(())
+}
+
+fn session_cookie_token(headers: &HeaderMap) -> Option<&str> {
+    let cookies = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    cookies
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("ahand_hub_session="))
+}
+
+fn resync_event(reason: &str) -> DashboardEvent {
+    DashboardEvent {
+        event: "system.resync".into(),
+        resource_type: "system".into(),
+        resource_id: "dashboard".into(),
+        actor: "hub".into(),
+        detail: serde_json::json!({ "reason": reason }),
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lagged_broadcasts_turn_into_resync_events() {
+        let event = resync_event("lagged");
+
+        assert_eq!(event.event, "system.resync");
+        assert_eq!(event.resource_type, "system");
+        assert_eq!(event.resource_id, "dashboard");
+        assert_eq!(event.actor, "hub");
+        assert_eq!(event.detail["reason"], "lagged");
+    }
 }

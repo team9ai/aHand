@@ -3,9 +3,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import AuditLogsPage from "@/app/(dashboard)/audit-logs/page";
 import { getAuditLogs } from "@/lib/api";
 
-vi.mock("@/lib/api", () => ({
-  getAuditLogs: vi.fn(),
-}));
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    getAuditLogs: vi.fn(),
+    withDashboardSession: actual.withDashboardSession,
+  };
+});
 
 describe("audit logs page", () => {
   afterEach(() => {

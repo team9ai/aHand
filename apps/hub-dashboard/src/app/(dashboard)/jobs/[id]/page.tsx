@@ -1,5 +1,5 @@
 import { JobOutputViewer } from "@/components/job-output-viewer";
-import { getAuditLogs, getJob } from "@/lib/api";
+import { getAuditLogs, getJob, withDashboardSession } from "@/lib/api";
 
 type JobDetailPageProps = {
   params: Promise<{ id: string }>;
@@ -7,10 +7,9 @@ type JobDetailPageProps = {
 
 export default async function JobDetailPage({ params }: JobDetailPageProps) {
   const { id } = await params;
-  const [job, timeline] = await Promise.all([
-    getJob(id),
-    getAuditLogs({ resource: id, limit: 20 }),
-  ]);
+  const [job, timeline] = await withDashboardSession(() =>
+    Promise.all([getJob(id), getAuditLogs({ resource: id, limit: 20 })]),
+  );
 
   if (!job) {
     return (

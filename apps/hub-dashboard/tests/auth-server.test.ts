@@ -85,7 +85,7 @@ describe("hub dashboard auth server flow", () => {
       body: JSON.stringify({ password: "shared-secret" }),
     });
     expect(response.cookies.get("ahand_hub_session")?.value).toBe("session-token");
-    expect(response.cookies.get("ahand_hub_ws_token")?.value).toBe("session-token");
+    expect(response.cookies.get("ahand_hub_ws_token")).toBeUndefined();
   });
 
   it("does not set cookies when the upstream login payload has no token", async () => {

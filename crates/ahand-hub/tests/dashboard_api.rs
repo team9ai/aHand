@@ -160,6 +160,8 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
     let jobs = jobs.as_array().expect("jobs list should be an array");
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0]["tool"], "render");
+    assert!(jobs[0].get("env").is_none());
+    assert!(jobs[0].get("requested_by").is_none());
 
     let job_response = server
         .get(&format!("/api/jobs/{}", running_job.id), &token)
@@ -167,6 +169,8 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
     assert_eq!(job_response.status(), reqwest::StatusCode::OK);
     let job: Value = job_response.json().await.unwrap();
     assert_eq!(job["device_id"], "device-2");
+    assert!(job.get("env").is_none());
+    assert!(job.get("requested_by").is_none());
 
     let since = (Utc::now() - ChronoDuration::minutes(5))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -201,11 +205,7 @@ async fn dashboard_websocket_streams_device_and_job_events() {
     let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
     let server = spawn_server_with_state(state).await;
 
-    let (mut dashboard_socket, _) = tokio_tungstenite::connect_async(server.ws_url(&format!(
-        "/ws/dashboard?token={token}"
-    )))
-    .await
-    .unwrap();
+    let mut dashboard_socket = server.connect_dashboard_socket(Some(&token)).await;
 
     let mut device = server.attach_test_device("device-1").await;
     let created = server
@@ -225,6 +225,7 @@ async fn dashboard_websocket_streams_device_and_job_events() {
     let _ = device.recv_job_request().await;
     device.send_stdout(&job_id, b"hello\n").await;
     device.send_finished(&job_id, 0, "").await;
+    drop(device);
 
     let mut events = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -247,6 +248,7 @@ async fn dashboard_websocket_streams_device_and_job_events() {
             && events.iter().any(|event| event == "job.created")
             && events.iter().any(|event| event == "job.running")
             && events.iter().any(|event| event == "job.finished")
+            && events.iter().any(|event| event == "device.offline")
         {
             break;
         }
@@ -256,4 +258,83 @@ async fn dashboard_websocket_streams_device_and_job_events() {
     assert!(events.iter().any(|event| event == "job.created"));
     assert!(events.iter().any(|event| event == "job.running"));
     assert!(events.iter().any(|event| event == "job.finished"));
+    assert!(events.iter().any(|event| event == "device.offline"));
+}
+
+#[tokio::test]
+async fn dashboard_websocket_streams_failed_and_cancelled_events() {
+    let state = AppState::for_tests().await;
+    let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
+    let server = spawn_server_with_state(state).await;
+
+    let mut dashboard_socket = server.connect_dashboard_socket(Some(&token)).await;
+    let mut device = server.attach_test_device("device-1").await;
+
+    let failed = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-1",
+                "tool": "echo",
+                "args": ["bad"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+    let failed_job_id = failed["job_id"].as_str().unwrap().to_string();
+    let _ = device.recv_job_request().await;
+    device.send_finished(&failed_job_id, 1, "boom").await;
+
+    let cancelled = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-1",
+                "tool": "sleep",
+                "args": ["60"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+    let cancelled_job_id = cancelled["job_id"].as_str().unwrap().to_string();
+    let _ = device.recv_job_request().await;
+    let response = server
+        .post(
+            &format!("/api/jobs/{cancelled_job_id}/cancel"),
+            "service-test-token",
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let _ = device.recv_cancel_request().await;
+    device.send_finished(&cancelled_job_id, -1, "cancelled").await;
+
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = tokio::time::timeout(remaining, dashboard_socket.next())
+            .await
+            .expect("dashboard websocket should yield event")
+            .expect("dashboard websocket should stay open")
+            .expect("dashboard websocket should not error");
+
+        if let Message::Text(text) = message {
+            let payload: Value = serde_json::from_str(text.as_str()).unwrap();
+            if let Some(event) = payload["event"].as_str() {
+                events.push(event.to_string());
+            }
+        }
+
+        if events.iter().any(|event| event == "job.failed")
+            && events.iter().any(|event| event == "job.cancelled")
+        {
+            break;
+        }
+    }
+
+    assert!(events.iter().any(|event| event == "job.failed"));
+    assert!(events.iter().any(|event| event == "job.cancelled"));
 }

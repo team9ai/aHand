@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { DeviceStatusBadge } from "@/components/device-status-badge";
-import { getDevice, getJobs } from "@/lib/api";
+import { getDevice, getJobs, withDashboardSession } from "@/lib/api";
 
 type DeviceDetailPageProps = {
   params: Promise<{ id: string }>;
@@ -8,7 +8,9 @@ type DeviceDetailPageProps = {
 
 export default async function DeviceDetailPage({ params }: DeviceDetailPageProps) {
   const { id } = await params;
-  const [device, jobs] = await Promise.all([getDevice(id), getJobs({ deviceId: id })]);
+  const [device, jobs] = await withDashboardSession(() =>
+    Promise.all([getDevice(id), getJobs({ deviceId: id })]),
+  );
 
   if (!device) {
     return (

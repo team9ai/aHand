@@ -45,6 +45,17 @@ pub struct CreateJobResponse {
     pub status: String,
 }
 
+#[derive(Serialize)]
+pub struct DashboardJobResponse {
+    pub id: String,
+    pub device_id: String,
+    pub tool: String,
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    pub timeout_ms: u64,
+    pub status: String,
+}
+
 pub struct JobRuntime {
     dispatcher: Arc<JobDispatcher>,
     jobs: Arc<dyn JobStore>,
@@ -284,7 +295,7 @@ pub async fn list_jobs(
     auth: AuthContextExt,
     State(state): State<AppState>,
     Query(query): Query<JobListQuery>,
-) -> Result<Json<Vec<Job>>, StatusCode> {
+) -> Result<Json<Vec<DashboardJobResponse>>, StatusCode> {
     auth.require_read_jobs()?;
     let filter = JobFilter {
         device_id: query.device_id,
@@ -295,14 +306,14 @@ pub async fn list_jobs(
         .list(filter)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(jobs))
+    Ok(Json(jobs.into_iter().map(DashboardJobResponse::from).collect()))
 }
 
 pub async fn get_job(
     auth: AuthContextExt,
     State(state): State<AppState>,
     Path(job_id): Path<String>,
-) -> Result<Json<Job>, StatusCode> {
+) -> Result<Json<DashboardJobResponse>, StatusCode> {
     auth.require_read_jobs()?;
     let job = state
         .jobs_store
@@ -310,7 +321,7 @@ pub async fn get_job(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(job))
+    Ok(Json(DashboardJobResponse::from(job)))
 }
 
 pub async fn cancel_job(
@@ -395,6 +406,20 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+impl From<Job> for DashboardJobResponse {
+    fn from(job: Job) -> Self {
+        Self {
+            id: job.id.to_string(),
+            device_id: job.device_id,
+            tool: job.tool,
+            args: job.args,
+            cwd: job.cwd,
+            timeout_ms: job.timeout_ms,
+            status: job_status_name(job.status).into(),
+        }
+    }
 }
 
 #[cfg(test)]

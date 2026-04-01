@@ -1,4 +1,4 @@
-import { getAuditLogs } from "@/lib/api";
+import { getAuditLogs, withDashboardSession } from "@/lib/api";
 
 type AuditLogsPageProps = {
   searchParams: Promise<{
@@ -11,13 +11,15 @@ type AuditLogsPageProps = {
 
 export default async function AuditLogsPage({ searchParams }: AuditLogsPageProps) {
   const filters = await searchParams;
-  const auditLogs = await getAuditLogs({
-    action: filters.action?.trim() || undefined,
-    resource: filters.resource?.trim() || undefined,
-    since: filters.since?.trim() || undefined,
-    until: filters.until?.trim() || undefined,
-    limit: 100,
-  });
+  const auditLogs = await withDashboardSession(() =>
+    getAuditLogs({
+      action: filters.action?.trim() || undefined,
+      resource: filters.resource?.trim() || undefined,
+      since: filters.since?.trim() || undefined,
+      until: filters.until?.trim() || undefined,
+      limit: 100,
+    }),
+  );
 
   return (
     <section className="dashboard-stack">

@@ -35,12 +35,6 @@ export async function POST(request: NextRequest) {
       sameSite: "lax",
       secure: process.env.NODE_ENV === "production",
     });
-    next.cookies.set("ahand_hub_ws_token", payload.token, {
-      httpOnly: false,
-      path: "/",
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-    });
   }
 
   return next;

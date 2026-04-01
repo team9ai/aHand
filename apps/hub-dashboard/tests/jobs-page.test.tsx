@@ -6,11 +6,16 @@ import { JobOutputViewer } from "@/components/job-output-viewer";
 import { useJobOutput } from "@/hooks/use-job-output";
 import { getAuditLogs, getJob, getJobs } from "@/lib/api";
 
-vi.mock("@/lib/api", () => ({
-  getJobs: vi.fn(),
-  getJob: vi.fn(),
-  getAuditLogs: vi.fn(),
-}));
+vi.mock("@/lib/api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/api")>();
+  return {
+    ...actual,
+    getJobs: vi.fn(),
+    getJob: vi.fn(),
+    getAuditLogs: vi.fn(),
+    withDashboardSession: actual.withDashboardSession,
+  };
+});
 
 vi.mock("@/hooks/use-job-output", () => ({
   useJobOutput: vi.fn(),
@@ -29,10 +34,8 @@ describe("jobs surfaces", () => {
         tool: "echo",
         args: ["hello"],
         cwd: null,
-        env: {},
         timeout_ms: 30_000,
-        status: "Running",
-        requested_by: "operator",
+        status: "running",
       },
       {
         id: "job-2",
@@ -40,10 +43,8 @@ describe("jobs surfaces", () => {
         tool: "sleep",
         args: ["30"],
         cwd: null,
-        env: {},
         timeout_ms: 30_000,
-        status: "Finished",
-        requested_by: "operator",
+        status: "finished",
       },
     ]);
 
@@ -73,10 +74,8 @@ describe("jobs surfaces", () => {
       tool: "echo",
       args: ["hello"],
       cwd: "/tmp",
-      env: {},
       timeout_ms: 30_000,
-      status: "Finished",
-      requested_by: "operator",
+      status: "finished",
     });
     vi.mocked(getAuditLogs).mockResolvedValue([
       {

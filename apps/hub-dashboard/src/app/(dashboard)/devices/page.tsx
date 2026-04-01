@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { DeviceStatusBadge } from "@/components/device-status-badge";
-import { getDevices } from "@/lib/api";
+import { getDevices, withDashboardSession } from "@/lib/api";
 
 type DevicesPageProps = {
   searchParams: Promise<{
@@ -10,7 +10,9 @@ type DevicesPageProps = {
 };
 
 export default async function DevicesPage({ searchParams }: DevicesPageProps) {
-  const [{ status, q }, devices] = await Promise.all([searchParams, getDevices()]);
+  const [{ status, q }, devices] = await withDashboardSession(() =>
+    Promise.all([searchParams, getDevices()]),
+  );
   const normalizedQuery = q?.trim().toLowerCase() ?? "";
   const filteredDevices = devices.filter((device) => {
     const matchesStatus =

@@ -9,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::MaybeTlsStream;
 
 use ahand_protocol::{
@@ -90,6 +91,22 @@ impl TestServer {
             device_id: device_id.into(),
             socket,
         }
+    }
+
+    pub async fn connect_dashboard_socket(
+        &self,
+        session_token: Option<&str>,
+    ) -> tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
+        let mut request = self.ws_url("/ws/dashboard").into_client_request().unwrap();
+        if let Some(token) = session_token {
+            request.headers_mut().append(
+                "cookie",
+                format!("ahand_hub_session={token}").parse().unwrap(),
+            );
+        }
+
+        let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
     }
 
     pub async fn attach_bootstrap_device(&self, device_id: &str, token: &str) -> TestDevice {

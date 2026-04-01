@@ -1,4 +1,5 @@
 import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
 
 export type DashboardStats = {
   online_devices: number;
@@ -23,10 +24,8 @@ export type JobRecord = {
   tool: string;
   args: string[];
   cwd: string | null;
-  env: Record<string, string>;
   timeout_ms: number;
   status: string;
-  requested_by: string;
 };
 
 export type AuditLogRecord = {
@@ -76,6 +75,17 @@ export async function apiGet<T>(path: string): Promise<T> {
   }
 
   return (await response.json()) as T;
+}
+
+export async function withDashboardSession<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (isDashboardAuthError(error)) {
+      redirect("/login");
+    }
+    throw error;
+  }
 }
 
 export async function getDashboardStats() {
@@ -149,4 +159,8 @@ async function readSessionToken() {
 
 function buildHubUrl(baseUrl: string, path: string) {
   return new URL(path, `${baseUrl.replace(/\/?$/, "/")}`).toString();
+}
+
+function isDashboardAuthError(error: unknown) {
+  return error instanceof Error && (error.message === "unauthorized" || error.message === "api_401" || error.message === "api_403");
 }

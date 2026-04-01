@@ -51,11 +51,14 @@ export function useJobOutput(jobId: string): UseJobOutputResult {
       setStatus("complete");
       source.close();
     });
+    source.onopen = () => {
+      setStatus("streaming");
+      setError(null);
+    };
 
     source.onerror = () => {
       setStatus((current) => (current === "complete" ? current : "error"));
       setError("Live output connection lost.");
-      source.close();
     };
 
     return () => {

@@ -1,10 +1,9 @@
-import { getAuditLogs, getDashboardStats } from "@/lib/api";
+import { getAuditLogs, getDashboardStats, withDashboardSession } from "@/lib/api";
 
 export default async function DashboardHomePage() {
-  const [stats, activity] = await Promise.all([
-    getDashboardStats(),
-    getAuditLogs({ limit: 6 }),
-  ]);
+  const [stats, activity] = await withDashboardSession(() =>
+    Promise.all([getDashboardStats(), getAuditLogs({ limit: 6 })]),
+  );
 
   return (
     <section className="dashboard-stack">
