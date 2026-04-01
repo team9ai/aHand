@@ -1,8 +1,0 @@
-{
-  "/_global-error/page": "/_global-error",
-  "/_not-found/page": "/_not-found",
-  "/api/auth/login/route": "/api/auth/login",
-  "/api/auth/logout/route": "/api/auth/logout",
-  "/api/proxy/[...path]/route": "/api/proxy/[...path]",
-  "/login/page": "/login"
-}
