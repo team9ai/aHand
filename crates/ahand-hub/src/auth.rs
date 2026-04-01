@@ -1,12 +1,20 @@
 use ahand_hub_core::auth::{AuthContext, Role};
 use ahand_hub_core::{HubError, Result as HubResult};
-use ahand_protocol::{Hello, hello};
+use ahand_protocol::{hello, Hello};
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header::AUTHORIZATION};
+use axum::http::{header::AUTHORIZATION, StatusCode};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::state::AppState;
+
+#[derive(Debug, Clone)]
+pub struct VerifiedDeviceHello {
+    pub public_key: Vec<u8>,
+    pub signed_at_ms: u64,
+    pub auth_method: &'static str,
+    pub allow_registration: bool,
+}
 
 pub struct AuthContextExt(pub AuthContext);
 
@@ -72,37 +80,89 @@ pub fn verify_device_hello(
     device_id: &str,
     hello: &Hello,
     bootstrap_token: &str,
-) -> HubResult<()> {
+    bootstrap_device_id: &str,
+    max_age_ms: u64,
+) -> HubResult<VerifiedDeviceHello> {
     let Some(auth) = hello.auth.as_ref() else {
         return Err(HubError::Unauthorized);
     };
 
     match auth {
         hello::Auth::Ed25519(auth) => {
-            let public_key: [u8; 32] = auth
-                .public_key
-                .clone()
-                .try_into()
-                .map_err(|_| HubError::InvalidSignature)?;
-            let signature: [u8; 64] = auth
-                .signature
-                .clone()
-                .try_into()
-                .map_err(|_| HubError::InvalidSignature)?;
-            let verifying_key =
-                VerifyingKey::from_bytes(&public_key).map_err(|_| HubError::InvalidSignature)?;
-            let signature = Signature::from_bytes(&signature);
-            let payload = format!("ahand-hub|{device_id}|{}", auth.signed_at_ms);
-            verifying_key
-                .verify(payload.as_bytes(), &signature)
-                .map_err(|_| HubError::InvalidSignature)
+            let public_key = verify_signed_auth(
+                device_id,
+                &auth.public_key,
+                &auth.signature,
+                auth.signed_at_ms,
+                max_age_ms,
+            )?;
+            Ok(VerifiedDeviceHello {
+                public_key,
+                signed_at_ms: auth.signed_at_ms,
+                auth_method: "ed25519",
+                allow_registration: false,
+            })
         }
-        hello::Auth::BearerToken(token) => {
-            if token == bootstrap_token {
-                Ok(())
-            } else {
+        hello::Auth::Bootstrap(auth) => {
+            if auth.bearer_token != bootstrap_token || device_id != bootstrap_device_id {
                 Err(HubError::Unauthorized)
+            } else {
+                let public_key = verify_signed_auth(
+                    device_id,
+                    &auth.public_key,
+                    &auth.signature,
+                    auth.signed_at_ms,
+                    max_age_ms,
+                )?;
+                Ok(VerifiedDeviceHello {
+                    public_key,
+                    signed_at_ms: auth.signed_at_ms,
+                    auth_method: "bootstrap",
+                    allow_registration: true,
+                })
             }
         }
+        hello::Auth::BearerToken(_) => Err(HubError::Unauthorized),
     }
+}
+
+fn verify_signed_auth(
+    device_id: &str,
+    public_key: &[u8],
+    signature: &[u8],
+    signed_at_ms: u64,
+    max_age_ms: u64,
+) -> HubResult<Vec<u8>> {
+    validate_signed_at_ms(signed_at_ms, max_age_ms)?;
+
+    let public_key: [u8; 32] = public_key
+        .try_into()
+        .map_err(|_| HubError::InvalidSignature)?;
+    let signature: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| HubError::InvalidSignature)?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&public_key).map_err(|_| HubError::InvalidSignature)?;
+    let signature = Signature::from_bytes(&signature);
+    let payload = format!("ahand-hub|{device_id}|{signed_at_ms}");
+    verifying_key
+        .verify(payload.as_bytes(), &signature)
+        .map_err(|_| HubError::InvalidSignature)?;
+
+    Ok(public_key.to_vec())
+}
+
+fn validate_signed_at_ms(signed_at_ms: u64, max_age_ms: u64) -> HubResult<()> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| HubError::Unauthorized)?
+        .as_millis() as u64;
+
+    if now_ms.saturating_sub(signed_at_ms) > max_age_ms
+        || signed_at_ms > now_ms.saturating_add(max_age_ms)
+    {
+        return Err(HubError::Unauthorized);
+    }
+
+    Ok(())
 }

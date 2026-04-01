@@ -43,3 +43,30 @@ async fn build_hello_envelope_includes_ed25519_auth() {
         other => panic!("unexpected auth payload: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn build_hello_envelope_includes_bootstrap_auth() {
+    let identity = DeviceIdentity::generate_for_tests();
+    let hello = ahandd::ahand_client::build_hello_envelope(
+        "device-2",
+        &identity,
+        7,
+        false,
+        Some("bootstrap-token".into()),
+    );
+
+    let payload = match hello.payload.unwrap() {
+        ahand_protocol::envelope::Payload::Hello(hello) => hello,
+        other => panic!("unexpected payload: {other:?}"),
+    };
+
+    match payload.auth.unwrap() {
+        hello::Auth::Bootstrap(auth) => {
+            assert_eq!(auth.bearer_token, "bootstrap-token");
+            assert_eq!(auth.public_key.len(), 32);
+            assert_eq!(auth.signature.len(), 64);
+            assert!(auth.signed_at_ms > 0);
+        }
+        other => panic!("unexpected auth payload: {other:?}"),
+    }
+}

@@ -1,4 +1,4 @@
-use ahand_protocol::{hello, Ed25519Auth, Envelope, Hello};
+use ahand_protocol::{hello, BootstrapAuth, Ed25519Auth, Envelope, Hello};
 use prost::Message;
 
 #[test]
@@ -66,6 +66,46 @@ fn hello_bearer_token_roundtrip() {
     match hello.auth.unwrap() {
         hello::Auth::BearerToken(token) => {
             assert_eq!(token, "token-123");
+        }
+        other => panic!("unexpected auth payload: {other:?}"),
+    }
+}
+
+#[test]
+fn hello_bootstrap_auth_roundtrip() {
+    let envelope = Envelope {
+        device_id: "dev-456".into(),
+        msg_id: "hello-3".into(),
+        ts_ms: 1_717_000_000_002,
+        payload: Some(ahand_protocol::envelope::Payload::Hello(Hello {
+            version: "0.1.2".into(),
+            hostname: "mbp".into(),
+            os: "macos".into(),
+            capabilities: vec!["exec".into()],
+            last_ack: 9,
+            auth: Some(hello::Auth::Bootstrap(BootstrapAuth {
+                bearer_token: "token-456".into(),
+                public_key: vec![3; 32],
+                signature: vec![4; 64],
+                signed_at_ms: 1_717_000_000_002,
+            })),
+        })),
+        ..Default::default()
+    };
+
+    let encoded = envelope.encode_to_vec();
+    let decoded = Envelope::decode(encoded.as_slice()).unwrap();
+    let hello = match decoded.payload.unwrap() {
+        ahand_protocol::envelope::Payload::Hello(hello) => hello,
+        other => panic!("unexpected payload: {other:?}"),
+    };
+
+    match hello.auth.unwrap() {
+        hello::Auth::Bootstrap(auth) => {
+            assert_eq!(auth.bearer_token, "token-456");
+            assert_eq!(auth.public_key.len(), 32);
+            assert_eq!(auth.signature.len(), 64);
+            assert_eq!(auth.signed_at_ms, 1_717_000_000_002);
         }
         other => panic!("unexpected auth payload: {other:?}"),
     }

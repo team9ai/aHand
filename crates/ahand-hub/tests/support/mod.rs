@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{Request, header::AUTHORIZATION};
+use axum::http::{header::AUTHORIZATION, Request};
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -11,7 +11,10 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::MaybeTlsStream;
 
-use ahand_protocol::{Ed25519Auth, Envelope, Hello, JobFinished, JobRequest, JobEvent, envelope, hello, job_event};
+use ahand_protocol::{
+    envelope, hello, job_event, BootstrapAuth, Ed25519Auth, Envelope, Hello, JobEvent, JobFinished,
+    JobRequest,
+};
 
 pub fn service_request(uri: &str) -> Request<Body> {
     Request::builder()
@@ -183,8 +186,18 @@ pub async fn spawn_test_server() -> TestServer {
 }
 
 pub fn signed_hello(device_id: &str) -> Envelope {
-    let signed_at_ms = 1_717_000_000_000;
-    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    signed_hello_with_key_at(device_id, &SigningKey::from_bytes(&[7u8; 32]), now_ms())
+}
+
+pub fn signed_hello_at(device_id: &str, signed_at_ms: u64) -> Envelope {
+    signed_hello_with_key_at(device_id, &SigningKey::from_bytes(&[7u8; 32]), signed_at_ms)
+}
+
+pub fn signed_hello_with_key_at(
+    device_id: &str,
+    signing_key: &SigningKey,
+    signed_at_ms: u64,
+) -> Envelope {
     let signature = signing_key
         .sign(format!("ahand-hub|{device_id}|{signed_at_ms}").as_bytes())
         .to_bytes()
@@ -210,18 +223,30 @@ pub fn signed_hello(device_id: &str) -> Envelope {
     }
 }
 
-pub fn bearer_hello(device_id: &str, token: &str) -> Envelope {
+pub fn bootstrap_hello(device_id: &str, token: &str) -> Envelope {
+    let signed_at_ms = now_ms();
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let signature = signing_key
+        .sign(format!("ahand-hub|{device_id}|{signed_at_ms}").as_bytes())
+        .to_bytes()
+        .to_vec();
+
     Envelope {
         device_id: device_id.into(),
-        msg_id: "hello-bearer-1".into(),
-        ts_ms: 1_717_000_000_000,
+        msg_id: "hello-bootstrap-1".into(),
+        ts_ms: signed_at_ms,
         payload: Some(envelope::Payload::Hello(Hello {
             version: "0.1.2".into(),
             hostname: "bootstrap-box".into(),
             os: "linux".into(),
             capabilities: vec!["exec".into()],
             last_ack: 0,
-            auth: Some(hello::Auth::BearerToken(token.into())),
+            auth: Some(hello::Auth::Bootstrap(BootstrapAuth {
+                bearer_token: token.into(),
+                public_key: signing_key.verifying_key().to_bytes().to_vec(),
+                signature,
+                signed_at_ms,
+            })),
         })),
         ..Default::default()
     }

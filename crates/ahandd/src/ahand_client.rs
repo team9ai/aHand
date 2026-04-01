@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ahand_protocol::{BrowserResponse, Envelope, Hello, JobFinished, JobRejected, envelope, hello};
+use ahand_protocol::{envelope, hello, BrowserResponse, Envelope, Hello, JobFinished, JobRejected};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::{broadcast, mpsc};
@@ -12,7 +12,7 @@ use crate::browser::BrowserManager;
 use crate::config::Config;
 use crate::device_identity::DeviceIdentity;
 use crate::executor;
-use crate::outbox::{Outbox, prepare_outbound};
+use crate::outbox::{prepare_outbound, Outbox};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::{Direction, RunStore};
@@ -255,7 +255,12 @@ pub fn build_hello_envelope(
     }
 
     let auth = if let Some(token) = bearer_token {
-        Some(hello::Auth::BearerToken(token))
+        Some(hello::Auth::Bootstrap(ahand_protocol::BootstrapAuth {
+            bearer_token: token,
+            public_key: identity.public_key_bytes(),
+            signature: identity.sign_hello(device_id, signed_at_ms),
+            signed_at_ms,
+        }))
     } else {
         Some(hello::Auth::Ed25519(ahand_protocol::Ed25519Auth {
             public_key: identity.public_key_bytes(),

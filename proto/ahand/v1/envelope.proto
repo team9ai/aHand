@@ -44,6 +44,7 @@ message Hello {
   oneof auth {
     Ed25519Auth ed25519 = 6;
     string bearer_token = 7;
+    BootstrapAuth bootstrap = 8;
   }
 }
 
@@ -51,6 +52,13 @@ message Ed25519Auth {
   bytes public_key = 1;
   bytes signature = 2;
   uint64 signed_at_ms = 3;
+}
+
+message BootstrapAuth {
+  string bearer_token = 1;
+  bytes public_key = 2;
+  bytes signature = 3;
+  uint64 signed_at_ms = 4;
 }
 
 // JobRequest - cloud asks local to execute a tool.

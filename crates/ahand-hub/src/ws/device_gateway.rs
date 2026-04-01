@@ -3,8 +3,8 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::mpsc;
 
-use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
 use axum::response::Response;
 
 use crate::state::AppState;
@@ -37,10 +37,7 @@ impl ConnectionRegistry {
     }
 }
 
-pub async fn handle_device_socket(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
+pub async fn handle_device_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| async move {
         if let Err(err) = run_device_socket(socket, state).await {
             tracing::warn!(error = %err, "device socket ended with error");
@@ -60,12 +57,16 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         _ => anyhow::bail!("expected hello envelope"),
     };
 
-    crate::auth::verify_device_hello(
+    let verified = crate::auth::verify_device_hello(
         &envelope.device_id,
         &hello,
         state.device_bootstrap_token.as_str(),
+        state.device_bootstrap_device_id.as_str(),
+        state.device_hello_max_age_ms,
     )?;
-    state.devices.upsert_from_hello(&envelope.device_id, &hello)?;
+    state
+        .devices
+        .accept_verified_hello(&envelope.device_id, &hello, &verified)?;
     state
         .events
         .emit_device_online(&envelope.device_id, &hello.hostname)
