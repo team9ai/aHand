@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub bind_addr: String,
     pub service_token: String,
+    pub device_bootstrap_token: String,
     pub jwt_secret: String,
 }
 
@@ -17,6 +18,9 @@ impl Config {
         if let Ok(value) = std::env::var("AHAND_HUB_SERVICE_TOKEN") {
             config.service_token = value;
         }
+        if let Ok(value) = std::env::var("AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN") {
+            config.device_bootstrap_token = value;
+        }
         if let Ok(value) = std::env::var("AHAND_HUB_JWT_SECRET") {
             config.jwt_secret = value;
         }
@@ -28,6 +32,7 @@ impl Config {
         Self {
             bind_addr: "127.0.0.1:0".into(),
             service_token: "service-test-token".into(),
+            device_bootstrap_token: "bootstrap-test-token".into(),
             jwt_secret: "service-test-secret".into(),
         }
     }
@@ -38,6 +43,7 @@ impl Default for Config {
         Self {
             bind_addr: "127.0.0.1:8080".into(),
             service_token: "service-test-token".into(),
+            device_bootstrap_token: "bootstrap-test-token".into(),
             jwt_secret: "service-test-secret".into(),
         }
     }

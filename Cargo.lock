@@ -16,15 +16,24 @@ dependencies = [
  "ahand-hub-store",
  "ahand-protocol",
  "anyhow",
+ "async-stream",
+ "async-trait",
  "axum",
  "chrono",
+ "dashmap",
+ "ed25519-dalek",
+ "futures-util",
+ "prost",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.28.0",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -225,6 +234,28 @@ dependencies = [
  "blake2",
  "cpufeatures",
  "password-hash",
+]
+
+[[package]]
+name = "async-stream"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

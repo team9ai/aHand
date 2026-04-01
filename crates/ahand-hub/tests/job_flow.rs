@@ -1,0 +1,35 @@
+mod support;
+
+use support::spawn_test_server;
+
+#[tokio::test]
+async fn job_api_streams_stdout_and_completion_over_sse() {
+    let server = spawn_test_server().await;
+    let mut device = server.attach_test_device("device-1").await;
+
+    let created = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-1",
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+
+    let job_id = created["job_id"].as_str().unwrap().to_string();
+    let request = device.recv_job_request().await;
+    assert_eq!(request.tool, "echo");
+
+    device.send_stdout(&job_id, b"hello\n").await;
+    device.send_finished(&job_id, 0, "").await;
+
+    let body = server
+        .read_sse(&format!("/api/jobs/{job_id}/output"), "service-test-token")
+        .await;
+    assert!(body.contains("event: stdout"));
+    assert!(body.contains("event: finished"));
+}
