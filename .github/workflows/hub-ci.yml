@@ -74,6 +74,11 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -83,6 +88,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --all-targets
+
+      - name: Check coverage
+        run: cargo llvm-cov --summary-only -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --fail-under-lines 85
 
   compose:
     runs-on: ubuntu-latest

@@ -7,7 +7,7 @@ FROM rust:${RUST_VERSION} AS hub-build
 WORKDIR /repo
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libssl-dev pkg-config protobuf-compiler \
+    && apt-get install -y --no-install-recommends ca-certificates libssl-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock Cross.toml ./
@@ -62,4 +62,3 @@ WORKDIR /app/apps/hub-dashboard
 EXPOSE 3100
 
 CMD ["pnpm", "start"]
-
