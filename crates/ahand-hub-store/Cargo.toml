@@ -1,0 +1,20 @@
+[package]
+name = "ahand-hub-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ahand-hub-core = { path = "../ahand-hub-core" }
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+testcontainers.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
