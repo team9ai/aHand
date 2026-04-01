@@ -1,68 +1,125 @@
-use anyhow::Context;
-use testcontainers::core::{IntoContainerPort, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, bail};
 
 pub struct TestStack {
-    pub devices: ahand_hub_store::device_store::PgDeviceStore,
-    pub jobs: ahand_hub_store::job_store::PgJobStore,
-    pub audit: ahand_hub_store::audit_store::PgAuditStore,
-    pub presence: ahand_hub_store::presence_store::RedisPresenceStore,
-    _postgres: ContainerAsync<GenericImage>,
-    _redis: ContainerAsync<GenericImage>,
+    pub devices: crate::device_store::PgDeviceStore,
+    pub jobs: crate::job_store::PgJobStore,
+    pub audit: crate::audit_store::PgAuditStore,
+    pub presence: crate::presence_store::RedisPresenceStore,
+    postgres_container_id: String,
+    redis_container_id: String,
 }
 
 impl TestStack {
     pub async fn start() -> anyhow::Result<Self> {
-        let postgres = GenericImage::new("postgres", "17-alpine")
-            .with_exposed_port(5432.tcp())
-            .with_wait_for(WaitFor::message_on_stderr(
-                "database system is ready to accept connections",
-            ))
-            .with_env_var("POSTGRES_USER", "postgres")
-            .with_env_var("POSTGRES_PASSWORD", "postgres")
-            .with_env_var("POSTGRES_DB", "ahand_hub_test")
-            .start()
-            .await
-            .context("start postgres test container (docker daemon required)")?;
-        let postgres_host = postgres.get_host().await.context("resolve postgres host")?;
-        let postgres_port = postgres
-            .get_host_port_ipv4(5432.tcp())
-            .await
+        let postgres_container_id = docker([
+            "run",
+            "-d",
+            "-e",
+            "POSTGRES_USER=postgres",
+            "-e",
+            "POSTGRES_PASSWORD=postgres",
+            "-e",
+            "POSTGRES_DB=ahand_hub_test",
+            "-p",
+            "0:5432",
+            "postgres:17-alpine",
+        ])
+        .context("start postgres test container (docker daemon required)")?;
+        wait_for_container_log(
+            &postgres_container_id,
+            "database system is ready to accept connections",
+        )
+        .context("wait for postgres readiness")?;
+        let postgres_port = docker_host_port(&postgres_container_id, "5432/tcp")
             .context("resolve postgres port")?;
         let database_url =
-            format!("postgres://postgres:postgres@{postgres_host}:{postgres_port}/ahand_hub_test");
-        // This test harness controls the container lifecycle, so it also seeds
-        // the process-level connection URLs expected by the public helpers.
+            format!("postgres://postgres:postgres@127.0.0.1:{postgres_port}/ahand_hub_test");
         unsafe {
             std::env::set_var("AHAND_HUB_TEST_DATABASE_URL", &database_url);
         }
-        let postgres_pool = ahand_hub_store::postgres::connect_test_database().await;
+        let postgres_pool = crate::postgres::connect_test_database().await;
 
-        let redis = GenericImage::new("redis", "7-alpine")
-            .with_exposed_port(6379.tcp())
-            .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
-            .start()
-            .await
+        let redis_container_id = docker(["run", "-d", "-p", "0:6379", "redis:7-alpine"])
             .context("start redis test container (docker daemon required)")?;
-        let redis_host = redis.get_host().await.context("resolve redis host")?;
-        let redis_port = redis
-            .get_host_port_ipv4(6379.tcp())
-            .await
-            .context("resolve redis port")?;
-        let redis_url = format!("redis://{redis_host}:{redis_port}");
+        wait_for_container_log(&redis_container_id, "Ready to accept connections")
+            .context("wait for redis readiness")?;
+        let redis_port =
+            docker_host_port(&redis_container_id, "6379/tcp").context("resolve redis port")?;
+        let redis_url = format!("redis://127.0.0.1:{redis_port}");
         unsafe {
             std::env::set_var("AHAND_HUB_TEST_REDIS_URL", &redis_url);
         }
-        let redis_connection = ahand_hub_store::redis::connect_test_redis().await;
+        let redis_connection = crate::redis::connect_test_redis().await;
 
         Ok(Self {
-            devices: ahand_hub_store::device_store::PgDeviceStore::new(postgres_pool.clone()),
-            jobs: ahand_hub_store::job_store::PgJobStore::new(postgres_pool.clone()),
-            audit: ahand_hub_store::audit_store::PgAuditStore::new(postgres_pool),
-            presence: ahand_hub_store::presence_store::RedisPresenceStore::new(redis_connection),
-            _postgres: postgres,
-            _redis: redis,
+            devices: crate::device_store::PgDeviceStore::new(postgres_pool.clone()),
+            jobs: crate::job_store::PgJobStore::new(postgres_pool.clone()),
+            audit: crate::audit_store::PgAuditStore::new(postgres_pool),
+            presence: crate::presence_store::RedisPresenceStore::new(redis_connection),
+            postgres_container_id,
+            redis_container_id,
         })
     }
+}
+
+impl Drop for TestStack {
+    fn drop(&mut self) {
+        let _ = docker([
+            "rm",
+            "-f",
+            &self.postgres_container_id,
+            &self.redis_container_id,
+        ]);
+    }
+}
+
+fn docker<const N: usize>(args: [&str; N]) -> anyhow::Result<String> {
+    let output = Command::new("docker")
+        .args(args)
+        .output()
+        .context("run docker command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(stderr.trim().to_owned());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn wait_for_container_log(container_id: &str, needle: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    while Instant::now() < deadline {
+        let output = Command::new("docker")
+            .args(["logs", container_id])
+            .output()
+            .context("read container logs")?;
+
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if combined.contains(needle) {
+            return Ok(());
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    bail!("timed out waiting for log line: {needle}");
+}
+
+fn docker_host_port(container_id: &str, port: &str) -> anyhow::Result<u16> {
+    let mapping = docker(["port", container_id, port])?;
+    let port = mapping
+        .trim()
+        .rsplit(':')
+        .next()
+        .context("parse docker port output")?;
+    port.parse::<u16>().context("parse host port as u16")
 }

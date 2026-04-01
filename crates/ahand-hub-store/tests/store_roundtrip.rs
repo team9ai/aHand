@@ -4,11 +4,7 @@ use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
-
-#[path = "../src/test_support.rs"]
-mod test_support;
-
-use test_support::TestStack;
+use ahand_hub_store::test_support::TestStack;
 
 #[tokio::test]
 async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<()> {
