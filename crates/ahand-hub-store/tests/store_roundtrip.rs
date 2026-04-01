@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ahand_hub_core::audit::{AuditEntry, AuditFilter};
+use ahand_hub_core::audit::AuditFilter;
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
@@ -69,23 +69,11 @@ async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].id, created_job.id);
 
-    stack
-        .audit
-        .append(&[AuditEntry {
-            timestamp: chrono::Utc::now(),
-            action: "job.created".into(),
-            resource_type: "job".into(),
-            resource_id: jobs[0].id.to_string(),
-            actor: "service:test".into(),
-            detail: serde_json::json!({ "tool": "git" }),
-            source_ip: None,
-        }])
-        .await?;
     let audit_entries = stack
         .audit
         .query(AuditFilter {
             resource_type: Some("job".into()),
-            resource_id: Some(jobs[0].id.to_string()),
+            resource_id: Some(created_job.id.to_string()),
             action: Some("job.created".into()),
         })
         .await?;

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+doctest = false
+
 [dependencies]
 ahand-hub-core = { path = "../ahand-hub-core" }
 anyhow.workspace = true

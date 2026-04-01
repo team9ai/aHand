@@ -25,7 +25,7 @@ impl TestStack {
             "POSTGRES_DB=ahand_hub_test",
             "-p",
             "0:5432",
-            "postgres:17-alpine",
+            "postgres:16-alpine",
         ])
         .context("start postgres test container (docker daemon required)")?;
         wait_for_container_log(
