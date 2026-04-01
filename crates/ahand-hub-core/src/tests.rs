@@ -9,9 +9,10 @@ pub struct FakeStores {
 }
 
 pub mod fakes {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use dashmap::DashMap;
 
     use crate::audit::{AuditEntry, AuditFilter};
     use crate::device::{Device, NewDevice};
@@ -49,38 +50,98 @@ pub mod fakes {
     }
 
     #[derive(Default)]
-    struct MemoryJobStore;
+    struct MemoryJobStore {
+        jobs: DashMap<String, Job>,
+    }
 
     #[async_trait]
     impl JobStore for MemoryJobStore {
-        async fn insert(&self, _job: NewJob) -> Result<Job> {
-            Err(HubError::Internal("not needed in this test".into()))
+        async fn insert(&self, job: NewJob) -> Result<Job> {
+            let job = Job {
+                id: uuid::Uuid::new_v4(),
+                device_id: job.device_id,
+                tool: job.tool,
+                args: job.args,
+                cwd: job.cwd,
+                env: job.env,
+                timeout_ms: job.timeout_ms,
+                status: JobStatus::Pending,
+                requested_by: job.requested_by,
+            };
+            self.jobs.insert(job.id.to_string(), job.clone());
+            Ok(job)
         }
 
-        async fn get(&self, _job_id: &str) -> Result<Option<Job>> {
-            Ok(None)
+        async fn get(&self, job_id: &str) -> Result<Option<Job>> {
+            Ok(self.jobs.get(job_id).map(|job| job.clone()))
         }
 
-        async fn list(&self, _filter: JobFilter) -> Result<Vec<Job>> {
-            Ok(vec![])
+        async fn list(&self, filter: JobFilter) -> Result<Vec<Job>> {
+            let mut jobs = self
+                .jobs
+                .iter()
+                .filter(|entry| {
+                    let job = entry.value();
+                    filter
+                        .device_id
+                        .as_ref()
+                        .is_none_or(|device_id| &job.device_id == device_id)
+                        && filter.status.is_none_or(|status| job.status == status)
+                })
+                .map(|entry| entry.value().clone())
+                .collect::<Vec<_>>();
+            jobs.sort_by_key(|job| job.id);
+            Ok(jobs)
         }
 
-        async fn update_status(&self, _job_id: &str, _status: JobStatus) -> Result<()> {
+        async fn update_status(&self, job_id: &str, status: JobStatus) -> Result<()> {
+            let mut job = self
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
+            job.status = status;
             Ok(())
         }
     }
 
     #[derive(Default)]
-    struct MemoryAuditStore;
+    struct MemoryAuditStore {
+        entries: Mutex<Vec<AuditEntry>>,
+    }
 
     #[async_trait]
     impl AuditStore for MemoryAuditStore {
-        async fn append(&self, _entries: &[AuditEntry]) -> Result<()> {
+        async fn append(&self, entries: &[AuditEntry]) -> Result<()> {
+            self.entries
+                .lock()
+                .map_err(|err| HubError::Internal(err.to_string()))?
+                .extend(entries.iter().cloned());
             Ok(())
         }
 
-        async fn query(&self, _filter: AuditFilter) -> Result<Vec<AuditEntry>> {
-            Ok(vec![])
+        async fn query(&self, filter: AuditFilter) -> Result<Vec<AuditEntry>> {
+            let entries = self
+                .entries
+                .lock()
+                .map_err(|err| HubError::Internal(err.to_string()))?;
+            Ok(entries
+                .iter()
+                .filter(|entry| {
+                    filter
+                        .resource_type
+                        .as_ref()
+                        .is_none_or(|resource_type| &entry.resource_type == resource_type)
+                        && filter
+                            .resource_id
+                            .as_ref()
+                            .is_none_or(|resource_id| &entry.resource_id == resource_id)
+                        && filter
+                            .action
+                            .as_ref()
+                            .is_none_or(|action| &entry.action == action)
+                })
+                .cloned()
+                .collect())
         }
     }
 }
