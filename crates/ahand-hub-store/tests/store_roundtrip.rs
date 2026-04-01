@@ -1,9 +1,14 @@
 use std::collections::HashMap;
 
+use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
-use ahand_hub_core::traits::{DeviceStore, JobStore};
-use ahand_hub_store::test_support::TestStack;
+use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
+
+#[path = "../src/test_support.rs"]
+mod test_support;
+
+use test_support::TestStack;
 
 #[tokio::test]
 async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<()> {
@@ -52,6 +57,28 @@ async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<
         })
         .await?;
     assert_eq!(jobs.len(), 1);
+
+    stack
+        .audit
+        .append(&[AuditEntry {
+            timestamp: chrono::Utc::now(),
+            action: "job.created".into(),
+            resource_type: "job".into(),
+            resource_id: jobs[0].id.to_string(),
+            actor: "service:test".into(),
+            detail: serde_json::json!({ "tool": "git" }),
+            source_ip: None,
+        }])
+        .await?;
+    let audit_entries = stack
+        .audit
+        .query(AuditFilter {
+            resource_type: Some("job".into()),
+            resource_id: Some(jobs[0].id.to_string()),
+            action: Some("job.created".into()),
+        })
+        .await?;
+    assert_eq!(audit_entries.len(), 1);
 
     Ok(())
 }

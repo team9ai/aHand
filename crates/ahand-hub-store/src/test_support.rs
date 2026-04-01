@@ -4,10 +4,10 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
 pub struct TestStack {
-    pub devices: crate::device_store::PgDeviceStore,
-    pub jobs: crate::job_store::PgJobStore,
-    pub audit: crate::audit_store::PgAuditStore,
-    pub presence: crate::presence_store::RedisPresenceStore,
+    pub devices: ahand_hub_store::device_store::PgDeviceStore,
+    pub jobs: ahand_hub_store::job_store::PgJobStore,
+    pub audit: ahand_hub_store::audit_store::PgAuditStore,
+    pub presence: ahand_hub_store::presence_store::RedisPresenceStore,
     _postgres: ContainerAsync<GenericImage>,
     _redis: ContainerAsync<GenericImage>,
 }
@@ -32,7 +32,12 @@ impl TestStack {
             .context("resolve postgres port")?;
         let database_url =
             format!("postgres://postgres:postgres@{postgres_host}:{postgres_port}/ahand_hub_test");
-        let postgres_pool = crate::postgres::connect_database(&database_url).await?;
+        // This test harness controls the container lifecycle, so it also seeds
+        // the process-level connection URLs expected by the public helpers.
+        unsafe {
+            std::env::set_var("AHAND_HUB_TEST_DATABASE_URL", &database_url);
+        }
+        let postgres_pool = ahand_hub_store::postgres::connect_test_database().await;
 
         let redis = GenericImage::new("redis", "7-alpine")
             .with_exposed_port(6379.tcp())
@@ -46,13 +51,16 @@ impl TestStack {
             .await
             .context("resolve redis port")?;
         let redis_url = format!("redis://{redis_host}:{redis_port}");
-        let redis_connection = crate::redis::connect_redis(&redis_url).await?;
+        unsafe {
+            std::env::set_var("AHAND_HUB_TEST_REDIS_URL", &redis_url);
+        }
+        let redis_connection = ahand_hub_store::redis::connect_test_redis().await;
 
         Ok(Self {
-            devices: crate::device_store::PgDeviceStore::new(postgres_pool.clone()),
-            jobs: crate::job_store::PgJobStore::new(postgres_pool.clone()),
-            audit: crate::audit_store::PgAuditStore::new(postgres_pool),
-            presence: crate::presence_store::RedisPresenceStore::new(redis_connection),
+            devices: ahand_hub_store::device_store::PgDeviceStore::new(postgres_pool.clone()),
+            jobs: ahand_hub_store::job_store::PgJobStore::new(postgres_pool.clone()),
+            audit: ahand_hub_store::audit_store::PgAuditStore::new(postgres_pool),
+            presence: ahand_hub_store::presence_store::RedisPresenceStore::new(redis_connection),
             _postgres: postgres,
             _redis: redis,
         })
