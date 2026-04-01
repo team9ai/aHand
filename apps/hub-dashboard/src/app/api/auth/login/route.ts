@@ -9,11 +9,21 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "invalid_json" }, { status: 400 });
   }
 
-  const response = await fetch(`${process.env.AHAND_HUB_BASE_URL}/api/auth/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const baseUrl = process.env.AHAND_HUB_BASE_URL;
+  if (!baseUrl) {
+    return NextResponse.json({ error: "hub_unavailable" }, { status: 503 });
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return NextResponse.json({ error: "hub_unavailable" }, { status: 503 });
+  }
 
   const payload = await response.json().catch(() => ({}));
   const next = NextResponse.json(payload, { status: response.status });

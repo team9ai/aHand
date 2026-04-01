@@ -121,6 +121,23 @@ describe("hub dashboard auth server flow", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("returns 503 when the hub login upstream is unavailable", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed")));
+
+    const request = new NextRequest("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "shared-secret" }),
+    });
+
+    const response = await loginPost(request);
+    const payload = await response.json();
+
+    expect(response.status).toBe(503);
+    expect(payload).toEqual({ error: "hub_unavailable" });
+    expect(response.cookies.get("ahand_hub_session")).toBeUndefined();
+  });
+
   it("redirects logout POST requests with see-other semantics", async () => {
     const response = await logoutPost();
 

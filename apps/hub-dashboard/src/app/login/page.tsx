@@ -19,9 +19,14 @@ export default function LoginPage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ password }),
       });
+      const payload = await response.json().catch(() => null);
 
       if (!response.ok) {
-        setError("Unable to sign in with that password.");
+        if (response.status === 401 || response.status === 403 || payload?.error === "invalid_credentials") {
+          setError("Unable to sign in with that password.");
+        } else {
+          setError("Unable to reach the hub right now.");
+        }
         return;
       }
 
