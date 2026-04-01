@@ -1,6 +1,7 @@
 export {
   Envelope,
   Hello,
+  Ed25519Auth,
   JobRequest,
   JobEvent,
   JobFinished,

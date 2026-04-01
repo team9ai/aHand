@@ -452,6 +452,7 @@ async fn connect_and_hello(
             os: std::env::consts::OS.to_string(),
             capabilities: vec!["ctl".to_string()],
             last_ack: 0,
+            auth: None,
         })),
         ..Default::default()
     };

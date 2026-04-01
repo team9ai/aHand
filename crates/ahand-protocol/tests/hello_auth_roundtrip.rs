@@ -38,3 +38,35 @@ fn hello_auth_roundtrip() {
         other => panic!("unexpected auth payload: {other:?}"),
     }
 }
+
+#[test]
+fn hello_bearer_token_roundtrip() {
+    let envelope = Envelope {
+        device_id: "dev-123".into(),
+        msg_id: "hello-2".into(),
+        ts_ms: 1_717_000_000_001,
+        payload: Some(ahand_protocol::envelope::Payload::Hello(Hello {
+            version: "0.1.2".into(),
+            hostname: "mbp".into(),
+            os: "macos".into(),
+            capabilities: vec!["exec".into()],
+            last_ack: 8,
+            auth: Some(hello::Auth::BearerToken("token-123".into())),
+        })),
+        ..Default::default()
+    };
+
+    let encoded = envelope.encode_to_vec();
+    let decoded = Envelope::decode(encoded.as_slice()).unwrap();
+    let hello = match decoded.payload.unwrap() {
+        ahand_protocol::envelope::Payload::Hello(hello) => hello,
+        other => panic!("unexpected payload: {other:?}"),
+    };
+
+    match hello.auth.unwrap() {
+        hello::Auth::BearerToken(token) => {
+            assert_eq!(token, "token-123");
+        }
+        other => panic!("unexpected auth payload: {other:?}"),
+    }
+}

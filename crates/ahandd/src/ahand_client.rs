@@ -100,6 +100,7 @@ async fn connect(
             os: std::env::consts::OS.to_string(),
             capabilities,
             last_ack,
+            auth: None,
         })),
         ..Default::default()
     };

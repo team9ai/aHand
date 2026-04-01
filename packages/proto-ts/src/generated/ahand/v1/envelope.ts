@@ -103,6 +103,14 @@ export interface Hello {
   capabilities: string[];
   /** on reconnect, the highest seq received from peer */
   lastAck: number;
+  ed25519?: Ed25519Auth | undefined;
+  bearerToken?: string | undefined;
+}
+
+export interface Ed25519Auth {
+  publicKey: Buffer;
+  signature: Buffer;
+  signedAtMs: number;
 }
 
 /** JobRequest - cloud asks local to execute a tool. */
@@ -763,7 +771,15 @@ export const Envelope: MessageFns<Envelope> = {
 };
 
 function createBaseHello(): Hello {
-  return { version: "", hostname: "", os: "", capabilities: [], lastAck: 0 };
+  return {
+    version: "",
+    hostname: "",
+    os: "",
+    capabilities: [],
+    lastAck: 0,
+    ed25519: undefined,
+    bearerToken: undefined,
+  };
 }
 
 export const Hello: MessageFns<Hello> = {
@@ -782,6 +798,12 @@ export const Hello: MessageFns<Hello> = {
     }
     if (message.lastAck !== 0) {
       writer.uint32(40).uint64(message.lastAck);
+    }
+    if (message.ed25519 !== undefined) {
+      Ed25519Auth.encode(message.ed25519, writer.uint32(50).fork()).join();
+    }
+    if (message.bearerToken !== undefined) {
+      writer.uint32(58).string(message.bearerToken);
     }
     return writer;
   },
@@ -833,6 +855,22 @@ export const Hello: MessageFns<Hello> = {
           message.lastAck = longToNumber(reader.uint64());
           continue;
         }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.ed25519 = Ed25519Auth.decode(reader, reader.uint32());
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.bearerToken = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -855,6 +893,12 @@ export const Hello: MessageFns<Hello> = {
         : isSet(object.last_ack)
         ? globalThis.Number(object.last_ack)
         : 0,
+      ed25519: isSet(object.ed25519) ? Ed25519Auth.fromJSON(object.ed25519) : undefined,
+      bearerToken: isSet(object.bearerToken)
+        ? globalThis.String(object.bearerToken)
+        : isSet(object.bearer_token)
+        ? globalThis.String(object.bearer_token)
+        : undefined,
     };
   },
 
@@ -875,6 +919,12 @@ export const Hello: MessageFns<Hello> = {
     if (message.lastAck !== 0) {
       obj.lastAck = Math.round(message.lastAck);
     }
+    if (message.ed25519 !== undefined) {
+      obj.ed25519 = Ed25519Auth.toJSON(message.ed25519);
+    }
+    if (message.bearerToken !== undefined) {
+      obj.bearerToken = message.bearerToken;
+    }
     return obj;
   },
 
@@ -888,6 +938,110 @@ export const Hello: MessageFns<Hello> = {
     message.os = object.os ?? "";
     message.capabilities = object.capabilities?.map((e) => e) || [];
     message.lastAck = object.lastAck ?? 0;
+    message.ed25519 = (object.ed25519 !== undefined && object.ed25519 !== null)
+      ? Ed25519Auth.fromPartial(object.ed25519)
+      : undefined;
+    message.bearerToken = object.bearerToken ?? undefined;
+    return message;
+  },
+};
+
+function createBaseEd25519Auth(): Ed25519Auth {
+  return { publicKey: Buffer.alloc(0), signature: Buffer.alloc(0), signedAtMs: 0 };
+}
+
+export const Ed25519Auth: MessageFns<Ed25519Auth> = {
+  encode(message: Ed25519Auth, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.publicKey.length !== 0) {
+      writer.uint32(10).bytes(message.publicKey);
+    }
+    if (message.signature.length !== 0) {
+      writer.uint32(18).bytes(message.signature);
+    }
+    if (message.signedAtMs !== 0) {
+      writer.uint32(24).uint64(message.signedAtMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Ed25519Auth {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseEd25519Auth();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.publicKey = Buffer.from(reader.bytes());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.signature = Buffer.from(reader.bytes());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.signedAtMs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): Ed25519Auth {
+    return {
+      publicKey: isSet(object.publicKey)
+        ? Buffer.from(bytesFromBase64(object.publicKey))
+        : isSet(object.public_key)
+        ? Buffer.from(bytesFromBase64(object.public_key))
+        : Buffer.alloc(0),
+      signature: isSet(object.signature) ? Buffer.from(bytesFromBase64(object.signature)) : Buffer.alloc(0),
+      signedAtMs: isSet(object.signedAtMs)
+        ? globalThis.Number(object.signedAtMs)
+        : isSet(object.signed_at_ms)
+        ? globalThis.Number(object.signed_at_ms)
+        : 0,
+    };
+  },
+
+  toJSON(message: Ed25519Auth): unknown {
+    const obj: any = {};
+    if (message.publicKey.length !== 0) {
+      obj.publicKey = base64FromBytes(message.publicKey);
+    }
+    if (message.signature.length !== 0) {
+      obj.signature = base64FromBytes(message.signature);
+    }
+    if (message.signedAtMs !== 0) {
+      obj.signedAtMs = Math.round(message.signedAtMs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<Ed25519Auth>): Ed25519Auth {
+    return Ed25519Auth.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<Ed25519Auth>): Ed25519Auth {
+    const message = createBaseEd25519Auth();
+    message.publicKey = object.publicKey ?? Buffer.alloc(0);
+    message.signature = object.signature ?? Buffer.alloc(0);
+    message.signedAtMs = object.signedAtMs ?? 0;
     return message;
   },
 };
