@@ -1,0 +1,59 @@
+use std::collections::VecDeque;
+
+#[derive(Debug, Clone)]
+pub struct Outbox {
+    next_seq: u64,
+    peer_ack: u64,
+    local_ack: u64,
+    buffer: VecDeque<(u64, Vec<u8>)>,
+    max_buffer: usize,
+}
+
+impl Outbox {
+    pub fn new(max_buffer: usize) -> Self {
+        Self {
+            next_seq: 1,
+            peer_ack: 0,
+            local_ack: 0,
+            buffer: VecDeque::new(),
+            max_buffer,
+        }
+    }
+
+    pub fn store_raw(&mut self, data: Vec<u8>) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.buffer.push_back((seq, data));
+        while self.buffer.len() > self.max_buffer {
+            self.buffer.pop_front();
+        }
+        seq
+    }
+
+    pub fn on_recv(&mut self, seq: u64) {
+        self.local_ack = self.local_ack.max(seq);
+    }
+
+    pub fn on_peer_ack(&mut self, ack: u64) {
+        self.peer_ack = self.peer_ack.max(ack);
+        while let Some((seq, _)) = self.buffer.front() {
+            if *seq <= self.peer_ack {
+                self.buffer.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn replay_from(&self, last_ack: u64) -> Vec<Vec<u8>> {
+        self.buffer
+            .iter()
+            .filter(|(seq, _)| *seq > last_ack)
+            .map(|(_, data)| data.clone())
+            .collect()
+    }
+
+    pub fn local_ack(&self) -> u64 {
+        self.local_ack
+    }
+}

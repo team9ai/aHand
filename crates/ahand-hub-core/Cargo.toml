@@ -1,0 +1,21 @@
+[package]
+name = "ahand-hub-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+argon2.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+jsonwebtoken.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
