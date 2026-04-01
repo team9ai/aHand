@@ -122,6 +122,29 @@
       "cache": false,
       "persistent": true
     },
+    "@ahand/hub-dashboard#build": {
+      "inputs": [
+        "src/**",
+        "package.json",
+        "next.config.ts",
+        "tsconfig.json"
+      ],
+      "outputs": [
+        ".next/**"
+      ]
+    },
+    "@ahand/hub-dashboard#dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "@ahand/hub-dashboard#test": {
+      "inputs": [
+        "src/**",
+        "tests/**",
+        "vitest.config.ts",
+        "package.json"
+      ]
+    },
     // ── Admin Panel ── standalone Solid.js SPA ───────────────────────
     "@ahand/admin#build": {
       "inputs": [
