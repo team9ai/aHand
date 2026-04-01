@@ -8,6 +8,7 @@ on:
       - "crates/ahand-hub-core/**"
       - "crates/ahand-hub-store/**"
       - "deploy/hub/**"
+      - ".dockerignore"
       - ".github/workflows/hub-ci.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -24,6 +25,7 @@ on:
       - "crates/ahand-hub-core/**"
       - "crates/ahand-hub-store/**"
       - "deploy/hub/**"
+      - ".dockerignore"
       - ".github/workflows/hub-ci.yml"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -97,4 +99,3 @@ jobs:
           AHAND_HUB_DATABASE_URL: postgres://ci:ci@postgres:5432/ahand_hub
           AHAND_HUB_REDIS_URL: redis://redis:6379
         run: docker compose -f deploy/hub/docker-compose.yml config
-
