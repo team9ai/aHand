@@ -5,14 +5,27 @@ use async_trait::async_trait;
 use sqlx::PgPool;
 use sqlx::Row;
 
+use crate::presence_store::RedisPresenceStore;
+
 #[derive(Clone)]
 pub struct PgDeviceStore {
     pool: PgPool,
+    presence: Option<RedisPresenceStore>,
 }
 
 impl PgDeviceStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            presence: None,
+        }
+    }
+
+    pub fn with_presence(pool: PgPool, presence: RedisPresenceStore) -> Self {
+        Self {
+            pool,
+            presence: Some(presence),
+        }
     }
 }
 
@@ -55,7 +68,13 @@ impl DeviceStore for PgDeviceStore {
         .await
         .map_err(|err| HubError::Internal(err.to_string()))?;
 
-        row.map(map_device).transpose()
+        match row {
+            Some(row) => {
+                let online = self.online_state(device_id).await?;
+                Ok(Some(map_device(row, online)?))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn list(&self) -> Result<Vec<Device>> {
@@ -70,7 +89,16 @@ impl DeviceStore for PgDeviceStore {
         .await
         .map_err(|err| HubError::Internal(err.to_string()))?;
 
-        rows.into_iter().map(map_device).collect()
+        let mut devices = Vec::with_capacity(rows.len());
+        for row in rows {
+            let device_id = row
+                .try_get::<String, _>("id")
+                .map_err(|err| HubError::Internal(err.to_string()))?;
+            let online = self.online_state(&device_id).await?;
+            devices.push(map_device(row, online)?);
+        }
+
+        Ok(devices)
     }
 
     async fn delete(&self, device_id: &str) -> Result<()> {
@@ -84,7 +112,16 @@ impl DeviceStore for PgDeviceStore {
     }
 }
 
-fn map_device(row: sqlx::postgres::PgRow) -> Result<Device> {
+impl PgDeviceStore {
+    async fn online_state(&self, device_id: &str) -> Result<bool> {
+        match &self.presence {
+            Some(presence) => presence.is_online(device_id).await,
+            None => Ok(false),
+        }
+    }
+}
+
+fn map_device(row: sqlx::postgres::PgRow, online: bool) -> Result<Device> {
     Ok(Device {
         id: row
             .try_get("id")
@@ -107,6 +144,6 @@ fn map_device(row: sqlx::postgres::PgRow) -> Result<Device> {
         auth_method: row
             .try_get("auth_method")
             .map_err(|err| HubError::Internal(err.to_string()))?,
-        online: false,
+        online,
     })
 }

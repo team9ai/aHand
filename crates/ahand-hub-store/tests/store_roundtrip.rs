@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
+use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
 use ahand_hub_store::test_support::TestStack;
 
@@ -31,10 +33,22 @@ async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<
         .mark_online("device-1", "127.0.0.1:12345")
         .await?;
     assert!(stack.presence.is_online("device-1").await?);
+    assert!(
+        stack
+            .devices
+            .get("device-1")
+            .await?
+            .expect("device exists")
+            .online
+    );
 
-    stack
-        .jobs
-        .insert(NewJob {
+    let dispatcher = JobDispatcher::new(
+        Arc::new(stack.devices.clone()),
+        Arc::new(stack.jobs.clone()),
+        Arc::new(stack.audit.clone()),
+    );
+    let created_job = dispatcher
+        .create_job(NewJob {
             device_id: "device-1".into(),
             tool: "git".into(),
             args: vec!["status".into()],
@@ -53,6 +67,7 @@ async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<
         })
         .await?;
     assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, created_job.id);
 
     stack
         .audit

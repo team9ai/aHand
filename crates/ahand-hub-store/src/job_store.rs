@@ -24,6 +24,8 @@ impl JobStore for PgJobStore {
         let status = encode_status(JobStatus::Pending);
         let env =
             serde_json::to_value(&job.env).map_err(|err| HubError::Internal(err.to_string()))?;
+        let timeout_ms =
+            i64::try_from(job.timeout_ms).map_err(|err| HubError::Internal(err.to_string()))?;
 
         sqlx::query(
             r#"
@@ -37,7 +39,7 @@ impl JobStore for PgJobStore {
         .bind(&job.args)
         .bind(&job.cwd)
         .bind(env)
-        .bind(job.timeout_ms as i64)
+        .bind(timeout_ms)
         .bind(status)
         .bind(&job.requested_by)
         .execute(&self.pool)
@@ -130,9 +132,11 @@ fn map_job(row: sqlx::postgres::PgRow) -> Result<Job> {
             .try_get("cwd")
             .map_err(|err| HubError::Internal(err.to_string()))?,
         env: serde_json::from_value(env).map_err(|err| HubError::Internal(err.to_string()))?,
-        timeout_ms: row
-            .try_get::<i64, _>("timeout_ms")
-            .map_err(|err| HubError::Internal(err.to_string()))? as u64,
+        timeout_ms: u64::try_from(
+            row.try_get::<i64, _>("timeout_ms")
+                .map_err(|err| HubError::Internal(err.to_string()))?,
+        )
+        .map_err(|err| HubError::Internal(err.to_string()))?,
         status: decode_status(&status)?,
         requested_by: row
             .try_get("requested_by")

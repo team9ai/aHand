@@ -38,5 +38,5 @@ impl RedisPresenceStore {
 }
 
 fn presence_key(device_id: &str) -> String {
-    format!("ahand:test:presence:{device_id}")
+    format!("ahand:hub:presence:{device_id}")
 }

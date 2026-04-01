@@ -19,6 +19,12 @@ impl PgAuditStore {
 #[async_trait]
 impl AuditStore for PgAuditStore {
     async fn append(&self, entries: &[AuditEntry]) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+
         for entry in entries {
             sqlx::query(
                 r#"
@@ -33,10 +39,14 @@ impl AuditStore for PgAuditStore {
             .bind(&entry.actor)
             .bind(&entry.detail)
             .bind(&entry.source_ip)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|err| HubError::Internal(err.to_string()))?;
         }
+
+        tx.commit()
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
 
         Ok(())
     }

@@ -37,10 +37,7 @@ impl TestStack {
             .context("resolve postgres port")?;
         let database_url =
             format!("postgres://postgres:postgres@127.0.0.1:{postgres_port}/ahand_hub_test");
-        unsafe {
-            std::env::set_var("AHAND_HUB_TEST_DATABASE_URL", &database_url);
-        }
-        let postgres_pool = crate::postgres::connect_test_database().await;
+        let postgres_pool = crate::postgres::connect_database(&database_url).await?;
 
         let redis_container_id = docker(["run", "-d", "-p", "0:6379", "redis:7-alpine"])
             .context("start redis test container (docker daemon required)")?;
@@ -49,16 +46,17 @@ impl TestStack {
         let redis_port =
             docker_host_port(&redis_container_id, "6379/tcp").context("resolve redis port")?;
         let redis_url = format!("redis://127.0.0.1:{redis_port}");
-        unsafe {
-            std::env::set_var("AHAND_HUB_TEST_REDIS_URL", &redis_url);
-        }
-        let redis_connection = crate::redis::connect_test_redis().await;
+        let redis_connection = crate::redis::connect_redis(&redis_url).await?;
+        let presence = crate::presence_store::RedisPresenceStore::new(redis_connection);
 
         Ok(Self {
-            devices: crate::device_store::PgDeviceStore::new(postgres_pool.clone()),
+            devices: crate::device_store::PgDeviceStore::with_presence(
+                postgres_pool.clone(),
+                presence.clone(),
+            ),
             jobs: crate::job_store::PgJobStore::new(postgres_pool.clone()),
             audit: crate::audit_store::PgAuditStore::new(postgres_pool),
-            presence: crate::presence_store::RedisPresenceStore::new(redis_connection),
+            presence,
             postgres_container_id,
             redis_container_id,
         })
