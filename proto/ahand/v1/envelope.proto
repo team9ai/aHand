@@ -40,6 +40,17 @@ message Hello {
   string os         = 3;
   repeated string capabilities = 4;
   uint64 last_ack   = 5;  // on reconnect, the highest seq received from peer
+
+  oneof auth {
+    Ed25519Auth ed25519 = 6;
+    string bearer_token = 7;
+  }
+}
+
+message Ed25519Auth {
+  bytes public_key = 1;
+  bytes signature = 2;
+  uint64 signed_at_ms = 3;
 }
 
 // JobRequest - cloud asks local to execute a tool.
