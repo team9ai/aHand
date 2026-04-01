@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::audit::AuditEntry;
-use crate::job::{Job, JobStatus, NewJob};
+use crate::job::{Job, JobStatus, NewJob, resolve_status_transition};
 use crate::traits::{AuditStore, DeviceStore, JobStore};
 use crate::{HubError, Result};
 
@@ -48,7 +48,16 @@ impl JobDispatcher {
         Ok(job)
     }
 
-    pub async fn transition(&self, job_id: &str, status: JobStatus) -> Result<()> {
-        self.jobs.update_status(job_id, status).await
+    pub async fn transition(&self, job_id: &str, status: JobStatus) -> Result<Option<JobStatus>> {
+        let Some(job) = self.jobs.get(job_id).await? else {
+            return Err(HubError::JobNotFound(job_id.into()));
+        };
+        let next_status = resolve_status_transition(job.status, status);
+        if next_status == job.status {
+            return Ok(None);
+        }
+
+        self.jobs.update_status(job_id, next_status).await?;
+        Ok(Some(next_status))
     }
 }

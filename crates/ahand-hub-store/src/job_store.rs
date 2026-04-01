@@ -1,4 +1,4 @@
-use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob};
+use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, resolve_status_transition};
 use ahand_hub_core::traits::JobStore;
 use ahand_hub_core::{HubError, Result};
 use async_trait::async_trait;
@@ -92,9 +92,18 @@ impl JobStore for PgJobStore {
     async fn update_status(&self, job_id: &str, status: JobStatus) -> Result<()> {
         let parsed =
             Uuid::parse_str(job_id).map_err(|err| HubError::InvalidToken(err.to_string()))?;
+        let current = self
+            .get(job_id)
+            .await?
+            .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
+        let next_status = resolve_status_transition(current.status, status);
+        if next_status == current.status {
+            return Ok(());
+        }
+
         let result = sqlx::query("UPDATE jobs SET status = $2 WHERE id = $1")
             .bind(parsed)
-            .bind(encode_status(status))
+            .bind(encode_status(next_status))
             .execute(&self.pool)
             .await
             .map_err(|err| HubError::Internal(err.to_string()))?;

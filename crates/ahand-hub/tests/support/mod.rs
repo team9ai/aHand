@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{header::AUTHORIZATION, Request};
+use axum::http::{Request, header::AUTHORIZATION};
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -12,8 +12,8 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::MaybeTlsStream;
 
 use ahand_protocol::{
-    envelope, hello, job_event, BootstrapAuth, Ed25519Auth, Envelope, Hello, HelloChallenge,
-    JobEvent, JobFinished, JobRequest,
+    BootstrapAuth, CancelJob, Ed25519Auth, Envelope, Hello, HelloAccepted, HelloChallenge,
+    JobEvent, JobFinished, JobRequest, envelope, hello, job_event,
 };
 
 pub fn service_request(uri: &str) -> Request<Body> {
@@ -84,6 +84,7 @@ impl TestServer {
             ))
             .await
             .unwrap();
+        let _ = read_hello_accepted(&mut socket).await;
 
         TestDevice {
             device_id: device_id.into(),
@@ -103,6 +104,7 @@ impl TestServer {
             ))
             .await
             .unwrap();
+        let _ = read_hello_accepted(&mut socket).await;
 
         TestDevice {
             device_id: device_id.into(),
@@ -155,6 +157,11 @@ impl TestServer {
         }
 
         body
+    }
+
+    pub async fn shutdown(self) {
+        self._task.abort();
+        let _ = self._task.await;
     }
 }
 
@@ -220,12 +227,32 @@ impl TestDevice {
             .await
             .unwrap();
     }
+
+    pub async fn recv_cancel_request(&mut self) -> CancelJob {
+        while let Some(message) = self.socket.next().await {
+            let message = message.unwrap();
+            let tokio_tungstenite::tungstenite::Message::Binary(data) = message else {
+                continue;
+            };
+
+            let envelope = Envelope::decode(data.as_ref()).unwrap();
+            if let Some(envelope::Payload::CancelJob(cancel)) = envelope.payload {
+                return cancel;
+            }
+        }
+
+        panic!("device socket closed before a cancel request arrived");
+    }
 }
 
 pub async fn spawn_test_server() -> TestServer {
+    spawn_server_with_state(ahand_hub::state::AppState::for_tests().await).await
+}
+
+pub async fn spawn_server_with_state(state: ahand_hub::state::AppState) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let app = ahand_hub::build_test_app().await;
+    let app = ahand_hub::build_app(state);
     let task = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -249,6 +276,20 @@ pub async fn read_hello_challenge(
     let envelope = Envelope::decode(data.as_ref()).unwrap();
     match envelope.payload.unwrap() {
         envelope::Payload::HelloChallenge(challenge) => challenge,
+        other => panic!("unexpected handshake payload: {other:?}"),
+    }
+}
+
+pub async fn read_hello_accepted(
+    socket: &mut tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+) -> HelloAccepted {
+    let message = socket.next().await.unwrap().unwrap();
+    let tokio_tungstenite::tungstenite::Message::Binary(data) = message else {
+        panic!("expected binary hello accepted frame");
+    };
+    let envelope = Envelope::decode(data.as_ref()).unwrap();
+    match envelope.payload.unwrap() {
+        envelope::Payload::HelloAccepted(accepted) => accepted,
         other => panic!("unexpected handshake payload: {other:?}"),
     }
 }

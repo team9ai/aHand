@@ -6,7 +6,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let bind_addr = config.bind_addr.clone();
-    let state = AppState::from_config(config).await;
+    let state = AppState::from_config(config).await?;
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 

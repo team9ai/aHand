@@ -251,6 +251,39 @@ async fn create_job_does_not_fail_after_job_is_persisted_if_audit_write_fails() 
 }
 
 #[tokio::test]
+async fn transition_does_not_regress_terminal_jobs() {
+    let devices = Arc::new(OnlineDeviceStore::new("device-1"));
+    let jobs = Arc::new(MemoryJobStore::default());
+    let audit = Arc::new(RecordingAuditStore::default());
+    let dispatcher = JobDispatcher::new(devices, jobs.clone(), audit);
+
+    let job = dispatcher
+        .create_job(NewJob {
+            device_id: "device-1".into(),
+            tool: "git".into(),
+            args: vec!["status".into()],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap();
+
+    dispatcher
+        .transition(&job.id.to_string(), JobStatus::Finished)
+        .await
+        .unwrap();
+    dispatcher
+        .transition(&job.id.to_string(), JobStatus::Running)
+        .await
+        .unwrap();
+
+    let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
+    assert_eq!(stored.status, JobStatus::Finished);
+}
+
+#[tokio::test]
 async fn fake_job_store_persists_and_filters_jobs() {
     let stores = ahand_hub_core::tests::fakes::offline_job_stores();
 

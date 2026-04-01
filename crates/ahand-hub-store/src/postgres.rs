@@ -12,7 +12,7 @@ pub async fn connect_test_database() -> PgPool {
         .expect("test database should connect and migrate")
 }
 
-pub(crate) async fn connect_database(database_url: &str) -> anyhow::Result<PgPool> {
+pub async fn connect_database(database_url: &str) -> anyhow::Result<PgPool> {
     let mut last_error = None;
     let mut pool = None;
 

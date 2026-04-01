@@ -27,6 +27,52 @@ impl PgDeviceStore {
             presence: Some(presence),
         }
     }
+
+    pub async fn upsert_device(&self, device: NewDevice) -> Result<Device> {
+        let device_id = device.id.clone();
+        sqlx::query(
+            r#"
+            INSERT INTO devices (id, public_key, hostname, os, capabilities, version, auth_method)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (id) DO UPDATE
+            SET public_key = EXCLUDED.public_key,
+                hostname = EXCLUDED.hostname,
+                os = EXCLUDED.os,
+                capabilities = EXCLUDED.capabilities,
+                version = EXCLUDED.version,
+                auth_method = EXCLUDED.auth_method,
+                last_seen_at = now()
+            "#,
+        )
+        .bind(&device.id)
+        .bind(&device.public_key)
+        .bind(&device.hostname)
+        .bind(&device.os)
+        .bind(&device.capabilities)
+        .bind(&device.version)
+        .bind(&device.auth_method)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        self.get(&device_id)
+            .await?
+            .ok_or_else(|| HubError::Internal(format!("upserted device missing: {device_id}")))
+    }
+
+    pub async fn mark_online(&self, device_id: &str, endpoint: &str) -> Result<()> {
+        match &self.presence {
+            Some(presence) => presence.mark_online(device_id, endpoint).await,
+            None => Ok(()),
+        }
+    }
+
+    pub async fn mark_offline(&self, device_id: &str) -> Result<()> {
+        match &self.presence {
+            Some(presence) => presence.mark_offline(device_id).await,
+            None => Ok(()),
+        }
+    }
 }
 
 #[async_trait]

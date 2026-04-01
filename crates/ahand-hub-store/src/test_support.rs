@@ -8,6 +8,8 @@ pub struct TestStack {
     pub jobs: crate::job_store::PgJobStore,
     pub audit: crate::audit_store::PgAuditStore,
     pub presence: crate::presence_store::RedisPresenceStore,
+    database_url: String,
+    redis_url: String,
     postgres_container_id: String,
     redis_container_id: String,
 }
@@ -57,9 +59,19 @@ impl TestStack {
             jobs: crate::job_store::PgJobStore::new(postgres_pool.clone()),
             audit: crate::audit_store::PgAuditStore::new(postgres_pool),
             presence,
+            database_url,
+            redis_url,
             postgres_container_id,
             redis_container_id,
         })
+    }
+
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    pub fn redis_url(&self) -> &str {
+        &self.redis_url
     }
 }
 

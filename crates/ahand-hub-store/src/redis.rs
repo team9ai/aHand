@@ -10,7 +10,7 @@ pub async fn connect_test_redis() -> ConnectionManager {
         .expect("test redis should connect")
 }
 
-pub(crate) async fn connect_redis(redis_url: &str) -> anyhow::Result<ConnectionManager> {
+pub async fn connect_redis(redis_url: &str) -> anyhow::Result<ConnectionManager> {
     let client = redis::Client::open(redis_url).context("create redis client")?;
     client
         .get_connection_manager()

@@ -3,8 +3,8 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::mpsc;
 
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 
 use crate::state::AppState;
@@ -118,7 +118,8 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     )?;
     state
         .devices
-        .accept_verified_hello(&envelope.device_id, &hello, &verified)?;
+        .accept_verified_hello(&envelope.device_id, &hello, &verified)
+        .await?;
     sender
         .send(WsMessage::Binary(
             ahand_protocol::Envelope {
@@ -142,10 +143,13 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     let device_id = envelope.device_id.clone();
     let (connection_id, mut outbound_rx) = state.connections.register(device_id.clone());
     active_connection = Some((device_id.clone(), connection_id));
-    state
+    if let Err(err) = state
         .events
         .emit_device_online(&envelope.device_id, &hello.hostname)
-        .await?;
+        .await
+    {
+        tracing::warn!(device_id = %envelope.device_id, error = %err, "failed to write device.online audit");
+    }
 
     send_task = Some(tokio::spawn(async move {
         while let Some(envelope) = outbound_rx.recv().await {
@@ -178,9 +182,15 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         task.abort();
     }
     if let Some((device_id, connection_id)) = active_connection.take() {
-        if state.connections.unregister(&device_id, connection_id).await? {
-            state.devices.mark_offline(&device_id)?;
-            state.events.emit_device_offline(&device_id).await?;
+        if state
+            .connections
+            .unregister(&device_id, connection_id)
+            .await?
+        {
+            state.devices.mark_offline(&device_id).await?;
+            if let Err(err) = state.events.emit_device_offline(&device_id).await {
+                tracing::warn!(device_id = %device_id, error = %err, "failed to write device.offline audit");
+            }
         }
     }
 

@@ -12,6 +12,35 @@ pub enum JobStatus {
     Cancelled,
 }
 
+pub fn is_terminal_status(status: JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Finished | JobStatus::Failed | JobStatus::Cancelled
+    )
+}
+
+pub fn resolve_status_transition(current: JobStatus, requested: JobStatus) -> JobStatus {
+    if current == requested || is_terminal_status(current) {
+        return current;
+    }
+
+    match (current, requested) {
+        (JobStatus::Pending, JobStatus::Sent)
+        | (JobStatus::Pending, JobStatus::Running)
+        | (JobStatus::Pending, JobStatus::Finished)
+        | (JobStatus::Pending, JobStatus::Failed)
+        | (JobStatus::Pending, JobStatus::Cancelled)
+        | (JobStatus::Sent, JobStatus::Running)
+        | (JobStatus::Sent, JobStatus::Finished)
+        | (JobStatus::Sent, JobStatus::Failed)
+        | (JobStatus::Sent, JobStatus::Cancelled)
+        | (JobStatus::Running, JobStatus::Finished)
+        | (JobStatus::Running, JobStatus::Failed)
+        | (JobStatus::Running, JobStatus::Cancelled) => requested,
+        _ => current,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
     pub id: uuid::Uuid,

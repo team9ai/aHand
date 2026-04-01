@@ -35,6 +35,16 @@ impl RedisPresenceStore {
             .await
             .map_err(|err| HubError::Internal(err.to_string()))
     }
+
+    pub async fn mark_offline(&self, device_id: &str) -> Result<()> {
+        let key = presence_key(device_id);
+        let mut connection = self.connection.lock().await;
+        let _: () = connection
+            .del(key)
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+        Ok(())
+    }
 }
 
 fn presence_key(device_id: &str) -> String {
