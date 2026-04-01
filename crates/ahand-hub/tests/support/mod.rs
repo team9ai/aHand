@@ -35,14 +35,30 @@ impl TestServer {
         format!("{}{}", self.base_ws_url, path)
     }
 
-    pub async fn get_json(&self, path: &str, token: &str) -> serde_json::Value {
+    pub async fn get(&self, path: &str, token: &str) -> reqwest::Response {
         reqwest::Client::new()
             .get(format!("{}{}", self.base_http_url, path))
             .bearer_auth(token)
             .send()
             .await
             .unwrap()
-            .json()
+    }
+
+    pub async fn get_json(&self, path: &str, token: &str) -> serde_json::Value {
+        self.get(path, token).await.json().await.unwrap()
+    }
+
+    pub async fn post(
+        &self,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}{}", self.base_http_url, path))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
             .await
             .unwrap()
     }
@@ -53,16 +69,7 @@ impl TestServer {
         token: &str,
         body: serde_json::Value,
     ) -> serde_json::Value {
-        reqwest::Client::new()
-            .post(format!("{}{}", self.base_http_url, path))
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap()
+        self.post(path, token, body).await.json().await.unwrap()
     }
 
     pub async fn attach_test_device(&self, device_id: &str) -> TestDevice {
@@ -71,6 +78,25 @@ impl TestServer {
             .unwrap();
         let challenge = read_hello_challenge(&mut socket).await;
         let hello = signed_hello(device_id, &challenge.nonce);
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                hello.encode_to_vec().into(),
+            ))
+            .await
+            .unwrap();
+
+        TestDevice {
+            device_id: device_id.into(),
+            socket,
+        }
+    }
+
+    pub async fn attach_bootstrap_device(&self, device_id: &str, token: &str) -> TestDevice {
+        let (mut socket, _) = tokio_tungstenite::connect_async(self.ws_url("/ws"))
+            .await
+            .unwrap();
+        let challenge = read_hello_challenge(&mut socket).await;
+        let hello = bootstrap_hello(device_id, token, &challenge.nonce);
         socket
             .send(tokio_tungstenite::tungstenite::Message::Binary(
                 hello.encode_to_vec().into(),
@@ -101,6 +127,33 @@ impl TestServer {
                 break;
             }
         }
+        body
+    }
+
+    pub async fn read_sse_for(&self, path: &str, token: &str, duration: Duration) -> String {
+        let response = reqwest::Client::new()
+            .get(format!("{}{}", self.base_http_url, path))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+
+        let mut stream = response.bytes_stream();
+        let started_at = tokio::time::Instant::now();
+        let mut body = String::new();
+
+        loop {
+            let Some(remaining) = duration.checked_sub(started_at.elapsed()) else {
+                break;
+            };
+
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(chunk))) => body.push_str(&String::from_utf8_lossy(&chunk)),
+                Ok(Some(Err(err))) => panic!("failed reading SSE chunk: {err}"),
+                Ok(None) | Err(_) => break,
+            }
+        }
+
         body
     }
 }
