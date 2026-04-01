@@ -229,4 +229,41 @@ describe("hub dashboard auth server flow", () => {
     expect(response.status).toBe(502);
     await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
   });
+
+  it("returns 503 when proxy base URL config is missing", async () => {
+    delete process.env.AHAND_HUB_BASE_URL;
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const request = new NextRequest("http://localhost/api/proxy/api/devices", {
+      headers: {
+        cookie: "ahand_hub_session=session-token",
+      },
+    });
+
+    const response = await proxyGet(request, {
+      params: Promise.resolve({ path: ["api", "devices"] }),
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("returns 503 when the proxy upstream fetch rejects", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("fetch failed")));
+
+    const request = new NextRequest("http://localhost/api/proxy/api/devices", {
+      headers: {
+        cookie: "ahand_hub_session=session-token",
+      },
+    });
+
+    const response = await proxyGet(request, {
+      params: Promise.resolve({ path: ["api", "devices"] }),
+    });
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
+  });
 });
