@@ -3,6 +3,7 @@
 import { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { POST as loginPost } from "@/app/api/auth/login/route";
+import { POST as logoutPost } from "@/app/api/auth/logout/route";
 import { GET as proxyGet } from "@/app/api/proxy/[...path]/route";
 import { middleware } from "@/middleware";
 
@@ -40,6 +41,16 @@ describe("hub dashboard auth server flow", () => {
 
     expect(loginPageResponse.headers.get("x-middleware-next")).toBe("1");
     expect(authRouteResponse.headers.get("x-middleware-next")).toBe("1");
+  });
+
+  it("allows authenticated requests through middleware", () => {
+    const request = new NextRequest("http://localhost/", {
+      headers: { cookie: "ahand_hub_session=session-token" },
+    });
+
+    const response = middleware(request);
+
+    expect(response.headers.get("x-middleware-next")).toBe("1");
   });
 
   it("sets session cookies when the upstream login returns a token", async () => {
@@ -110,6 +121,13 @@ describe("hub dashboard auth server flow", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("redirects logout POST requests with see-other semantics", async () => {
+    const response = await logoutPost();
+
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("/login");
+  });
+
   it("forwards proxied GET requests with the session bearer token and accept header", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: true }), {
@@ -139,5 +157,59 @@ describe("hub dashboard auth server flow", () => {
       cache: "no-store",
     });
     expect(response.status).toBe(200);
+  });
+
+  it("forwards proxy query strings to the upstream URL", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const request = new NextRequest("http://localhost/api/proxy/api/devices?cursor=abc&limit=20", {
+      headers: {
+        cookie: "ahand_hub_session=session-token",
+      },
+    });
+
+    await proxyGet(request, {
+      params: Promise.resolve({ path: ["api", "devices"] }),
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(`${HUB_BASE_URL}/api/devices?cursor=abc&limit=20`, {
+      headers: {
+        authorization: "Bearer session-token",
+        accept: "application/json",
+      },
+      cache: "no-store",
+    });
+  });
+
+  it("preserves upstream proxy error statuses", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: "hub_unavailable" }), {
+          status: 502,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const request = new NextRequest("http://localhost/api/proxy/api/devices", {
+      headers: {
+        cookie: "ahand_hub_session=session-token",
+      },
+    });
+
+    const response = await proxyGet(request, {
+      params: Promise.resolve({ path: ["api", "devices"] }),
+    });
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
   });
 });
