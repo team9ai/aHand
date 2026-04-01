@@ -12,8 +12,8 @@ use tokio::task::JoinHandle;
 use tokio_tungstenite::MaybeTlsStream;
 
 use ahand_protocol::{
-    envelope, hello, job_event, BootstrapAuth, Ed25519Auth, Envelope, Hello, JobEvent, JobFinished,
-    JobRequest,
+    envelope, hello, job_event, BootstrapAuth, Ed25519Auth, Envelope, Hello, HelloChallenge,
+    JobEvent, JobFinished, JobRequest,
 };
 
 pub fn service_request(uri: &str) -> Request<Body> {
@@ -69,7 +69,8 @@ impl TestServer {
         let (mut socket, _) = tokio_tungstenite::connect_async(self.ws_url("/ws"))
             .await
             .unwrap();
-        let hello = signed_hello(device_id);
+        let challenge = read_hello_challenge(&mut socket).await;
+        let hello = signed_hello(device_id, &challenge.nonce);
         socket
             .send(tokio_tungstenite::tungstenite::Message::Binary(
                 hello.encode_to_vec().into(),
@@ -185,21 +186,50 @@ pub async fn spawn_test_server() -> TestServer {
     }
 }
 
-pub fn signed_hello(device_id: &str) -> Envelope {
-    signed_hello_with_key_at(device_id, &SigningKey::from_bytes(&[7u8; 32]), now_ms())
+pub async fn read_hello_challenge(
+    socket: &mut tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+) -> HelloChallenge {
+    let message = socket.next().await.unwrap().unwrap();
+    let tokio_tungstenite::tungstenite::Message::Binary(data) = message else {
+        panic!("expected binary hello challenge frame");
+    };
+    let envelope = Envelope::decode(data.as_ref()).unwrap();
+    match envelope.payload.unwrap() {
+        envelope::Payload::HelloChallenge(challenge) => challenge,
+        other => panic!("unexpected handshake payload: {other:?}"),
+    }
 }
 
-pub fn signed_hello_at(device_id: &str, signed_at_ms: u64) -> Envelope {
-    signed_hello_with_key_at(device_id, &SigningKey::from_bytes(&[7u8; 32]), signed_at_ms)
+pub fn signed_hello(device_id: &str, challenge_nonce: &[u8]) -> Envelope {
+    signed_hello_with_key_at(
+        device_id,
+        &SigningKey::from_bytes(&[7u8; 32]),
+        now_ms(),
+        challenge_nonce,
+    )
+}
+
+pub fn signed_hello_at(device_id: &str, signed_at_ms: u64, challenge_nonce: &[u8]) -> Envelope {
+    signed_hello_with_key_at(
+        device_id,
+        &SigningKey::from_bytes(&[7u8; 32]),
+        signed_at_ms,
+        challenge_nonce,
+    )
 }
 
 pub fn signed_hello_with_key_at(
     device_id: &str,
     signing_key: &SigningKey,
     signed_at_ms: u64,
+    challenge_nonce: &[u8],
 ) -> Envelope {
     let signature = signing_key
-        .sign(format!("ahand-hub|{device_id}|{signed_at_ms}").as_bytes())
+        .sign(&ahand_protocol::build_hello_auth_payload(
+            device_id,
+            signed_at_ms,
+            challenge_nonce,
+        ))
         .to_bytes()
         .to_vec();
 
@@ -223,11 +253,15 @@ pub fn signed_hello_with_key_at(
     }
 }
 
-pub fn bootstrap_hello(device_id: &str, token: &str) -> Envelope {
+pub fn bootstrap_hello(device_id: &str, token: &str, challenge_nonce: &[u8]) -> Envelope {
     let signed_at_ms = now_ms();
     let signing_key = SigningKey::from_bytes(&[7u8; 32]);
     let signature = signing_key
-        .sign(format!("ahand-hub|{device_id}|{signed_at_ms}").as_bytes())
+        .sign(&ahand_protocol::build_hello_auth_payload(
+            device_id,
+            signed_at_ms,
+            challenge_nonce,
+        ))
         .to_bytes()
         .to_vec();
 

@@ -1,4 +1,4 @@
-use ahand_protocol::{hello, BootstrapAuth, Ed25519Auth, Envelope, Hello};
+use ahand_protocol::{hello, BootstrapAuth, Ed25519Auth, Envelope, Hello, HelloChallenge};
 use prost::Message;
 
 #[test]
@@ -108,5 +108,31 @@ fn hello_bootstrap_auth_roundtrip() {
             assert_eq!(auth.signed_at_ms, 1_717_000_000_002);
         }
         other => panic!("unexpected auth payload: {other:?}"),
+    }
+}
+
+#[test]
+fn hello_challenge_roundtrip() {
+    let envelope = Envelope {
+        msg_id: "hello-challenge-1".into(),
+        ts_ms: 1_717_000_000_003,
+        payload: Some(ahand_protocol::envelope::Payload::HelloChallenge(
+            HelloChallenge {
+                nonce: vec![9; 16],
+                issued_at_ms: 1_717_000_000_003,
+            },
+        )),
+        ..Default::default()
+    };
+
+    let encoded = envelope.encode_to_vec();
+    let decoded = Envelope::decode(encoded.as_slice()).unwrap();
+
+    match decoded.payload.unwrap() {
+        ahand_protocol::envelope::Payload::HelloChallenge(challenge) => {
+            assert_eq!(challenge.nonce, vec![9; 16]);
+            assert_eq!(challenge.issued_at_ms, 1_717_000_000_003);
+        }
+        other => panic!("unexpected payload: {other:?}"),
     }
 }

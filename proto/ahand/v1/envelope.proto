@@ -14,6 +14,7 @@ message Envelope {
   uint64 ts_ms     = 6;
 
   oneof payload {
+    HelloChallenge   hello_challenge   = 9;
     Hello            hello             = 10;
     JobRequest       job_request       = 11;
     JobEvent         job_event         = 12;
@@ -31,6 +32,12 @@ message Envelope {
     BrowserRequest   browser_request   = 24;
     BrowserResponse  browser_response  = 25;
   }
+}
+
+// HelloChallenge - server nonce that must be signed in the initial Hello response.
+message HelloChallenge {
+  bytes nonce = 1;
+  uint64 issued_at_ms = 2;
 }
 
 // Hello - initial handshake after WS connection.

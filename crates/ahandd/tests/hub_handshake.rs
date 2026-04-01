@@ -27,7 +27,14 @@ private_key_path = "/tmp/ahand/id_ed25519"
 #[tokio::test]
 async fn build_hello_envelope_includes_ed25519_auth() {
     let identity = DeviceIdentity::generate_for_tests();
-    let hello = ahandd::ahand_client::build_hello_envelope("device-1", &identity, 42, true, None);
+    let hello = ahandd::ahand_client::build_hello_envelope(
+        "device-1",
+        &identity,
+        42,
+        true,
+        &[1, 2, 3, 4],
+        None,
+    );
 
     let payload = match hello.payload.unwrap() {
         ahand_protocol::envelope::Payload::Hello(hello) => hello,
@@ -52,6 +59,7 @@ async fn build_hello_envelope_includes_bootstrap_auth() {
         &identity,
         7,
         false,
+        &[9, 8, 7, 6],
         Some("bootstrap-token".into()),
     );
 

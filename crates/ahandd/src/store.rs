@@ -132,6 +132,7 @@ impl RunStore {
 fn describe_payload(envelope: &Envelope) -> &'static str {
     use ahand_protocol::envelope::Payload;
     match &envelope.payload {
+        Some(Payload::HelloChallenge(_)) => "HelloChallenge",
         Some(Payload::Hello(_)) => "Hello",
         Some(Payload::JobRequest(_)) => "JobRequest",
         Some(Payload::JobEvent(_)) => "JobEvent",

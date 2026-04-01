@@ -82,6 +82,7 @@ impl AppState {
 #[derive(Default)]
 pub struct MemoryDeviceStore {
     devices: DashMap<String, StoredDevice>,
+    consumed_bootstrap_registrations: DashMap<String, ()>,
 }
 
 #[derive(Clone)]
@@ -118,6 +119,9 @@ impl MemoryDeviceStore {
     ) -> Result<Device> {
         match self.devices.entry(device_id.into()) {
             Entry::Occupied(mut entry) => {
+                if verified.allow_registration {
+                    return Err(HubError::Unauthorized);
+                }
                 let stored = entry.get_mut();
                 match stored.device.public_key.as_ref() {
                     Some(existing_key) if existing_key == &verified.public_key => {}
@@ -141,6 +145,12 @@ impl MemoryDeviceStore {
                 if !verified.allow_registration {
                     return Err(HubError::Unauthorized);
                 }
+                if self
+                    .consumed_bootstrap_registrations
+                    .contains_key(device_id)
+                {
+                    return Err(HubError::Unauthorized);
+                }
 
                 let device = Device {
                     id: device_id.into(),
@@ -156,6 +166,8 @@ impl MemoryDeviceStore {
                     device: device.clone(),
                     last_signed_at_ms: verified.signed_at_ms,
                 });
+                self.consumed_bootstrap_registrations
+                    .insert(device_id.into(), ());
                 Ok(device)
             }
         }

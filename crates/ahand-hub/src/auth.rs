@@ -79,6 +79,7 @@ impl FromRequestParts<AppState> for AuthContextExt {
 pub fn verify_device_hello(
     device_id: &str,
     hello: &Hello,
+    challenge_nonce: &[u8],
     bootstrap_token: &str,
     bootstrap_device_id: &str,
     max_age_ms: u64,
@@ -94,6 +95,7 @@ pub fn verify_device_hello(
                 &auth.public_key,
                 &auth.signature,
                 auth.signed_at_ms,
+                challenge_nonce,
                 max_age_ms,
             )?;
             Ok(VerifiedDeviceHello {
@@ -112,6 +114,7 @@ pub fn verify_device_hello(
                     &auth.public_key,
                     &auth.signature,
                     auth.signed_at_ms,
+                    challenge_nonce,
                     max_age_ms,
                 )?;
                 Ok(VerifiedDeviceHello {
@@ -131,6 +134,7 @@ fn verify_signed_auth(
     public_key: &[u8],
     signature: &[u8],
     signed_at_ms: u64,
+    challenge_nonce: &[u8],
     max_age_ms: u64,
 ) -> HubResult<Vec<u8>> {
     validate_signed_at_ms(signed_at_ms, max_age_ms)?;
@@ -144,9 +148,10 @@ fn verify_signed_auth(
     let verifying_key =
         VerifyingKey::from_bytes(&public_key).map_err(|_| HubError::InvalidSignature)?;
     let signature = Signature::from_bytes(&signature);
-    let payload = format!("ahand-hub|{device_id}|{signed_at_ms}");
+    let payload =
+        ahand_protocol::build_hello_auth_payload(device_id, signed_at_ms, challenge_nonce);
     verifying_key
-        .verify(payload.as_bytes(), &signature)
+        .verify(&payload, &signature)
         .map_err(|_| HubError::InvalidSignature)?;
 
     Ok(public_key.to_vec())

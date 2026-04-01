@@ -48,12 +48,15 @@ impl DeviceIdentity {
         self.signing_key.verifying_key().to_bytes().to_vec()
     }
 
-    pub fn sign_hello(&self, device_id: &str, signed_at_ms: u64) -> Vec<u8> {
-        let payload = format!("ahand-hub|{device_id}|{signed_at_ms}");
-        self.signing_key
-            .sign(payload.as_bytes())
-            .to_bytes()
-            .to_vec()
+    pub fn sign_hello(
+        &self,
+        device_id: &str,
+        signed_at_ms: u64,
+        challenge_nonce: &[u8],
+    ) -> Vec<u8> {
+        let payload =
+            ahand_protocol::build_hello_auth_payload(device_id, signed_at_ms, challenge_nonce);
+        self.signing_key.sign(&payload).to_bytes().to_vec()
     }
 
     #[allow(dead_code)]

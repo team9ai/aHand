@@ -47,6 +47,22 @@ pub async fn handle_device_socket(ws: WebSocketUpgrade, State(state): State<AppS
 
 async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
     let (mut sender, mut receiver) = socket.split();
+    let challenge = issue_hello_challenge();
+    sender
+        .send(WsMessage::Binary(
+            ahand_protocol::Envelope {
+                msg_id: "hello-challenge-0".into(),
+                ts_ms: challenge.issued_at_ms,
+                payload: Some(ahand_protocol::envelope::Payload::HelloChallenge(
+                    challenge.clone(),
+                )),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        ))
+        .await?;
+
     let Some(Ok(WsMessage::Binary(first_frame))) = receiver.next().await else {
         return Ok(());
     };
@@ -60,6 +76,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     let verified = crate::auth::verify_device_hello(
         &envelope.device_id,
         &hello,
+        &challenge.nonce,
         state.device_bootstrap_token.as_str(),
         state.device_bootstrap_device_id.as_str(),
         state.device_hello_max_age_ms,
@@ -102,4 +119,14 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     state.events.emit_device_offline(&device_id).await?;
     send_task.abort();
     Ok(())
+}
+
+fn issue_hello_challenge() -> ahand_protocol::HelloChallenge {
+    ahand_protocol::HelloChallenge {
+        nonce: uuid::Uuid::new_v4().into_bytes().to_vec(),
+        issued_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    }
 }

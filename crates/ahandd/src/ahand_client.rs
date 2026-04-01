@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use ahand_protocol::{envelope, hello, BrowserResponse, Envelope, Hello, JobFinished, JobRejected};
+use ahand_protocol::{
+    envelope, hello, BrowserResponse, Envelope, Hello, HelloChallenge, JobFinished, JobRejected,
+};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::{broadcast, mpsc};
@@ -94,6 +96,7 @@ async fn connect(
     let (mut sink, mut stream) = ws_stream.split();
 
     let last_ack = outbox.lock().await.local_ack();
+    let challenge = recv_hello_challenge(&mut stream).await?;
     info!(last_ack, "connected, sending Hello");
 
     // Send Hello envelope — Hello is NOT stamped (seq=0), it's a connection signal.
@@ -102,6 +105,7 @@ async fn connect(
         identity,
         last_ack,
         browser_mgr.is_enabled(),
+        &challenge.nonce,
         bearer_token,
     );
     let data = hello.encode_to_vec();
@@ -246,6 +250,7 @@ pub fn build_hello_envelope(
     identity: &DeviceIdentity,
     last_ack: u64,
     browser_enabled: bool,
+    challenge_nonce: &[u8],
     bearer_token: Option<String>,
 ) -> Envelope {
     let signed_at_ms = now_ms();
@@ -258,13 +263,13 @@ pub fn build_hello_envelope(
         Some(hello::Auth::Bootstrap(ahand_protocol::BootstrapAuth {
             bearer_token: token,
             public_key: identity.public_key_bytes(),
-            signature: identity.sign_hello(device_id, signed_at_ms),
+            signature: identity.sign_hello(device_id, signed_at_ms, challenge_nonce),
             signed_at_ms,
         }))
     } else {
         Some(hello::Auth::Ed25519(ahand_protocol::Ed25519Auth {
             public_key: identity.public_key_bytes(),
-            signature: identity.sign_hello(device_id, signed_at_ms),
+            signature: identity.sign_hello(device_id, signed_at_ms, challenge_nonce),
             signed_at_ms,
         }))
     };
@@ -634,4 +639,24 @@ fn new_msg_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!("d-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+async fn recv_hello_challenge<S>(
+    stream: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
+) -> anyhow::Result<HelloChallenge>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Some(message) = stream.next().await else {
+        anyhow::bail!("websocket closed before hello challenge");
+    };
+    let message = message?;
+    let tungstenite::Message::Binary(data) = message else {
+        anyhow::bail!("expected binary hello challenge frame");
+    };
+    let envelope = Envelope::decode(data.as_ref())?;
+    match envelope.payload {
+        Some(envelope::Payload::HelloChallenge(challenge)) => Ok(challenge),
+        _ => anyhow::bail!("expected hello challenge envelope"),
+    }
 }
