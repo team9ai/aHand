@@ -19,6 +19,22 @@ Cloud (WS server)  ←──  WebSocket (protobuf)  ──→  Local daemon (WS 
 - **Daemon** (`ahandd`) enforces local security policy before executing any job.
 - **Admin Panel** — local web UI served by `ahandctl configure` for status, config, logs, and run history.
 
+## Production Control Center
+
+The production hub stack is the operator-facing control plane:
+
+- `ahand-hub` is the Rust API/WebSocket service that owns auth, device state, jobs, and audit logs.
+- `ahand-hub-dashboard` is the Next.js 16 dashboard that talks to the hub over HTTP and the dashboard WebSocket.
+- PostgreSQL stores durable hub state.
+- Redis backs transient queueing and presence data.
+
+The deployment assets live under [`deploy/hub`](deploy/hub). That stack exposes two Docker build targets:
+
+- `hub` for the Rust service image
+- `dashboard` for the Next.js dashboard image
+
+The dashboard can be deployed independently first, but the compose stack also brings up the full hub environment for local or integrated validation.
+
 ## Quick Start
 
 ### 1. Install
@@ -90,16 +106,22 @@ ahand/
 │  └─ sdk/                     # @ahand/sdk — cloud control plane SDK
 ├─ apps/
 │  ├─ admin/                   # Admin panel (Solid.js SPA)
+│  ├─ hub-dashboard/           # Production Control Center dashboard (Next.js)
 │  ├─ dashboard/               # Dashboard UI (dev mode)
 │  └─ dev-cloud/               # Development cloud server (WS + dashboard)
 ├─ crates/
 │  ├─ ahand-protocol/          # Rust prost generated types
+│  ├─ ahand-hub/               # Production control plane HTTP/WebSocket server
+│  ├─ ahand-hub-core/          # Hub domain logic
+│  ├─ ahand-hub-store/         # Hub persistence adapters
 │  ├─ ahandd/                  # Local daemon (bin)
 │  └─ ahandctl/                # CLI tool (bin)
+├─ deploy/
+│  └─ hub/                     # Hub Dockerfile + compose stack
 ├─ scripts/
 │  └─ dist/                    # Distribution scripts (install, upgrade, setup-browser)
 ├─ e2e/scripts/                # E2E tests for distribution scripts (BATS)
-├─ .github/workflows/          # CI/CD (release-rust, release-admin, release-browser)
+├─ .github/workflows/          # CI/CD (release-rust, release-admin, release-browser, release-hub)
 ├─ turbo.json                  # Turborepo pipeline
 ├─ Cargo.toml                  # Rust workspace
 └─ pnpm-workspace.yaml         # pnpm monorepo
@@ -128,6 +150,7 @@ pnpm dev                    # start dashboard + dev-cloud + daemon
 pnpm dev:admin              # admin panel only
 pnpm dev:cloud              # cloud server + dashboard
 pnpm dev:daemon             # daemon only (watch mode)
+pnpm dev:hub-dashboard      # production dashboard only
 ```
 
 ### Test
@@ -136,6 +159,7 @@ pnpm dev:daemon             # daemon only (watch mode)
 pnpm test                   # all tests
 pnpm test:ts                # TypeScript tests
 pnpm test:rust              # Rust tests
+pnpm test:hub-dashboard     # hub dashboard tests
 pnpm test:e2e:scripts       # distribution script tests (BATS)
 ```
 
@@ -153,9 +177,25 @@ Per-component versioning via git tags:
 git tag rust-v0.2.0 && git push origin rust-v0.2.0       # daemon + CLI
 git tag admin-v0.2.0 && git push origin admin-v0.2.0     # admin panel
 git tag browser-v0.2.0 && git push origin browser-v0.2.0 # browser bundle
+git tag hub-v0.2.0 && git push origin hub-v0.2.0         # production control center images
 ```
 
-Each tag triggers a GitHub Actions workflow that builds and publishes to GitHub Releases.
+Each tag triggers a GitHub Actions workflow that builds and publishes the relevant release artifacts. The hub release workflow pushes the `ahand-hub` and `ahand-hub-dashboard` images to GitHub Container Registry.
+
+### Hub deployment
+
+To validate the full hub stack locally:
+
+```bash
+export AHAND_HUB_SERVICE_TOKEN=dev-service-token
+export AHAND_HUB_DASHBOARD_PASSWORD=dev-dashboard-password
+export AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN=dev-bootstrap-token
+export AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID=device-dev-1
+export AHAND_HUB_JWT_SECRET=dev-jwt-secret
+docker compose -f deploy/hub/docker-compose.yml up --build
+```
+
+The compose file provisions PostgreSQL and Redis alongside the hub and dashboard containers.
 
 ## License
 

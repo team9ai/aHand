@@ -1,0 +1,74 @@
+name: ahand-hub
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ahand_hub
+      POSTGRES_USER: ahand_hub
+      POSTGRES_PASSWORD: ${AHAND_HUB_POSTGRES_PASSWORD:-ahand_hub}
+    volumes:
+      - hub-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ahand_hub -d ahand_hub"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - hub-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  hub:
+    build:
+      context: ../..
+      dockerfile: deploy/hub/Dockerfile
+      target: hub
+    image: ahand-hub:local
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      AHAND_HUB_BIND_ADDR: 0.0.0.0:8080
+      AHAND_HUB_SERVICE_TOKEN: ${AHAND_HUB_SERVICE_TOKEN:?set AHAND_HUB_SERVICE_TOKEN}
+      AHAND_HUB_DASHBOARD_PASSWORD: ${AHAND_HUB_DASHBOARD_PASSWORD:?set AHAND_HUB_DASHBOARD_PASSWORD}
+      AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN: ${AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN:?set AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN}
+      AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID: ${AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID:?set AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID}
+      AHAND_HUB_JWT_SECRET: ${AHAND_HUB_JWT_SECRET:?set AHAND_HUB_JWT_SECRET}
+      AHAND_HUB_DATABASE_URL: postgres://ahand_hub:${AHAND_HUB_POSTGRES_PASSWORD:-ahand_hub}@postgres:5432/ahand_hub
+      AHAND_HUB_REDIS_URL: redis://redis:6379
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  dashboard:
+    build:
+      context: ../..
+      dockerfile: deploy/hub/Dockerfile
+      target: dashboard
+    image: ahand-hub-dashboard:local
+    depends_on:
+      hub:
+        condition: service_healthy
+    environment:
+      AHAND_HUB_BASE_URL: http://hub:8080
+      NODE_ENV: production
+    ports:
+      - "3100:3100"
+
+volumes:
+  hub-postgres:
+  hub-redis:

@@ -1,0 +1,100 @@
+name: Hub CI
+
+on:
+  pull_request:
+    paths:
+      - "apps/hub-dashboard/**"
+      - "crates/ahand-hub/**"
+      - "crates/ahand-hub-core/**"
+      - "crates/ahand-hub-store/**"
+      - "deploy/hub/**"
+      - ".github/workflows/hub-ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "package.json"
+      - "proto/**"
+      - "README.md"
+  push:
+    branches: [main]
+    paths:
+      - "apps/hub-dashboard/**"
+      - "crates/ahand-hub/**"
+      - "crates/ahand-hub-core/**"
+      - "crates/ahand-hub-store/**"
+      - "deploy/hub/**"
+      - ".github/workflows/hub-ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "package.json"
+      - "proto/**"
+      - "README.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint hub dashboard
+        run: pnpm --filter @ahand/hub-dashboard lint
+
+      - name: Test hub dashboard
+        run: pnpm --filter @ahand/hub-dashboard test
+
+      - name: Build hub dashboard
+        run: pnpm --filter @ahand/hub-dashboard build
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate hub compose file
+        env:
+          AHAND_HUB_SERVICE_TOKEN: ci-service-token
+          AHAND_HUB_DASHBOARD_PASSWORD: ci-dashboard-password
+          AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN: ci-bootstrap-token
+          AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID: device-ci
+          AHAND_HUB_JWT_SECRET: ci-jwt-secret
+          AHAND_HUB_DATABASE_URL: postgres://ci:ci@postgres:5432/ahand_hub
+          AHAND_HUB_REDIS_URL: redis://redis:6379
+        run: docker compose -f deploy/hub/docker-compose.yml config
+
