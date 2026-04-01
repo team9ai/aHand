@@ -19,6 +19,13 @@ pub struct VerifiedDeviceHello {
 pub struct AuthContextExt(pub AuthContext);
 
 impl AuthContextExt {
+    pub fn require_dashboard_access(&self) -> Result<(), StatusCode> {
+        match self.0.role {
+            Role::Admin | Role::DashboardUser => Ok(()),
+            _ => Err(StatusCode::FORBIDDEN),
+        }
+    }
+
     pub fn require_admin(&self) -> Result<(), StatusCode> {
         if self.0.role == Role::Admin {
             Ok(())
@@ -28,17 +35,19 @@ impl AuthContextExt {
     }
 
     pub fn require_read_devices(&self) -> Result<(), StatusCode> {
-        match self.0.role {
-            Role::Admin | Role::DashboardUser => Ok(()),
-            _ => Err(StatusCode::FORBIDDEN),
-        }
+        self.require_dashboard_access()
     }
 
     pub fn require_read_jobs(&self) -> Result<(), StatusCode> {
-        match self.0.role {
-            Role::Admin | Role::DashboardUser => Ok(()),
-            _ => Err(StatusCode::FORBIDDEN),
-        }
+        self.require_dashboard_access()
+    }
+
+    pub fn require_read_audit(&self) -> Result<(), StatusCode> {
+        self.require_dashboard_access()
+    }
+
+    pub fn require_read_stats(&self) -> Result<(), StatusCode> {
+        self.require_dashboard_access()
     }
 }
 
@@ -59,21 +68,23 @@ impl FromRequestParts<AppState> for AuthContextExt {
             return Err(StatusCode::UNAUTHORIZED);
         };
 
-        if token == state.service_token.as_str() {
-            return Ok(Self(AuthContext {
-                role: Role::Admin,
-                subject: "service:test".into(),
-                iss: "ahand-hub".into(),
-                exp: usize::MAX,
-            }));
-        }
-
-        let claims = state
-            .auth
-            .verify_jwt(token)
-            .map_err(|_| StatusCode::UNAUTHORIZED)?;
-        Ok(Self(claims))
+        authenticate_token(state, token)
+            .map(Self)
+            .map_err(|_| StatusCode::UNAUTHORIZED)
     }
+}
+
+pub fn authenticate_token(state: &AppState, token: &str) -> HubResult<AuthContext> {
+    if token == state.service_token.as_str() {
+        return Ok(AuthContext {
+            role: Role::Admin,
+            subject: "service:test".into(),
+            iss: "ahand-hub".into(),
+            exp: usize::MAX,
+        });
+    }
+
+    state.auth.verify_jwt(token)
 }
 
 pub fn verify_device_hello(

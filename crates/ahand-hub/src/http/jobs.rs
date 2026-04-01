@@ -2,10 +2,10 @@ use std::convert::Infallible;
 use std::sync::Arc;
 
 use ahand_hub_core::HubError;
-use ahand_hub_core::job::{Job, JobStatus, NewJob, is_terminal_status};
+use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, is_terminal_status};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::JobStore;
-use axum::extract::{Json, Path, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use futures_util::Stream;
@@ -72,6 +72,7 @@ impl JobRuntime {
 
     pub async fn create_job(&self, job: NewJob) -> anyhow::Result<Job> {
         let job = self.dispatcher.create_job(job).await?;
+        self.events.publish_job_created(&job);
         self.output_stream.prime(&job.id.to_string());
         self.transition_job(&job.id.to_string(), JobStatus::Sent, "service:api")
             .await?;
@@ -273,6 +274,45 @@ pub async fn create_job(
     ))
 }
 
+#[derive(Deserialize, Default)]
+pub struct JobListQuery {
+    pub device_id: Option<String>,
+    pub status: Option<String>,
+}
+
+pub async fn list_jobs(
+    auth: AuthContextExt,
+    State(state): State<AppState>,
+    Query(query): Query<JobListQuery>,
+) -> Result<Json<Vec<Job>>, StatusCode> {
+    auth.require_read_jobs()?;
+    let filter = JobFilter {
+        device_id: query.device_id,
+        status: parse_job_status(query.status.as_deref())?,
+    };
+    let jobs = state
+        .jobs_store
+        .list(filter)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(jobs))
+}
+
+pub async fn get_job(
+    auth: AuthContextExt,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<Job>, StatusCode> {
+    auth.require_read_jobs()?;
+    let job = state
+        .jobs_store
+        .get(&job_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(job))
+}
+
 pub async fn cancel_job(
     auth: AuthContextExt,
     State(state): State<AppState>,
@@ -334,6 +374,19 @@ fn job_status_name(status: JobStatus) -> &'static str {
         JobStatus::Finished => "finished",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_job_status(status: Option<&str>) -> Result<Option<JobStatus>, StatusCode> {
+    match status {
+        None => Ok(None),
+        Some("pending") => Ok(Some(JobStatus::Pending)),
+        Some("sent") => Ok(Some(JobStatus::Sent)),
+        Some("running") => Ok(Some(JobStatus::Running)),
+        Some("finished") => Ok(Some(JobStatus::Finished)),
+        Some("failed") => Ok(Some(JobStatus::Failed)),
+        Some("cancelled") => Ok(Some(JobStatus::Cancelled)),
+        Some(_) => Err(StatusCode::BAD_REQUEST),
     }
 }
 

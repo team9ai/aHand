@@ -1,11 +1,54 @@
 import { render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import DashboardHomePage from "@/app/(dashboard)/page";
+import { getAuditLogs, getDashboardStats } from "@/lib/api";
 
-describe("dashboard home page", () => {
-  it("renders the authenticated landing page content", () => {
-    render(<DashboardHomePage />);
+vi.mock("@/lib/api", () => ({
+  getDashboardStats: vi.fn(),
+  getAuditLogs: vi.fn(),
+}));
 
-    expect(screen.getByRole("heading", { name: /dashboard ready/i })).toBeInTheDocument();
-    expect(screen.getByText(/signed in through the shared hub auth shell/i)).toBeInTheDocument();
+describe("dashboard overview page", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("renders the live overview counts and recent activity", async () => {
+    vi.mocked(getDashboardStats).mockResolvedValue({
+      online_devices: 3,
+      offline_devices: 1,
+      running_jobs: 2,
+    });
+    vi.mocked(getAuditLogs).mockResolvedValue([
+      {
+        timestamp: "2026-04-02T09:15:00Z",
+        action: "job.finished",
+        resource_type: "job",
+        resource_id: "job-1",
+        actor: "device:device-1",
+        detail: { status: "finished" },
+      },
+    ]);
+
+    render(await DashboardHomePage());
+
+    expect(screen.getByRole("heading", { name: /overview/i })).toBeInTheDocument();
+    expect(screen.getByText("3")).toBeInTheDocument();
+    expect(screen.getByText("1")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(screen.getByText(/job.finished/i)).toBeInTheDocument();
+  });
+
+  it("renders an empty activity state when the hub has no recent events", async () => {
+    vi.mocked(getDashboardStats).mockResolvedValue({
+      online_devices: 0,
+      offline_devices: 1,
+      running_jobs: 0,
+    });
+    vi.mocked(getAuditLogs).mockResolvedValue([]);
+
+    render(await DashboardHomePage());
+
+    expect(screen.getByText(/no recent activity yet/i)).toBeInTheDocument();
   });
 });

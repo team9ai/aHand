@@ -6,16 +6,25 @@ use axum::{
 use crate::state::AppState;
 
 pub mod devices;
+pub mod audit;
+pub mod auth;
 pub mod jobs;
 pub mod system;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(system::health))
+        .route("/api/stats", get(system::stats))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/verify", get(auth::verify))
         .route("/api/devices", get(devices::list_devices))
-        .route("/api/jobs", post(jobs::create_job))
+        .route("/api/devices/{device_id}", get(devices::get_device))
+        .route("/api/jobs", get(jobs::list_jobs).post(jobs::create_job))
+        .route("/api/jobs/{job_id}", get(jobs::get_job))
         .route("/api/jobs/{job_id}/cancel", post(jobs::cancel_job))
         .route("/api/jobs/{job_id}/output", get(jobs::stream_output))
+        .route("/api/audit-logs", get(audit::list_audit_logs))
         .route("/ws", get(crate::ws::device_gateway::handle_device_socket))
+        .route("/ws/dashboard", get(crate::ws::dashboard::handle_dashboard_socket))
         .with_state(state)
 }

@@ -13,6 +13,7 @@ pub enum StoreConfig {
 pub struct Config {
     pub bind_addr: String,
     pub service_token: String,
+    pub dashboard_shared_password: String,
     pub device_bootstrap_token: String,
     pub device_bootstrap_device_id: String,
     pub device_hello_max_age_ms: u64,
@@ -30,6 +31,7 @@ impl Config {
         Self {
             bind_addr: "127.0.0.1:0".into(),
             service_token: "service-test-token".into(),
+            dashboard_shared_password: "shared-secret".into(),
             device_bootstrap_token: "bootstrap-test-token".into(),
             device_bootstrap_device_id: "device-2".into(),
             device_hello_max_age_ms: 30_000,
@@ -46,6 +48,7 @@ impl Config {
         Ok(Self {
             bind_addr: getenv("AHAND_HUB_BIND_ADDR").unwrap_or_else(|| "127.0.0.1:8080".into()),
             service_token: required_env(&getenv, "AHAND_HUB_SERVICE_TOKEN")?,
+            dashboard_shared_password: required_env(&getenv, "AHAND_HUB_DASHBOARD_PASSWORD")?,
             device_bootstrap_token: required_env(&getenv, "AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN")?,
             device_bootstrap_device_id: required_env(
                 &getenv,
@@ -97,6 +100,10 @@ mod tests {
                 "service-prod-token".to_string(),
             ),
             (
+                "AHAND_HUB_DASHBOARD_PASSWORD".to_string(),
+                "shared-dashboard-password".to_string(),
+            ),
+            (
                 "AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN".to_string(),
                 "bootstrap-prod-token".to_string(),
             ),
@@ -121,6 +128,7 @@ mod tests {
         let config = Config::from_env_with(|key| env.get(key).cloned()).unwrap();
         assert_eq!(config.bind_addr, "127.0.0.1:8080");
         assert_eq!(config.service_token, "service-prod-token");
+        assert_eq!(config.dashboard_shared_password, "shared-dashboard-password");
         assert_eq!(config.device_bootstrap_token, "bootstrap-prod-token");
         assert_eq!(config.device_bootstrap_device_id, "device-prod-1");
         assert_eq!(config.jwt_secret, "jwt-prod-secret");
@@ -142,6 +150,10 @@ mod tests {
             (
                 "AHAND_HUB_SERVICE_TOKEN".to_string(),
                 "service-prod-token".to_string(),
+            ),
+            (
+                "AHAND_HUB_DASHBOARD_PASSWORD".to_string(),
+                "shared-dashboard-password".to_string(),
             ),
             (
                 "AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN".to_string(),

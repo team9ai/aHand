@@ -33,6 +33,7 @@ pub struct AppState {
     pub device_bootstrap_device_id: Arc<String>,
     pub device_hello_max_age_ms: u64,
     pub service_token: Arc<String>,
+    pub dashboard_shared_password: Arc<String>,
 }
 
 impl AppState {
@@ -94,6 +95,7 @@ impl AppState {
             device_bootstrap_device_id: Arc::new(config.device_bootstrap_device_id),
             device_hello_max_age_ms: config.device_hello_max_age_ms,
             service_token: Arc::new(config.service_token),
+            dashboard_shared_password: Arc::new(config.dashboard_shared_password),
         })
     }
 
