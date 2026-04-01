@@ -8,12 +8,18 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct RedisPresenceStore {
     connection: Arc<Mutex<ConnectionManager>>,
+    ttl_secs: u64,
 }
 
 impl RedisPresenceStore {
     pub fn new(connection: ConnectionManager) -> Self {
+        Self::new_with_ttl(connection, 60)
+    }
+
+    pub fn new_with_ttl(connection: ConnectionManager, ttl_secs: u64) -> Self {
         Self {
             connection: Arc::new(Mutex::new(connection)),
+            ttl_secs: ttl_secs.max(1),
         }
     }
 
@@ -21,7 +27,7 @@ impl RedisPresenceStore {
         let key = presence_key(device_id);
         let mut connection = self.connection.lock().await;
         let _: () = connection
-            .set_ex(key, endpoint, 60)
+            .set_ex(key, endpoint, self.ttl_secs)
             .await
             .map_err(|err| HubError::Internal(err.to_string()))?;
         Ok(())

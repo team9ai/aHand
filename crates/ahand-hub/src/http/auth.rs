@@ -1,9 +1,5 @@
 use ahand_hub_core::auth::Role;
-use axum::{
-    Json,
-    extract::State,
-    http::StatusCode,
-};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthContextExt;

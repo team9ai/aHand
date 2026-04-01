@@ -16,6 +16,7 @@ pub struct TestStack {
 
 impl TestStack {
     pub async fn start() -> anyhow::Result<Self> {
+        let mut cleanup = ContainerCleanup::default();
         let postgres_container_id = docker([
             "run",
             "-d",
@@ -30,6 +31,7 @@ impl TestStack {
             "postgres:16-alpine",
         ])
         .context("start postgres test container (docker daemon required)")?;
+        cleanup.track(postgres_container_id.clone());
         wait_for_container_log(
             &postgres_container_id,
             "database system is ready to accept connections",
@@ -43,6 +45,7 @@ impl TestStack {
 
         let redis_container_id = docker(["run", "-d", "-p", "0:6379", "redis:7-alpine"])
             .context("start redis test container (docker daemon required)")?;
+        cleanup.track(redis_container_id.clone());
         wait_for_container_log(&redis_container_id, "Ready to accept connections")
             .context("wait for redis readiness")?;
         let redis_port =
@@ -51,6 +54,7 @@ impl TestStack {
         let redis_connection = crate::redis::connect_redis(&redis_url).await?;
         let presence = crate::presence_store::RedisPresenceStore::new(redis_connection);
 
+        cleanup.disarm();
         Ok(Self {
             devices: crate::device_store::PgDeviceStore::with_presence(
                 postgres_pool.clone(),
@@ -72,6 +76,37 @@ impl TestStack {
 
     pub fn redis_url(&self) -> &str {
         &self.redis_url
+    }
+}
+
+#[derive(Default)]
+struct ContainerCleanup {
+    container_ids: Vec<String>,
+    armed: bool,
+}
+
+impl ContainerCleanup {
+    fn track(&mut self, container_id: String) {
+        self.armed = true;
+        self.container_ids.push(container_id);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainerCleanup {
+    fn drop(&mut self) {
+        if !self.armed || self.container_ids.is_empty() {
+            return;
+        }
+
+        let mut args = vec!["rm", "-f"];
+        for container_id in &self.container_ids {
+            args.push(container_id.as_str());
+        }
+        let _ = Command::new("docker").args(&args).output();
     }
 }
 

@@ -9,8 +9,8 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::MaybeTlsStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use ahand_protocol::{
     BootstrapAuth, CancelJob, Ed25519Auth, Envelope, Hello, HelloAccepted, HelloChallenge,

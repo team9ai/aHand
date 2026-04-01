@@ -9,3 +9,13 @@ fn dashboard_jwt_roundtrip_preserves_role() {
     assert_eq!(claims.role, Role::DashboardUser);
     assert_eq!(claims.subject, "operator-1");
 }
+
+#[test]
+fn device_jwt_roundtrip_preserves_role() {
+    let service = AuthService::new_for_tests("unit-test-secret");
+    let token = service.issue_device_jwt("device-7").unwrap();
+    let claims = service.verify_jwt(&token).unwrap();
+
+    assert_eq!(claims.role, Role::Device);
+    assert_eq!(claims.subject, "device-7");
+}

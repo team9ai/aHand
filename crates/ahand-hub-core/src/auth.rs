@@ -34,20 +34,28 @@ impl AuthService {
     }
 
     pub fn issue_dashboard_jwt(&self, subject: &str) -> Result<String> {
+        self.issue_jwt(Role::DashboardUser, subject)
+    }
+
+    pub fn issue_device_jwt(&self, subject: &str) -> Result<String> {
+        self.issue_jwt(Role::Device, subject)
+    }
+
+    pub fn verify_jwt(&self, token: &str) -> Result<AuthContext> {
+        decode::<AuthContext>(token, &self.decoding_key, &Validation::default())
+            .map(|data| data.claims)
+            .map_err(|err| HubError::InvalidToken(err.to_string()))
+    }
+
+    fn issue_jwt(&self, role: Role, subject: &str) -> Result<String> {
         let claims = AuthContext {
-            role: Role::DashboardUser,
+            role,
             subject: subject.into(),
             iss: "ahand-hub".into(),
             exp: (Utc::now() + Duration::hours(24)).timestamp() as usize,
         };
 
         encode(&Header::default(), &claims, &self.encoding_key)
-            .map_err(|err| HubError::InvalidToken(err.to_string()))
-    }
-
-    pub fn verify_jwt(&self, token: &str) -> Result<AuthContext> {
-        decode::<AuthContext>(token, &self.decoding_key, &Validation::default())
-            .map(|data| data.claims)
             .map_err(|err| HubError::InvalidToken(err.to_string()))
     }
 }

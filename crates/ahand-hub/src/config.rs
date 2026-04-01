@@ -17,6 +17,8 @@ pub struct Config {
     pub device_bootstrap_token: String,
     pub device_bootstrap_device_id: String,
     pub device_hello_max_age_ms: u64,
+    pub device_presence_ttl_secs: u64,
+    pub device_presence_refresh_ms: u64,
     pub jwt_secret: String,
     pub output_retention_ms: u64,
     pub store: StoreConfig,
@@ -35,6 +37,8 @@ impl Config {
             device_bootstrap_token: "bootstrap-test-token".into(),
             device_bootstrap_device_id: "device-2".into(),
             device_hello_max_age_ms: 30_000,
+            device_presence_ttl_secs: 60,
+            device_presence_refresh_ms: 20_000,
             jwt_secret: "service-test-secret".into(),
             output_retention_ms: 60_000,
             store: StoreConfig::Memory,
@@ -58,6 +62,14 @@ impl Config {
                 .map(|value| value.parse())
                 .transpose()?
                 .unwrap_or(30_000),
+            device_presence_ttl_secs: getenv("AHAND_HUB_DEVICE_PRESENCE_TTL_SECS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(60),
+            device_presence_refresh_ms: getenv("AHAND_HUB_DEVICE_PRESENCE_REFRESH_MS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(20_000),
             jwt_secret: required_env(&getenv, "AHAND_HUB_JWT_SECRET")?,
             output_retention_ms: getenv("AHAND_HUB_OUTPUT_RETENTION_MS")
                 .map(|value| value.parse())
@@ -128,9 +140,14 @@ mod tests {
         let config = Config::from_env_with(|key| env.get(key).cloned()).unwrap();
         assert_eq!(config.bind_addr, "127.0.0.1:8080");
         assert_eq!(config.service_token, "service-prod-token");
-        assert_eq!(config.dashboard_shared_password, "shared-dashboard-password");
+        assert_eq!(
+            config.dashboard_shared_password,
+            "shared-dashboard-password"
+        );
         assert_eq!(config.device_bootstrap_token, "bootstrap-prod-token");
         assert_eq!(config.device_bootstrap_device_id, "device-prod-1");
+        assert_eq!(config.device_presence_ttl_secs, 60);
+        assert_eq!(config.device_presence_refresh_ms, 20_000);
         assert_eq!(config.jwt_secret, "jwt-prod-secret");
         match config.store {
             StoreConfig::Persistent {

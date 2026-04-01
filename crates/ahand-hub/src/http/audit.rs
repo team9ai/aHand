@@ -38,11 +38,9 @@ pub async fn list_audit_logs(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     entries.retain(|entry| {
-        query
-            .resource
-            .as_ref()
-            .is_none_or(|resource| &entry.resource_type == resource || &entry.resource_id == resource)
-            && since.is_none_or(|since| entry.timestamp >= since)
+        query.resource.as_ref().is_none_or(|resource| {
+            &entry.resource_type == resource || &entry.resource_id == resource
+        }) && since.is_none_or(|since| entry.timestamp >= since)
             && until.is_none_or(|until| entry.timestamp <= until)
     });
     entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));

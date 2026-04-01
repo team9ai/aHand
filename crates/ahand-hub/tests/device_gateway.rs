@@ -5,8 +5,8 @@ use futures_util::SinkExt;
 use prost::Message;
 
 use support::{
-    bootstrap_hello, read_hello_challenge, signed_hello, signed_hello_at, signed_hello_with_key_at,
-    spawn_test_server,
+    bootstrap_hello, read_hello_accepted, read_hello_challenge, signed_hello, signed_hello_at,
+    signed_hello_with_key_at, spawn_test_server,
 };
 
 #[tokio::test]
@@ -148,11 +148,13 @@ async fn device_ws_rejects_bootstrap_token_for_wrong_device_id() {
 
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let listed = server.get_json("/api/devices", "service-test-token").await;
-    assert!(listed
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|device| device["id"] != "device-999"));
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|device| device["id"] != "device-999")
+    );
 
     let _ = socket.close(None).await;
 }
@@ -209,6 +211,7 @@ async fn device_ws_rejects_hello_signed_for_old_challenge() {
         ))
         .await
         .unwrap();
+    let _ = read_hello_accepted(&mut first_socket).await;
     let _ = first_socket.close(None).await;
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
@@ -334,6 +337,7 @@ async fn old_connection_closing_does_not_mark_new_connection_offline() {
         ))
         .await
         .unwrap();
+    let _ = read_hello_accepted(&mut second_socket).await;
 
     let _ = first_socket.close(None).await;
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -367,7 +371,9 @@ async fn invalid_device_frame_marks_device_offline() {
         .unwrap();
 
     socket
-        .send(tokio_tungstenite::tungstenite::Message::Binary(vec![0xde, 0xad, 0xbe, 0xef].into()))
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            vec![0xde, 0xad, 0xbe, 0xef].into(),
+        ))
         .await
         .unwrap();
 

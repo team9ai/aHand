@@ -1,8 +1,14 @@
 mod support;
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use ahand_hub::output_stream::OutputStream;
+use ahand_hub::state::AppState;
+use ahand_hub_core::job::NewJob;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderName};
-use support::spawn_test_server;
+use support::{spawn_server_with_state, spawn_test_server};
 
 #[tokio::test]
 async fn reconnecting_sse_with_last_event_id_does_not_duplicate_output_history() {
@@ -26,7 +32,10 @@ async fn reconnecting_sse_with_last_event_id_does_not_duplicate_output_history()
 
     let client = reqwest::Client::new();
     let response = client
-        .get(format!("{}/api/jobs/{job_id}/output", server.http_base_url()))
+        .get(format!(
+            "{}/api/jobs/{job_id}/output",
+            server.http_base_url()
+        ))
         .header(AUTHORIZATION, "Bearer service-test-token")
         .send()
         .await
@@ -56,7 +65,10 @@ async fn reconnecting_sse_with_last_event_id_does_not_duplicate_output_history()
     device.send_finished(&job_id, 0, "").await;
 
     let resumed = client
-        .get(format!("{}/api/jobs/{job_id}/output", server.http_base_url()))
+        .get(format!(
+            "{}/api/jobs/{job_id}/output",
+            server.http_base_url()
+        ))
         .header(AUTHORIZATION, "Bearer service-test-token")
         .header(
             HeaderName::from_static("last-event-id"),
@@ -79,4 +91,80 @@ async fn reconnecting_sse_with_last_event_id_does_not_duplicate_output_history()
     assert!(resumed_body.contains("data: second"));
     assert!(resumed_body.contains("event: finished"));
     assert!(!resumed_body.contains("data: first"));
+}
+
+#[tokio::test]
+async fn reconnecting_sse_with_stale_last_event_id_emits_resync_event() {
+    let mut state = AppState::for_tests().await;
+    state.output_stream = Arc::new(OutputStream::new(Duration::from_secs(60), 2));
+    let job = state
+        .jobs_store
+        .insert(NewJob {
+            device_id: "device-1".into(),
+            tool: "echo".into(),
+            args: vec!["hello".into()],
+            cwd: None,
+            env: Default::default(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap();
+    let job_id = job.id.to_string();
+
+    state
+        .output_stream
+        .push_stdout(&job_id, b"one\n".to_vec())
+        .await
+        .unwrap();
+    state
+        .output_stream
+        .push_stdout(&job_id, b"two\n".to_vec())
+        .await
+        .unwrap();
+    state
+        .output_stream
+        .push_stdout(&job_id, b"three\n".to_vec())
+        .await
+        .unwrap();
+    state
+        .output_stream
+        .push_stdout(&job_id, b"four\n".to_vec())
+        .await
+        .unwrap();
+
+    let server = spawn_server_with_state(state).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "{}/api/jobs/{job_id}/output",
+            server.http_base_url()
+        ))
+        .header(AUTHORIZATION, "Bearer service-test-token")
+        .header(HeaderName::from_static("last-event-id"), "1")
+        .send()
+        .await
+        .unwrap();
+
+    let mut stream = response.bytes_stream();
+    let mut body = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                body.push_str(&String::from_utf8_lossy(&chunk));
+                if body.contains("data: four") {
+                    break;
+                }
+            }
+            Ok(Some(Err(err))) => panic!("failed reading SSE chunk: {err}"),
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    assert!(body.contains("event: resync"));
+    assert!(body.contains("data: three"));
+    assert!(body.contains("data: four"));
+    assert!(!body.contains("data: one"));
 }

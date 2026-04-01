@@ -1,9 +1,9 @@
 use ahand_hub_core::auth::{AuthContext, Role};
 use ahand_hub_core::{HubError, Result as HubResult};
-use ahand_protocol::{hello, Hello};
+use ahand_protocol::{Hello, hello};
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use axum::http::{header::AUTHORIZATION, StatusCode};
+use axum::http::{StatusCode, header::AUTHORIZATION};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 use crate::state::AppState;
@@ -36,6 +36,14 @@ impl AuthContextExt {
 
     pub fn require_read_devices(&self) -> Result<(), StatusCode> {
         self.require_dashboard_access()
+    }
+
+    pub fn require_read_device(&self, device_id: &str) -> Result<(), StatusCode> {
+        match self.0.role {
+            Role::Admin | Role::DashboardUser => Ok(()),
+            Role::Device if self.0.subject == device_id => Ok(()),
+            _ => Err(StatusCode::FORBIDDEN),
+        }
     }
 
     pub fn require_read_jobs(&self) -> Result<(), StatusCode> {
@@ -90,6 +98,7 @@ pub fn authenticate_token(state: &AppState, token: &str) -> HubResult<AuthContex
 pub fn verify_device_hello(
     device_id: &str,
     hello: &Hello,
+    auth_service: &ahand_hub_core::auth::AuthService,
     challenge_nonce: &[u8],
     bootstrap_token: &str,
     bootstrap_device_id: &str,
@@ -117,9 +126,26 @@ pub fn verify_device_hello(
             })
         }
         hello::Auth::Bootstrap(auth) => {
-            if auth.bearer_token != bootstrap_token || device_id != bootstrap_device_id {
-                Err(HubError::Unauthorized)
+            if auth.bearer_token == bootstrap_token && device_id == bootstrap_device_id {
+                let public_key = verify_signed_auth(
+                    device_id,
+                    &auth.public_key,
+                    &auth.signature,
+                    auth.signed_at_ms,
+                    challenge_nonce,
+                    max_age_ms,
+                )?;
+                Ok(VerifiedDeviceHello {
+                    public_key,
+                    signed_at_ms: auth.signed_at_ms,
+                    auth_method: "bootstrap",
+                    allow_registration: true,
+                })
             } else {
+                let claims = auth_service.verify_jwt(&auth.bearer_token)?;
+                if claims.role != Role::Device || claims.subject != device_id {
+                    return Err(HubError::Unauthorized);
+                }
                 let public_key = verify_signed_auth(
                     device_id,
                     &auth.public_key,

@@ -17,6 +17,8 @@ async fn app_state_uses_persistent_store_backends_across_restart() -> anyhow::Re
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,
+        device_presence_ttl_secs: 60,
+        device_presence_refresh_ms: 20_000,
         jwt_secret: "service-test-secret".into(),
         output_retention_ms: 60_000,
         store: StoreConfig::Persistent {
@@ -73,6 +75,42 @@ async fn app_state_uses_persistent_store_backends_across_restart() -> anyhow::Re
         })
         .await?;
     assert_eq!(audit_entries.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_presence_is_refreshed_while_device_socket_stays_open() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let config = Config {
+        bind_addr: "127.0.0.1:0".into(),
+        service_token: "service-test-token".into(),
+        dashboard_shared_password: "shared-secret".into(),
+        device_bootstrap_token: "bootstrap-test-token".into(),
+        device_bootstrap_device_id: "device-2".into(),
+        device_hello_max_age_ms: 30_000,
+        device_presence_ttl_secs: 1,
+        device_presence_refresh_ms: 100,
+        jwt_secret: "service-test-secret".into(),
+        output_retention_ms: 60_000,
+        store: StoreConfig::Persistent {
+            database_url: stack.database_url().into(),
+            redis_url: stack.redis_url().into(),
+        },
+    };
+
+    let state = ahand_hub::state::AppState::from_config(config).await?;
+    let server = spawn_server_with_state(state).await;
+    let _device = server
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    let device = server
+        .get_json("/api/devices/device-2", "service-test-token")
+        .await;
+    assert_eq!(device["online"], true);
 
     Ok(())
 }

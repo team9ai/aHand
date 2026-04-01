@@ -1,5 +1,5 @@
 use ahand_protocol::{
-    hello, BootstrapAuth, Ed25519Auth, Envelope, Hello, HelloAccepted, HelloChallenge,
+    BootstrapAuth, Ed25519Auth, Envelope, Hello, HelloAccepted, HelloChallenge, hello,
 };
 use prost::Message;
 
@@ -144,9 +144,11 @@ fn hello_accepted_roundtrip() {
     let envelope = Envelope {
         msg_id: "hello-accepted-1".into(),
         ts_ms: 1_717_000_000_004,
-        payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(HelloAccepted {
-            auth_method: "ed25519".into(),
-        })),
+        payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(
+            HelloAccepted {
+                auth_method: "ed25519".into(),
+            },
+        )),
         ..Default::default()
     };
 
@@ -159,4 +161,19 @@ fn hello_accepted_roundtrip() {
         }
         other => panic!("unexpected payload: {other:?}"),
     }
+}
+
+#[test]
+fn hello_auth_payload_is_canonical_for_known_input() {
+    let payload = ahand_protocol::build_hello_auth_payload("device-7", 1_717_000_000_123, b"xyz");
+
+    assert_eq!(payload, b"ahand-hub|device-7|1717000000123|xyz");
+}
+
+#[test]
+fn hello_auth_payload_changes_when_nonce_changes() {
+    let first = ahand_protocol::build_hello_auth_payload("device-7", 1_717_000_000_123, b"abc");
+    let second = ahand_protocol::build_hello_auth_payload("device-7", 1_717_000_000_123, b"abd");
+
+    assert_ne!(first, second);
 }

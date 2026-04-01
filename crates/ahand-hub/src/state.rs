@@ -32,6 +32,7 @@ pub struct AppState {
     pub device_bootstrap_token: Arc<String>,
     pub device_bootstrap_device_id: Arc<String>,
     pub device_hello_max_age_ms: u64,
+    pub device_presence_refresh_ms: u64,
     pub service_token: Arc<String>,
     pub dashboard_shared_password: Arc<String>,
 }
@@ -50,7 +51,8 @@ impl AppState {
             } => {
                 let pool = ahand_hub_store::postgres::connect_database(database_url).await?;
                 let redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
-                let presence = RedisPresenceStore::new(redis);
+                let presence =
+                    RedisPresenceStore::new_with_ttl(redis, config.device_presence_ttl_secs);
                 (
                     Arc::new(MemoryDeviceStore::with_persistent(
                         PgDeviceStore::with_presence(pool.clone(), presence),
@@ -80,7 +82,7 @@ impl AppState {
             output_stream.clone(),
         ));
 
-        Ok(Self {
+        let state = Self {
             auth: Arc::new(AuthService::new_for_tests(&config.jwt_secret)),
             device_manager,
             job_dispatcher,
@@ -94,9 +96,14 @@ impl AppState {
             device_bootstrap_token: Arc::new(config.device_bootstrap_token),
             device_bootstrap_device_id: Arc::new(config.device_bootstrap_device_id),
             device_hello_max_age_ms: config.device_hello_max_age_ms,
+            device_presence_refresh_ms: config.device_presence_refresh_ms,
             service_token: Arc::new(config.service_token),
             dashboard_shared_password: Arc::new(config.dashboard_shared_password),
-        })
+        };
+        state
+            .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())
+            .await?;
+        Ok(state)
     }
 
     pub async fn for_tests() -> Self {
@@ -110,11 +117,30 @@ impl AppState {
             .await;
         state
     }
+
+    async fn preregister_bootstrap_device(&self, device_id: &str) -> Result<()> {
+        if self.devices.get(device_id).await?.is_some() {
+            return Ok(());
+        }
+
+        self.devices
+            .insert(NewDevice {
+                id: device_id.into(),
+                public_key: None,
+                hostname: "pending-device".into(),
+                os: "unknown".into(),
+                capabilities: Vec::new(),
+                version: None,
+                auth_method: "bootstrap".into(),
+            })
+            .await?;
+        self.devices.mark_offline(device_id).await?;
+        Ok(())
+    }
 }
 
 pub struct MemoryDeviceStore {
     devices: DashMap<String, StoredDevice>,
-    consumed_bootstrap_registrations: DashMap<String, ()>,
     persistent: Option<PgDeviceStore>,
 }
 
@@ -128,7 +154,6 @@ impl MemoryDeviceStore {
     pub fn with_persistent(persistent: PgDeviceStore) -> Self {
         Self {
             devices: DashMap::new(),
-            consumed_bootstrap_registrations: DashMap::new(),
             persistent: Some(persistent),
         }
     }
@@ -180,12 +205,15 @@ impl MemoryDeviceStore {
 
         match self.devices.entry(device_id.into()) {
             Entry::Occupied(mut entry) => {
-                if verified.allow_registration {
-                    return Err(HubError::Unauthorized);
-                }
                 let stored = entry.get_mut();
-                match stored.device.public_key.as_ref() {
-                    Some(existing_key) if existing_key == &verified.public_key => {}
+                match (
+                    verified.allow_registration,
+                    stored.device.public_key.as_ref(),
+                ) {
+                    (true, None) => {
+                        stored.device.public_key = Some(verified.public_key.clone());
+                    }
+                    (false, Some(existing_key)) if existing_key == &verified.public_key => {}
                     _ => return Err(HubError::Unauthorized),
                 }
                 if verified.signed_at_ms <= stored.last_signed_at_ms {
@@ -197,40 +225,26 @@ impl MemoryDeviceStore {
                 stored.device.capabilities = hello.capabilities.clone();
                 stored.device.version = Some(hello.version.clone());
                 stored.device.auth_method = verified.auth_method.into();
-                stored.device.online = true;
                 stored.last_signed_at_ms = verified.signed_at_ms;
 
                 Ok(stored.device.clone())
             }
-            Entry::Vacant(entry) => {
-                if !verified.allow_registration {
-                    return Err(HubError::Unauthorized);
-                }
-                if self
-                    .consumed_bootstrap_registrations
-                    .contains_key(device_id)
-                {
-                    return Err(HubError::Unauthorized);
-                }
+            Entry::Vacant(_) => Err(HubError::Unauthorized),
+        }
+    }
 
-                let device = Device {
-                    id: device_id.into(),
-                    public_key: Some(verified.public_key.clone()),
-                    hostname: hello.hostname.clone(),
-                    os: hello.os.clone(),
-                    capabilities: hello.capabilities.clone(),
-                    version: Some(hello.version.clone()),
-                    auth_method: verified.auth_method.into(),
-                    online: true,
-                };
-                entry.insert(StoredDevice {
-                    device: device.clone(),
-                    last_signed_at_ms: verified.signed_at_ms,
-                });
-                self.consumed_bootstrap_registrations
-                    .insert(device_id.into(), ());
-                Ok(device)
-            }
+    pub async fn mark_online(&self, device_id: &str, endpoint: &str) -> Result<()> {
+        if let Some(mut device) = self.devices.get_mut(device_id) {
+            device.device.online = true;
+        }
+        if let Some(persistent) = &self.persistent {
+            persistent.mark_online(device_id, endpoint).await?;
+        }
+
+        if self.devices.contains_key(device_id) {
+            Ok(())
+        } else {
+            Err(HubError::DeviceNotFound(device_id.into()))
         }
     }
 
@@ -267,20 +281,12 @@ impl MemoryDeviceStore {
         }
 
         match persistent.get(device_id).await? {
-            Some(existing) => {
-                if verified.allow_registration {
-                    return Err(HubError::Unauthorized);
-                }
-                match existing.public_key.as_ref() {
-                    Some(existing_key) if existing_key == &verified.public_key => {}
-                    _ => return Err(HubError::Unauthorized),
-                }
-            }
-            None => {
-                if !verified.allow_registration {
-                    return Err(HubError::Unauthorized);
-                }
-            }
+            Some(existing) => match (verified.allow_registration, existing.public_key.as_ref()) {
+                (true, None) => {}
+                (false, Some(existing_key)) if existing_key == &verified.public_key => {}
+                _ => return Err(HubError::Unauthorized),
+            },
+            None => return Err(HubError::Unauthorized),
         }
 
         let device = persistent
@@ -294,9 +300,8 @@ impl MemoryDeviceStore {
                 auth_method: verified.auth_method.into(),
             })
             .await?;
-        persistent.mark_online(device_id, "ws").await?;
         let device = persistent.get(device_id).await?.unwrap_or(Device {
-            online: true,
+            online: false,
             ..device
         });
         self.devices.insert(
@@ -314,7 +319,6 @@ impl Default for MemoryDeviceStore {
     fn default() -> Self {
         Self {
             devices: DashMap::new(),
-            consumed_bootstrap_registrations: DashMap::new(),
             persistent: None,
         }
     }

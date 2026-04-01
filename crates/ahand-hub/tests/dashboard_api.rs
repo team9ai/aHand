@@ -29,7 +29,9 @@ async fn dashboard_login_issues_a_dashboard_token_and_verify_accepts_it() {
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let payload: Value = response.json().await.unwrap();
-    let token = payload["token"].as_str().expect("login should return token");
+    let token = payload["token"]
+        .as_str()
+        .expect("login should return token");
 
     let verify = server.get("/api/auth/verify", token).await;
     assert_eq!(verify.status(), reqwest::StatusCode::OK);
@@ -182,7 +184,9 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
         .await;
     assert_eq!(audit_response.status(), reqwest::StatusCode::OK);
     let audit: Value = audit_response.json().await.unwrap();
-    let audit = audit.as_array().expect("audit log response should be an array");
+    let audit = audit
+        .as_array()
+        .expect("audit log response should be an array");
     assert_eq!(audit.len(), 1);
     assert_eq!(audit[0]["action"], "job.finished");
 }
@@ -228,6 +232,7 @@ async fn dashboard_websocket_streams_device_and_job_events() {
     drop(device);
 
     let mut events = Vec::new();
+    let mut records = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -241,11 +246,13 @@ async fn dashboard_websocket_streams_device_and_job_events() {
             let payload: Value = serde_json::from_str(text.as_str()).unwrap();
             if let Some(event) = payload["event"].as_str() {
                 events.push(event.to_string());
+                records.push(payload);
             }
         }
 
         if events.iter().any(|event| event == "device.online")
             && events.iter().any(|event| event == "job.created")
+            && events.iter().any(|event| event == "job.sent")
             && events.iter().any(|event| event == "job.running")
             && events.iter().any(|event| event == "job.finished")
             && events.iter().any(|event| event == "device.offline")
@@ -256,9 +263,15 @@ async fn dashboard_websocket_streams_device_and_job_events() {
 
     assert!(events.iter().any(|event| event == "device.online"));
     assert!(events.iter().any(|event| event == "job.created"));
+    assert!(events.iter().any(|event| event == "job.sent"));
     assert!(events.iter().any(|event| event == "job.running"));
     assert!(events.iter().any(|event| event == "job.finished"));
     assert!(events.iter().any(|event| event == "device.offline"));
+    let created = records
+        .iter()
+        .find(|record| record["event"] == "job.created")
+        .expect("job.created event should be present");
+    assert_eq!(created["detail"]["status"], "sent");
 }
 
 #[tokio::test]
@@ -309,7 +322,9 @@ async fn dashboard_websocket_streams_failed_and_cancelled_events() {
         .await;
     assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
     let _ = device.recv_cancel_request().await;
-    device.send_finished(&cancelled_job_id, -1, "cancelled").await;
+    device
+        .send_finished(&cancelled_job_id, -1, "cancelled")
+        .await;
 
     let mut events = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -337,4 +352,80 @@ async fn dashboard_websocket_streams_failed_and_cancelled_events() {
 
     assert!(events.iter().any(|event| event == "job.failed"));
     assert!(events.iter().any(|event| event == "job.cancelled"));
+}
+
+#[tokio::test]
+async fn job_api_returns_conflict_when_device_channel_is_stale() {
+    let state = AppState::for_tests().await;
+    state
+        .devices
+        .insert(NewDevice {
+            id: "device-8".into(),
+            public_key: Some(vec![7; 32]),
+            hostname: "ghost-node".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+        })
+        .await
+        .unwrap();
+    let server = spawn_server_with_state(state).await;
+
+    let response = server
+        .post(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-8",
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn cancel_job_returns_conflict_when_device_channel_is_stale() {
+    let state = AppState::for_tests().await;
+    state
+        .devices
+        .insert(NewDevice {
+            id: "device-9".into(),
+            public_key: Some(vec![8; 32]),
+            hostname: "ghost-node".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+        })
+        .await
+        .unwrap();
+    let job = state
+        .jobs_store
+        .insert(NewJob {
+            device_id: "device-9".into(),
+            tool: "sleep".into(),
+            args: vec!["30".into()],
+            cwd: None,
+            env: Default::default(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap();
+    let server = spawn_server_with_state(state).await;
+
+    let response = server
+        .post(
+            &format!("/api/jobs/{}/cancel", job.id),
+            "service-test-token",
+            serde_json::json!({}),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
 }

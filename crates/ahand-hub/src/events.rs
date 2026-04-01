@@ -129,6 +129,7 @@ impl EventBus {
 
 fn job_status_action(job: &Job) -> Option<&'static str> {
     match job.status {
+        ahand_hub_core::job::JobStatus::Sent => Some("job.sent"),
         ahand_hub_core::job::JobStatus::Running => Some("job.running"),
         ahand_hub_core::job::JobStatus::Finished => Some("job.finished"),
         ahand_hub_core::job::JobStatus::Failed => Some("job.failed"),

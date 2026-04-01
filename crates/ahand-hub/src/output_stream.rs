@@ -114,8 +114,18 @@ impl OutputStream {
         let mut rx = state.tx.subscribe();
         let history = state.history.lock().await.clone();
         let mut last_seq = last_event_id.unwrap_or(0);
+        let needs_resync = history
+            .first()
+            .and_then(|first| {
+                last_event_id.map(|last_event_id| first.seq > last_event_id.saturating_add(1))
+            })
+            .unwrap_or(false);
 
         Ok(Box::pin(stream! {
+            if needs_resync {
+                yield Ok(resync_event("history_trimmed"));
+            }
+
             for item in history {
                 if item.seq <= last_seq {
                     continue;
@@ -132,15 +142,23 @@ impl OutputStream {
                 return;
             }
 
-            while let Ok(item) = rx.recv().await {
-                if item.seq <= last_seq {
-                    continue;
-                }
-                last_seq = item.seq;
-                let is_terminal = item.item.is_terminal();
-                yield Ok(item.item.to_event(item.seq));
-                if is_terminal {
-                    break;
+            loop {
+                match rx.recv().await {
+                    Ok(item) => {
+                        if item.seq <= last_seq {
+                            continue;
+                        }
+                        last_seq = item.seq;
+                        let is_terminal = item.item.is_terminal();
+                        yield Ok(item.item.to_event(item.seq));
+                        if is_terminal {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        yield Ok(resync_event("lagged"));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }))
@@ -218,6 +236,10 @@ impl OutputStream {
     }
 
     fn prune_expired(&self) {}
+}
+
+fn resync_event(reason: &str) -> Event {
+    Event::default().event("resync").data(reason)
 }
 
 impl Default for OutputStream {
@@ -308,5 +330,68 @@ mod tests {
 
         assert!(debug.contains("second"));
         assert!(!debug.contains("first"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_emits_resync_when_history_gap_exceeds_retention() {
+        let stream = OutputStream::new(Duration::from_secs(60), 2);
+        stream
+            .push_stdout("job-1", b"one\n".to_vec())
+            .await
+            .unwrap();
+        stream
+            .push_stdout("job-1", b"two\n".to_vec())
+            .await
+            .unwrap();
+        stream
+            .push_stdout("job-1", b"three\n".to_vec())
+            .await
+            .unwrap();
+        stream
+            .push_stdout("job-1", b"four\n".to_vec())
+            .await
+            .unwrap();
+
+        let mut output = stream
+            .subscribe_from("job-1".into(), Some(1))
+            .await
+            .unwrap();
+        let first = output
+            .next()
+            .await
+            .expect("stream should yield resync event")
+            .expect("stream item should be ok");
+        let debug = format!("{first:?}");
+
+        assert!(debug.contains("resync"));
+    }
+
+    #[tokio::test]
+    async fn lagged_live_subscribers_receive_resync_event() {
+        let stream = OutputStream::new(Duration::from_secs(60), 128);
+        stream.prime("job-1");
+
+        let mut output = stream.subscribe("job-1".into()).await.unwrap();
+        for index in 0..80 {
+            stream
+                .push_stdout("job-1", format!("chunk-{index}\n").into_bytes())
+                .await
+                .unwrap();
+        }
+
+        let mut saw_resync = false;
+        for _ in 0..10 {
+            let event = output
+                .next()
+                .await
+                .expect("stream should stay open")
+                .expect("stream item should be ok");
+            if format!("{event:?}").contains("resync") {
+                saw_resync = true;
+                break;
+            }
+        }
+
+        assert!(saw_resync, "lagged subscribers should be told to resync");
     }
 }

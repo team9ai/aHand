@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::mpsc;
 
+use ahand_hub_core::HubError;
 use axum::extract::State;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -43,11 +44,11 @@ impl ConnectionRegistry {
         let sender = self
             .senders
             .get(device_id)
-            .ok_or_else(|| anyhow::anyhow!("device {device_id} is not connected"))?;
+            .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
         sender
             .sender
             .send(envelope)
-            .map_err(|_| anyhow::anyhow!("device {device_id} connection closed"))
+            .map_err(|_| HubError::DeviceOffline(device_id.into()).into())
     }
 
     pub async fn unregister(
@@ -80,117 +81,134 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     let (mut sender, mut receiver) = socket.split();
     let mut active_connection: Option<(String, uuid::Uuid)> = None;
     let mut send_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let run_result: anyhow::Result<()> = async {
-    let challenge = issue_hello_challenge();
-    sender
-        .send(WsMessage::Binary(
-            ahand_protocol::Envelope {
-                msg_id: "hello-challenge-0".into(),
-                ts_ms: challenge.issued_at_ms,
-                payload: Some(ahand_protocol::envelope::Payload::HelloChallenge(
-                    challenge.clone(),
-                )),
-                ..Default::default()
+        let challenge = issue_hello_challenge();
+        sender
+            .send(WsMessage::Binary(
+                ahand_protocol::Envelope {
+                    msg_id: "hello-challenge-0".into(),
+                    ts_ms: challenge.issued_at_ms,
+                    payload: Some(ahand_protocol::envelope::Payload::HelloChallenge(
+                        challenge.clone(),
+                    )),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into(),
+            ))
+            .await?;
+
+        let Some(Ok(WsMessage::Binary(first_frame))) = receiver.next().await else {
+            return Ok(());
+        };
+
+        let envelope = ahand_protocol::Envelope::decode(first_frame.as_ref())?;
+        let hello = match envelope.payload {
+            Some(ahand_protocol::envelope::Payload::Hello(hello)) => hello,
+            _ => anyhow::bail!("expected hello envelope"),
+        };
+
+        let verified = crate::auth::verify_device_hello(
+            &envelope.device_id,
+            &hello,
+            state.auth.as_ref(),
+            &challenge.nonce,
+            state.device_bootstrap_token.as_str(),
+            state.device_bootstrap_device_id.as_str(),
+            state.device_hello_max_age_ms,
+        )?;
+        state
+            .devices
+            .accept_verified_hello(&envelope.device_id, &hello, &verified)
+            .await?;
+        sender
+            .send(WsMessage::Binary(
+                ahand_protocol::Envelope {
+                    device_id: envelope.device_id.clone(),
+                    msg_id: "hello-accepted-0".into(),
+                    ts_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64,
+                    payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(
+                        ahand_protocol::HelloAccepted {
+                            auth_method: verified.auth_method.into(),
+                        },
+                    )),
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into(),
+            ))
+            .await?;
+        let device_id = envelope.device_id.clone();
+        let hostname = hello.hostname.clone();
+        let (connection_id, mut outbound_rx) = state.connections.register(device_id.clone());
+        active_connection = Some((device_id.clone(), connection_id));
+        state.devices.mark_online(&device_id, "ws").await?;
+        if let Err(err) = state.events.emit_device_online(&device_id, &hostname).await {
+            tracing::warn!(device_id = %device_id, error = %err, "failed to write device.online audit");
+        }
+
+        if state.device_presence_refresh_ms > 0 {
+            let devices = state.devices.clone();
+            let refresh_ms = state.device_presence_refresh_ms;
+            let refresh_device_id = device_id.clone();
+            presence_task = Some(tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(refresh_ms)).await;
+                    if let Err(err) = devices.mark_online(&refresh_device_id, "ws").await {
+                        tracing::warn!(device_id = %refresh_device_id, error = %err, "failed to refresh device presence");
+                        break;
+                    }
+                }
+            }));
+        }
+
+        send_task = Some(tokio::spawn(async move {
+            while let Some(envelope) = outbound_rx.recv().await {
+                if sender
+                    .send(WsMessage::Binary(envelope.encode_to_vec().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
-            .encode_to_vec()
-            .into(),
-        ))
-        .await?;
+        }));
 
-    let Some(Ok(WsMessage::Binary(first_frame))) = receiver.next().await else {
-        return Ok(());
-    };
-
-    let envelope = ahand_protocol::Envelope::decode(first_frame.as_ref())?;
-    let hello = match envelope.payload {
-        Some(ahand_protocol::envelope::Payload::Hello(hello)) => hello,
-        _ => anyhow::bail!("expected hello envelope"),
-    };
-
-    let verified = crate::auth::verify_device_hello(
-        &envelope.device_id,
-        &hello,
-        &challenge.nonce,
-        state.device_bootstrap_token.as_str(),
-        state.device_bootstrap_device_id.as_str(),
-        state.device_hello_max_age_ms,
-    )?;
-    state
-        .devices
-        .accept_verified_hello(&envelope.device_id, &hello, &verified)
-        .await?;
-    sender
-        .send(WsMessage::Binary(
-            ahand_protocol::Envelope {
-                device_id: envelope.device_id.clone(),
-                msg_id: "hello-accepted-0".into(),
-                ts_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64,
-                payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(
-                    ahand_protocol::HelloAccepted {
-                        auth_method: verified.auth_method.into(),
-                    },
-                )),
-                ..Default::default()
-            }
-            .encode_to_vec()
-            .into(),
-        ))
-        .await?;
-    let device_id = envelope.device_id.clone();
-    let (connection_id, mut outbound_rx) = state.connections.register(device_id.clone());
-    active_connection = Some((device_id.clone(), connection_id));
-    if let Err(err) = state
-        .events
-        .emit_device_online(&envelope.device_id, &hello.hostname)
-        .await
-    {
-        tracing::warn!(device_id = %envelope.device_id, error = %err, "failed to write device.online audit");
-    }
-
-    send_task = Some(tokio::spawn(async move {
-        while let Some(envelope) = outbound_rx.recv().await {
-            if sender
-                .send(WsMessage::Binary(envelope.encode_to_vec().into()))
-                .await
-                .is_err()
-            {
-                break;
+        while let Some(message) = receiver.next().await {
+            let message = message?;
+            match message {
+                WsMessage::Binary(frame) => {
+                    state.jobs.handle_device_frame(&device_id, &frame).await?;
+                }
+                WsMessage::Close(_) => break,
+                _ => {}
             }
         }
-    }));
 
-    while let Some(message) = receiver.next().await {
-        let message = message?;
-        match message {
-            WsMessage::Binary(frame) => {
-                state.jobs.handle_device_frame(&device_id, &frame).await?;
-            }
-            WsMessage::Close(_) => break,
-            _ => {}
-        }
-    }
-
-    Ok(())
+        Ok(())
     }
     .await;
 
     if let Some(task) = send_task.take() {
         task.abort();
     }
-    if let Some((device_id, connection_id)) = active_connection.take() {
-        if state
+    if let Some(task) = presence_task.take() {
+        task.abort();
+    }
+    if let Some((device_id, connection_id)) = active_connection.take()
+        && state
             .connections
             .unregister(&device_id, connection_id)
             .await?
-        {
-            state.devices.mark_offline(&device_id).await?;
-            if let Err(err) = state.events.emit_device_offline(&device_id).await {
-                tracing::warn!(device_id = %device_id, error = %err, "failed to write device.offline audit");
-            }
+    {
+        state.devices.mark_offline(&device_id).await?;
+        if let Err(err) = state.events.emit_device_offline(&device_id).await {
+            tracing::warn!(device_id = %device_id, error = %err, "failed to write device.offline audit");
         }
     }
 

@@ -6,9 +6,9 @@ use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, is_terminal_status}
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::JobStore;
 use axum::extract::{Json, Path, Query, State};
-use axum::http::header::HeaderName;
-use axum::http::StatusCode;
 use axum::http::HeaderMap;
+use axum::http::StatusCode;
+use axum::http::header::HeaderName;
 use axum::response::sse::{Event, Sse};
 use futures_util::Stream;
 use prost::Message;
@@ -85,10 +85,11 @@ impl JobRuntime {
 
     pub async fn create_job(&self, job: NewJob) -> anyhow::Result<Job> {
         let job = self.dispatcher.create_job(job).await?;
-        self.events.publish_job_created(&job);
         self.output_stream.prime(&job.id.to_string());
         self.transition_job(&job.id.to_string(), JobStatus::Sent, "service:api")
             .await?;
+        let job = self.jobs.get(&job.id.to_string()).await?.unwrap_or(job);
+        self.events.publish_job_created(&job);
 
         let envelope = ahand_protocol::Envelope {
             device_id: job.device_id.clone(),
@@ -112,7 +113,7 @@ impl JobRuntime {
             self.output_stream
                 .push_finished(&job.id.to_string(), -1, &err.to_string())
                 .await?;
-            return Err(err);
+            return Err(HubError::DeviceOffline(job.device_id.clone()).into());
         }
         Ok(self.jobs.get(&job.id.to_string()).await?.unwrap_or(job))
     }
@@ -127,20 +128,26 @@ impl JobRuntime {
             return Err(HubError::JobNotCancellable(job_id.into()).into());
         }
 
-        self.connections.send(
-            &job.device_id,
-            ahand_protocol::Envelope {
-                device_id: job.device_id.clone(),
-                msg_id: format!("cancel-{job_id}"),
-                ts_ms: now_ms(),
-                payload: Some(ahand_protocol::envelope::Payload::CancelJob(
-                    ahand_protocol::CancelJob {
-                        job_id: job_id.into(),
-                    },
-                )),
-                ..Default::default()
-            },
-        )?;
+        if self
+            .connections
+            .send(
+                &job.device_id,
+                ahand_protocol::Envelope {
+                    device_id: job.device_id.clone(),
+                    msg_id: format!("cancel-{job_id}"),
+                    ts_ms: now_ms(),
+                    payload: Some(ahand_protocol::envelope::Payload::CancelJob(
+                        ahand_protocol::CancelJob {
+                            job_id: job_id.into(),
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )
+            .is_err()
+        {
+            return Err(HubError::DeviceOffline(job.device_id.clone()).into());
+        }
         Ok(job)
     }
 
@@ -258,10 +265,10 @@ impl JobRuntime {
             .get(job_id)
             .await?
             .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
-        if transitioned.is_some() {
-            if let Err(err) = self.events.emit_job_status(&job, actor).await {
-                tracing::warn!(job_id, error = %err, "failed to write job audit event");
-            }
+        if transitioned.is_some()
+            && let Err(err) = self.events.emit_job_status(&job, actor).await
+        {
+            tracing::warn!(job_id, error = %err, "failed to write job audit event");
         }
         Ok(job.status)
     }
@@ -308,7 +315,9 @@ pub async fn list_jobs(
         .list(filter)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(jobs.into_iter().map(DashboardJobResponse::from).collect()))
+    Ok(Json(
+        jobs.into_iter().map(DashboardJobResponse::from).collect(),
+    ))
 }
 
 pub async fn get_job(
@@ -510,10 +519,10 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("device device-1 connection closed")
-        );
+        assert!(matches!(
+            err.downcast_ref::<HubError>(),
+            Some(HubError::DeviceOffline(device_id)) if device_id == "device-1"
+        ));
 
         let jobs = jobs.list(JobFilter::default()).await.unwrap();
         assert_eq!(jobs.len(), 1);

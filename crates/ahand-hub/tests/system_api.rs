@@ -1,7 +1,10 @@
 mod support;
 
+use ahand_hub::state::AppState;
+use ahand_hub_core::device::NewDevice;
+use ahand_hub_core::traits::DeviceStore;
 use axum::body::Body;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;
 
 #[tokio::test]
@@ -116,4 +119,108 @@ async fn stream_output_returns_not_found_for_unknown_job() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn create_device_preregisters_device_and_returns_bootstrap_data() {
+    let state = AppState::for_tests().await;
+    let server = support::spawn_server_with_state(state.clone()).await;
+
+    let response = server
+        .post(
+            "/api/devices",
+            "service-test-token",
+            serde_json::json!({
+                "id": "device-9",
+                "hostname": "edge-box",
+                "os": "linux",
+                "capabilities": ["exec", "browser"],
+                "version": "0.1.2"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["device_id"], "device-9");
+    assert!(payload["bootstrap_token"].is_string());
+
+    let stored = state.devices.get("device-9").await.unwrap().unwrap();
+    assert!(!stored.online);
+    assert!(stored.public_key.is_none());
+}
+
+#[tokio::test]
+async fn device_token_can_read_only_its_own_device_record() {
+    let state = AppState::for_tests().await;
+    state
+        .devices
+        .insert(NewDevice {
+            id: "device-2".into(),
+            public_key: None,
+            hostname: "edge-box".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into(), "browser".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "bootstrap".into(),
+        })
+        .await
+        .unwrap();
+    state.devices.mark_offline("device-2").await.unwrap();
+
+    let device_token = state.auth.issue_device_jwt("device-2").unwrap();
+    let other_device_token = state.auth.issue_device_jwt("device-1").unwrap();
+    let server = support::spawn_server_with_state(state).await;
+
+    let own_response = server.get("/api/devices/device-2", &device_token).await;
+    assert_eq!(own_response.status(), reqwest::StatusCode::OK);
+
+    let capabilities = server
+        .get("/api/devices/device-2/capabilities", &device_token)
+        .await;
+    assert_eq!(capabilities.status(), reqwest::StatusCode::OK);
+
+    let other_response = server
+        .get("/api/devices/device-2", &other_device_token)
+        .await;
+    assert_eq!(other_response.status(), reqwest::StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn delete_device_requires_admin_and_removes_device() {
+    let state = AppState::for_tests().await;
+    state
+        .devices
+        .insert(NewDevice {
+            id: "device-7".into(),
+            public_key: None,
+            hostname: "to-delete".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "bootstrap".into(),
+        })
+        .await
+        .unwrap();
+    state.devices.mark_offline("device-7").await.unwrap();
+
+    let dashboard_token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
+    let server = support::spawn_server_with_state(state.clone()).await;
+
+    let forbidden = reqwest::Client::new()
+        .delete(format!("{}/api/devices/device-7", server.http_base_url()))
+        .bearer_auth(&dashboard_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let deleted = reqwest::Client::new()
+        .delete(format!("{}/api/devices/device-7", server.http_base_url()))
+        .bearer_auth("service-test-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(state.devices.get("device-7").await.unwrap().is_none());
 }
