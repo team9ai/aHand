@@ -40,3 +40,4 @@ dist/
 plan.md
 
 .claude/
+.worktrees/
