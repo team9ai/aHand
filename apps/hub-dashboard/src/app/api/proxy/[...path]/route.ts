@@ -24,11 +24,17 @@ export async function GET(
 
   let response: Response;
   try {
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${session}`,
+      accept: request.headers.get("accept") ?? "application/json",
+    };
+    const lastEventId = request.headers.get("last-event-id");
+    if (lastEventId) {
+      headers["last-event-id"] = lastEventId;
+    }
+
     response = await fetch(upstream.toString(), {
-      headers: {
-        authorization: `Bearer ${session}`,
-        accept: request.headers.get("accept") ?? "application/json",
-      },
+      headers,
       cache: "no-store",
     });
   } catch {

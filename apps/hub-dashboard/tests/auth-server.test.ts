@@ -185,6 +185,39 @@ describe("hub dashboard auth server flow", () => {
     expect(response.status).toBe(200);
   });
 
+  it("forwards last-event-id for proxied SSE reconnects", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response("event: stdout\ndata: hello\n\n", {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      }),
+    );
+
+    vi.stubGlobal("fetch", fetchMock);
+
+    const request = new NextRequest("http://localhost/api/proxy/api/jobs/job-1/output", {
+      headers: {
+        accept: "text/event-stream",
+        "last-event-id": "7",
+        cookie: "ahand_hub_session=session-token",
+      },
+    });
+
+    const response = await proxyGet(request, {
+      params: Promise.resolve({ path: ["api", "jobs", "job-1", "output"] }),
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(`${HUB_BASE_URL}/api/jobs/job-1/output`, {
+      headers: {
+        authorization: "Bearer session-token",
+        accept: "text/event-stream",
+        "last-event-id": "7",
+      },
+      cache: "no-store",
+    });
+    expect(response.status).toBe(200);
+  });
+
   it("forwards proxy query strings to the upstream URL", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: true }), {
