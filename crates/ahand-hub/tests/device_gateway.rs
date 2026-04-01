@@ -306,3 +306,80 @@ async fn bootstrap_registration_is_one_time_and_reconnect_switches_to_ed25519() 
 
     let _ = reconnect_socket.close(None).await;
 }
+
+#[tokio::test]
+async fn old_connection_closing_does_not_mark_new_connection_offline() {
+    let server = spawn_test_server().await;
+
+    let (mut first_socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let first_challenge = read_hello_challenge(&mut first_socket).await;
+    let first_hello = signed_hello("device-1", &first_challenge.nonce);
+    first_socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            first_hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+
+    let (mut second_socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let second_challenge = read_hello_challenge(&mut second_socket).await;
+    let second_hello = signed_hello("device-1", &second_challenge.nonce);
+    second_socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            second_hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+
+    let _ = first_socket.close(None).await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    let listed = server.get_json("/api/devices", "service-test-token").await;
+    let device = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "device-1")
+        .unwrap();
+    assert_eq!(device["online"], true);
+
+    let _ = second_socket.close(None).await;
+}
+
+#[tokio::test]
+async fn invalid_device_frame_marks_device_offline() {
+    let server = spawn_test_server().await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("device-1", &challenge.nonce);
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(vec![0xde, 0xad, 0xbe, 0xef].into()))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let listed = server.get_json("/api/devices", "service-test-token").await;
+    let device = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "device-1")
+        .unwrap();
+    assert_eq!(device["online"], false);
+
+    let _ = socket.close(None).await;
+}

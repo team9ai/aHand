@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use ahand_protocol::{
-    envelope, hello, BrowserResponse, Envelope, Hello, HelloChallenge, JobFinished, JobRejected,
+    envelope, hello, BrowserResponse, Envelope, Hello, HelloAccepted, HelloChallenge, JobFinished,
+    JobRejected,
 };
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -18,6 +19,12 @@ use crate::outbox::{prepare_outbound, Outbox};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::{Direction, RunStore};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelloAuthMode {
+    Ed25519,
+    Bootstrap(String),
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -92,11 +99,59 @@ async fn connect(
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
 ) -> anyhow::Result<()> {
-    let (ws_stream, _) = tokio_tungstenite::connect_async(url).await?;
+    let auth_modes = hello_auth_modes(bearer_token.as_deref());
+    let mut last_handshake_error = None;
+
+    for auth_mode in auth_modes {
+        match connect_with_auth(
+            url,
+            device_id,
+            identity,
+            &auth_mode,
+            session_mgr,
+            registry,
+            store,
+            outbox,
+            approval_mgr,
+            approval_broadcast_tx,
+            browser_mgr,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(ConnectError::HandshakeRejected(err)) => {
+                warn!(?auth_mode, error = %err, "hello auth rejected");
+                last_handshake_error = Some(err);
+            }
+            Err(ConnectError::Session(err)) => return Err(err),
+        }
+    }
+
+    Err(last_handshake_error.unwrap_or_else(|| anyhow::anyhow!("device hello rejected")))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn connect_with_auth(
+    url: &str,
+    device_id: &str,
+    identity: &DeviceIdentity,
+    auth_mode: &HelloAuthMode,
+    session_mgr: &Arc<SessionManager>,
+    registry: &Arc<JobRegistry>,
+    store: &Option<Arc<RunStore>>,
+    outbox: &Arc<tokio::sync::Mutex<Outbox>>,
+    approval_mgr: &Arc<ApprovalManager>,
+    approval_broadcast_tx: &broadcast::Sender<Envelope>,
+    browser_mgr: &Arc<BrowserManager>,
+) -> Result<(), ConnectError> {
+    let (ws_stream, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(ConnectError::Session)?;
     let (mut sink, mut stream) = ws_stream.split();
 
-    let last_ack = outbox.lock().await.local_ack();
     let challenge = recv_hello_challenge(&mut stream).await?;
+    let last_ack = outbox.lock().await.local_ack();
     info!(last_ack, "connected, sending Hello");
 
     // Send Hello envelope — Hello is NOT stamped (seq=0), it's a connection signal.
@@ -106,20 +161,31 @@ async fn connect(
         last_ack,
         browser_mgr.is_enabled(),
         &challenge.nonce,
-        bearer_token,
+        match auth_mode {
+            HelloAuthMode::Ed25519 => None,
+            HelloAuthMode::Bootstrap(token) => Some(token.clone()),
+        },
     );
     let data = hello.encode_to_vec();
     if let Some(s) = store {
         s.log_envelope(&hello, Direction::Outbound).await;
     }
-    sink.send(tungstenite::Message::Binary(data)).await?;
+    sink.send(tungstenite::Message::Binary(data))
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(ConnectError::Session)?;
+    let accepted = recv_hello_accepted(&mut stream).await?;
+    info!(auth_method = %accepted.auth_method, "hello accepted");
 
     // Replay unacked messages from previous connection.
     let unacked = outbox.lock().await.drain_unacked();
     if !unacked.is_empty() {
         info!(count = unacked.len(), "replaying unacked messages");
         for data in unacked {
-            sink.send(tungstenite::Message::Binary(data)).await?;
+            sink.send(tungstenite::Message::Binary(data))
+                .await
+                .map_err(anyhow::Error::from)
+                .map_err(ConnectError::Session)?;
         }
     }
 
@@ -288,6 +354,14 @@ pub fn build_hello_envelope(
         })),
         ..Default::default()
     }
+}
+
+pub fn hello_auth_modes(bootstrap_token: Option<&str>) -> Vec<HelloAuthMode> {
+    let mut modes = vec![HelloAuthMode::Ed25519];
+    if let Some(token) = bootstrap_token {
+        modes.push(HelloAuthMode::Bootstrap(token.to_owned()));
+    }
+    modes
 }
 
 /// Handle an incoming JobRequest with idempotency + session mode check.
@@ -643,20 +717,69 @@ fn new_msg_id() -> String {
 
 async fn recv_hello_challenge<S>(
     stream: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
-) -> anyhow::Result<HelloChallenge>
+) -> Result<HelloChallenge, ConnectError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let Some(message) = stream.next().await else {
-        anyhow::bail!("websocket closed before hello challenge");
+        return Err(ConnectError::Session(anyhow::anyhow!(
+            "websocket closed before hello challenge"
+        )));
     };
-    let message = message?;
+    let message = message.map_err(anyhow::Error::from).map_err(ConnectError::Session)?;
     let tungstenite::Message::Binary(data) = message else {
-        anyhow::bail!("expected binary hello challenge frame");
+        return Err(ConnectError::Session(anyhow::anyhow!(
+            "expected binary hello challenge frame"
+        )));
     };
-    let envelope = Envelope::decode(data.as_ref())?;
+    let envelope = Envelope::decode(data.as_ref())
+        .map_err(anyhow::Error::from)
+        .map_err(ConnectError::Session)?;
     match envelope.payload {
         Some(envelope::Payload::HelloChallenge(challenge)) => Ok(challenge),
-        _ => anyhow::bail!("expected hello challenge envelope"),
+        _ => Err(ConnectError::Session(anyhow::anyhow!(
+            "expected hello challenge envelope"
+        ))),
+    }
+}
+
+async fn recv_hello_accepted<S>(
+    stream: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
+) -> Result<HelloAccepted, ConnectError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let Some(message) = stream.next().await else {
+        return Err(ConnectError::HandshakeRejected(anyhow::anyhow!(
+            "websocket closed before hello accepted"
+        )));
+    };
+    let message = message
+        .map_err(anyhow::Error::from)
+        .map_err(ConnectError::HandshakeRejected)?;
+    let tungstenite::Message::Binary(data) = message else {
+        return Err(ConnectError::HandshakeRejected(anyhow::anyhow!(
+            "expected binary hello accepted frame"
+        )));
+    };
+    let envelope = Envelope::decode(data.as_ref())
+        .map_err(anyhow::Error::from)
+        .map_err(ConnectError::HandshakeRejected)?;
+    match envelope.payload {
+        Some(envelope::Payload::HelloAccepted(accepted)) => Ok(accepted),
+        _ => Err(ConnectError::HandshakeRejected(anyhow::anyhow!(
+            "expected hello accepted envelope"
+        ))),
+    }
+}
+
+enum ConnectError {
+    HandshakeRejected(anyhow::Error),
+    Session(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ConnectError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Session(err)
     }
 }

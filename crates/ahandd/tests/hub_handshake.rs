@@ -1,5 +1,6 @@
 use ahand_protocol::hello;
 use ahandd::config::Config;
+use ahandd::ahand_client::HelloAuthMode;
 use ahandd::device_identity::DeviceIdentity;
 
 #[test]
@@ -77,4 +78,16 @@ async fn build_hello_envelope_includes_bootstrap_auth() {
         }
         other => panic!("unexpected auth payload: {other:?}"),
     }
+}
+
+#[test]
+fn hello_auth_modes_prefer_ed25519_before_bootstrap() {
+    let modes = ahandd::ahand_client::hello_auth_modes(Some("bootstrap-token"));
+    assert_eq!(
+        modes,
+        vec![
+            HelloAuthMode::Ed25519,
+            HelloAuthMode::Bootstrap("bootstrap-token".into())
+        ]
+    );
 }

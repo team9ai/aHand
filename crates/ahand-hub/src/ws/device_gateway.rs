@@ -11,14 +11,32 @@ use crate::state::AppState;
 
 #[derive(Default)]
 pub struct ConnectionRegistry {
-    senders: DashMap<String, mpsc::UnboundedSender<ahand_protocol::Envelope>>,
+    senders: DashMap<String, ConnectionEntry>,
+}
+
+struct ConnectionEntry {
+    connection_id: uuid::Uuid,
+    sender: mpsc::UnboundedSender<ahand_protocol::Envelope>,
 }
 
 impl ConnectionRegistry {
-    pub fn register(&self, device_id: String) -> mpsc::UnboundedReceiver<ahand_protocol::Envelope> {
+    pub fn register(
+        &self,
+        device_id: String,
+    ) -> (
+        uuid::Uuid,
+        mpsc::UnboundedReceiver<ahand_protocol::Envelope>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.senders.insert(device_id, tx);
-        rx
+        let connection_id = uuid::Uuid::new_v4();
+        self.senders.insert(
+            device_id,
+            ConnectionEntry {
+                connection_id,
+                sender: tx,
+            },
+        );
+        (connection_id, rx)
     }
 
     pub fn send(&self, device_id: &str, envelope: ahand_protocol::Envelope) -> anyhow::Result<()> {
@@ -27,13 +45,26 @@ impl ConnectionRegistry {
             .get(device_id)
             .ok_or_else(|| anyhow::anyhow!("device {device_id} is not connected"))?;
         sender
+            .sender
             .send(envelope)
             .map_err(|_| anyhow::anyhow!("device {device_id} connection closed"))
     }
 
-    pub async fn unregister(&self, device_id: &str) -> anyhow::Result<()> {
-        self.senders.remove(device_id);
-        Ok(())
+    pub async fn unregister(
+        &self,
+        device_id: &str,
+        connection_id: uuid::Uuid,
+    ) -> anyhow::Result<bool> {
+        let should_remove = self
+            .senders
+            .get(device_id)
+            .is_some_and(|entry| entry.connection_id == connection_id);
+        if should_remove {
+            self.senders.remove(device_id);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
@@ -47,6 +78,10 @@ pub async fn handle_device_socket(ws: WebSocketUpgrade, State(state): State<AppS
 
 async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
     let (mut sender, mut receiver) = socket.split();
+    let mut active_connection: Option<(String, uuid::Uuid)> = None;
+    let mut send_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    let run_result: anyhow::Result<()> = async {
     let challenge = issue_hello_challenge();
     sender
         .send(WsMessage::Binary(
@@ -84,14 +119,35 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     state
         .devices
         .accept_verified_hello(&envelope.device_id, &hello, &verified)?;
+    sender
+        .send(WsMessage::Binary(
+            ahand_protocol::Envelope {
+                device_id: envelope.device_id.clone(),
+                msg_id: "hello-accepted-0".into(),
+                ts_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(
+                    ahand_protocol::HelloAccepted {
+                        auth_method: verified.auth_method.into(),
+                    },
+                )),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        ))
+        .await?;
+    let device_id = envelope.device_id.clone();
+    let (connection_id, mut outbound_rx) = state.connections.register(device_id.clone());
+    active_connection = Some((device_id.clone(), connection_id));
     state
         .events
         .emit_device_online(&envelope.device_id, &hello.hostname)
         .await?;
 
-    let device_id = envelope.device_id.clone();
-    let mut outbound_rx = state.connections.register(device_id.clone());
-    let send_task = tokio::spawn(async move {
+    send_task = Some(tokio::spawn(async move {
         while let Some(envelope) = outbound_rx.recv().await {
             if sender
                 .send(WsMessage::Binary(envelope.encode_to_vec().into()))
@@ -101,7 +157,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                 break;
             }
         }
-    });
+    }));
 
     while let Some(message) = receiver.next().await {
         let message = message?;
@@ -114,11 +170,21 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         }
     }
 
-    state.connections.unregister(&device_id).await?;
-    state.devices.mark_offline(&device_id)?;
-    state.events.emit_device_offline(&device_id).await?;
-    send_task.abort();
     Ok(())
+    }
+    .await;
+
+    if let Some(task) = send_task.take() {
+        task.abort();
+    }
+    if let Some((device_id, connection_id)) = active_connection.take() {
+        if state.connections.unregister(&device_id, connection_id).await? {
+            state.devices.mark_offline(&device_id)?;
+            state.events.emit_device_offline(&device_id).await?;
+        }
+    }
+
+    run_result
 }
 
 fn issue_hello_challenge() -> ahand_protocol::HelloChallenge {

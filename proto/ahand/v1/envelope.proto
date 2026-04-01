@@ -31,6 +31,7 @@ message Envelope {
     SessionQuery     session_query     = 23;
     BrowserRequest   browser_request   = 24;
     BrowserResponse  browser_response  = 25;
+    HelloAccepted    hello_accepted    = 26;
   }
 }
 
@@ -38,6 +39,11 @@ message Envelope {
 message HelloChallenge {
   bytes nonce = 1;
   uint64 issued_at_ms = 2;
+}
+
+// Hello - initial handshake after WS connection.
+message HelloAccepted {
+  string auth_method = 1;
 }
 
 // Hello - initial handshake after WS connection.

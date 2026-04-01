@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::{fs::OpenOptions, io::Write};
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -104,16 +105,8 @@ impl DeviceIdentity {
 
         let content =
             serde_json::to_string_pretty(&stored).context("failed to serialize hub identity")?;
-        std::fs::write(path, format!("{content}\n"))
+        write_secure_file(path, format!("{content}\n").as_bytes())
             .with_context(|| format!("failed to write {}", path.display()))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
 
         Ok(())
     }
@@ -124,4 +117,69 @@ pub fn default_identity_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".ahand")
         .join(IDENTITY_FILE)
+}
+
+fn write_secure_file(path: &Path, content: &[u8]) -> Result<()> {
+    let tmp_path = path.with_extension(format!(
+        "tmp-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(content)?;
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_secure_file;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secure_file_uses_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ahandd-device-identity-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.json");
+
+        write_secure_file(&path, b"secret").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
