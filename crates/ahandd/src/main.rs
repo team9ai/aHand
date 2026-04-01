@@ -3,6 +3,7 @@ mod approval;
 mod browser;
 mod browser_init;
 mod config;
+mod device_identity;
 mod executor;
 mod ipc;
 mod openclaw;
@@ -18,7 +19,7 @@ use std::sync::Arc;
 use ahand_protocol::Envelope;
 use clap::{Parser, Subcommand};
 use config::ConnectionMode;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 
 #[derive(Parser)]
@@ -116,8 +117,7 @@ async fn main() -> anyhow::Result<()> {
         config::Config::load(path)?
     } else {
         // No --config given: try default path, or fall back to CLI args.
-        let default_path = dirs::home_dir()
-            .map(|h| h.join(".ahand").join("config.toml"));
+        let default_path = dirs::home_dir().map(|h| h.join(".ahand").join("config.toml"));
 
         if let Some(ref path) = default_path {
             if path.exists() {
@@ -148,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
                     policy: Default::default(),
                     openclaw: None,
                     browser: None,
+                    hub: None,
                 }
             }
         } else {
@@ -171,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
                 policy: Default::default(),
                 openclaw: None,
                 browser: None,
+                hub: None,
             }
         }
     };

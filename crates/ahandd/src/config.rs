@@ -67,6 +67,20 @@ pub struct Config {
     /// Browser control configuration (playwright-cli integration)
     #[serde(default)]
     pub browser: Option<BrowserConfig>,
+
+    /// Hub authentication configuration for authenticated Hello handshakes.
+    #[serde(default)]
+    pub hub: Option<HubConfig>,
+}
+
+/// Hub authentication configuration.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+pub struct HubConfig {
+    /// Optional one-time bootstrap bearer token for first registration.
+    pub bootstrap_token: Option<String>,
+
+    /// Path to the persisted Ed25519 private key used for Hello signing.
+    pub private_key_path: Option<String>,
 }
 
 /// OpenClaw Gateway connection configuration
@@ -215,6 +229,11 @@ impl Config {
         self.browser.clone().unwrap_or_default()
     }
 
+    /// Get hub config, creating default if needed.
+    pub fn hub_config(&self) -> HubConfig {
+        self.hub.clone().unwrap_or_default()
+    }
+
     /// Serialize and write the config back to a TOML file.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
         let content = toml::to_string_pretty(self)?;
@@ -223,9 +242,7 @@ impl Config {
     }
 
     pub fn device_id(&self) -> String {
-        self.device_id
-            .clone()
-            .unwrap_or_else(uuid_v4)
+        self.device_id.clone().unwrap_or_else(uuid_v4)
     }
 
     /// Resolve the IPC socket path. Default: ~/.ahand/ahandd.sock.

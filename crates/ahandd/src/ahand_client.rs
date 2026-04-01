@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ahand_protocol::{envelope, BrowserResponse, Envelope, Hello, JobFinished, JobRejected};
+use ahand_protocol::{BrowserResponse, Envelope, Hello, JobFinished, JobRejected, envelope, hello};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::{broadcast, mpsc};
@@ -10,8 +10,9 @@ use tracing::{error, info, warn};
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::config::Config;
+use crate::device_identity::DeviceIdentity;
 use crate::executor;
-use crate::outbox::{prepare_outbound, Outbox};
+use crate::outbox::{Outbox, prepare_outbound};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::{Direction, RunStore};
@@ -27,6 +28,14 @@ pub async fn run(
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
 ) -> anyhow::Result<()> {
+    let hub_config = config.hub_config();
+    let identity_path = hub_config
+        .private_key_path
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(crate::device_identity::default_identity_path);
+    let identity = DeviceIdentity::load_or_create(&identity_path)?;
+    let bearer_token = hub_config.bootstrap_token.clone();
 
     // Outbox survives across reconnects.
     let outbox = Arc::new(tokio::sync::Mutex::new(Outbox::new(10_000)));
@@ -39,6 +48,8 @@ pub async fn run(
         match connect(
             &config.server_url,
             &device_id,
+            &identity,
+            bearer_token.clone(),
             &session_mgr,
             &registry,
             &store,
@@ -69,6 +80,8 @@ pub async fn run(
 async fn connect(
     url: &str,
     device_id: &str,
+    identity: &DeviceIdentity,
+    bearer_token: Option<String>,
     session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
@@ -84,26 +97,13 @@ async fn connect(
     info!(last_ack, "connected, sending Hello");
 
     // Send Hello envelope — Hello is NOT stamped (seq=0), it's a connection signal.
-    let mut capabilities = vec!["exec".to_string()];
-    if browser_mgr.is_enabled() {
-        capabilities.push("browser".to_string());
-    }
-    let hello = Envelope {
-        device_id: device_id.to_string(),
-        msg_id: "hello-0".to_string(),
-        ts_ms: now_ms(),
-        payload: Some(envelope::Payload::Hello(Hello {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            hostname: gethostname::gethostname()
-                .to_string_lossy()
-                .to_string(),
-            os: std::env::consts::OS.to_string(),
-            capabilities,
-            last_ack,
-            auth: None,
-        })),
-        ..Default::default()
-    };
+    let hello = build_hello_envelope(
+        device_id,
+        identity,
+        last_ack,
+        browser_mgr.is_enabled(),
+        bearer_token,
+    );
     let data = hello.encode_to_vec();
     if let Some(s) = store {
         s.log_envelope(&hello, Direction::Outbound).await;
@@ -115,8 +115,7 @@ async fn connect(
     if !unacked.is_empty() {
         info!(count = unacked.len(), "replaying unacked messages");
         for data in unacked {
-            sink.send(tungstenite::Message::Binary(data))
-                .await?;
+            sink.send(tungstenite::Message::Binary(data)).await?;
         }
     }
 
@@ -138,11 +137,7 @@ async fn connect(
             if let Some(s) = &store_send {
                 s.log_envelope(&envelope, Direction::Outbound).await;
             }
-            if sink
-                .send(tungstenite::Message::Binary(data))
-                .await
-                .is_err()
-            {
+            if sink.send(tungstenite::Message::Binary(data)).await.is_err() {
                 break;
             }
         }
@@ -232,15 +227,8 @@ async fn connect(
                 handle_session_query(device_id, session_mgr, &query, &tx).await;
             }
             Some(envelope::Payload::BrowserRequest(req)) => {
-                handle_browser_request(
-                    device_id,
-                    caller_uid,
-                    &req,
-                    &tx,
-                    session_mgr,
-                    browser_mgr,
-                )
-                .await;
+                handle_browser_request(device_id, caller_uid, &req, &tx, session_mgr, browser_mgr)
+                    .await;
             }
             _ => {}
         }
@@ -251,6 +239,45 @@ async fn connect(
     let _ = send_handle.await;
 
     Ok(())
+}
+
+pub fn build_hello_envelope(
+    device_id: &str,
+    identity: &DeviceIdentity,
+    last_ack: u64,
+    browser_enabled: bool,
+    bearer_token: Option<String>,
+) -> Envelope {
+    let signed_at_ms = now_ms();
+    let mut capabilities = vec!["exec".to_string()];
+    if browser_enabled {
+        capabilities.push("browser".to_string());
+    }
+
+    let auth = if let Some(token) = bearer_token {
+        Some(hello::Auth::BearerToken(token))
+    } else {
+        Some(hello::Auth::Ed25519(ahand_protocol::Ed25519Auth {
+            public_key: identity.public_key_bytes(),
+            signature: identity.sign_hello(device_id, signed_at_ms),
+            signed_at_ms,
+        }))
+    };
+
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: "hello-0".to_string(),
+        ts_ms: signed_at_ms,
+        payload: Some(envelope::Payload::Hello(Hello {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            hostname: gethostname::gethostname().to_string_lossy().to_string(),
+            os: std::env::consts::OS.to_string(),
+            capabilities,
+            last_ack,
+            auth,
+        })),
+        ..Default::default()
+    }
 }
 
 /// Handle an incoming JobRequest with idempotency + session mode check.
@@ -310,7 +337,10 @@ async fn handle_job_request(
         SessionDecision::Allow => {
             spawn_job(device_id, req, tx, registry, store).await;
         }
-        SessionDecision::NeedsApproval { reason, previous_refusals } => {
+        SessionDecision::NeedsApproval {
+            reason,
+            previous_refusals,
+        } => {
             info!(job_id = %req.job_id, reason = %reason, "job needs approval (strict mode)");
 
             let (approval_req, approval_rx) = approval_mgr
@@ -414,8 +444,7 @@ async fn spawn_job(
 
     tokio::spawn(async move {
         let _permit = reg.acquire_permit().await;
-        let (exit_code, error) =
-            executor::run_job(did, req, tx_clone, cancel_rx, st).await;
+        let (exit_code, error) = executor::run_job(did, req, tx_clone, cancel_rx, st).await;
         reg.remove(&job_id).await;
         reg.mark_completed(job_id, exit_code, error).await;
     });
@@ -427,7 +456,8 @@ async fn handle_set_session_mode(
     msg: &ahand_protocol::SetSessionMode,
     tx: &mpsc::UnboundedSender<Envelope>,
 ) {
-    let mode = ahand_protocol::SessionMode::try_from(msg.mode).unwrap_or(ahand_protocol::SessionMode::Inactive);
+    let mode = ahand_protocol::SessionMode::try_from(msg.mode)
+        .unwrap_or(ahand_protocol::SessionMode::Inactive);
     info!(caller_uid = %msg.caller_uid, ?mode, "received set session mode");
     let state = session_mgr
         .set_mode(&msg.caller_uid, mode, msg.trust_timeout_mins)
