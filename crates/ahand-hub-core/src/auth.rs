@@ -26,7 +26,7 @@ pub struct AuthService {
 }
 
 impl AuthService {
-    pub fn new_for_tests(secret: &str) -> Self {
+    pub fn new(secret: &str) -> Self {
         Self {
             encoding_key: EncodingKey::from_secret(secret.as_bytes()),
             decoding_key: DecodingKey::from_secret(secret.as_bytes()),
@@ -71,7 +71,7 @@ mod tests {
 
     #[test]
     fn issue_jwt_supports_admin_claims() {
-        let service = AuthService::new_for_tests("unit-test-secret");
+        let service = AuthService::new("unit-test-secret");
         let token = service.issue_jwt(Role::Admin, "service:test").unwrap();
         let claims = service.verify_jwt(&token).unwrap();
 

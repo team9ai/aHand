@@ -83,7 +83,7 @@ impl AppState {
         ));
 
         let state = Self {
-            auth: Arc::new(AuthService::new_for_tests(&config.jwt_secret)),
+            auth: Arc::new(AuthService::new(&config.jwt_secret)),
             device_manager,
             job_dispatcher,
             devices,

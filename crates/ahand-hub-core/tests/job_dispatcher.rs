@@ -14,6 +14,12 @@ struct OnlineDeviceStore {
     device: Device,
 }
 
+struct OfflineStores {
+    devices: Arc<dyn DeviceStore>,
+    jobs: Arc<dyn JobStore>,
+    audit: Arc<dyn AuditStore>,
+}
+
 impl OnlineDeviceStore {
     fn new(device_id: &str) -> Self {
         Self {
@@ -31,6 +37,8 @@ impl OnlineDeviceStore {
     }
 }
 
+struct OfflineDeviceStore;
+
 #[async_trait]
 impl DeviceStore for OnlineDeviceStore {
     async fn insert(&self, _device: NewDevice) -> ahand_hub_core::Result<Device> {
@@ -43,6 +51,43 @@ impl DeviceStore for OnlineDeviceStore {
 
     async fn list(&self) -> ahand_hub_core::Result<Vec<Device>> {
         Ok(vec![self.device.clone()])
+    }
+
+    async fn delete(&self, _device_id: &str) -> ahand_hub_core::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DeviceStore for OfflineDeviceStore {
+    async fn insert(&self, _device: NewDevice) -> ahand_hub_core::Result<Device> {
+        Err(HubError::Internal("not needed in this test".into()))
+    }
+
+    async fn get(&self, _device_id: &str) -> ahand_hub_core::Result<Option<Device>> {
+        Ok(Some(Device {
+            id: "device-1".into(),
+            public_key: None,
+            hostname: "offline-device".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+            online: false,
+        }))
+    }
+
+    async fn list(&self) -> ahand_hub_core::Result<Vec<Device>> {
+        Ok(vec![Device {
+            id: "device-1".into(),
+            public_key: None,
+            hostname: "offline-device".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+            online: false,
+        }])
     }
 
     async fn delete(&self, _device_id: &str) -> ahand_hub_core::Result<()> {
@@ -176,6 +221,14 @@ impl AuditStore for RecordingAuditStore {
     }
 }
 
+fn offline_job_stores() -> OfflineStores {
+    OfflineStores {
+        devices: Arc::new(OfflineDeviceStore),
+        jobs: Arc::new(MemoryJobStore::default()),
+        audit: Arc::new(RecordingAuditStore::default()),
+    }
+}
+
 struct FailingAuditStore;
 
 #[async_trait]
@@ -269,7 +322,7 @@ impl JobStore for FailingUpdateJobStore {
 
 #[tokio::test]
 async fn create_job_requires_online_device() {
-    let stores = ahand_hub_core::tests::fakes::offline_job_stores();
+    let stores = offline_job_stores();
     let dispatcher = JobDispatcher::new(stores.devices, stores.jobs, stores.audit);
 
     let err = dispatcher
@@ -590,7 +643,7 @@ async fn transition_propagates_job_store_update_errors() {
 
 #[tokio::test]
 async fn fake_job_store_persists_and_filters_jobs() {
-    let stores = ahand_hub_core::tests::fakes::offline_job_stores();
+    let stores = offline_job_stores();
 
     let first = stores
         .jobs
@@ -662,7 +715,7 @@ async fn fake_job_store_persists_and_filters_jobs() {
 
 #[tokio::test]
 async fn fake_audit_store_appends_and_queries_entries() {
-    let stores = ahand_hub_core::tests::fakes::offline_job_stores();
+    let stores = offline_job_stores();
     let first = AuditEntry {
         timestamp: chrono::Utc::now(),
         action: "job.created".into(),

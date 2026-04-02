@@ -5,7 +5,7 @@ use jsonwebtoken::{EncodingKey, Header, encode};
 
 #[test]
 fn dashboard_jwt_roundtrip_preserves_role() {
-    let service = AuthService::new_for_tests("unit-test-secret");
+    let service = AuthService::new("unit-test-secret");
     let token = service.issue_dashboard_jwt("operator-1").unwrap();
     let claims = service.verify_jwt(&token).unwrap();
 
@@ -15,7 +15,7 @@ fn dashboard_jwt_roundtrip_preserves_role() {
 
 #[test]
 fn device_jwt_roundtrip_preserves_role() {
-    let service = AuthService::new_for_tests("unit-test-secret");
+    let service = AuthService::new("unit-test-secret");
     let token = service.issue_device_jwt("device-7").unwrap();
     let claims = service.verify_jwt(&token).unwrap();
 
@@ -27,7 +27,7 @@ fn device_jwt_roundtrip_preserves_role() {
 
 #[test]
 fn verify_jwt_rejects_invalid_tokens() {
-    let service = AuthService::new_for_tests("unit-test-secret");
+    let service = AuthService::new("unit-test-secret");
     let err = service.verify_jwt("not-a-jwt").unwrap_err();
 
     assert!(matches!(err, HubError::InvalidToken(_)));
@@ -35,7 +35,7 @@ fn verify_jwt_rejects_invalid_tokens() {
 
 #[test]
 fn verify_jwt_rejects_tokens_with_the_wrong_issuer() {
-    let service = AuthService::new_for_tests("unit-test-secret");
+    let service = AuthService::new("unit-test-secret");
     let token = encode(
         &Header::default(),
         &AuthContext {

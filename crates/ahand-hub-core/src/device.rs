@@ -12,21 +12,6 @@ pub struct Device {
     pub online: bool,
 }
 
-impl Device {
-    pub fn offline_for_tests(id: &str) -> Self {
-        Self {
-            id: id.into(),
-            public_key: None,
-            hostname: "offline-device".into(),
-            os: "linux".into(),
-            capabilities: vec!["exec".into()],
-            version: Some("0.1.2".into()),
-            auth_method: "ed25519".into(),
-            online: false,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct NewDevice {
     pub id: String,

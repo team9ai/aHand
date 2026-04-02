@@ -30,7 +30,18 @@ impl DeviceStore for FixedDeviceStore {
 
 #[tokio::test]
 async fn list_devices_returns_store_snapshot() {
-    let manager = DeviceManager::for_tests();
+    let manager = DeviceManager::new(Arc::new(FixedDeviceStore {
+        devices: vec![Device {
+            id: "device-1".into(),
+            public_key: None,
+            hostname: "offline-device".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+            online: false,
+        }],
+    }));
 
     let devices = manager.list_devices().await.unwrap();
 
