@@ -467,7 +467,11 @@ impl JobStore for MemoryJobStore {
         Ok(jobs)
     }
 
-    async fn transition_status(&self, job_id: &str, status: JobStatus) -> Result<Option<JobStatus>> {
+    async fn transition_status(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+    ) -> Result<Option<JobStatus>> {
         let mut job = self
             .jobs
             .get_mut(job_id)
@@ -520,23 +524,6 @@ impl AuditStore for MemoryAuditStore {
             .entries
             .lock()
             .map_err(|err| HubError::Internal(err.to_string()))?;
-        Ok(entries
-            .iter()
-            .filter(|entry| {
-                filter
-                    .resource_type
-                    .as_ref()
-                    .is_none_or(|resource_type| &entry.resource_type == resource_type)
-                    && filter
-                        .resource_id
-                        .as_ref()
-                        .is_none_or(|resource_id| &entry.resource_id == resource_id)
-                    && filter
-                        .action
-                        .as_ref()
-                        .is_none_or(|action| &entry.action == action)
-            })
-            .cloned()
-            .collect())
+        Ok(filter.apply(entries.iter().cloned()))
     }
 }

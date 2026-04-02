@@ -26,24 +26,7 @@ impl AuditStore for RecordingAuditStore {
             .entries
             .lock()
             .map_err(|err| HubError::Internal(err.to_string()))?;
-        Ok(entries
-            .iter()
-            .filter(|entry| {
-                filter
-                    .resource_type
-                    .as_ref()
-                    .is_none_or(|resource_type| &entry.resource_type == resource_type)
-                    && filter
-                        .resource_id
-                        .as_ref()
-                        .is_none_or(|resource_id| &entry.resource_id == resource_id)
-                    && filter
-                        .action
-                        .as_ref()
-                        .is_none_or(|action| &entry.action == action)
-            })
-            .cloned()
-            .collect())
+        Ok(filter.apply(entries.iter().cloned()))
     }
 }
 
@@ -68,6 +51,7 @@ async fn audit_service_appends_and_queries_entries() {
             resource_type: Some("job".into()),
             resource_id: Some("job-1".into()),
             action: Some("job.created".into()),
+            ..Default::default()
         })
         .await
         .unwrap();

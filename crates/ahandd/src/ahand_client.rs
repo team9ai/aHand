@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ahand_protocol::{
     BrowserResponse, Envelope, Hello, HelloAccepted, HelloChallenge, JobFinished, JobRejected,
@@ -26,6 +26,35 @@ pub enum HelloAuthMode {
     Bootstrap(String),
 }
 
+#[derive(Clone)]
+struct BufferedEnvelopeSender {
+    tx: mpsc::UnboundedSender<QueuedEnvelope>,
+    outbox: Arc<Mutex<Outbox>>,
+}
+
+struct QueuedEnvelope {
+    frame: Vec<u8>,
+    envelope: Envelope,
+}
+
+impl BufferedEnvelopeSender {
+    fn new(tx: mpsc::UnboundedSender<QueuedEnvelope>, outbox: Arc<Mutex<Outbox>>) -> Self {
+        Self { tx, outbox }
+    }
+}
+
+impl crate::executor::EnvelopeSink for BufferedEnvelopeSender {
+    fn send(&self, mut envelope: Envelope) -> Result<(), ()> {
+        let frame = {
+            let mut outbox = self.outbox.lock().expect("outbox mutex poisoned");
+            prepare_outbound(&mut outbox, &mut envelope)
+        };
+        self.tx
+            .send(QueuedEnvelope { frame, envelope })
+            .map_err(|_| ())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -47,7 +76,7 @@ pub async fn run(
     let bearer_token = hub_config.bootstrap_token.clone();
 
     // Outbox survives across reconnects.
-    let outbox = Arc::new(tokio::sync::Mutex::new(Outbox::new(10_000)));
+    let outbox = Arc::new(Mutex::new(Outbox::new(10_000)));
 
     let mut backoff = 1u64;
 
@@ -94,7 +123,7 @@ async fn connect(
     session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
-    outbox: &Arc<tokio::sync::Mutex<Outbox>>,
+    outbox: &Arc<Mutex<Outbox>>,
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
@@ -139,7 +168,7 @@ async fn connect_with_auth(
     session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
-    outbox: &Arc<tokio::sync::Mutex<Outbox>>,
+    outbox: &Arc<Mutex<Outbox>>,
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
@@ -151,7 +180,7 @@ async fn connect_with_auth(
     let (mut sink, mut stream) = ws_stream.split();
 
     let challenge = recv_hello_challenge(&mut stream).await?;
-    let last_ack = outbox.lock().await.local_ack();
+    let last_ack = outbox.lock().expect("outbox mutex poisoned").local_ack();
     info!(last_ack, "connected, sending Hello");
 
     // Send Hello envelope — Hello is NOT stamped (seq=0), it's a connection signal.
@@ -178,7 +207,10 @@ async fn connect_with_auth(
     info!(auth_method = %accepted.auth_method, "hello accepted");
 
     // Replay unacked messages from previous connection.
-    let unacked = outbox.lock().await.drain_unacked();
+    let unacked = outbox
+        .lock()
+        .expect("outbox mutex poisoned")
+        .drain_unacked();
     if !unacked.is_empty() {
         info!(count = unacked.len(), "replaying unacked messages");
         for data in unacked {
@@ -190,24 +222,22 @@ async fn connect_with_auth(
     }
 
     // Channel: executor sends Envelope objects, send task stamps + encodes + sends.
-    let (tx, mut rx) = mpsc::unbounded_channel::<Envelope>();
-
+    let (raw_tx, mut rx) = mpsc::unbounded_channel::<QueuedEnvelope>();
+    let tx = BufferedEnvelopeSender::new(raw_tx, Arc::clone(outbox));
     let store_send = store.clone();
-    let outbox_send = Arc::clone(outbox);
 
     // Task: receive Envelope from executors, stamp with outbox, encode, send over WS.
     let send_handle = tokio::spawn(async move {
-        while let Some(mut envelope) = rx.recv().await {
-            let data = {
-                let mut ob = outbox_send.lock().await;
-                prepare_outbound(&mut ob, &mut envelope)
-            };
-
+        while let Some(queued) = rx.recv().await {
             // Log outbound envelopes to trace.
             if let Some(s) = &store_send {
-                s.log_envelope(&envelope, Direction::Outbound).await;
+                s.log_envelope(&queued.envelope, Direction::Outbound).await;
             }
-            if sink.send(tungstenite::Message::Binary(data)).await.is_err() {
+            if sink
+                .send(tungstenite::Message::Binary(queued.frame))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -249,7 +279,7 @@ async fn connect_with_auth(
 
         // Update outbox with peer's seq and ack.
         {
-            let mut ob = outbox.lock().await;
+            let mut ob = outbox.lock().expect("outbox mutex poisoned");
             if envelope.seq > 0 {
                 ob.on_recv(envelope.seq);
             }
@@ -369,17 +399,19 @@ pub fn hello_auth_modes(bootstrap_token: Option<&str>) -> Vec<HelloAuthMode> {
 
 /// Handle an incoming JobRequest with idempotency + session mode check.
 #[allow(clippy::too_many_arguments)]
-async fn handle_job_request(
+async fn handle_job_request<T>(
     req: ahand_protocol::JobRequest,
     device_id: &str,
     caller_uid: &str,
-    tx: &mpsc::UnboundedSender<Envelope>,
+    tx: &T,
     session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
-) {
+) where
+    T: crate::executor::EnvelopeSink,
+{
     // Idempotency check.
     match registry.is_known(&req.job_id).await {
         IsKnown::Running => {
@@ -448,7 +480,7 @@ async fn handle_job_request(
             let _ = approval_broadcast_tx.send(approval_env);
 
             // Spawn a task to wait for approval.
-            let tx_clone = tx.clone();
+            let tx_clone = (*tx).clone();
             let did = device_id.to_string();
             let reg = Arc::clone(registry);
             let st = store.clone();
@@ -510,15 +542,17 @@ async fn handle_job_request(
 }
 
 /// Spawn a job execution task.
-async fn spawn_job(
+async fn spawn_job<T>(
     device_id: &str,
     req: ahand_protocol::JobRequest,
-    tx: &mpsc::UnboundedSender<Envelope>,
+    tx: &T,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
-) {
+) where
+    T: crate::executor::EnvelopeSink,
+{
     let job_id = req.job_id.clone();
-    let tx_clone = tx.clone();
+    let tx_clone = (*tx).clone();
     let did = device_id.to_string();
     let reg = Arc::clone(registry);
     let st = store.clone();
@@ -537,12 +571,14 @@ async fn spawn_job(
     });
 }
 
-async fn handle_set_session_mode(
+async fn handle_set_session_mode<T>(
     device_id: &str,
     session_mgr: &Arc<SessionManager>,
     msg: &ahand_protocol::SetSessionMode,
-    tx: &mpsc::UnboundedSender<Envelope>,
-) {
+    tx: &T,
+) where
+    T: crate::executor::EnvelopeSink,
+{
     let mode = ahand_protocol::SessionMode::try_from(msg.mode)
         .unwrap_or(ahand_protocol::SessionMode::Inactive);
     info!(caller_uid = %msg.caller_uid, ?mode, "received set session mode");
@@ -559,12 +595,14 @@ async fn handle_set_session_mode(
     let _ = tx.send(state_env);
 }
 
-async fn handle_session_query(
+async fn handle_session_query<T>(
     device_id: &str,
     session_mgr: &Arc<SessionManager>,
     query: &ahand_protocol::SessionQuery,
-    tx: &mpsc::UnboundedSender<Envelope>,
-) {
+    tx: &T,
+) where
+    T: crate::executor::EnvelopeSink,
+{
     info!(caller_uid = %query.caller_uid, "received session query");
     let states = session_mgr.query_sessions(&query.caller_uid).await;
     for state in states {
@@ -579,14 +617,16 @@ async fn handle_session_query(
     }
 }
 
-async fn handle_browser_request(
+async fn handle_browser_request<T>(
     device_id: &str,
     caller_uid: &str,
     req: &ahand_protocol::BrowserRequest,
-    tx: &mpsc::UnboundedSender<Envelope>,
+    tx: &T,
     session_mgr: &Arc<SessionManager>,
     browser_mgr: &Arc<BrowserManager>,
-) {
+) where
+    T: crate::executor::EnvelopeSink,
+{
     info!(
         request_id = %req.request_id,
         session_id = %req.session_id,
@@ -778,13 +818,13 @@ fn classify_hello_accepted_message(
                     "hello auth rejected"
                 )))
             }
-            tungstenite::Message::Close(Some(frame)) => Err(ConnectError::Session(
-                anyhow::anyhow!(
+            tungstenite::Message::Close(Some(frame)) => {
+                Err(ConnectError::Session(anyhow::anyhow!(
                     "websocket closed before hello accepted: code={} reason={}",
                     frame.code,
                     frame.reason
-                ),
-            )),
+                )))
+            }
             tungstenite::Message::Close(None) => Err(ConnectError::Session(anyhow::anyhow!(
                 "websocket closed before hello accepted"
             ))),
@@ -818,13 +858,21 @@ impl From<anyhow::Error> for ConnectError {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::sync::{Arc, Mutex};
 
+    use ahand_protocol::{Envelope, JobFinished, envelope};
+    use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::{
         Message,
         protocol::{CloseFrame, frame::coding::CloseCode},
     };
 
-    use super::{ConnectError, classify_hello_accepted_message};
+    use crate::executor::EnvelopeSink;
+    use crate::outbox::Outbox;
+
+    use super::{
+        BufferedEnvelopeSender, ConnectError, QueuedEnvelope, classify_hello_accepted_message,
+    };
 
     #[test]
     fn auth_rejection_close_frame_is_classified_as_handshake_rejected() {
@@ -842,5 +890,28 @@ mod tests {
         let err = classify_hello_accepted_message(Message::Close(None)).unwrap_err();
 
         assert!(matches!(err, ConnectError::Session(_)));
+    }
+
+    #[test]
+    fn buffered_envelope_sender_stores_frames_before_transport_send() {
+        let outbox = Arc::new(Mutex::new(Outbox::new(16)));
+        let (tx, rx) = mpsc::unbounded_channel::<QueuedEnvelope>();
+        let sender = BufferedEnvelopeSender::new(tx, outbox.clone());
+
+        sender
+            .send(Envelope {
+                device_id: "device-1".into(),
+                payload: Some(envelope::Payload::JobFinished(JobFinished {
+                    job_id: "job-1".into(),
+                    exit_code: 0,
+                    error: String::new(),
+                })),
+                ..Default::default()
+            })
+            .expect("send should enqueue");
+        drop(rx);
+
+        let buffered = outbox.lock().unwrap().drain_unacked();
+        assert_eq!(buffered.len(), 1);
     }
 }

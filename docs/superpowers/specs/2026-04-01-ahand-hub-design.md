@@ -178,39 +178,46 @@ Issued by a business backend for external integration scenarios. It is limited t
 
 ### 6.2 Device Authentication
 
-Device authentication is Ed25519-first. Tokens are used only for bootstrap or assisted registration, not as the long-term device identity.
+Device authentication is Ed25519-first. Bootstrap credentials are only used to bind a device's first key or to recover a specifically reserved device identity; they are not the long-term device identity.
 
 Suggested handshake:
 
 1. Device connects to `/ws`
-2. Device sends `Hello`
-3. `Hello` carries authentication:
-   - `ed25519`: public key, signature, timestamp
-   - `bearer_token`: bootstrap token or external device JWT
-4. `ahand-hub` verifies the signature or token
-5. `ahand-hub` finds or creates the device record
-6. `ahand-hub` marks the device online and restores any unacked outbound messages
+2. `ahand-hub` sends `HelloChallenge(nonce, issued_at_ms)`
+3. Device sends `Hello`
+4. `Hello` carries authentication:
+   - `ed25519`: public key, signature over the canonical hello payload, timestamp
+   - `bootstrap`: the same signed hello plus a bootstrap credential
+5. `ahand-hub` verifies the challenge nonce, signed timestamp freshness, signature, and device-to-key binding
+6. `ahand-hub` finds or creates the device record
+7. `ahand-hub` marks the device online and restores any unacked outbound messages
 
 Bootstrap binding rules:
 
-1. `POST /api/devices` pre-registers a device and returns a one-time bootstrap token
-2. The device may use that bootstrap token on its first connection
-3. On the first successful connection, the device must present its Ed25519 public key
+1. `POST /api/devices` pre-registers a device and returns a one-time bootstrap credential bound to that device `id`
+2. The device may use that credential only on its first successful connection
+3. On the first successful connection, the device must present its Ed25519 public key and signed challenge response
 4. `ahand-hub` binds that key to the device record
-5. All later connections should use Ed25519 signatures by default
-6. The bootstrap token is invalidated immediately after successful first use
+5. All later connections use Ed25519 challenge-response by default
+6. The one-time bootstrap credential is invalidated immediately after successful first use
+7. An optional fixed bootstrap credential may exist only for one configured reserved device `id`, for controlled provisioning or recovery
 
-The signed payload is fixed:
+The signed payload is canonical and includes:
 
 ```text
-ahand-hub|{device_id}|{signed_at_ms}
+domain tag
+device_id
+Hello version/hostname/os/capabilities/last_ack
+signed_at_ms
+challenge_nonce
 ```
 
 Restrictions:
 
-1. Signature validity window defaults to 5 minutes
-2. Device `id` is derived from the public key or a fixed pre-registration identity and remains stable
-3. Anonymous `Hello` must not create an active business connection
+1. Signature freshness window defaults to 5 minutes
+2. `signed_at_ms` must move forward monotonically for an already bound device
+3. Device `id` is derived from the public key or a fixed pre-registration identity and remains stable
+4. Anonymous or unsigned `Hello` must not create an active business connection
 
 ## 7. Device Connection and WebSocket Design
 
@@ -218,8 +225,9 @@ Restrictions:
 
 ```text
 device -> connect /ws
+hub    -> HelloChallenge(nonce)
 device -> Hello(version, host, os, capabilities, last_ack, auth)
-hub    -> verify auth
+hub    -> verify challenge + auth
 hub    -> upsert device record
 hub    -> restore outbox from last_ack
 hub    -> mark online in Redis
@@ -619,11 +627,12 @@ Key configuration areas:
 1. HTTP and WebSocket listen address and port
 2. PostgreSQL URL and pool sizing
 3. Redis URL and pool sizing
-4. Dashboard password hash
+4. Dashboard password hash and allowed browser origins
 5. JWT secret, TTL, and external JWT verification settings
 6. Service token definitions
-7. Heartbeat, outbox retention, and output stream TTL
-8. Audit batching and retention days
+7. Bootstrap credential settings, including the reserved device bootstrap identity
+8. Heartbeat, outbox retention, and output stream TTL
+9. Audit batching and retention days
 
 Startup flow:
 
@@ -652,6 +661,7 @@ Deployment shape:
 2. PostgreSQL and Redis are external dependencies; the deployment compose file points to externally managed endpoints rather than provisioning them itself
 3. CI and operator docs must still provide a smoke path that starts the hub container against disposable Postgres/Redis dependencies before release
 4. The dashboard may be deployed separately first, and can later be embedded as static assets if needed
+5. Split-origin dashboard deployments must configure `AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS` so browser WebSocket upgrades are accepted intentionally rather than implicitly
 
 V1 does not require service splitting yet, but the crate boundaries must preserve a clean path to future extraction.
 

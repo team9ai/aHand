@@ -1,12 +1,22 @@
 use std::sync::Arc;
 
-use ahand_protocol::{envelope, job_event, Envelope, JobEvent, JobFinished, JobRequest};
+use ahand_protocol::{Envelope, JobEvent, JobFinished, JobRequest, envelope, job_event};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::store::RunStore;
+
+pub trait EnvelopeSink: Clone + Send + Sync + 'static {
+    fn send(&self, envelope: Envelope) -> Result<(), ()>;
+}
+
+impl EnvelopeSink for mpsc::UnboundedSender<Envelope> {
+    fn send(&self, envelope: Envelope) -> Result<(), ()> {
+        self.send(envelope).map_err(|_| ())
+    }
+}
 
 /// Runs a job and sends Envelope-wrapped events back via the channel.
 ///
@@ -16,13 +26,16 @@ use crate::store::RunStore;
 /// If a `RunStore` is provided, stdout/stderr chunks and the final result are
 /// persisted to disk.
 /// Returns `(exit_code, error)` for the caller to use (e.g. for idempotency caching).
-pub async fn run_job(
+pub async fn run_job<T>(
     device_id: String,
     req: JobRequest,
-    tx: mpsc::UnboundedSender<Envelope>,
+    tx: T,
     mut cancel_rx: mpsc::Receiver<()>,
     store: Option<Arc<RunStore>>,
-) -> (i32, String) {
+) -> (i32, String)
+where
+    T: EnvelopeSink,
+{
     let job_id = req.job_id.clone();
     info!(job_id = %job_id, tool = %req.tool, "starting job");
 
@@ -179,7 +192,7 @@ fn finish(
     job_id: &str,
     exit_code: i32,
     error: &str,
-    tx: &mpsc::UnboundedSender<Envelope>,
+    tx: &impl EnvelopeSink,
     store: &Option<Arc<RunStore>>,
 ) -> (i32, String) {
     if let Some(s) = &store {

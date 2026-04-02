@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use ahand_hub_core::{HubError, Result};
@@ -40,6 +41,29 @@ impl RedisPresenceStore {
             .exists(key)
             .await
             .map_err(|err| HubError::Internal(err.to_string()))
+    }
+
+    pub async fn online_states(&self, device_ids: &[String]) -> Result<HashMap<String, bool>> {
+        if device_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut pipeline = redis::pipe();
+        for device_id in device_ids {
+            pipeline.cmd("EXISTS").arg(presence_key(device_id));
+        }
+
+        let mut connection = self.connection.lock().await;
+        let exists: Vec<u64> = pipeline
+            .query_async(&mut *connection)
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        Ok(device_ids
+            .iter()
+            .cloned()
+            .zip(exists.into_iter().map(|value| value > 0))
+            .collect())
     }
 
     pub async fn mark_offline(&self, device_id: &str) -> Result<()> {

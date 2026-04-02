@@ -2,8 +2,9 @@ use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::traits::AuditStore;
 use ahand_hub_core::{HubError, Result};
 use async_trait::async_trait;
-use sqlx::PgPool;
 use sqlx::Row;
+use sqlx::postgres::Postgres;
+use sqlx::{PgPool, QueryBuilder};
 
 #[derive(Clone)]
 pub struct PgAuditStore {
@@ -52,22 +53,57 @@ impl AuditStore for PgAuditStore {
     }
 
     async fn query(&self, filter: AuditFilter) -> Result<Vec<AuditEntry>> {
-        let rows = sqlx::query(
+        let mut query = QueryBuilder::<Postgres>::new(
             r#"
             SELECT timestamp, action, resource_type, resource_id, actor, detail, source_ip
             FROM audit_logs
-            WHERE ($1::text IS NULL OR resource_type = $1)
-              AND ($2::text IS NULL OR resource_id = $2)
-              AND ($3::text IS NULL OR action = $3)
-            ORDER BY id
+            WHERE 1 = 1
             "#,
-        )
-        .bind(filter.resource_type)
-        .bind(filter.resource_id)
-        .bind(filter.action)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|err| HubError::Internal(err.to_string()))?;
+        );
+
+        if let Some(resource) = filter.resource.as_ref() {
+            query
+                .push(" AND (resource_type = ")
+                .push_bind(resource)
+                .push(" OR resource_id = ")
+                .push_bind(resource)
+                .push(")");
+        }
+        if let Some(resource_type) = filter.resource_type.as_ref() {
+            query.push(" AND resource_type = ").push_bind(resource_type);
+        }
+        if let Some(resource_id) = filter.resource_id.as_ref() {
+            query.push(" AND resource_id = ").push_bind(resource_id);
+        }
+        if let Some(action) = filter.action.as_ref() {
+            query.push(" AND action = ").push_bind(action);
+        }
+        if let Some(since) = filter.since {
+            query.push(" AND timestamp >= ").push_bind(since);
+        }
+        if let Some(until) = filter.until {
+            query.push(" AND timestamp <= ").push_bind(until);
+        }
+
+        query.push(" ORDER BY timestamp ");
+        if filter.descending {
+            query.push("DESC, id DESC");
+        } else {
+            query.push("ASC, id ASC");
+        }
+
+        if let Some(limit) = filter.limit {
+            query.push(" LIMIT ").push_bind(limit as i64);
+        }
+        if let Some(offset) = filter.offset.filter(|offset| *offset > 0) {
+            query.push(" OFFSET ").push_bind(offset as i64);
+        }
+
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
 
         rows.into_iter().map(map_audit).collect()
     }

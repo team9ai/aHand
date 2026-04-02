@@ -238,7 +238,7 @@ async fn timed_out_job_sends_cancel_and_then_fails_with_timeout_output() {
 }
 
 #[tokio::test]
-async fn disconnect_fails_sent_job_before_it_starts_running() {
+async fn sent_job_fails_after_disconnect_grace_without_reconnect() {
     let server = spawn_test_server().await;
     let mut device = server.attach_test_device("device-1").await;
 
@@ -260,6 +260,12 @@ async fn disconnect_fails_sent_job_before_it_starts_running() {
     assert_eq!(request.tool, "sleep");
     drop(device);
 
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let still_sent = server
+        .get_json(&format!("/api/jobs/{job_id}"), "service-test-token")
+        .await;
+    assert_eq!(still_sent["status"], "sent");
+
     let stored = wait_for_job_status(&server, &job_id, "failed", Duration::from_secs(1)).await;
     assert_eq!(stored["status"], "failed");
 
@@ -272,6 +278,41 @@ async fn disconnect_fails_sent_job_before_it_starts_running() {
         .await;
     assert!(body.contains("event: finished"));
     assert!(body.contains("\"error\":\"device disconnected\""));
+}
+
+#[tokio::test]
+async fn sent_job_replays_after_reconnect_within_disconnect_grace() {
+    let server = spawn_test_server().await;
+    let mut device = server.attach_test_device("device-1").await;
+
+    let created = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-1",
+                "tool": "sleep",
+                "args": ["30"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+
+    let job_id = created["job_id"].as_str().unwrap().to_string();
+    let request = device.recv_job_request().await;
+    assert_eq!(request.tool, "sleep");
+    drop(device);
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let mut replacement = server.attach_test_device("device-1").await;
+    let replayed = replacement.recv_job_request().await;
+    assert_eq!(replayed.job_id, job_id);
+    replacement.send_finished(&job_id, 0, "").await;
+
+    let stored =
+        wait_for_job_status(&server, &job_id, "finished", Duration::from_secs(1)).await;
+    assert_eq!(stored["status"], "finished");
 }
 
 #[tokio::test]

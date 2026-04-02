@@ -4,13 +4,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ahand_hub_core::audit::AuditFilter;
+use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
+use chrono::{Duration as ChronoDuration, Utc};
 use sqlx::Row;
 use support::TestStack;
 
@@ -81,6 +82,7 @@ async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<
             resource_type: Some("job".into()),
             resource_id: Some(created_job.id.to_string()),
             action: Some("job.created".into()),
+            ..Default::default()
         })
         .await?;
     assert_eq!(audit_entries.len(), 1);
@@ -110,6 +112,34 @@ async fn deleting_a_device_clears_presence() -> anyhow::Result<()> {
     stack.devices.delete("device-2").await?;
 
     assert!(!stack.presence.is_online("device-2").await?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_presence_store_reads_multiple_device_states_in_one_call() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    stack
+        .presence
+        .mark_online("device-1", "127.0.0.1:12345")
+        .await?;
+    stack
+        .presence
+        .mark_online("device-3", "127.0.0.1:12346")
+        .await?;
+
+    let states = stack
+        .presence
+        .online_states(&[
+            "device-1".to_string(),
+            "device-2".to_string(),
+            "device-3".to_string(),
+        ])
+        .await?;
+
+    assert_eq!(states.get("device-1"), Some(&true));
+    assert_eq!(states.get("device-2"), Some(&false));
+    assert_eq!(states.get("device-3"), Some(&true));
 
     Ok(())
 }
@@ -360,7 +390,75 @@ async fn concurrent_terminal_transitions_do_not_overwrite_each_other() -> anyhow
         .get(&job.id.to_string())
         .await?
         .expect("job should still exist");
-    assert!(matches!(stored.status, JobStatus::Finished | JobStatus::Failed));
+    assert!(matches!(
+        stored.status,
+        JobStatus::Finished | JobStatus::Failed
+    ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn audit_store_filters_orders_and_paginates_in_query() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let base = Utc::now();
+    stack
+        .audit
+        .append(&[
+            AuditEntry {
+                timestamp: base,
+                action: "job.finished".into(),
+                resource_type: "job".into(),
+                resource_id: "job-1".into(),
+                actor: "service:test".into(),
+                detail: serde_json::json!({ "ordinal": 1 }),
+                source_ip: None,
+            },
+            AuditEntry {
+                timestamp: base + ChronoDuration::seconds(10),
+                action: "job.running".into(),
+                resource_type: "job".into(),
+                resource_id: "job-2".into(),
+                actor: "service:test".into(),
+                detail: serde_json::json!({ "ordinal": 2 }),
+                source_ip: None,
+            },
+            AuditEntry {
+                timestamp: base + ChronoDuration::seconds(20),
+                action: "job.finished".into(),
+                resource_type: "job".into(),
+                resource_id: "job-3".into(),
+                actor: "service:test".into(),
+                detail: serde_json::json!({ "ordinal": 3 }),
+                source_ip: None,
+            },
+            AuditEntry {
+                timestamp: base + ChronoDuration::seconds(30),
+                action: "job.finished".into(),
+                resource_type: "job".into(),
+                resource_id: "job-4".into(),
+                actor: "service:test".into(),
+                detail: serde_json::json!({ "ordinal": 4 }),
+                source_ip: None,
+            },
+        ])
+        .await?;
+
+    let entries = stack
+        .audit
+        .query(AuditFilter {
+            action: Some("job.finished".into()),
+            since: Some(base + ChronoDuration::seconds(5)),
+            until: Some(base + ChronoDuration::seconds(35)),
+            limit: Some(1),
+            offset: Some(1),
+            descending: true,
+            ..Default::default()
+        })
+        .await?;
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].resource_id, "job-3");
 
     Ok(())
 }

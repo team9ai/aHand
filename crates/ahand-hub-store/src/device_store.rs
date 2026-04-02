@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ahand_hub_core::device::{Device, NewDevice};
 use ahand_hub_core::traits::DeviceStore;
 use ahand_hub_core::{HubError, Result};
@@ -140,16 +142,23 @@ impl DeviceStore for PgDeviceStore {
         .await
         .map_err(|err| HubError::Internal(err.to_string()))?;
 
-        let mut devices = Vec::with_capacity(rows.len());
+        let mut rows_with_ids = Vec::with_capacity(rows.len());
+        let mut device_ids = Vec::with_capacity(rows.len());
         for row in rows {
             let device_id = row
                 .try_get::<String, _>("id")
                 .map_err(|err| HubError::Internal(err.to_string()))?;
-            let online = self.online_state(&device_id).await?;
-            devices.push(map_device(row, online)?);
+            device_ids.push(device_id.clone());
+            rows_with_ids.push((row, device_id));
         }
 
-        Ok(devices)
+        let online_states = self.online_states(&device_ids).await?;
+        rows_with_ids
+            .into_iter()
+            .map(|(row, device_id)| {
+                map_device(row, online_states.get(&device_id).copied().unwrap_or(false))
+            })
+            .collect()
     }
 
     async fn delete(&self, device_id: &str) -> Result<()> {
@@ -169,6 +178,17 @@ impl PgDeviceStore {
         match &self.presence {
             Some(presence) => presence.is_online(device_id).await,
             None => Ok(false),
+        }
+    }
+
+    async fn online_states(&self, device_ids: &[String]) -> Result<HashMap<String, bool>> {
+        match &self.presence {
+            Some(presence) => presence.online_states(device_ids).await,
+            None => Ok(device_ids
+                .iter()
+                .cloned()
+                .map(|device_id| (device_id, false))
+                .collect()),
         }
     }
 }

@@ -31,23 +31,20 @@ pub async fn list_audit_logs(
 
     let since = parse_timestamp(query.since.as_deref())?;
     let until = parse_timestamp(query.until.as_deref())?;
-    let mut entries = state
+    let entries = state
         .audit_store
         .query(AuditFilter {
+            resource: query.resource.clone(),
             action: query.action.clone(),
+            since,
+            until,
+            limit: query.limit,
+            offset: query.offset,
+            descending: true,
             ..Default::default()
         })
         .await
         .map_err(|_| ApiError::internal("Failed to list audit logs"))?;
-
-    entries.retain(|entry| {
-        query.resource.as_ref().is_none_or(|resource| {
-            &entry.resource_type == resource || &entry.resource_id == resource
-        }) && since.is_none_or(|since| entry.timestamp >= since)
-            && until.is_none_or(|until| entry.timestamp <= until)
-    });
-    entries.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
-    apply_pagination(&mut entries, query.offset.unwrap_or(0), query.limit);
 
     Ok(Json(entries))
 }
@@ -59,18 +56,4 @@ fn parse_timestamp(value: Option<&str>) -> ApiResult<Option<DateTime<Utc>>> {
             .map(|timestamp| Some(timestamp.with_timezone(&Utc)))
             .map_err(|_| ApiError::validation(format!("Invalid RFC3339 timestamp: {value}"))),
     }
-}
-
-fn apply_pagination<T>(items: &mut Vec<T>, offset: usize, limit: Option<usize>) {
-    if offset == 0 && limit.is_none() {
-        return;
-    }
-
-    let take = limit.unwrap_or(usize::MAX);
-    let paged = std::mem::take(items)
-        .into_iter()
-        .skip(offset)
-        .take(take)
-        .collect();
-    *items = paged;
 }

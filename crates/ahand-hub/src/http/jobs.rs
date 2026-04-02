@@ -196,30 +196,45 @@ impl JobRuntime {
                 if let Some(event_kind) = event.event {
                     match event_kind {
                         ahand_protocol::job_event::Event::StdoutChunk(chunk) => {
-                            self.transition_job(
-                                &event.job_id,
-                                JobStatus::Running,
-                                &format!("device:{device_id}"),
-                            )
-                            .await?;
+                            if let Err(err) = self
+                                .transition_job(
+                                    &event.job_id,
+                                    JobStatus::Running,
+                                    &format!("device:{device_id}"),
+                                )
+                                .await
+                            {
+                                return self
+                                    .handle_stale_device_frame_error(device_id, seq, ack, err);
+                            }
                             self.output_stream.push_stdout(&event.job_id, chunk).await?;
                         }
                         ahand_protocol::job_event::Event::StderrChunk(chunk) => {
-                            self.transition_job(
-                                &event.job_id,
-                                JobStatus::Running,
-                                &format!("device:{device_id}"),
-                            )
-                            .await?;
+                            if let Err(err) = self
+                                .transition_job(
+                                    &event.job_id,
+                                    JobStatus::Running,
+                                    &format!("device:{device_id}"),
+                                )
+                                .await
+                            {
+                                return self
+                                    .handle_stale_device_frame_error(device_id, seq, ack, err);
+                            }
                             self.output_stream.push_stderr(&event.job_id, chunk).await?;
                         }
                         ahand_protocol::job_event::Event::Progress(progress) => {
-                            self.transition_job(
-                                &event.job_id,
-                                JobStatus::Running,
-                                &format!("device:{device_id}"),
-                            )
-                            .await?;
+                            if let Err(err) = self
+                                .transition_job(
+                                    &event.job_id,
+                                    JobStatus::Running,
+                                    &format!("device:{device_id}"),
+                                )
+                                .await
+                            {
+                                return self
+                                    .handle_stale_device_frame_error(device_id, seq, ack, err);
+                            }
                             self.output_stream
                                 .push_progress(&event.job_id, progress)
                                 .await?;
@@ -237,12 +252,16 @@ impl JobRuntime {
                     return Ok(());
                 }
                 if job.status != JobStatus::Running {
-                    self.transition_job(
-                        &finished.job_id,
-                        JobStatus::Running,
-                        &format!("device:{device_id}"),
-                    )
-                    .await?;
+                    if let Err(err) = self
+                        .transition_job(
+                            &finished.job_id,
+                            JobStatus::Running,
+                            &format!("device:{device_id}"),
+                        )
+                        .await
+                    {
+                        return self.handle_stale_device_frame_error(device_id, seq, ack, err);
+                    }
                 }
                 let status = if finished.error == "cancelled" {
                     JobStatus::Cancelled
@@ -251,14 +270,18 @@ impl JobRuntime {
                 } else {
                     JobStatus::Failed
                 };
-                self.finish_job(
-                    &finished.job_id,
-                    status,
-                    finished.exit_code,
-                    &finished.error,
-                    &format!("device:{device_id}"),
-                )
-                .await?;
+                if let Err(err) = self
+                    .finish_job(
+                        &finished.job_id,
+                        status,
+                        finished.exit_code,
+                        &finished.error,
+                        &format!("device:{device_id}"),
+                    )
+                    .await
+                {
+                    return self.handle_stale_device_frame_error(device_id, seq, ack, err);
+                }
             }
             Some(ahand_protocol::envelope::Payload::JobRejected(rejected)) => {
                 let Some(job) = self.job_for_device(device_id, &rejected.job_id).await? else {
@@ -269,14 +292,18 @@ impl JobRuntime {
                     self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
                 }
-                self.finish_job(
-                    &rejected.job_id,
-                    JobStatus::Failed,
-                    -1,
-                    &rejected.reason,
-                    &format!("device:{device_id}"),
-                )
-                .await?;
+                if let Err(err) = self
+                    .finish_job(
+                        &rejected.job_id,
+                        JobStatus::Failed,
+                        -1,
+                        &rejected.reason,
+                        &format!("device:{device_id}"),
+                    )
+                    .await
+                {
+                    return self.handle_stale_device_frame_error(device_id, seq, ack, err);
+                }
             }
             _ => {}
         }
@@ -290,11 +317,13 @@ impl JobRuntime {
             .jobs
             .list(JobFilter {
                 device_id: Some(device_id.into()),
-                status: Some(JobStatus::Running),
+                status: None,
             })
             .await?
         {
-            self.clear_disconnect_task(&job.id.to_string());
+            if matches!(job.status, JobStatus::Sent | JobStatus::Running) {
+                self.clear_disconnect_task(&job.id.to_string());
+            }
         }
         Ok(())
     }
@@ -310,7 +339,7 @@ impl JobRuntime {
         {
             let job_id = job.id.to_string();
             match job.status {
-                JobStatus::Pending | JobStatus::Sent => {
+                JobStatus::Pending => {
                     self.finish_job(
                         &job_id,
                         JobStatus::Failed,
@@ -320,7 +349,7 @@ impl JobRuntime {
                     )
                     .await?;
                 }
-                JobStatus::Running => self.schedule_disconnect_failure(&job),
+                JobStatus::Sent | JobStatus::Running => self.schedule_disconnect_failure(&job),
                 JobStatus::Finished | JobStatus::Failed | JobStatus::Cancelled => {}
             }
         }
@@ -487,7 +516,7 @@ impl JobRuntime {
             self.remove_disconnect_task(job_id);
             return Ok(());
         };
-        if job.status != JobStatus::Running {
+        if !matches!(job.status, JobStatus::Sent | JobStatus::Running) {
             self.remove_disconnect_task(job_id);
             return Ok(());
         }
@@ -500,6 +529,23 @@ impl JobRuntime {
         self.output_stream
             .push_finished(job_id, -1, "device disconnected")
             .await
+    }
+
+    fn handle_stale_device_frame_error(
+        &self,
+        device_id: &str,
+        seq: u64,
+        ack: u64,
+        err: anyhow::Error,
+    ) -> anyhow::Result<()> {
+        if matches!(
+            err.downcast_ref::<HubError>(),
+            Some(HubError::IllegalJobTransition { current, .. }) if is_terminal_status(*current)
+        ) {
+            self.connections.observe_inbound(device_id, seq, ack)?;
+            return Ok(());
+        }
+        Err(err)
     }
 
     fn replace_task(
@@ -745,6 +791,7 @@ impl From<Job> for DashboardJobResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use ahand_hub_core::audit::AuditFilter;
@@ -755,6 +802,70 @@ mod tests {
 
     use super::*;
     use crate::state::{MemoryAuditStore, MemoryDeviceStore, MemoryJobStore};
+
+    #[derive(Clone)]
+    struct RacingJobStore {
+        inner: Arc<MemoryJobStore>,
+        fail_next_running_transition: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl JobStore for RacingJobStore {
+        async fn insert(&self, job: NewJob) -> ahand_hub_core::Result<Job> {
+            self.inner.insert(job).await
+        }
+
+        async fn get(&self, job_id: &str) -> ahand_hub_core::Result<Option<Job>> {
+            self.inner.get(job_id).await
+        }
+
+        async fn list(&self, filter: JobFilter) -> ahand_hub_core::Result<Vec<Job>> {
+            self.inner.list(filter).await
+        }
+
+        async fn transition_status(
+            &self,
+            job_id: &str,
+            status: JobStatus,
+        ) -> ahand_hub_core::Result<Option<JobStatus>> {
+            if status == JobStatus::Running
+                && self
+                    .fail_next_running_transition
+                    .swap(false, Ordering::SeqCst)
+            {
+                let _ = self
+                    .inner
+                    .transition_status(job_id, JobStatus::Failed)
+                    .await?;
+                return Err(HubError::IllegalJobTransition {
+                    current: JobStatus::Failed,
+                    requested: JobStatus::Running,
+                });
+            }
+            self.inner.transition_status(job_id, status).await
+        }
+
+        async fn update_status(
+            &self,
+            job_id: &str,
+            status: JobStatus,
+        ) -> ahand_hub_core::Result<()> {
+            self.inner.update_status(job_id, status).await
+        }
+
+        async fn update_terminal(
+            &self,
+            job_id: &str,
+            exit_code: i32,
+            error: &str,
+            output_summary: &str,
+        ) -> ahand_hub_core::Result<()> {
+            self.inner
+                .update_terminal(job_id, exit_code, error, output_summary)
+                .await
+        }
+    }
+
     async fn insert_online_device(devices: &MemoryDeviceStore, device_id: &str) {
         devices
             .insert(NewDevice {
@@ -804,6 +915,34 @@ mod tests {
         )
     }
 
+    async fn build_runtime_with_jobs(
+        jobs: Arc<dyn JobStore>,
+    ) -> (JobRuntime, Arc<ConnectionRegistry>, Arc<MemoryAuditStore>) {
+        let devices = Arc::new(MemoryDeviceStore::default());
+        insert_online_device(&devices, "device-1").await;
+        insert_online_device(&devices, "device-2").await;
+
+        let audit = Arc::new(MemoryAuditStore::default());
+        let connections = Arc::new(ConnectionRegistry::default());
+        let events = Arc::new(EventBus::new(audit.clone()));
+        let output_stream = Arc::new(crate::output_stream::OutputStream::default());
+        let dispatcher = Arc::new(JobDispatcher::new(devices, jobs.clone(), audit.clone()));
+
+        (
+            JobRuntime::new(
+                dispatcher,
+                jobs,
+                connections.clone(),
+                events,
+                output_stream,
+                100,
+                100,
+            ),
+            connections,
+            audit,
+        )
+    }
+
     async fn wait_for_audit_entries(
         audit: &Arc<MemoryAuditStore>,
         resource_id: String,
@@ -816,6 +955,7 @@ mod tests {
                     resource_type: Some("job".into()),
                     resource_id: Some(resource_id.clone()),
                     action: Some(action.into()),
+                    ..Default::default()
                 })
                 .await
                 .unwrap();
@@ -884,6 +1024,7 @@ mod tests {
                 resource_type: Some("job".into()),
                 resource_id: Some(jobs[0].id.to_string()),
                 action: Some("job.sent".into()),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -991,6 +1132,48 @@ mod tests {
         assert!(stored.started_at.is_some());
         let audit_entries = wait_for_audit_entries(&audit, job.id.to_string(), "job.running").await;
         assert_eq!(audit_entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_running_transition_from_device_frame_is_ignored() {
+        let jobs = Arc::new(RacingJobStore {
+            inner: Arc::new(MemoryJobStore::default()),
+            fail_next_running_transition: Arc::new(AtomicBool::new(true)),
+        });
+        let (runtime, connections, _audit) = build_runtime_with_jobs(jobs.clone()).await;
+        let _transport = attach_live_connection(&connections, "device-1");
+        let job = runtime
+            .create_job(NewJob {
+                device_id: "device-1".into(),
+                tool: "echo".into(),
+                args: vec!["hello".into()],
+                cwd: None,
+                env: Default::default(),
+                timeout_ms: 30_000,
+                requested_by: "service:test".into(),
+            })
+            .await
+            .unwrap();
+
+        let frame = ahand_protocol::Envelope {
+            device_id: "device-1".into(),
+            payload: Some(ahand_protocol::envelope::Payload::JobEvent(
+                ahand_protocol::JobEvent {
+                    job_id: job.id.to_string(),
+                    event: Some(ahand_protocol::job_event::Event::Progress(7)),
+                },
+            )),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        runtime
+            .handle_device_frame("device-1", &frame)
+            .await
+            .unwrap();
+
+        let stored = jobs.inner.get(&job.id.to_string()).await.unwrap().unwrap();
+        assert_eq!(stored.status, JobStatus::Failed);
     }
 
     #[tokio::test]

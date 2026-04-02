@@ -61,13 +61,12 @@ impl AuditStore for BufferedAuditStore {
                         path = %fallback_path.display(),
                         "audit queue unavailable, writing entry to fallback file"
                     );
-                    if let Err(err) =
-                        write_fallback_entries(
-                            fallback_path.as_ref(),
-                            std::slice::from_ref(&entry),
-                            fallback_lock.as_ref(),
-                        )
-                            .await
+                    if let Err(err) = write_fallback_entries(
+                        fallback_path.as_ref(),
+                        std::slice::from_ref(&entry),
+                        fallback_lock.as_ref(),
+                    )
+                    .await
                     {
                         tracing::error!(error = %err, path = %fallback_path.display(), "failed to write audit fallback entry");
                     }
@@ -218,16 +217,7 @@ mod tests {
                 .entries
                 .lock()
                 .map_err(|err| HubError::Internal(err.to_string()))?;
-            Ok(entries
-                .iter()
-                .filter(|entry| {
-                    filter
-                        .action
-                        .as_ref()
-                        .is_none_or(|action| &entry.action == action)
-                })
-                .cloned()
-                .collect())
+            Ok(filter.apply(entries.iter().cloned()))
         }
     }
 

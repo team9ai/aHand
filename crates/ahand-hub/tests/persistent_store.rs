@@ -89,6 +89,7 @@ async fn app_state_uses_persistent_store_backends_across_restart() -> anyhow::Re
             resource_type: Some("job".into()),
             resource_id: Some(created["job_id"].as_str().unwrap().into()),
             action: Some("job.created".into()),
+            ..Default::default()
         })
         .await?;
     assert_eq!(audit_entries.len(), 1);

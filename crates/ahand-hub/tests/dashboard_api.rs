@@ -283,6 +283,79 @@ async fn jobs_list_rejects_invalid_status_with_error_envelope() {
 }
 
 #[tokio::test]
+async fn audit_logs_apply_resource_window_and_pagination_filters() {
+    let state = support::test_state().await;
+    let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
+    let server = spawn_server_with_state(state.clone()).await;
+    let base = Utc::now();
+
+    state
+        .audit_store
+        .append(&[
+            AuditEntry {
+                timestamp: base,
+                action: "job.finished".into(),
+                resource_type: "job".into(),
+                resource_id: "job-1".into(),
+                actor: "service".into(),
+                detail: serde_json::json!({ "ordinal": 1 }),
+                source_ip: None,
+            },
+            AuditEntry {
+                timestamp: base + ChronoDuration::seconds(10),
+                action: "job.finished".into(),
+                resource_type: "job".into(),
+                resource_id: "job-2".into(),
+                actor: "service".into(),
+                detail: serde_json::json!({ "ordinal": 2 }),
+                source_ip: None,
+            },
+            AuditEntry {
+                timestamp: base + ChronoDuration::seconds(20),
+                action: "job.finished".into(),
+                resource_type: "job".into(),
+                resource_id: "job-3".into(),
+                actor: "service".into(),
+                detail: serde_json::json!({ "ordinal": 3 }),
+                source_ip: None,
+            },
+            AuditEntry {
+                timestamp: base + ChronoDuration::seconds(30),
+                action: "device.connected".into(),
+                resource_type: "device".into(),
+                resource_id: "device-1".into(),
+                actor: "hub".into(),
+                detail: serde_json::json!({}),
+                source_ip: None,
+            },
+        ])
+        .await
+        .unwrap();
+    wait_for_audit_event(&state, "job.finished", 3).await;
+
+    let since =
+        (base + ChronoDuration::seconds(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let until =
+        (base + ChronoDuration::seconds(25)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let response = server
+        .get(
+            &format!(
+                "/api/audit-logs?resource=job&action=job.finished&since={since}&until={until}&limit=1&offset=1"
+            ),
+            &token,
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let payload: Value = response.json().await.unwrap();
+    let entries = payload
+        .as_array()
+        .expect("audit log response should be an array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["resource_id"], "job-2");
+}
+
+#[tokio::test]
 async fn jobs_list_rejects_invalid_limit_with_error_envelope() {
     let state = support::test_state().await;
     let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();

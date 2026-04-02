@@ -24,6 +24,7 @@ async fn wait_for_audit_count(
                 action: Some(action.into()),
                 resource_type: None,
                 resource_id: Some(resource_id.into()),
+                ..Default::default()
             })
             .await
             .unwrap();

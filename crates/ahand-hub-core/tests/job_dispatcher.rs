@@ -217,24 +217,7 @@ impl AuditStore for RecordingAuditStore {
             .entries
             .lock()
             .map_err(|err| HubError::Internal(err.to_string()))?;
-        Ok(entries
-            .iter()
-            .filter(|entry| {
-                filter
-                    .resource_type
-                    .as_ref()
-                    .is_none_or(|resource_type| &entry.resource_type == resource_type)
-                    && filter
-                        .resource_id
-                        .as_ref()
-                        .is_none_or(|resource_id| &entry.resource_id == resource_id)
-                    && filter
-                        .action
-                        .as_ref()
-                        .is_none_or(|action| &entry.action == action)
-            })
-            .cloned()
-            .collect())
+        Ok(filter.apply(entries.iter().cloned()))
     }
 }
 
@@ -467,6 +450,7 @@ async fn create_job_writes_audit_entry_for_online_device() {
             resource_type: Some("job".into()),
             resource_id: Some(job.id.to_string()),
             action: Some("job.created".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -780,6 +764,7 @@ async fn fake_audit_store_appends_and_queries_entries() {
             resource_type: Some("job".into()),
             resource_id: None,
             action: None,
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -789,6 +774,7 @@ async fn fake_audit_store_appends_and_queries_entries() {
             resource_type: None,
             resource_id: None,
             action: Some("device.deleted".into()),
+            ..Default::default()
         })
         .await
         .unwrap();
