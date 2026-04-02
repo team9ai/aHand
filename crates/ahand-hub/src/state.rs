@@ -39,7 +39,7 @@ pub struct AppState {
 
 impl AppState {
     pub async fn from_config(config: crate::config::Config) -> anyhow::Result<Self> {
-        let (devices, jobs_store, audit_store) = match &config.store {
+        let (devices, jobs_store, raw_audit_store) = match &config.store {
             crate::config::StoreConfig::Memory => (
                 Arc::new(MemoryDeviceStore::default()),
                 Arc::new(MemoryJobStore::default()) as Arc<dyn JobStore>,
@@ -62,6 +62,9 @@ impl AppState {
                 )
             }
         };
+        let audit_store = Arc::new(crate::audit_writer::BufferedAuditStore::new(
+            raw_audit_store,
+        )) as Arc<dyn AuditStore>;
         let output_stream = Arc::new(crate::output_stream::OutputStream::new(
             Duration::from_millis(config.output_retention_ms),
             256,
