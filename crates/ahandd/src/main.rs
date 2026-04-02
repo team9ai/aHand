@@ -357,6 +357,7 @@ async fn main() -> anyhow::Result<()> {
                     Arc::clone(&registry),
                     Arc::clone(&session_mgr),
                     Arc::clone(&approval_mgr),
+                    approval_broadcast_tx.clone(),
                     store_opt.clone(),
                     Arc::clone(&browser_mgr),
                 );

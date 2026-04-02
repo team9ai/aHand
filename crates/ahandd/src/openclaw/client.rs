@@ -25,9 +25,8 @@ use super::pairing::{
     GatewayInfo, default_pairing_path, generate_node_id, load_pairing_state, save_pairing_state,
 };
 use super::protocol::{
-    AuthParams, ClientInfo, ConnectChallengePayload, ConnectParams, DeviceParams, EventFrame,
-    GatewayFrame, HelloOk, NodeEvent, NodeInvokeRequest, NodeInvokeResult, PROTOCOL_VERSION,
-    RequestFrame, ResponseFrame,
+    AuthParams, ClientInfo, ConnectChallengePayload, ConnectParams, DeviceParams, GatewayFrame,
+    HelloOk, NodeEvent, NodeInvokeRequest, PROTOCOL_VERSION, RequestFrame, ResponseFrame,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,6 +37,7 @@ pub struct OpenClawClient {
     registry: Arc<JobRegistry>,
     session_mgr: Arc<SessionManager>,
     approval_mgr: Arc<ApprovalManager>,
+    approval_broadcast_tx: tokio::sync::broadcast::Sender<ahand_protocol::Envelope>,
     store: Option<Arc<RunStore>>,
     browser_mgr: Arc<BrowserManager>,
 }
@@ -48,6 +48,7 @@ impl OpenClawClient {
         registry: Arc<JobRegistry>,
         session_mgr: Arc<SessionManager>,
         approval_mgr: Arc<ApprovalManager>,
+        approval_broadcast_tx: tokio::sync::broadcast::Sender<ahand_protocol::Envelope>,
         store: Option<Arc<RunStore>>,
         browser_mgr: Arc<BrowserManager>,
     ) -> Self {
@@ -56,6 +57,7 @@ impl OpenClawClient {
             registry,
             session_mgr,
             approval_mgr,
+            approval_broadcast_tx,
             store,
             browser_mgr,
         }
@@ -142,6 +144,7 @@ impl OpenClawClient {
             Arc::clone(&self.registry),
             Arc::clone(&self.session_mgr),
             Arc::clone(&self.approval_mgr),
+            self.approval_broadcast_tx.clone(),
             self.store.clone(),
             self.config.exec_approvals_path.as_ref().map(PathBuf::from),
             Arc::clone(&self.browser_mgr),
@@ -151,7 +154,6 @@ impl OpenClawClient {
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
         // Spawn send task
-        let tx_clone = tx.clone();
         let send_task = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if let Err(e) = sink.send(msg).await {
@@ -236,14 +238,10 @@ impl OpenClawClient {
                                                 let (result, exec_event) = handler.handle_invoke(invoke).await;
 
                                                 // Send exec event if present
-                                                if let Some(event_payload) = exec_event {
+                                                if let Some(exec_event) = exec_event {
                                                     let event = NodeEvent {
-                                                        event: if event_payload.success == Some(true) {
-                                                            "exec.finished".to_string()
-                                                        } else {
-                                                            "exec.denied".to_string()
-                                                        },
-                                                        payload_json: serde_json::to_string(&event_payload).ok(),
+                                                        event: exec_event.kind.as_str().to_string(),
+                                                        payload_json: serde_json::to_string(&exec_event.payload).ok(),
                                                     };
                                                     let req = RequestFrame::new(
                                                         uuid::Uuid::new_v4().to_string(),

@@ -9,16 +9,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahand_protocol::{ApprovalResponse, Envelope, JobRequest, envelope};
 use serde::Deserialize;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::broadcast;
 use tracing::debug;
 
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::registry::JobRegistry;
-use crate::session::SessionManager;
+use crate::session::{SessionDecision, SessionManager};
 use crate::store::RunStore;
 
 use super::exec_approvals::{
@@ -31,12 +33,34 @@ use super::protocol::{
     SystemWhichParams, SystemWhichResult,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecEventKind {
+    Finished,
+    Denied,
+}
+
+impl ExecEventKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Finished => "exec.finished",
+            Self::Denied => "exec.denied",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ExecEvent {
+    pub kind: ExecEventKind,
+    pub payload: ExecEventPayload,
+}
+
 /// Handler for OpenClaw node invocations
 pub struct OpenClawHandler {
     node_id: String,
     registry: Arc<JobRegistry>,
     session_mgr: Arc<SessionManager>,
     approval_mgr: Arc<ApprovalManager>,
+    approval_broadcast_tx: broadcast::Sender<Envelope>,
     store: Option<Arc<RunStore>>,
     exec_approvals_path: PathBuf,
     browser_mgr: Arc<BrowserManager>,
@@ -48,6 +72,7 @@ impl OpenClawHandler {
         registry: Arc<JobRegistry>,
         session_mgr: Arc<SessionManager>,
         approval_mgr: Arc<ApprovalManager>,
+        approval_broadcast_tx: broadcast::Sender<Envelope>,
         store: Option<Arc<RunStore>>,
         exec_approvals_path: Option<PathBuf>,
         browser_mgr: Arc<BrowserManager>,
@@ -57,6 +82,7 @@ impl OpenClawHandler {
             registry,
             session_mgr,
             approval_mgr,
+            approval_broadcast_tx,
             store,
             exec_approvals_path: exec_approvals_path.unwrap_or_else(default_exec_approvals_path),
             browser_mgr,
@@ -67,7 +93,7 @@ impl OpenClawHandler {
     pub async fn handle_invoke(
         &self,
         invoke: NodeInvokeRequest,
-    ) -> (NodeInvokeResult, Option<ExecEventPayload>) {
+    ) -> (NodeInvokeResult, Option<ExecEvent>) {
         let command = invoke.command.as_str();
 
         debug!(
@@ -113,7 +139,7 @@ impl OpenClawHandler {
     async fn handle_system_run(
         &self,
         invoke: &NodeInvokeRequest,
-    ) -> (NodeInvokeResult, Option<ExecEventPayload>) {
+    ) -> (NodeInvokeResult, Option<ExecEvent>) {
         let params: SystemRunParams = match decode_params(&invoke.params_json) {
             Ok(p) => p,
             Err(e) => {
@@ -147,52 +173,63 @@ impl OpenClawHandler {
             .session_key
             .clone()
             .unwrap_or_else(|| "openclaw".to_string());
-        let run_id = params
-            .run_id
-            .clone()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let run_id = params.run_id.clone().unwrap_or_else(|| invoke.id.clone());
         let cmd_text = format_command(&params.command);
+        let request = build_job_request(invoke, &params, &run_id);
 
-        // Check if approval is pre-granted
-        let is_approved = params.approved == Some(true)
-            || params.approval_decision == Some("allow-once".to_string())
-            || params.approval_decision == Some("allow-always".to_string());
-
-        // For now, execute directly (approval integration in Phase 5)
-        // TODO: Integrate with SessionManager for approval flow
+        match self.session_mgr.check(&request, &session_key).await {
+            SessionDecision::Deny(reason) => {
+                return self.denied_system_run(invoke, &session_key, &run_id, &cmd_text, reason);
+            }
+            SessionDecision::Allow => {}
+            SessionDecision::NeedsApproval {
+                reason,
+                previous_refusals,
+            } => match approval_disposition(&params) {
+                ApprovalDisposition::Granted => {}
+                ApprovalDisposition::Denied => {
+                    return self.denied_system_run(
+                        invoke,
+                        &session_key,
+                        &run_id,
+                        &cmd_text,
+                        "approval denied".to_string(),
+                    );
+                }
+                ApprovalDisposition::Missing => {
+                    let outcome = self
+                        .await_local_approval(&request, &session_key, reason, previous_refusals)
+                        .await;
+                    match outcome {
+                        ApprovalOutcome::Approved => {}
+                        ApprovalOutcome::Denied(reason) => {
+                            return self.denied_system_run(
+                                invoke,
+                                &session_key,
+                                &run_id,
+                                &cmd_text,
+                                reason,
+                            );
+                        }
+                        ApprovalOutcome::TimedOut => {
+                            return self.denied_system_run(
+                                invoke,
+                                &session_key,
+                                &run_id,
+                                &cmd_text,
+                                "approval timed out".to_string(),
+                            );
+                        }
+                    }
+                }
+            },
+        }
 
         let result = self.run_command(&params).await;
-
-        let event = ExecEventPayload {
-            session_key: session_key.clone(),
-            run_id: run_id.clone(),
-            host: "node".to_string(),
-            command: Some(cmd_text),
-            exit_code: result.exit_code,
-            timed_out: Some(result.timed_out),
-            success: Some(result.success),
-            output: Some(truncate_output(
-                &[
-                    &result.stdout,
-                    &result.stderr,
-                    result.error.as_deref().unwrap_or(""),
-                ]
-                .iter()
-                .filter(|s| !s.is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n"),
-                OUTPUT_EVENT_TAIL,
-            )),
-            reason: None,
-        };
-
-        let invoke_result = NodeInvokeResult {
-            id: invoke.id.clone(),
-            node_id: self.node_id.clone(),
-            ok: true,
-            payload_json: Some(serde_json::to_string(&result).unwrap_or_default()),
-            error: None,
+        let invoke_result = invoke_result_from_run(invoke, &self.node_id, &result);
+        let event = ExecEvent {
+            kind: ExecEventKind::Finished,
+            payload: exec_event_payload(&session_key, &run_id, &cmd_text, &result, None),
         };
 
         (invoke_result, Some(event))
@@ -331,6 +368,61 @@ impl OpenClawHandler {
             stderr,
             error: None,
         }
+    }
+
+    async fn await_local_approval(
+        &self,
+        request: &JobRequest,
+        caller_uid: &str,
+        reason: String,
+        previous_refusals: Vec<ahand_protocol::RefusalContext>,
+    ) -> ApprovalOutcome {
+        let (approval_req, approval_rx) = self
+            .approval_mgr
+            .submit(request.clone(), caller_uid, reason, previous_refusals)
+            .await;
+        let approval_env = Envelope {
+            device_id: self.node_id.clone(),
+            msg_id: new_msg_id(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::ApprovalRequest(approval_req)),
+            ..Default::default()
+        };
+        let _ = self.approval_broadcast_tx.send(approval_env);
+
+        match tokio::time::timeout(self.approval_mgr.default_timeout(), approval_rx).await {
+            Ok(Ok(resp)) if resp.approved => ApprovalOutcome::Approved,
+            Ok(Ok(resp)) => {
+                if !resp.reason.is_empty() {
+                    self.session_mgr
+                        .record_refusal(caller_uid, &request.tool, &resp.reason)
+                        .await;
+                }
+                self.approval_mgr.expire(&request.job_id).await;
+                ApprovalOutcome::Denied(approval_denied_reason(&resp))
+            }
+            _ => {
+                self.approval_mgr.expire(&request.job_id).await;
+                ApprovalOutcome::TimedOut
+            }
+        }
+    }
+
+    fn denied_system_run(
+        &self,
+        invoke: &NodeInvokeRequest,
+        session_key: &str,
+        run_id: &str,
+        cmd_text: &str,
+        reason: String,
+    ) -> (NodeInvokeResult, Option<ExecEvent>) {
+        let result = denied_run_result(reason.clone());
+        let invoke_result = invoke_result_from_run(invoke, &self.node_id, &result);
+        let event = ExecEvent {
+            kind: ExecEventKind::Denied,
+            payload: exec_event_payload(session_key, run_id, cmd_text, &result, Some(reason)),
+        };
+        (invoke_result, Some(event))
     }
 
     /// Handle system.which command
@@ -751,6 +843,136 @@ impl OpenClawHandler {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalDisposition {
+    Granted,
+    Denied,
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApprovalOutcome {
+    Approved,
+    Denied(String),
+    TimedOut,
+}
+
+fn approval_disposition(params: &SystemRunParams) -> ApprovalDisposition {
+    if params.approved == Some(true)
+        || matches!(
+            params.approval_decision.as_deref(),
+            Some("allow-once" | "allow-always")
+        )
+    {
+        ApprovalDisposition::Granted
+    } else if params.approved == Some(false)
+        || matches!(
+            params.approval_decision.as_deref(),
+            Some("deny" | "reject" | "blocked")
+        )
+    {
+        ApprovalDisposition::Denied
+    } else {
+        ApprovalDisposition::Missing
+    }
+}
+
+fn build_job_request(invoke: &NodeInvokeRequest, params: &SystemRunParams, run_id: &str) -> JobRequest {
+    let tool = params
+        .command
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "sh".to_string());
+    let args = if params.command.len() > 1 {
+        params.command[1..].to_vec()
+    } else if let Some(raw_command) = &params.raw_command {
+        vec![raw_command.clone()]
+    } else {
+        Vec::new()
+    };
+
+    JobRequest {
+        job_id: run_id.to_string(),
+        tool,
+        args,
+        cwd: params.cwd.clone().unwrap_or_default(),
+        env: params.env.clone().unwrap_or_default(),
+        timeout_ms: params.timeout_ms.or(invoke.timeout_ms).unwrap_or(120_000),
+    }
+}
+
+fn denied_run_result(reason: String) -> RunResult {
+    RunResult {
+        exit_code: None,
+        timed_out: false,
+        success: false,
+        stdout: String::new(),
+        stderr: String::new(),
+        error: Some(reason),
+    }
+}
+
+fn approval_denied_reason(resp: &ApprovalResponse) -> String {
+    if resp.reason.is_empty() {
+        "approval denied".to_string()
+    } else {
+        format!("approval denied: {}", resp.reason)
+    }
+}
+
+fn invoke_result_from_run(invoke: &NodeInvokeRequest, node_id: &str, result: &RunResult) -> NodeInvokeResult {
+    NodeInvokeResult {
+        id: invoke.id.clone(),
+        node_id: node_id.to_string(),
+        ok: true,
+        payload_json: Some(serde_json::to_string(result).unwrap_or_default()),
+        error: None,
+    }
+}
+
+fn exec_event_payload(
+    session_key: &str,
+    run_id: &str,
+    cmd_text: &str,
+    result: &RunResult,
+    reason: Option<String>,
+) -> ExecEventPayload {
+    ExecEventPayload {
+        session_key: session_key.to_string(),
+        run_id: run_id.to_string(),
+        host: "node".to_string(),
+        command: Some(cmd_text.to_string()),
+        exit_code: result.exit_code,
+        timed_out: Some(result.timed_out),
+        success: Some(result.success),
+        output: Some(truncate_output(
+            &[
+                &result.stdout,
+                &result.stderr,
+                result.error.as_deref().unwrap_or(""),
+            ]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n"),
+            OUTPUT_EVENT_TAIL,
+        )),
+        reason,
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn new_msg_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 /// Translate an OpenClaw HTTP-style browser proxy request into a CLI action
 /// and params JSON that `BrowserManager::execute()` understands.
 ///
@@ -1131,4 +1353,192 @@ fn sanitize_env(overrides: &HashMap<String, String>) -> HashMap<String, String> 
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecEventKind, OpenClawHandler};
+    use crate::approval::ApprovalManager;
+    use crate::browser::BrowserManager;
+    use crate::config::BrowserConfig;
+    use crate::registry::JobRegistry;
+    use crate::session::SessionManager;
+    use ahand_protocol::{ApprovalResponse, SessionMode, envelope};
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    fn test_handler(
+        approval_timeout_secs: u64,
+    ) -> (
+        OpenClawHandler,
+        Arc<SessionManager>,
+        Arc<ApprovalManager>,
+        broadcast::Sender<ahand_protocol::Envelope>,
+    ) {
+        let session_mgr = Arc::new(SessionManager::new(5));
+        let approval_mgr = Arc::new(ApprovalManager::new(approval_timeout_secs));
+        let (approval_broadcast_tx, _) = broadcast::channel(8);
+        let handler = OpenClawHandler::new(
+            "device-test".to_string(),
+            Arc::new(JobRegistry::new(1)),
+            session_mgr.clone(),
+            approval_mgr.clone(),
+            approval_broadcast_tx.clone(),
+            None,
+            None,
+            Arc::new(BrowserManager::new(BrowserConfig::default())),
+        );
+        (handler, session_mgr, approval_mgr, approval_broadcast_tx)
+    }
+
+    fn unique_output_path() -> PathBuf {
+        PathBuf::from(format!(
+            "/tmp/ahand-openclaw-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn system_run_invoke(
+        session_key: &str,
+        raw_command: String,
+        approved: Option<bool>,
+        approval_decision: Option<&str>,
+    ) -> super::NodeInvokeRequest {
+        let mut params = serde_json::Map::new();
+        params.insert("command".into(), json!(["sh"]));
+        params.insert("rawCommand".into(), json!(raw_command));
+        params.insert("sessionKey".into(), json!(session_key));
+        params.insert("runId".into(), json!("run-1"));
+        if let Some(approved) = approved {
+            params.insert("approved".into(), json!(approved));
+        }
+        if let Some(approval_decision) = approval_decision {
+            params.insert("approvalDecision".into(), json!(approval_decision));
+        }
+
+        super::NodeInvokeRequest {
+            id: "invoke-1".to_string(),
+            node_id: "node-1".to_string(),
+            command: "system.run".to_string(),
+            params_json: Some(serde_json::Value::Object(params).to_string()),
+            timeout_ms: Some(1_000),
+            idempotency_key: None,
+        }
+    }
+
+    fn payload_json(result: &super::NodeInvokeResult) -> serde_json::Value {
+        serde_json::from_str(result.payload_json.as_deref().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn inactive_session_denies_system_run_without_execution() {
+        let (handler, _session_mgr, _approval_mgr, _broadcast_tx) = test_handler(1);
+        let output_path = unique_output_path();
+        let command = format!("printf denied > {}", output_path.display());
+
+        let (result, event) = handler
+            .handle_invoke(system_run_invoke("session-1", command, None, None))
+            .await;
+
+        assert!(!output_path.exists());
+        let payload = payload_json(&result);
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["error"], "session not activated");
+
+        let event = event.unwrap();
+        assert_eq!(event.kind, ExecEventKind::Denied);
+        assert_eq!(event.payload.reason.as_deref(), Some("session not activated"));
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_preapproved_request_executes_without_local_wait() {
+        let (handler, session_mgr, _approval_mgr, approval_broadcast_tx) = test_handler(1);
+        session_mgr
+            .set_mode("session-1", SessionMode::Strict, 0)
+            .await;
+        let mut approval_rx = approval_broadcast_tx.subscribe();
+        let output_path = unique_output_path();
+        let command = format!("printf approved > {}", output_path.display());
+
+        let (result, event) = handler
+            .handle_invoke(system_run_invoke("session-1", command, Some(true), None))
+            .await;
+
+        assert!(output_path.exists());
+        let payload = payload_json(&result);
+        assert_eq!(payload["success"], true);
+
+        let event = event.unwrap();
+        assert_eq!(event.kind, ExecEventKind::Finished);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), approval_rx.recv())
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_waits_for_local_approval_before_running() {
+        let (handler, session_mgr, approval_mgr, approval_broadcast_tx) = test_handler(1);
+        session_mgr
+            .set_mode("session-1", SessionMode::Strict, 0)
+            .await;
+        let mut approval_rx = approval_broadcast_tx.subscribe();
+        let output_path = unique_output_path();
+        let command = format!("printf locally-approved > {}", output_path.display());
+
+        let resolver = tokio::spawn(async move {
+            let envelope = approval_rx.recv().await.unwrap();
+            let request = match envelope.payload.unwrap() {
+                envelope::Payload::ApprovalRequest(request) => request,
+                other => panic!("unexpected payload: {other:?}"),
+            };
+            approval_mgr
+                .resolve(&ApprovalResponse {
+                    job_id: request.job_id,
+                    approved: true,
+                    remember: false,
+                    reason: String::new(),
+                })
+                .await;
+        });
+
+        let (result, event) = handler
+            .handle_invoke(system_run_invoke("session-1", command, None, None))
+            .await;
+
+        resolver.await.unwrap();
+        assert!(output_path.exists());
+        let payload = payload_json(&result);
+        assert_eq!(payload["success"], true);
+        assert_eq!(event.unwrap().kind, ExecEventKind::Finished);
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[tokio::test]
+    async fn execution_failures_emit_finished_events_not_denied() {
+        let (handler, session_mgr, _approval_mgr, _broadcast_tx) = test_handler(1);
+        session_mgr
+            .set_mode("session-1", SessionMode::AutoAccept, 0)
+            .await;
+
+        let (result, event) = handler
+            .handle_invoke(system_run_invoke(
+                "session-1",
+                "exit 7".to_string(),
+                None,
+                None,
+            ))
+            .await;
+
+        let payload = payload_json(&result);
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["exitCode"], 7);
+        assert_eq!(event.unwrap().kind, ExecEventKind::Finished);
+    }
 }
