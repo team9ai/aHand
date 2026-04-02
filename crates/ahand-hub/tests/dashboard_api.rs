@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
-use support::spawn_server_with_state;
+use support::{persistent_test_config, spawn_server_with_state};
 
 #[tokio::test]
 async fn dashboard_login_issues_a_dashboard_token_and_verify_accepts_it() {
@@ -472,7 +472,10 @@ async fn dashboard_websocket_rejects_cross_origin_clients() {
     let request = {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-        let mut request = server.ws_url("/ws/dashboard").into_client_request().unwrap();
+        let mut request = server
+            .ws_url("/ws/dashboard")
+            .into_client_request()
+            .unwrap();
         request.headers_mut().append(
             "cookie",
             format!("ahand_hub_session={token}").parse().unwrap(),
@@ -494,7 +497,9 @@ async fn dashboard_websocket_rejects_cross_origin_clients() {
 async fn dashboard_websocket_accepts_configured_split_origin_clients() {
     let mut config = support::test_config();
     config.dashboard_allowed_origins = vec!["https://dashboard.example".into()];
-    let state = ahand_hub::state::AppState::from_config(config).await.unwrap();
+    let state = ahand_hub::state::AppState::from_config(config)
+        .await
+        .unwrap();
     let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
     let server = spawn_server_with_state(state).await;
 
@@ -503,4 +508,67 @@ async fn dashboard_websocket_accepts_configured_split_origin_clients() {
         .await;
 
     drop(socket);
+}
+
+#[tokio::test]
+async fn dashboard_websocket_receives_events_from_another_persistent_instance(
+) -> anyhow::Result<()> {
+    let stack = ahand_hub_store::test_support::TestStack::start().await?;
+    let config = persistent_test_config(&stack);
+
+    let state_a = ahand_hub::state::AppState::from_config(config.clone()).await?;
+    let state_b = ahand_hub::state::AppState::from_config(config).await?;
+    let token = state_b.auth.issue_dashboard_jwt("operator-1")?;
+
+    let server_a = spawn_server_with_state(state_a).await;
+    let server_b = spawn_server_with_state(state_b).await;
+    let mut dashboard_socket = server_b.connect_dashboard_socket(Some(&token)).await;
+
+    let mut device = server_a
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+    let created = server_a
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-2",
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+    let job_id = created["job_id"].as_str().unwrap().to_string();
+    let _ = device.recv_job_request().await;
+    device.send_finished(&job_id, 0, "").await;
+
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = tokio::time::timeout(remaining, dashboard_socket.next())
+            .await
+            .expect("dashboard websocket should yield event")
+            .expect("dashboard websocket should stay open")
+            .expect("dashboard websocket should not error");
+
+        if let Message::Text(text) = message {
+            let payload: Value = serde_json::from_str(text.as_str()).unwrap();
+            if let Some(event) = payload["event"].as_str() {
+                events.push(event.to_string());
+            }
+        }
+
+        if events.iter().any(|event| event == "job.created")
+            && events.iter().any(|event| event == "job.finished")
+        {
+            break;
+        }
+    }
+
+    assert!(events.iter().any(|event| event == "device.online"));
+    assert!(events.iter().any(|event| event == "job.created"));
+    assert!(events.iter().any(|event| event == "job.finished"));
+    Ok(())
 }

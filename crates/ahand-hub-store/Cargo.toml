@@ -18,8 +18,10 @@ required-features = ["test-support"]
 [dependencies]
 ahand-hub-core = { path = "../ahand-hub-core" }
 anyhow.workspace = true
+async-stream = "0.3"
 async-trait.workspace = true
 chrono.workspace = true
+futures-util = "0.3"
 redis.workspace = true
 serde.workspace = true
 serde_json.workspace = true

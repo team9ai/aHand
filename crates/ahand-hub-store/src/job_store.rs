@@ -120,12 +120,12 @@ impl JobStore for PgJobStore {
             WHERE id = $1
             "#,
         )
-            .bind(parsed)
-            .bind(encode_status(next_status))
-            .bind(transitioned_at)
-            .execute(&self.pool)
-            .await
-            .map_err(|err| HubError::Internal(err.to_string()))?;
+        .bind(parsed)
+        .bind(encode_status(next_status))
+        .bind(transitioned_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| HubError::Internal(err.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(HubError::JobNotFound(job_id.into()));

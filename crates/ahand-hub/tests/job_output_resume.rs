@@ -7,7 +7,7 @@ use ahand_hub::output_stream::OutputStream;
 use ahand_hub_core::job::NewJob;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderName};
-use support::{spawn_server_with_state, spawn_test_server};
+use support::{persistent_test_config, spawn_server_with_state, spawn_test_server};
 
 #[tokio::test]
 async fn reconnecting_sse_with_last_event_id_does_not_duplicate_output_history() {
@@ -198,4 +198,70 @@ async fn existing_job_without_live_output_state_still_streams_with_200() {
         .unwrap();
 
     assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn persistent_output_history_survives_restart() -> anyhow::Result<()> {
+    let stack = ahand_hub_store::test_support::TestStack::start().await?;
+    let config = persistent_test_config(&stack);
+
+    let state = ahand_hub::state::AppState::from_config(config.clone()).await?;
+    let server = spawn_server_with_state(state).await;
+    let mut device = server
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+
+    let created = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-2",
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+    let job_id = created["job_id"].as_str().unwrap().to_string();
+    let _ = device.recv_job_request().await;
+    device.send_stdout(&job_id, b"first\n").await;
+    device.send_stdout(&job_id, b"second\n").await;
+    device.send_finished(&job_id, 0, "").await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.shutdown().await;
+
+    let restarted = ahand_hub::state::AppState::from_config(config).await?;
+    let restarted = spawn_server_with_state(restarted).await;
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/api/jobs/{job_id}/output",
+            restarted.http_base_url()
+        ))
+        .header(AUTHORIZATION, "Bearer service-test-token")
+        .send()
+        .await?;
+
+    let mut stream = response.bytes_stream();
+    let mut body = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                body.push_str(&String::from_utf8_lossy(&chunk));
+                if body.contains("event: finished") {
+                    break;
+                }
+            }
+            Ok(Some(Err(err))) => panic!("failed reading SSE chunk after restart: {err}"),
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    assert!(body.contains("data: first"));
+    assert!(body.contains("data: second"));
+    assert!(body.contains("event: finished"));
+    Ok(())
 }

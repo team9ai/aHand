@@ -6,6 +6,7 @@ use ahand_hub::config::{Config, StoreConfig};
 use ahand_hub::state::AppState;
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::traits::DeviceStore;
+use ahand_hub_store::test_support::TestStack;
 use axum::body::Body;
 use axum::http::{Request, header::AUTHORIZATION};
 use ed25519_dalek::{Signer, SigningKey};
@@ -45,6 +46,28 @@ pub fn test_config() -> Config {
         jwt_secret: "service-test-secret".into(),
         output_retention_ms: 60_000,
         store: StoreConfig::Memory,
+    }
+}
+
+pub fn persistent_test_config(stack: &TestStack) -> Config {
+    Config {
+        bind_addr: "127.0.0.1:0".into(),
+        service_token: "service-test-token".into(),
+        dashboard_shared_password: "shared-secret".into(),
+        dashboard_allowed_origins: Vec::new(),
+        device_bootstrap_token: "bootstrap-test-token".into(),
+        device_bootstrap_device_id: "device-2".into(),
+        device_hello_max_age_ms: 30_000,
+        device_presence_ttl_secs: 60,
+        device_presence_refresh_ms: 20_000,
+        job_timeout_grace_ms: 50,
+        device_disconnect_grace_ms: 100,
+        jwt_secret: "service-test-secret".into(),
+        output_retention_ms: 60_000,
+        store: StoreConfig::Persistent {
+            database_url: stack.database_url().into(),
+            redis_url: stack.redis_url().into(),
+        },
     }
 }
 

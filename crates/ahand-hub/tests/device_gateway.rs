@@ -824,7 +824,9 @@ async fn duplicate_frame_with_invalid_ack_does_not_clear_replay_buffer() {
                 payload: Some(ahand_protocol::envelope::Payload::JobEvent(
                     ahand_protocol::JobEvent {
                         job_id: job_id.clone(),
-                        event: Some(ahand_protocol::job_event::Event::StdoutChunk(b"hello\n".to_vec())),
+                        event: Some(ahand_protocol::job_event::Event::StdoutChunk(
+                            b"hello\n".to_vec(),
+                        )),
                     },
                 )),
                 ..Default::default()
@@ -846,7 +848,9 @@ async fn duplicate_frame_with_invalid_ack_does_not_clear_replay_buffer() {
                 payload: Some(ahand_protocol::envelope::Payload::JobEvent(
                     ahand_protocol::JobEvent {
                         job_id: job_id.clone(),
-                        event: Some(ahand_protocol::job_event::Event::StdoutChunk(b"ignored\n".to_vec())),
+                        event: Some(ahand_protocol::job_event::Event::StdoutChunk(
+                            b"ignored\n".to_vec(),
+                        )),
                     },
                 )),
                 ..Default::default()

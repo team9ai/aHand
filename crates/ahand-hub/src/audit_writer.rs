@@ -31,11 +31,7 @@ impl BufferedAuditStore {
     pub fn new_with_fallback_path(inner: Arc<dyn AuditStore>, fallback_path: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel(AUDIT_QUEUE_CAPACITY);
         let fallback_path = Arc::new(fallback_path);
-        tokio::spawn(run_audit_writer(
-            inner.clone(),
-            rx,
-            fallback_path.clone(),
-        ));
+        tokio::spawn(run_audit_writer(inner.clone(), rx, fallback_path.clone()));
         Self {
             inner,
             tx,
@@ -56,11 +52,9 @@ impl AuditStore for BufferedAuditStore {
                         path = %fallback_path.display(),
                         "audit queue unavailable, writing entry to fallback file"
                     );
-                    if let Err(err) = write_fallback_entries(
-                        fallback_path.as_ref(),
-                        std::slice::from_ref(&entry),
-                    )
-                    .await
+                    if let Err(err) =
+                        write_fallback_entries(fallback_path.as_ref(), std::slice::from_ref(&entry))
+                            .await
                     {
                         tracing::error!(error = %err, path = %fallback_path.display(), "failed to write audit fallback entry");
                     }
@@ -147,7 +141,8 @@ async fn write_fallback_entries(path: &PathBuf, batch: &[AuditEntry]) -> Result<
         .map_err(|err| HubError::Internal(err.to_string()))?;
 
     for entry in batch {
-        let line = serde_json::to_string(entry).map_err(|err| HubError::Internal(err.to_string()))?;
+        let line =
+            serde_json::to_string(entry).map_err(|err| HubError::Internal(err.to_string()))?;
         file.write_all(line.as_bytes())
             .await
             .map_err(|err| HubError::Internal(err.to_string()))?;
@@ -253,10 +248,14 @@ mod tests {
 
     #[tokio::test]
     async fn buffered_store_falls_back_to_file_after_store_failure() {
-        let fallback_path =
-            std::env::temp_dir().join(format!("ahand-hub-audit-fallback-{}.jsonl", uuid::Uuid::new_v4()));
-        let buffered =
-            BufferedAuditStore::new_with_fallback_path(Arc::new(FailingAuditStore), fallback_path.clone());
+        let fallback_path = std::env::temp_dir().join(format!(
+            "ahand-hub-audit-fallback-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let buffered = BufferedAuditStore::new_with_fallback_path(
+            Arc::new(FailingAuditStore),
+            fallback_path.clone(),
+        );
 
         buffered
             .append(&[AuditEntry {

@@ -61,8 +61,10 @@ version = "0.1.2"
 dependencies = [
  "ahand-hub-core",
  "anyhow",
+ "async-stream",
  "async-trait",
  "chrono",
+ "futures-util",
  "redis",
  "serde",
  "serde_json",
