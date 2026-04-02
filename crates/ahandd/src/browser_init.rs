@@ -95,7 +95,10 @@ async fn ensure_node(dirs: &Dirs) -> Result<PathBuf> {
     if dirs.node.exists() {
         let _ = std::fs::remove_dir_all(&dirs.node);
     }
-    println!("  Installing Node.js v{NODE_LTS_VERSION} to {}...", dirs.node.display());
+    println!(
+        "  Installing Node.js v{NODE_LTS_VERSION} to {}...",
+        dirs.node.display()
+    );
     install_node(dirs).await.context(
         "Failed to install Node.js. Check your network connection and retry, \
          or install Node.js >= 20 manually (e.g. `brew install node`).",
@@ -106,7 +109,10 @@ async fn ensure_node(dirs: &Dirs) -> Result<PathBuf> {
             local_node.display()
         );
     }
-    println!("[1/2] Node.js: v{NODE_LTS_VERSION} ({})", dirs.node.display());
+    println!(
+        "[1/2] Node.js: v{NODE_LTS_VERSION} ({})",
+        dirs.node.display()
+    );
     Ok(local_node)
 }
 
@@ -142,7 +148,10 @@ async fn install_node(dirs: &Dirs) -> Result<()> {
     let decoder = xz2::read::XzDecoder::new(std::io::Cursor::new(bytes));
     let mut archive = tar::Archive::new(decoder);
     archive.set_preserve_permissions(true);
-    for entry in archive.entries().context("Failed to read Node.js archive — download may be corrupted")? {
+    for entry in archive
+        .entries()
+        .context("Failed to read Node.js archive — download may be corrupted")?
+    {
         let mut entry = entry.context("Corrupted entry in Node.js archive")?;
         let path = entry.path()?.into_owned();
         // Strip first component (e.g. "node-v24.13.0-darwin-arm64/bin/node" -> "bin/node")
@@ -182,7 +191,10 @@ async fn install_playwright_cli(dirs: &Dirs, node_bin: &Path) -> Result<()> {
         if let Ok(out) = output {
             let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if out.status.success() {
-                println!("[2/2] playwright-cli: {ver} ({}) (cached)", cli_path.display());
+                println!(
+                    "[2/2] playwright-cli: {ver} ({}) (cached)",
+                    cli_path.display()
+                );
                 return Ok(());
             }
         }

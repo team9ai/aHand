@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use ed25519_dalek::{SecretKey, SigningKey, VerifyingKey, Signer};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{SecretKey, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -124,8 +124,8 @@ impl DeviceIdentity {
                 .as_millis() as u64,
         };
 
-        let content = serde_json::to_string_pretty(&stored)
-            .context("failed to serialize identity")?;
+        let content =
+            serde_json::to_string_pretty(&stored).context("failed to serialize identity")?;
 
         std::fs::write(path, format!("{}\n", content))
             .with_context(|| format!("failed to write {}", path.display()))?;

@@ -75,8 +75,8 @@ pub fn save_pairing_state(path: &PathBuf, state: &PairingState) -> Result<()> {
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    let content = serde_json::to_string_pretty(state)
-        .context("failed to serialize pairing state")?;
+    let content =
+        serde_json::to_string_pretty(state).context("failed to serialize pairing state")?;
 
     std::fs::write(path, format!("{}\n", content))
         .with_context(|| format!("failed to write {}", path.display()))?;

@@ -92,9 +92,7 @@ impl SessionManager {
         };
 
         match session.mode {
-            SessionMode::Inactive => {
-                SessionDecision::Deny("session not activated".to_string())
-            }
+            SessionMode::Inactive => SessionDecision::Deny("session not activated".to_string()),
             SessionMode::Strict => {
                 // Drop the sessions lock before acquiring refusal_log lock.
                 drop(sessions);

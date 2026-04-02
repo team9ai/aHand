@@ -56,8 +56,8 @@ pub fn save_exec_approvals(path: &Path, file: &ExecApprovalsFile) -> Result<()> 
             .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
 
-    let content = serde_json::to_string_pretty(file)
-        .context("failed to serialize exec approvals")?;
+    let content =
+        serde_json::to_string_pretty(file).context("failed to serialize exec approvals")?;
 
     std::fs::write(path, format!("{}\n", content))
         .with_context(|| format!("failed to write {}", path.display()))?;

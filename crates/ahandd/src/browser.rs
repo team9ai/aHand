@@ -96,7 +96,9 @@ impl BrowserManager {
         if let Some(exe) = self.resolve_executable_path() {
             info!(path = %exe, "system browser detected");
         } else {
-            warn!("no system browser (Chrome/Edge) detected — please install one for browser automation");
+            warn!(
+                "no system browser (Chrome/Edge) detected — please install one for browser automation"
+            );
         }
 
         if self.config.headed.unwrap_or(false) {
@@ -192,7 +194,8 @@ impl BrowserManager {
             }
         };
 
-        self.parse_output(&output, action, output_file.as_deref()).await
+        self.parse_output(&output, action, output_file.as_deref())
+            .await
     }
 
     /// Execute a single CLI command (used internally by download/wait polling).
@@ -317,10 +320,7 @@ impl BrowserManager {
         timeout_ms: u64,
     ) -> anyhow::Result<BrowserCommandResult> {
         let escaped = text.replace('\\', "\\\\").replace('\'', "\\'");
-        let js_expr = format!(
-            "() => document.body.innerText.includes('{}')",
-            escaped
-        );
+        let js_expr = format!("() => document.body.innerText.includes('{}')", escaped);
         let params = serde_json::json!({ "expression": js_expr });
         let params_str = params.to_string();
 
@@ -440,10 +440,7 @@ impl BrowserManager {
         params_json: &str,
         output_file: Option<&Path>,
     ) -> Vec<String> {
-        let mut args = vec![
-            format!("-s={}", session_id),
-            action.to_string(),
-        ];
+        let mut args = vec![format!("-s={}", session_id), action.to_string()];
 
         // Parse params_json and convert to CLI positional/flag arguments.
         if let Ok(params) = serde_json::from_str::<serde_json::Value>(params_json) {
@@ -539,16 +536,15 @@ impl BrowserManager {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
         // For screenshot/pdf, read binary file from the --filename path.
-        let (binary_data, binary_mime) =
-            if matches!(action, "screenshot" | "pdf") && success {
-                if let Some(path) = output_file {
-                    self.read_file_at_path(path).await
-                } else {
-                    (Vec::new(), String::new())
-                }
+        let (binary_data, binary_mime) = if matches!(action, "screenshot" | "pdf") && success {
+            if let Some(path) = output_file {
+                self.read_file_at_path(path).await
             } else {
                 (Vec::new(), String::new())
-            };
+            }
+        } else {
+            (Vec::new(), String::new())
+        };
 
         Ok(BrowserCommandResult {
             success,
@@ -595,26 +591,46 @@ fn params_to_cli_args(
             }
         }
         "click" | "hover" => {
-            if let Some(sel) = params.get("ref").or(params.get("selector")).and_then(|v| v.as_str()) {
+            if let Some(sel) = params
+                .get("ref")
+                .or(params.get("selector"))
+                .and_then(|v| v.as_str())
+            {
                 args.push(sel.to_string());
             }
         }
         "fill" => {
-            if let Some(sel) = params.get("ref").or(params.get("selector")).and_then(|v| v.as_str()) {
+            if let Some(sel) = params
+                .get("ref")
+                .or(params.get("selector"))
+                .and_then(|v| v.as_str())
+            {
                 args.push(sel.to_string());
             }
-            if let Some(val) = params.get("text").or(params.get("value")).and_then(|v| v.as_str()) {
+            if let Some(val) = params
+                .get("text")
+                .or(params.get("value"))
+                .and_then(|v| v.as_str())
+            {
                 args.push(val.to_string());
             }
         }
         "type" => {
             // playwright-cli `type` has no ref param — types into focused element.
-            if let Some(val) = params.get("text").or(params.get("value")).and_then(|v| v.as_str()) {
+            if let Some(val) = params
+                .get("text")
+                .or(params.get("value"))
+                .and_then(|v| v.as_str())
+            {
                 args.push(val.to_string());
             }
         }
         "select" => {
-            if let Some(sel) = params.get("ref").or(params.get("selector")).and_then(|v| v.as_str()) {
+            if let Some(sel) = params
+                .get("ref")
+                .or(params.get("selector"))
+                .and_then(|v| v.as_str())
+            {
                 args.push(sel.to_string());
             }
             if let Some(val) = params.get("value").and_then(|v| v.as_str()) {
@@ -731,10 +747,7 @@ async fn list_files(dir: &Path) -> HashSet<PathBuf> {
 
 /// Check if a downloaded file is complete (not a temp/partial file).
 fn is_download_complete(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
     !name.ends_with(".crdownload")
         && !name.ends_with(".part")
         && !name.ends_with(".tmp")
@@ -860,8 +873,14 @@ mod tests {
         assert_eq!(mime_from_extension("/tmp/shot.png"), "image/png");
         assert_eq!(mime_from_extension("/tmp/doc.PDF"), "application/pdf");
         assert_eq!(mime_from_extension("/tmp/data.csv"), "text/csv");
-        assert_eq!(mime_from_extension("/tmp/report.xlsx"), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-        assert_eq!(mime_from_extension("/tmp/unknown.xyz"), "application/octet-stream");
+        assert_eq!(
+            mime_from_extension("/tmp/report.xlsx"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        assert_eq!(
+            mime_from_extension("/tmp/unknown.xyz"),
+            "application/octet-stream"
+        );
     }
 
     #[test]

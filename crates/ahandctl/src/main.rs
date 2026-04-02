@@ -1,6 +1,6 @@
 use ahand_protocol::{
-    envelope, ApprovalResponse, CancelJob, Envelope, Hello, JobRequest, PolicyQuery, PolicyUpdate,
-    SessionQuery, SetSessionMode,
+    ApprovalResponse, CancelJob, Envelope, Hello, JobRequest, PolicyQuery, PolicyUpdate,
+    SessionQuery, SetSessionMode, envelope,
 };
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
@@ -172,7 +172,12 @@ async fn main() -> anyhow::Result<()> {
     // Commands that don't use IPC/WS, handle early
     match &args.command {
         Cmd::Configure { .. } => {
-            if let Cmd::Configure { port, config, no_open } = args.command {
+            if let Cmd::Configure {
+                port,
+                config,
+                no_open,
+            } = args.command
+            {
                 return admin::serve(port, config, no_open).await;
             }
         }
@@ -200,7 +205,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ipc_path) = &args.ipc {
         // IPC mode — connect via Unix socket.
         match args.command {
-            Cmd::Exec { tool, args: tool_args } => {
+            Cmd::Exec {
+                tool,
+                args: tool_args,
+            } => {
                 ipc_exec(ipc_path, &tool, &tool_args).await?;
             }
             Cmd::Cancel { job_id } => {
@@ -219,15 +227,23 @@ async fn main() -> anyhow::Result<()> {
             Cmd::Session { action } => {
                 ipc_session(ipc_path, action).await?;
             }
-            Cmd::Configure { .. } | Cmd::BrowserInit { .. } | Cmd::Upgrade { .. }
-            | Cmd::Start { .. } | Cmd::Stop | Cmd::Restart { .. } | Cmd::Status => {
+            Cmd::Configure { .. }
+            | Cmd::BrowserInit { .. }
+            | Cmd::Upgrade { .. }
+            | Cmd::Start { .. }
+            | Cmd::Stop
+            | Cmd::Restart { .. }
+            | Cmd::Status => {
                 unreachable!("Handled early, should not reach here");
             }
         }
     } else {
         // WS mode.
         match args.command {
-            Cmd::Exec { tool, args: tool_args } => {
+            Cmd::Exec {
+                tool,
+                args: tool_args,
+            } => {
                 ws_exec(&args.url, &tool, &tool_args).await?;
             }
             Cmd::Cancel { job_id } => {
@@ -246,8 +262,13 @@ async fn main() -> anyhow::Result<()> {
             Cmd::Session { action } => {
                 ws_session(&args.url, action).await?;
             }
-            Cmd::Configure { .. } | Cmd::BrowserInit { .. } | Cmd::Upgrade { .. }
-            | Cmd::Start { .. } | Cmd::Stop | Cmd::Restart { .. } | Cmd::Status => {
+            Cmd::Configure { .. }
+            | Cmd::BrowserInit { .. }
+            | Cmd::Upgrade { .. }
+            | Cmd::Start { .. }
+            | Cmd::Stop
+            | Cmd::Restart { .. }
+            | Cmd::Status => {
                 unreachable!("Handled early, should not reach here");
             }
         }
@@ -361,7 +382,9 @@ async fn ipc_exec(socket_path: &str, tool: &str, args: &[String]) -> anyhow::Res
                 if !req.detected_domains.is_empty() {
                     eprintln!("  Detected domains: {}", req.detected_domains.join(", "));
                 }
-                eprintln!("  Run `ahandctl --ipc <socket> approve` in another terminal to approve.");
+                eprintln!(
+                    "  Run `ahandctl --ipc <socket> approve` in another terminal to approve."
+                );
             }
             _ => {}
         }
@@ -446,9 +469,7 @@ async fn connect_and_hello(
         ts_ms: now_ms(),
         payload: Some(envelope::Payload::Hello(Hello {
             version: env!("CARGO_PKG_VERSION").to_string(),
-            hostname: gethostname::gethostname()
-                .to_string_lossy()
-                .to_string(),
+            hostname: gethostname::gethostname().to_string_lossy().to_string(),
             os: std::env::consts::OS.to_string(),
             capabilities: vec!["ctl".to_string()],
             last_ack: 0,
@@ -621,7 +642,13 @@ async fn ipc_approve(socket_path: &str) -> anyhow::Result<()> {
 
         if let Some(envelope::Payload::ApprovalRequest(req)) = envelope.payload {
             eprintln!();
-            eprintln!("[approval] Job {} (from {}) wants to run: {} {}", req.job_id, req.caller_uid, req.tool, req.args.join(" "));
+            eprintln!(
+                "[approval] Job {} (from {}) wants to run: {} {}",
+                req.job_id,
+                req.caller_uid,
+                req.tool,
+                req.args.join(" ")
+            );
             if !req.cwd.is_empty() {
                 eprintln!("  Working directory: {}", req.cwd);
             }
@@ -673,11 +700,18 @@ async fn ipc_approve(socket_path: &str) -> anyhow::Result<()> {
             write_frame(&mut writer, &resp_env.encode_to_vec()).await?;
 
             if approved {
-                eprintln!("[approval] Approved job {}{}", req.job_id, if remember { " (remembered)" } else { "" });
+                eprintln!(
+                    "[approval] Approved job {}{}",
+                    req.job_id,
+                    if remember { " (remembered)" } else { "" }
+                );
             } else if reason.is_empty() {
                 eprintln!("[approval] Denied job {}", req.job_id);
             } else {
-                eprintln!("[approval] Denied job {} with reason: {}", req.job_id, reason);
+                eprintln!(
+                    "[approval] Denied job {} with reason: {}",
+                    req.job_id, reason
+                );
             }
         }
     }
@@ -763,10 +797,8 @@ async fn ws_policy(url: &str, action: PolicyAction) -> anyhow::Result<()> {
         }
     };
 
-    sink.send(tungstenite::Message::Binary(
-        request_env.encode_to_vec(),
-    ))
-    .await?;
+    sink.send(tungstenite::Message::Binary(request_env.encode_to_vec()))
+        .await?;
 
     // Wait for PolicyState response.
     while let Some(msg) = stream.next().await {
@@ -863,7 +895,11 @@ fn build_session_envelope(device_id: &str, action: &SessionAction) -> Envelope {
             })),
             ..Default::default()
         },
-        SessionAction::Set { mode, caller, timeout } => {
+        SessionAction::Set {
+            mode,
+            caller,
+            timeout,
+        } => {
             let mode_val = match mode.as_str() {
                 "inactive" => 0,
                 "strict" => 1,

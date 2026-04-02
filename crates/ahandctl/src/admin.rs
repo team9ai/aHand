@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use warp::http::StatusCode;
-use warp::{reject, Filter, Rejection, Reply};
+use warp::{Filter, Rejection, Reply, reject};
 
 // ──────────────────────────────────────────────────────────────────────
 // Types
@@ -143,34 +143,34 @@ pub async fn serve(port: u16, config_path: Option<String>, no_open: bool) -> Res
 struct Unauthorized;
 impl reject::Reject for Unauthorized {}
 
-fn with_auth(
-    token: Arc<String>,
-) -> impl Filter<Extract = (), Error = Rejection> + Clone {
+fn with_auth(token: Arc<String>) -> impl Filter<Extract = (), Error = Rejection> + Clone {
     warp::any()
         .and(warp::header::optional::<String>("authorization"))
         .and(warp::query::<std::collections::HashMap<String, String>>())
-        .and_then(move |auth_header: Option<String>, query: std::collections::HashMap<String, String>| {
-            let token = token.clone();
-            async move {
-                // Check Authorization header
-                if let Some(header) = auth_header {
-                    if let Some(bearer) = header.strip_prefix("Bearer ") {
-                        if bearer == token.as_str() {
-                            return Ok::<_, Rejection>(());
+        .and_then(
+            move |auth_header: Option<String>, query: std::collections::HashMap<String, String>| {
+                let token = token.clone();
+                async move {
+                    // Check Authorization header
+                    if let Some(header) = auth_header {
+                        if let Some(bearer) = header.strip_prefix("Bearer ") {
+                            if bearer == token.as_str() {
+                                return Ok::<_, Rejection>(());
+                            }
                         }
                     }
-                }
 
-                // Check query parameter
-                if let Some(query_token) = query.get("token") {
-                    if query_token == token.as_str() {
-                        return Ok(());
+                    // Check query parameter
+                    if let Some(query_token) = query.get("token") {
+                        if query_token == token.as_str() {
+                            return Ok(());
+                        }
                     }
-                }
 
-                Err(reject::custom(Unauthorized))
-            }
-        })
+                    Err(reject::custom(Unauthorized))
+                }
+            },
+        )
         .untuple_one()
 }
 
@@ -251,52 +251,60 @@ fn logs_route(token: Arc<String>) -> impl Filter<Extract = impl Reply, Error = R
         .and(warp::get())
         .and(with_auth(token))
         .and(warp::query::<std::collections::HashMap<String, String>>())
-        .and_then(|query: std::collections::HashMap<String, String>| async move {
-            let limit = query
-                .get("limit")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(50);
-            let offset = query
-                .get("offset")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
+        .and_then(
+            |query: std::collections::HashMap<String, String>| async move {
+                let limit = query
+                    .get("limit")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(50);
+                let offset = query
+                    .get("offset")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
 
-            match get_logs(limit, offset).await {
-                Ok(logs) => Ok::<_, Rejection>(warp::reply::json(&logs)),
-                Err(e) => {
-                    eprintln!("Logs error: {}", e);
-                    Err(reject::reject())
+                match get_logs(limit, offset).await {
+                    Ok(logs) => Ok::<_, Rejection>(warp::reply::json(&logs)),
+                    Err(e) => {
+                        eprintln!("Logs error: {}", e);
+                        Err(reject::reject())
+                    }
                 }
-            }
-        })
+            },
+        )
 }
 
-fn runs_list_route(token: Arc<String>) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+fn runs_list_route(
+    token: Arc<String>,
+) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     warp::path!("runs")
         .and(warp::get())
         .and(with_auth(token))
         .and(warp::query::<std::collections::HashMap<String, String>>())
-        .and_then(|query: std::collections::HashMap<String, String>| async move {
-            let limit = query
-                .get("limit")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(20);
-            let offset = query
-                .get("offset")
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
+        .and_then(
+            |query: std::collections::HashMap<String, String>| async move {
+                let limit = query
+                    .get("limit")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(20);
+                let offset = query
+                    .get("offset")
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
 
-            match list_runs(limit, offset).await {
-                Ok(runs) => Ok::<_, Rejection>(warp::reply::json(&runs)),
-                Err(e) => {
-                    eprintln!("Runs list error: {}", e);
-                    Err(reject::reject())
+                match list_runs(limit, offset).await {
+                    Ok(runs) => Ok::<_, Rejection>(warp::reply::json(&runs)),
+                    Err(e) => {
+                        eprintln!("Runs list error: {}", e);
+                        Err(reject::reject())
+                    }
                 }
-            }
-        })
+            },
+        )
 }
 
-fn runs_get_route(token: Arc<String>) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+fn runs_get_route(
+    token: Arc<String>,
+) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     warp::path!("runs" / String)
         .and(warp::get())
         .and(with_auth(token))
@@ -311,7 +319,9 @@ fn runs_get_route(token: Arc<String>) -> impl Filter<Extract = impl Reply, Error
         })
 }
 
-fn runs_file_route(token: Arc<String>) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+fn runs_file_route(
+    token: Arc<String>,
+) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
     warp::path!("runs" / String / String)
         .and(warp::get())
         .and(with_auth(token))
@@ -342,8 +352,8 @@ fn browser_init_route(
         })
 }
 
-fn browser_init_stream(
-) -> impl futures_util::Stream<Item = std::result::Result<warp::sse::Event, Infallible>> {
+fn browser_init_stream()
+-> impl futures_util::Stream<Item = std::result::Result<warp::sse::Event, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<warp::sse::Event>();
 
     tokio::spawn(async move {
@@ -524,12 +534,7 @@ async fn get_logs(limit: usize, offset: usize) -> Result<LogsResponse> {
                         msg_id: v.get("msg_id")?.as_str()?.to_string(),
                         seq: v.get("seq")?.as_u64()?,
                         ack: v.get("ack")?.as_u64()?,
-                        payload_type: v
-                            .get("payload")?
-                            .as_object()?
-                            .keys()
-                            .next()?
-                            .to_string(),
+                        payload_type: v.get("payload")?.as_object()?.keys().next()?.to_string(),
                     })
                 })
         })

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ahand_protocol::{ApprovalRequest, ApprovalResponse, JobRequest, RefusalContext};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tracing::info;
 
 /// A pending approval entry.

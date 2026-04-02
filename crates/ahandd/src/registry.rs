@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{info, warn};
 
 /// Handle kept per running job, used to send a cancel signal.

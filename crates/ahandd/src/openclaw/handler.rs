@@ -27,8 +27,8 @@ use super::exec_approvals::{
 };
 use super::protocol::{
     ExecApprovalsSetParams, ExecApprovalsSnapshot, ExecEventPayload, InvokeError,
-    NodeInvokeRequest, NodeInvokeResult, RunResult, SystemRunParams, SystemWhichParams,
-    SystemWhichResult, OUTPUT_CAP, OUTPUT_EVENT_TAIL,
+    NodeInvokeRequest, NodeInvokeResult, OUTPUT_CAP, OUTPUT_EVENT_TAIL, RunResult, SystemRunParams,
+    SystemWhichParams, SystemWhichResult,
 };
 
 /// Handler for OpenClaw node invocations
@@ -58,8 +58,7 @@ impl OpenClawHandler {
             session_mgr,
             approval_mgr,
             store,
-            exec_approvals_path: exec_approvals_path
-                .unwrap_or_else(default_exec_approvals_path),
+            exec_approvals_path: exec_approvals_path.unwrap_or_else(default_exec_approvals_path),
             browser_mgr,
         }
     }
@@ -173,12 +172,16 @@ impl OpenClawHandler {
             timed_out: Some(result.timed_out),
             success: Some(result.success),
             output: Some(truncate_output(
-                &[&result.stdout, &result.stderr, result.error.as_deref().unwrap_or("")]
-                    .iter()
-                    .filter(|s| !s.is_empty())
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+                &[
+                    &result.stdout,
+                    &result.stderr,
+                    result.error.as_deref().unwrap_or(""),
+                ]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
                 OUTPUT_EVENT_TAIL,
             )),
             reason: None,
@@ -462,13 +465,13 @@ impl OpenClawHandler {
             };
         }
 
-        let method = params
-            .method
-            .as_deref()
-            .unwrap_or("GET")
-            .to_uppercase();
-        let body = params.body.unwrap_or(serde_json::Value::Object(Default::default()));
-        let query = params.query.unwrap_or(serde_json::Value::Object(Default::default()));
+        let method = params.method.as_deref().unwrap_or("GET").to_uppercase();
+        let body = params
+            .body
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let query = params
+            .query
+            .unwrap_or(serde_json::Value::Object(Default::default()));
         let session_id = params.profile.as_deref().unwrap_or("default").to_string();
         let timeout_ms = params.timeout_ms.unwrap_or(0);
 
@@ -503,7 +506,12 @@ impl OpenClawHandler {
             "download" => {
                 let ref_sel = serde_json::from_str::<serde_json::Value>(&action_params_json)
                     .ok()
-                    .and_then(|v| v.get("selector").or(v.get("ref")).and_then(|s| s.as_str()).map(String::from))
+                    .and_then(|v| {
+                        v.get("selector")
+                            .or(v.get("ref"))
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                    })
                     .unwrap_or_default();
                 self.browser_mgr
                     .execute_download(&session_id, &ref_sel, timeout_ms)
@@ -518,7 +526,11 @@ impl OpenClawHandler {
                     // Pure delay wait — use eval with Promise.
                     let delay_ms = serde_json::from_str::<serde_json::Value>(&action_params_json)
                         .ok()
-                        .and_then(|v| v.get("timeMs").or(v.get("timeout")).and_then(|t| t.as_u64()))
+                        .and_then(|v| {
+                            v.get("timeMs")
+                                .or(v.get("timeout"))
+                                .and_then(|t| t.as_u64())
+                        })
                         .unwrap_or(1000);
                     let js = format!("() => new Promise(r => setTimeout(r, {}))", delay_ms);
                     let params = serde_json::json!({ "expression": js });
@@ -537,15 +549,22 @@ impl OpenClawHandler {
                     .ok()
                     .and_then(|v| v.get("submit").and_then(|s| s.as_bool()))
                     .unwrap_or(false);
-                let result = self.browser_mgr
+                let result = self
+                    .browser_mgr
                     .execute(&session_id, &action, &action_params_json, timeout_ms)
                     .await;
                 if submit {
                     if let Ok(ref r) = result {
                         if r.success {
                             let press_params = serde_json::json!({ "key": "Enter" });
-                            let _ = self.browser_mgr
-                                .execute(&session_id, "press", &press_params.to_string(), timeout_ms)
+                            let _ = self
+                                .browser_mgr
+                                .execute(
+                                    &session_id,
+                                    "press",
+                                    &press_params.to_string(),
+                                    timeout_ms,
+                                )
                                 .await;
                         }
                     }
@@ -571,9 +590,8 @@ impl OpenClawHandler {
                 // JSON parse first (for backwards compat), then fall back to
                 // wrapping the text as a JSON string value.
                 let result_value: serde_json::Value = if !result.result_json.is_empty() {
-                    serde_json::from_str(&result.result_json).unwrap_or_else(|_| {
-                        serde_json::Value::String(result.result_json.clone())
-                    })
+                    serde_json::from_str(&result.result_json)
+                        .unwrap_or_else(|_| serde_json::Value::String(result.result_json.clone()))
                 } else if !result.error.is_empty() {
                     serde_json::json!({ "error": result.error })
                 } else {
@@ -589,8 +607,7 @@ impl OpenClawHandler {
                 let mut files = Vec::<serde_json::Value>::new();
                 if !result.binary_data.is_empty() {
                     use base64::Engine;
-                    let b64 = base64::engine::general_purpose::STANDARD
-                        .encode(&result.binary_data);
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&result.binary_data);
                     // Extract original file path from result data if available.
                     let file_path = result_value
                         .get("path")
@@ -613,9 +630,7 @@ impl OpenClawHandler {
                     id: invoke.id.clone(),
                     node_id: self.node_id.clone(),
                     ok: result.success,
-                    payload_json: Some(
-                        serde_json::to_string(&proxy_response).unwrap_or_default(),
-                    ),
+                    payload_json: Some(serde_json::to_string(&proxy_response).unwrap_or_default()),
                     error: if result.success {
                         None
                     } else {
@@ -752,10 +767,7 @@ fn translate_http_to_cli(
     match (method, path) {
         // --- Page interaction: POST /act ---
         ("POST", "/act") => {
-            let kind = body
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let kind = body.get("kind").and_then(|v| v.as_str()).unwrap_or("");
             translate_act_kind(kind, body)
         }
 
@@ -776,7 +788,10 @@ fn translate_http_to_cli(
             if let Some(r) = body.get("ref").and_then(|v| v.as_str()) {
                 params.insert("ref".into(), serde_json::Value::String(r.to_string()));
             }
-            Ok(("screenshot".to_string(), serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string())))
+            Ok((
+                "screenshot".to_string(),
+                serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()),
+            ))
         }
 
         // --- Navigate: POST /navigate ---
@@ -789,19 +804,14 @@ fn translate_http_to_cli(
         }
 
         // --- PDF: POST /pdf ---
-        ("POST", "/pdf") => {
-            Ok(("pdf".to_string(), "{}".to_string()))
-        }
+        ("POST", "/pdf") => Ok(("pdf".to_string(), "{}".to_string())),
 
         // --- Tabs: GET /tabs ---
         ("GET", "/tabs") => Ok(("tab-list".to_string(), "{}".to_string())),
 
         // --- Open tab: POST /tabs/open ---
         ("POST", "/tabs/open") => {
-            let url = body
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let url = body.get("url").and_then(|v| v.as_str()).unwrap_or("");
             Ok((
                 "tab-new".to_string(),
                 serde_json::json!({ "url": url }).to_string(),
@@ -811,9 +821,7 @@ fn translate_http_to_cli(
         // --- Close tab: DELETE /tabs/<targetId> ---
         // playwright-cli uses index-based tab-close, so we pass through
         // and BrowserManager will need to handle the ID-to-index mapping.
-        ("DELETE", p) if p.starts_with("/tabs/") => {
-            Ok(("tab-close".to_string(), "{}".to_string()))
-        }
+        ("DELETE", p) if p.starts_with("/tabs/") => Ok(("tab-close".to_string(), "{}".to_string())),
 
         // --- Start browser: POST /start ---
         ("POST", "/start") => {
@@ -833,22 +841,19 @@ fn translate_http_to_cli(
         // --- Download: POST /download ---
         ("POST", "/download") => {
             // Handled specially by BrowserManager::execute_download.
-            let params_str =
-                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            let params_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
             Ok(("download".to_string(), params_str))
         }
 
         // --- Wait download: POST /wait/download ---
         ("POST", "/wait/download") => {
-            let params_str =
-                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            let params_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
             Ok(("download".to_string(), params_str))
         }
 
         // --- File chooser (upload): POST /hooks/file-chooser ---
         ("POST", "/hooks/file-chooser") => {
-            let params_str =
-                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            let params_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
             Ok(("upload".to_string(), params_str))
         }
 
@@ -858,9 +863,15 @@ fn translate_http_to_cli(
             if accept {
                 let mut params = serde_json::Map::new();
                 if let Some(text) = body.get("promptText").and_then(|v| v.as_str()) {
-                    params.insert("promptText".into(), serde_json::Value::String(text.to_string()));
+                    params.insert(
+                        "promptText".into(),
+                        serde_json::Value::String(text.to_string()),
+                    );
                 }
-                Ok(("dialog-accept".to_string(), serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string())))
+                Ok((
+                    "dialog-accept".to_string(),
+                    serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()),
+                ))
             } else {
                 Ok(("dialog-dismiss".to_string(), "{}".to_string()))
             }
@@ -887,10 +898,7 @@ fn translate_http_to_cli(
 }
 
 /// Translate a `POST /act` request with a specific `kind` into a playwright-cli action.
-fn translate_act_kind(
-    kind: &str,
-    body: &serde_json::Value,
-) -> Result<(String, String), String> {
+fn translate_act_kind(kind: &str, body: &serde_json::Value) -> Result<(String, String), String> {
     match kind {
         "click" => {
             let ref_val = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
@@ -902,7 +910,10 @@ fn translate_act_kind(
             // For keystroke simulation, use click + type combo.
             let ref_val = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
             let text = body.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let submit = body.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
+            let submit = body
+                .get("submit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let mut params = serde_json::Map::new();
             params.insert("ref".into(), serde_json::Value::String(ref_val.to_string()));
             params.insert("text".into(), serde_json::Value::String(text.to_string()));
@@ -932,7 +943,8 @@ fn translate_act_kind(
         }
         "select" => {
             let ref_val = body.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-            let value = body.get("values")
+            let value = body
+                .get("values")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
@@ -956,8 +968,7 @@ fn translate_act_kind(
         }
         "wait" => {
             // playwright-cli has no native wait; handled by BrowserManager::execute_wait_for_text.
-            let params_str =
-                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            let params_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
             Ok(("wait".to_string(), params_str))
         }
         "evaluate" => {
@@ -965,7 +976,10 @@ fn translate_act_kind(
             let ref_val = body.get("ref").and_then(|v| v.as_str());
             let mut params = serde_json::json!({ "expression": expr });
             if let Some(r) = ref_val {
-                params.as_object_mut().unwrap().insert("ref".into(), serde_json::Value::String(r.to_string()));
+                params
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("ref".into(), serde_json::Value::String(r.to_string()));
             }
             Ok(("eval".to_string(), params.to_string()))
         }
@@ -985,8 +999,7 @@ fn translate_act_kind(
         "" => Err("act kind is required".to_string()),
         other => {
             // Unknown kind — pass through, let playwright-cli handle it.
-            let params_str =
-                serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+            let params_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
             Ok((other.to_string(), params_str))
         }
     }
@@ -1026,7 +1039,32 @@ fn shell_escape_join(argv: &[String]) -> String {
     argv.iter()
         .map(|arg| {
             // If arg contains shell special chars, quote it
-            if arg.chars().any(|c| matches!(c, ' ' | '"' | '\'' | '\\' | '$' | '`' | '!' | '*' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '|' | '&' | ';' | '<' | '>' | '\n' | '\t')) {
+            if arg.chars().any(|c| {
+                matches!(
+                    c,
+                    ' ' | '"'
+                        | '\''
+                        | '\\'
+                        | '$'
+                        | '`'
+                        | '!'
+                        | '*'
+                        | '?'
+                        | '['
+                        | ']'
+                        | '('
+                        | ')'
+                        | '{'
+                        | '}'
+                        | '|'
+                        | '&'
+                        | ';'
+                        | '<'
+                        | '>'
+                        | '\n'
+                        | '\t'
+                )
+            }) {
                 // Use single quotes and escape any single quotes inside
                 format!("'{}'", arg.replace('\'', "'\\''"))
             } else if arg.is_empty() {

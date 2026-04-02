@@ -42,10 +42,7 @@ impl PolicyChecker {
 
         // 1. Denied tools — hard reject.
         if cfg.denied_tools.contains(&req.tool) {
-            return PolicyDecision::Deny(format!(
-                "tool {:?} is in the deny list",
-                req.tool
-            ));
+            return PolicyDecision::Deny(format!("tool {:?} is in the deny list", req.tool));
         }
 
         // 2. Denied paths — hard reject.
@@ -95,18 +92,13 @@ impl PolicyChecker {
         if !detected_domains.is_empty() && !cfg.allowed_domains.is_empty() {
             let unapproved: Vec<String> = detected_domains
                 .iter()
-                .filter(|d| {
-                    !cfg.allowed_domains.contains(d) && !remembered_domains.contains(*d)
-                })
+                .filter(|d| !cfg.allowed_domains.contains(d) && !remembered_domains.contains(*d))
                 .cloned()
                 .collect();
 
             if !unapproved.is_empty() {
                 return PolicyDecision::NeedsApproval {
-                    reason: format!(
-                        "domain(s) {} not in allowed domains",
-                        unapproved.join(", ")
-                    ),
+                    reason: format!("domain(s) {} not in allowed domains", unapproved.join(", ")),
                     detected_domains,
                 };
             }
@@ -143,10 +135,26 @@ impl PolicyChecker {
     pub async fn apply_update(&self, update: &PolicyUpdate) {
         let mut cfg = self.config.write().await;
 
-        apply_list_update(&mut cfg.allowed_tools, &update.add_allowed_tools, &update.remove_allowed_tools);
-        apply_list_update(&mut cfg.denied_tools, &update.add_denied_tools, &update.remove_denied_tools);
-        apply_list_update(&mut cfg.denied_paths, &update.add_denied_paths, &update.remove_denied_paths);
-        apply_list_update(&mut cfg.allowed_domains, &update.add_allowed_domains, &update.remove_allowed_domains);
+        apply_list_update(
+            &mut cfg.allowed_tools,
+            &update.add_allowed_tools,
+            &update.remove_allowed_tools,
+        );
+        apply_list_update(
+            &mut cfg.denied_tools,
+            &update.add_denied_tools,
+            &update.remove_denied_tools,
+        );
+        apply_list_update(
+            &mut cfg.denied_paths,
+            &update.add_denied_paths,
+            &update.remove_denied_paths,
+        );
+        apply_list_update(
+            &mut cfg.allowed_domains,
+            &update.add_allowed_domains,
+            &update.remove_allowed_domains,
+        );
 
         if update.approval_timeout_secs > 0 {
             cfg.approval_timeout_secs = update.approval_timeout_secs;
@@ -163,7 +171,6 @@ impl PolicyChecker {
     pub async fn approval_timeout_secs(&self) -> u64 {
         self.config.read().await.approval_timeout_secs
     }
-
 }
 
 /// Apply add/remove operations to a list, deduplicating.
@@ -182,9 +189,8 @@ fn apply_list_update(list: &mut Vec<String>, add: &[String], remove: &[String]) 
 
 /// Tools known to make network connections.
 const NETWORK_TOOLS: &[&str] = &[
-    "curl", "wget", "git", "ssh", "scp", "rsync", "sftp",
-    "nc", "ncat", "nmap", "ping", "dig", "nslookup",
-    "http", "https", "fetch",
+    "curl", "wget", "git", "ssh", "scp", "rsync", "sftp", "nc", "ncat", "nmap", "ping", "dig",
+    "nslookup", "http", "https", "fetch",
 ];
 
 /// Extract domain names from tool arguments using heuristics.

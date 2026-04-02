@@ -240,7 +240,11 @@ pub struct ExecApprovalsFile {
     pub ask: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowlist: Option<Vec<AllowlistEntry>>,
-    #[serde(default, rename = "autoAllowSkills", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "autoAllowSkills",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub auto_allow_skills: Option<bool>,
 }
 

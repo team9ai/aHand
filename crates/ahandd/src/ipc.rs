@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ahand_protocol::{envelope, BrowserResponse, Envelope, JobFinished, JobRejected, SessionMode};
+use ahand_protocol::{BrowserResponse, Envelope, JobFinished, JobRejected, SessionMode, envelope};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -63,10 +63,9 @@ pub async fn serve_ipc(
                 let did = device_id.clone();
                 let bmgr = Arc::clone(&browser_mgr);
                 tokio::spawn(async move {
-                    if let Err(e) = handle_ipc_conn(
-                        stream, reg, st, smgr, amgr, bcast, did, caller_uid, bmgr,
-                    )
-                    .await
+                    if let Err(e) =
+                        handle_ipc_conn(stream, reg, st, smgr, amgr, bcast, did, caller_uid, bmgr)
+                            .await
                     {
                         warn!(error = %e, "IPC connection error");
                     }
@@ -225,7 +224,10 @@ async fn handle_ipc_conn(
                             reg.mark_completed(job_id, exit_code, error).await;
                         });
                     }
-                    SessionDecision::NeedsApproval { reason, previous_refusals } => {
+                    SessionDecision::NeedsApproval {
+                        reason,
+                        previous_refusals,
+                    } => {
                         info!(job_id = %req.job_id, reason = %reason, "IPC: job needs approval (strict mode)");
 
                         let (approval_req, approval_rx) = approval_mgr
@@ -237,9 +239,7 @@ async fn handle_ipc_conn(
                             device_id: device_id.clone(),
                             msg_id: new_msg_id(),
                             ts_ms: now_ms(),
-                            payload: Some(envelope::Payload::ApprovalRequest(
-                                approval_req.clone(),
-                            )),
+                            payload: Some(envelope::Payload::ApprovalRequest(approval_req.clone())),
                             ..Default::default()
                         };
                         let _ = tx.send(approval_env.clone());
@@ -334,8 +334,7 @@ async fn handle_ipc_conn(
                 }
             }
             Some(envelope::Payload::SetSessionMode(msg)) => {
-                let mode = SessionMode::try_from(msg.mode)
-                    .unwrap_or(SessionMode::Inactive);
+                let mode = SessionMode::try_from(msg.mode).unwrap_or(SessionMode::Inactive);
                 info!(caller_uid = %msg.caller_uid, ?mode, "IPC: received set session mode");
                 let state = session_mgr
                     .set_mode(&msg.caller_uid, mode, msg.trust_timeout_mins)
@@ -385,7 +384,8 @@ async fn handle_ipc_conn(
                         ..Default::default()
                     };
                     let _ = tx.send(resp_env);
-                } else if let Err(reason) = browser_mgr.check_domain(&req.action, &req.params_json) {
+                } else if let Err(reason) = browser_mgr.check_domain(&req.action, &req.params_json)
+                {
                     let resp_env = Envelope {
                         device_id: device_id.clone(),
                         msg_id: new_msg_id(),
@@ -406,7 +406,12 @@ async fn handle_ipc_conn(
                     let tx_clone = tx.clone();
                     tokio::spawn(async move {
                         let result = bmgr
-                            .execute(&req.session_id, &req.action, &req.params_json, req.timeout_ms)
+                            .execute(
+                                &req.session_id,
+                                &req.action,
+                                &req.params_json,
+                                req.timeout_ms,
+                            )
                             .await;
                         let resp = match result {
                             Ok(r) => BrowserResponse {

@@ -19,15 +19,15 @@ use crate::registry::JobRegistry;
 use crate::session::SessionManager;
 use crate::store::RunStore;
 
-use super::device_identity::{build_auth_payload, default_identity_path, DeviceIdentity};
+use super::device_identity::{DeviceIdentity, build_auth_payload, default_identity_path};
 use super::handler::OpenClawHandler;
 use super::pairing::{
-    default_pairing_path, generate_node_id, load_pairing_state, save_pairing_state, GatewayInfo,
+    GatewayInfo, default_pairing_path, generate_node_id, load_pairing_state, save_pairing_state,
 };
 use super::protocol::{
     AuthParams, ClientInfo, ConnectChallengePayload, ConnectParams, DeviceParams, EventFrame,
-    GatewayFrame, HelloOk, NodeEvent, NodeInvokeRequest, NodeInvokeResult, RequestFrame,
-    ResponseFrame, PROTOCOL_VERSION,
+    GatewayFrame, HelloOk, NodeEvent, NodeInvokeRequest, NodeInvokeResult, PROTOCOL_VERSION,
+    RequestFrame, ResponseFrame,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -66,11 +66,7 @@ impl OpenClawClient {
         let mut backoff = 1u64;
 
         loop {
-            let host = self
-                .config
-                .gateway_host
-                .as_deref()
-                .unwrap_or("127.0.0.1");
+            let host = self.config.gateway_host.as_deref().unwrap_or("127.0.0.1");
             let port = self.config.gateway_port.unwrap_or(18789);
 
             info!(
@@ -109,11 +105,7 @@ impl OpenClawClient {
 
         // Ensure we have a node ID
         if pairing.node_id.is_empty() {
-            pairing.node_id = self
-                .config
-                .node_id
-                .clone()
-                .unwrap_or_else(generate_node_id);
+            pairing.node_id = self.config.node_id.clone().unwrap_or_else(generate_node_id);
         }
 
         // Update display name if provided
@@ -416,7 +408,7 @@ impl OpenClawClient {
             min_protocol: PROTOCOL_VERSION,
             max_protocol: PROTOCOL_VERSION,
             client: ClientInfo {
-                id: "node-host".to_string(),  // Required predefined client ID
+                id: "node-host".to_string(), // Required predefined client ID
                 display_name: display_name.clone(),
                 version: VERSION.to_string(),
                 platform: std::env::consts::OS.to_string(),
@@ -433,7 +425,11 @@ impl OpenClawClient {
             auth,
         };
 
-        let frame = RequestFrame::new(id.clone(), "connect".to_string(), Some(serde_json::to_value(&params)?));
+        let frame = RequestFrame::new(
+            id.clone(),
+            "connect".to_string(),
+            Some(serde_json::to_value(&params)?),
+        );
 
         debug!(device_id = %device_identity.device_id, "sending connect request with device identity");
         tx.send(Message::Text(serde_json::to_string(&frame)?))?;
@@ -501,11 +497,7 @@ impl OpenClawClient {
 
     /// Build WebSocket URL
     fn build_url(&self) -> String {
-        let host = self
-            .config
-            .gateway_host
-            .as_deref()
-            .unwrap_or("127.0.0.1");
+        let host = self.config.gateway_host.as_deref().unwrap_or("127.0.0.1");
         let port = self.config.gateway_port.unwrap_or(18789);
         let scheme = if self.config.gateway_tls.unwrap_or(false) {
             "wss"

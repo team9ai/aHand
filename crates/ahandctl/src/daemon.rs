@@ -34,9 +34,7 @@ fn find_ahandd_binary() -> Result<PathBuf> {
         }
     }
 
-    anyhow::bail!(
-        "Cannot find ahandd binary. Expected at ~/.ahand/bin/ahandd or next to ahandctl."
-    )
+    anyhow::bail!("Cannot find ahandd binary. Expected at ~/.ahand/bin/ahandd or next to ahandctl.")
 }
 
 /// Read PID file and check if the process is still alive.
@@ -46,7 +44,10 @@ fn read_running_pid() -> Result<Option<u32>> {
         return Ok(None);
     }
     let pid_str = std::fs::read_to_string(&pid_path)?;
-    let pid: u32 = pid_str.trim().parse().context("Invalid PID in daemon.pid")?;
+    let pid: u32 = pid_str
+        .trim()
+        .parse()
+        .context("Invalid PID in daemon.pid")?;
     if is_process_running(pid) {
         Ok(Some(pid))
     } else {

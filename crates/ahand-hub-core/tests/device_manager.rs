@@ -16,7 +16,11 @@ impl DeviceStore for FixedDeviceStore {
     }
 
     async fn get(&self, device_id: &str) -> ahand_hub_core::Result<Option<Device>> {
-        Ok(self.devices.iter().find(|device| device.id == device_id).cloned())
+        Ok(self
+            .devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .cloned())
     }
 
     async fn list(&self) -> ahand_hub_core::Result<Vec<Device>> {
