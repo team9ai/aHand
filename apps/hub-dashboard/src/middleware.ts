@@ -1,5 +1,6 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
+import { dashboardErrorResponse } from "@/lib/api-error";
 
 export function middleware(request: NextRequest) {
   if (request.nextUrl.pathname === "/ws/dashboard") {
@@ -9,7 +10,7 @@ export function middleware(request: NextRequest) {
   const session = request.cookies.get("ahand_hub_session");
 
   if (!session && request.nextUrl.pathname.startsWith("/api/proxy/")) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    return dashboardErrorResponse("unauthorized", "Sign in required.", 401);
   }
 
   if (
@@ -26,12 +27,12 @@ export function middleware(request: NextRequest) {
 function rewriteDashboardWebSocket(request: NextRequest) {
   const session = request.cookies.get("ahand_hub_session");
   if (!session) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    return dashboardErrorResponse("unauthorized", "Sign in required.", 401);
   }
 
   const hubBaseUrl = process.env.AHAND_HUB_BASE_URL;
   if (!hubBaseUrl) {
-    return NextResponse.json({ error: "hub_unavailable" }, { status: 503 });
+    return dashboardErrorResponse("hub_unavailable", "Unable to reach the hub right now.", 503);
   }
 
   return NextResponse.rewrite(new URL("/ws/dashboard", hubBaseUrl.replace(/\/$/, "")));

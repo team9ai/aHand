@@ -46,6 +46,8 @@ pub fn test_config() -> Config {
         job_timeout_grace_ms: 50,
         device_disconnect_grace_ms: 100,
         jwt_secret: "service-test-secret".into(),
+        audit_retention_days: 90,
+        audit_fallback_path: std::env::temp_dir().join("ahand-hub-test-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
         store: StoreConfig::Memory,
     }
@@ -67,6 +69,9 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
         job_timeout_grace_ms: 50,
         device_disconnect_grace_ms: 100,
         jwt_secret: "service-test-secret".into(),
+        audit_retention_days: 90,
+        audit_fallback_path: std::env::temp_dir()
+            .join("ahand-hub-persistent-test-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
         store: StoreConfig::Persistent {
             database_url: stack.database_url().into(),

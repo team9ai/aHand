@@ -6,6 +6,7 @@ use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::traits::AuditStore;
 use ahand_hub_core::{HubError, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
@@ -78,6 +79,10 @@ impl AuditStore for BufferedAuditStore {
 
     async fn query(&self, filter: AuditFilter) -> Result<Vec<AuditEntry>> {
         self.inner.query(filter).await
+    }
+
+    async fn prune_before(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+        self.inner.prune_before(cutoff).await
     }
 }
 

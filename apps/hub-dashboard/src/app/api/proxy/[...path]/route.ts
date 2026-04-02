@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { dashboardErrorResponse } from "@/lib/api-error";
 
 export async function GET(
   request: NextRequest,
@@ -9,11 +10,11 @@ export async function GET(
   const baseUrl = process.env.AHAND_HUB_BASE_URL;
 
   if (!session) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+    return dashboardErrorResponse("unauthorized", "Sign in required.", 401);
   }
 
   if (!baseUrl) {
-    return NextResponse.json({ error: "hub_unavailable" }, { status: 503 });
+    return dashboardErrorResponse("hub_unavailable", "Unable to reach the hub right now.", 503);
   }
 
   const upstream = new URL(
@@ -38,7 +39,7 @@ export async function GET(
       cache: "no-store",
     });
   } catch {
-    return NextResponse.json({ error: "hub_unavailable" }, { status: 503 });
+    return dashboardErrorResponse("hub_unavailable", "Unable to reach the hub right now.", 503);
   }
 
   return new NextResponse(response.body, {

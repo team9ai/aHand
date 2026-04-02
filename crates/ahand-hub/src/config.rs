@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -25,6 +27,8 @@ pub struct Config {
     pub job_timeout_grace_ms: u64,
     pub device_disconnect_grace_ms: u64,
     pub jwt_secret: String,
+    pub audit_retention_days: u64,
+    pub audit_fallback_path: PathBuf,
     pub output_retention_ms: u64,
     pub store: StoreConfig,
 }
@@ -86,6 +90,13 @@ impl Config {
                 .transpose()?
                 .unwrap_or(10 * 60 * 1_000),
             jwt_secret: required_env(&getenv, "AHAND_HUB_JWT_SECRET")?,
+            audit_retention_days: getenv("AHAND_HUB_AUDIT_RETENTION_DAYS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(90),
+            audit_fallback_path: getenv("AHAND_HUB_AUDIT_FALLBACK_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_audit_fallback_path),
             output_retention_ms: getenv("AHAND_HUB_OUTPUT_RETENTION_MS")
                 .map(|value| value.parse())
                 .transpose()?
@@ -96,6 +107,10 @@ impl Config {
             },
         })
     }
+}
+
+fn default_audit_fallback_path() -> PathBuf {
+    std::env::temp_dir().join("ahand-hub-audit-fallback.jsonl")
 }
 
 fn required_env<F>(getenv: &F, key: &str) -> anyhow::Result<String>
@@ -112,9 +127,11 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     use super::Config;
     use super::StoreConfig;
+    use super::default_audit_fallback_path;
 
     #[test]
     fn from_env_with_requires_secret_inputs() {
@@ -174,6 +191,8 @@ mod tests {
         assert_eq!(config.job_timeout_grace_ms, 1_000);
         assert_eq!(config.device_disconnect_grace_ms, 10 * 60 * 1_000);
         assert_eq!(config.jwt_secret, "jwt-prod-secret");
+        assert_eq!(config.audit_retention_days, 90);
+        assert_eq!(config.audit_fallback_path, default_audit_fallback_path());
         match config.store {
             StoreConfig::Persistent {
                 database_url,
@@ -297,6 +316,55 @@ mod tests {
                 "https://dashboard.example".to_string(),
                 "https://ops.example".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn from_env_with_parses_audit_retention_and_fallback_path() {
+        let env = HashMap::from([
+            (
+                "AHAND_HUB_SERVICE_TOKEN".to_string(),
+                "service-prod-token".to_string(),
+            ),
+            (
+                "AHAND_HUB_DASHBOARD_PASSWORD".to_string(),
+                "shared-dashboard-password".to_string(),
+            ),
+            (
+                "AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN".to_string(),
+                "bootstrap-prod-token".to_string(),
+            ),
+            (
+                "AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID".to_string(),
+                "device-prod-1".to_string(),
+            ),
+            (
+                "AHAND_HUB_JWT_SECRET".to_string(),
+                "jwt-prod-secret".to_string(),
+            ),
+            (
+                "AHAND_HUB_AUDIT_RETENTION_DAYS".to_string(),
+                "45".to_string(),
+            ),
+            (
+                "AHAND_HUB_AUDIT_FALLBACK_PATH".to_string(),
+                "/var/lib/ahand-hub/audit-fallback.jsonl".to_string(),
+            ),
+            (
+                "AHAND_HUB_DATABASE_URL".to_string(),
+                "postgres://prod".to_string(),
+            ),
+            (
+                "AHAND_HUB_REDIS_URL".to_string(),
+                "redis://prod".to_string(),
+            ),
+        ]);
+
+        let config = Config::from_env_with(|key| env.get(key).cloned()).unwrap();
+        assert_eq!(config.audit_retention_days, 45);
+        assert_eq!(
+            config.audit_fallback_path,
+            PathBuf::from("/var/lib/ahand-hub/audit-fallback.jsonl")
         );
     }
 }

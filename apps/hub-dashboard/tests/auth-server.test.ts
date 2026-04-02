@@ -46,7 +46,12 @@ describe("hub dashboard auth server flow", () => {
     const response = middleware(request);
 
     expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "unauthorized",
+        message: "Sign in required.",
+      },
+    });
   });
 
   it("bypasses auth redirects for the login page and auth routes", () => {
@@ -206,7 +211,12 @@ describe("hub dashboard auth server flow", () => {
     const payload = await response.json();
 
     expect(response.status).toBe(400);
-    expect(payload).toEqual({ error: "invalid_json" });
+    expect(payload).toEqual({
+      error: {
+        code: "invalid_json",
+        message: "Request body must be valid JSON.",
+      },
+    });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -223,7 +233,12 @@ describe("hub dashboard auth server flow", () => {
     const payload = await response.json();
 
     expect(response.status).toBe(503);
-    expect(payload).toEqual({ error: "hub_unavailable" });
+    expect(payload).toEqual({
+      error: {
+        code: "hub_unavailable",
+        message: "Unable to reach the hub right now.",
+      },
+    });
     expect(response.cookies.get("ahand_hub_session")).toBeUndefined();
   });
 
@@ -338,7 +353,12 @@ describe("hub dashboard auth server flow", () => {
     });
 
     expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "unauthorized",
+        message: "Sign in required.",
+      },
+    });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -383,7 +403,12 @@ describe("hub dashboard auth server flow", () => {
     });
 
     expect(response.status).toBe(503);
-    await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "hub_unavailable",
+        message: "Unable to reach the hub right now.",
+      },
+    });
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -401,7 +426,12 @@ describe("hub dashboard auth server flow", () => {
     });
 
     expect(response.status).toBe(503);
-    await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "hub_unavailable",
+        message: "Unable to reach the hub right now.",
+      },
+    });
   });
 
   it("rewrites authenticated dashboard websocket requests to the hub at runtime", () => {
@@ -418,7 +448,12 @@ describe("hub dashboard auth server flow", () => {
     const response = middleware(new NextRequest("http://localhost/ws/dashboard"));
 
     expect(response.status).toBe(401);
-    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "unauthorized",
+        message: "Sign in required.",
+      },
+    });
   });
 
   it("returns 503 for dashboard websocket requests when the hub base URL is missing", async () => {
@@ -430,6 +465,11 @@ describe("hub dashboard auth server flow", () => {
     const response = middleware(request);
 
     expect(response.status).toBe(503);
-    await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "hub_unavailable",
+        message: "Unable to reach the hub right now.",
+      },
+    });
   });
 });

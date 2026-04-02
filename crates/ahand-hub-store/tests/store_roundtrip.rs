@@ -462,3 +462,44 @@ async fn audit_store_filters_orders_and_paginates_in_query() -> anyhow::Result<(
 
     Ok(())
 }
+
+#[tokio::test]
+async fn audit_store_prunes_entries_older_than_cutoff() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let base = Utc::now();
+    stack
+        .audit
+        .append(&[
+            AuditEntry {
+                timestamp: base - ChronoDuration::days(120),
+                action: "job.created".into(),
+                resource_type: "job".into(),
+                resource_id: "old-job".into(),
+                actor: "service:test".into(),
+                detail: serde_json::json!({}),
+                source_ip: None,
+            },
+            AuditEntry {
+                timestamp: base - ChronoDuration::days(10),
+                action: "job.created".into(),
+                resource_type: "job".into(),
+                resource_id: "recent-job".into(),
+                actor: "service:test".into(),
+                detail: serde_json::json!({}),
+                source_ip: None,
+            },
+        ])
+        .await?;
+
+    let removed = stack
+        .audit
+        .prune_before(base - ChronoDuration::days(90))
+        .await?;
+    assert_eq!(removed, 1);
+
+    let remaining = stack.audit.query(AuditFilter::default()).await?;
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].resource_id, "recent-job");
+
+    Ok(())
+}

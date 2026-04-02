@@ -46,6 +46,8 @@ pub struct AppState {
 impl AppState {
     pub async fn from_config(config: crate::config::Config) -> anyhow::Result<Self> {
         let finished_retention = Duration::from_millis(config.output_retention_ms);
+        let audit_retention_days = config.audit_retention_days;
+        let audit_fallback_path = config.audit_fallback_path.clone();
         let bootstrap_reservation_ttl =
             crate::bootstrap::BootstrapCredentials::reservation_ttl(config.device_hello_max_age_ms);
         let (
@@ -90,9 +92,13 @@ impl AppState {
                 )
             }
         };
-        let audit_store = Arc::new(crate::audit_writer::BufferedAuditStore::new(
-            raw_audit_store,
-        )) as Arc<dyn AuditStore>;
+        let audit_store = Arc::new(
+            crate::audit_writer::BufferedAuditStore::new_with_fallback_path(
+                raw_audit_store,
+                audit_fallback_path,
+            ),
+        ) as Arc<dyn AuditStore>;
+        spawn_audit_retention_task(audit_store.clone(), audit_retention_days);
         let output_stream = Arc::new(match persistent_output {
             Some(store) => crate::output_stream::OutputStream::persistent(store),
             None => crate::output_stream::OutputStream::new(finished_retention, 256),
@@ -526,4 +532,38 @@ impl AuditStore for MemoryAuditStore {
             .map_err(|err| HubError::Internal(err.to_string()))?;
         Ok(filter.apply(entries.iter().cloned()))
     }
+
+    async fn prune_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> Result<u64> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+        let original_len = entries.len();
+        entries.retain(|entry| entry.timestamp >= cutoff);
+        Ok((original_len - entries.len()) as u64)
+    }
+}
+
+fn spawn_audit_retention_task(audit_store: Arc<dyn AuditStore>, retention_days: u64) {
+    tokio::spawn(async move {
+        if let Err(err) = prune_audit_entries(audit_store.as_ref(), retention_days).await {
+            tracing::warn!(error = %err, retention_days, "failed to prune audit entries");
+        }
+
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.tick().await;
+
+        loop {
+            interval.tick().await;
+            if let Err(err) = prune_audit_entries(audit_store.as_ref(), retention_days).await {
+                tracing::warn!(error = %err, retention_days, "failed to prune audit entries");
+            }
+        }
+    });
+}
+
+async fn prune_audit_entries(audit_store: &dyn AuditStore, retention_days: u64) -> Result<u64> {
+    let retention_days = std::cmp::min(retention_days, i64::MAX as u64) as i64;
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
+    audit_store.prune_before(cutoff).await
 }

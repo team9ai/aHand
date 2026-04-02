@@ -2,6 +2,7 @@ use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::traits::AuditStore;
 use ahand_hub_core::{HubError, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::Row;
 use sqlx::postgres::Postgres;
 use sqlx::{PgPool, QueryBuilder};
@@ -106,6 +107,21 @@ impl AuditStore for PgAuditStore {
             .map_err(|err| HubError::Internal(err.to_string()))?;
 
         rows.into_iter().map(map_audit).collect()
+    }
+
+    async fn prune_before(&self, cutoff: DateTime<Utc>) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM audit_logs
+            WHERE timestamp < $1
+            "#,
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        Ok(result.rows_affected())
     }
 }
 

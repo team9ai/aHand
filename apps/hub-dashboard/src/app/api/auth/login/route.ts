@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { dashboardErrorResponse } from "@/lib/api-error";
 
 export async function POST(request: NextRequest) {
   let body: unknown;
@@ -6,12 +7,12 @@ export async function POST(request: NextRequest) {
   try {
     body = await request.json();
   } catch {
-    return NextResponse.json({ error: "invalid_json" }, { status: 400 });
+    return dashboardErrorResponse("invalid_json", "Request body must be valid JSON.", 400);
   }
 
   const baseUrl = process.env.AHAND_HUB_BASE_URL;
   if (!baseUrl) {
-    return NextResponse.json({ error: "hub_unavailable" }, { status: 503 });
+    return dashboardErrorResponse("hub_unavailable", "Unable to reach the hub right now.", 503);
   }
 
   let response: Response;
@@ -22,7 +23,7 @@ export async function POST(request: NextRequest) {
       body: JSON.stringify(body),
     });
   } catch {
-    return NextResponse.json({ error: "hub_unavailable" }, { status: 503 });
+    return dashboardErrorResponse("hub_unavailable", "Unable to reach the hub right now.", 503);
   }
 
   const payload = await response.json().catch(() => ({}));
