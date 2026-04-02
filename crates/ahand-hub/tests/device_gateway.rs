@@ -1,13 +1,17 @@
 mod support;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
+use ahand_hub_core::traits::DeviceStore;
 
 use support::{
     bootstrap_hello, read_hello_accepted, read_hello_challenge, signed_hello, signed_hello_at,
     signed_hello_with_key_at, signed_hello_with_last_ack, spawn_server_with_state,
-    spawn_test_server, test_state,
+    spawn_test_server, test_config, test_state,
 };
 
 #[tokio::test]
@@ -31,6 +35,152 @@ async fn device_ws_accepts_signed_hello_and_registers_presence() {
     assert_eq!(listed[0]["online"], true);
 
     let _ = socket.close(None).await;
+}
+
+#[tokio::test]
+async fn idle_device_connection_times_out_and_marks_presence_offline() {
+    let mut config = test_config();
+    config.device_heartbeat_interval_ms = 20;
+    config.device_heartbeat_timeout_ms = 60;
+    let state = ahand_hub::state::AppState::from_config(config)
+        .await
+        .expect("test state should build");
+    state
+        .devices
+        .insert(ahand_hub_core::device::NewDevice {
+            id: "device-1".into(),
+            public_key: Some(
+                SigningKey::from_bytes(&[7u8; 32])
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec(),
+            ),
+            hostname: "seeded-device".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+        })
+        .await
+        .unwrap();
+    state.devices.mark_offline("device-1").await.unwrap();
+    let server = spawn_server_with_state(state).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("device-1", &challenge.nonce);
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+
+    let listed = server.get_json("/api/devices", "service-test-token").await;
+    let device = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "device-1")
+        .unwrap();
+    assert_eq!(device["online"], false);
+
+    let _ = socket.close(None).await;
+}
+
+#[tokio::test]
+async fn pong_responses_keep_idle_device_connection_online() {
+    let mut config = test_config();
+    config.device_heartbeat_interval_ms = 20;
+    config.device_heartbeat_timeout_ms = 60;
+    let state = ahand_hub::state::AppState::from_config(config)
+        .await
+        .expect("test state should build");
+    state
+        .devices
+        .insert(ahand_hub_core::device::NewDevice {
+            id: "device-1".into(),
+            public_key: Some(
+                SigningKey::from_bytes(&[7u8; 32])
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec(),
+            ),
+            hostname: "seeded-device".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+        })
+        .await
+        .unwrap();
+    state.devices.mark_offline("device-1").await.unwrap();
+    let server = spawn_server_with_state(state).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("device-1", &challenge.nonce);
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+
+    let ping_count = Arc::new(AtomicUsize::new(0));
+    let reader_ping_count = ping_count.clone();
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let reader = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    let _ = socket.close(None).await;
+                    break;
+                }
+                message = socket.next() => {
+                    let Some(Ok(message)) = message else {
+                        break;
+                    };
+                    match message {
+                        tokio_tungstenite::tungstenite::Message::Ping(_) => {
+                            reader_ping_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                        tokio_tungstenite::tungstenite::Message::Binary(_) => {}
+                        tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                            panic!("unexpected close frame: {frame:?}");
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(140)).await;
+
+    let listed = server.get_json("/api/devices", "service-test-token").await;
+    let device = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "device-1")
+        .unwrap();
+    assert_eq!(device["online"], true);
+    assert!(
+        ping_count.load(Ordering::Relaxed) > 0,
+        "expected heartbeat ping frames"
+    );
+
+    let _ = shutdown_tx.send(true);
+    reader.await.unwrap();
 }
 
 #[tokio::test]

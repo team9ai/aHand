@@ -1,9 +1,9 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 use ahand_hub_core::HubError;
 use axum::extract::State;
@@ -298,6 +298,8 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     let mut bootstrap_reservation: Option<crate::bootstrap::BootstrapReservation> = None;
     let mut send_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
+    let (local_close_tx, local_close_rx) = watch::channel(false);
 
     let run_result: anyhow::Result<()> = async {
         let challenge = issue_hello_challenge();
@@ -384,6 +386,8 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         let (connection_id, mut outbound_rx, close_rx) = state
             .connections
             .register(device_id.clone(), hello.last_ack)?;
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel::<WsMessage>();
+        let last_inbound_at = Arc::new(AsyncMutex::new(tokio::time::Instant::now()));
         active_connection = Some((device_id.clone(), connection_id));
         state.devices.mark_online(&device_id, "ws").await?;
         state.jobs.handle_device_connected(&device_id).await?;
@@ -396,11 +400,13 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             let refresh_ms = state.device_presence_refresh_ms;
             let refresh_device_id = device_id.clone();
             let mut refresh_close_rx = close_rx.clone();
+            let mut refresh_local_close_rx = local_close_rx.clone();
             presence_task = Some(tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         biased;
                         _ = refresh_close_rx.changed() => break,
+                        _ = refresh_local_close_rx.changed() => break,
                         _ = tokio::time::sleep(std::time::Duration::from_millis(refresh_ms)) => {
                             if let Err(err) = devices.mark_online(&refresh_device_id, "ws").await {
                                 tracing::warn!(device_id = %refresh_device_id, error = %err, "failed to refresh device presence");
@@ -415,11 +421,23 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         let connections = state.connections.clone();
         let send_device_id = device_id.clone();
         let mut send_close_rx = close_rx.clone();
+        let mut send_local_close_rx = local_close_rx.clone();
+        let send_local_close_tx = local_close_tx.clone();
         send_task = Some(tokio::spawn(async move {
             loop {
                 tokio::select! {
                     biased;
                     _ = send_close_rx.changed() => break,
+                    _ = send_local_close_rx.changed() => break,
+                    control = control_rx.recv() => {
+                        let Some(control) = control else {
+                            break;
+                        };
+                        if sender.send(control).await.is_err() {
+                            let _ = send_local_close_tx.send(true);
+                            break;
+                        }
+                    }
                     outbound = outbound_rx.recv() => {
                         let Some(outbound) = outbound else {
                             break;
@@ -432,6 +450,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                             .await
                             .is_err()
                         {
+                            let _ = send_local_close_tx.send(true);
                             break;
                         }
                     }
@@ -439,11 +458,46 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             }
         }));
 
+        if state.device_heartbeat_interval_ms > 0 && state.device_heartbeat_timeout_ms > 0 {
+            let heartbeat_interval = state.device_heartbeat_interval_ms;
+            let heartbeat_timeout = std::time::Duration::from_millis(state.device_heartbeat_timeout_ms);
+            let mut heartbeat_close_rx = close_rx.clone();
+            let mut heartbeat_local_close_rx = local_close_rx.clone();
+            let heartbeat_last_inbound_at = last_inbound_at.clone();
+            let heartbeat_control_tx = control_tx.clone();
+            let heartbeat_local_close_tx = local_close_tx.clone();
+            heartbeat_task = Some(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = heartbeat_close_rx.changed() => break,
+                        _ = heartbeat_local_close_rx.changed() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(heartbeat_interval)) => {
+                            let elapsed = heartbeat_last_inbound_at.lock().await.elapsed();
+                            if elapsed >= heartbeat_timeout {
+                                let _ = heartbeat_local_close_tx.send(true);
+                                break;
+                            }
+                            if heartbeat_control_tx
+                                .send(WsMessage::Ping(Vec::new().into()))
+                                .is_err()
+                            {
+                                let _ = heartbeat_local_close_tx.send(true);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
         let mut recv_close_rx = close_rx;
+        let mut recv_local_close_rx = local_close_rx.clone();
         loop {
             let message = tokio::select! {
                 biased;
                 _ = recv_close_rx.changed() => break,
+                _ = recv_local_close_rx.changed() => break,
                 message = receiver.next() => {
                     let Some(message) = message else {
                         break;
@@ -456,7 +510,18 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             }
             match message {
                 WsMessage::Binary(frame) => {
+                    *last_inbound_at.lock().await = tokio::time::Instant::now();
                     state.jobs.handle_device_frame(&device_id, &frame).await?;
+                }
+                WsMessage::Ping(payload) => {
+                    *last_inbound_at.lock().await = tokio::time::Instant::now();
+                    if control_tx.send(WsMessage::Pong(payload)).is_err() {
+                        let _ = local_close_tx.send(true);
+                        break;
+                    }
+                }
+                WsMessage::Pong(_) => {
+                    *last_inbound_at.lock().await = tokio::time::Instant::now();
                 }
                 WsMessage::Close(_) => break,
                 _ => {}
@@ -471,6 +536,9 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         task.abort();
     }
     if let Some(task) = presence_task.take() {
+        task.abort();
+    }
+    if let Some(task) = heartbeat_task.take() {
         task.abort();
     }
     if let Some(reservation) = bootstrap_reservation.take() {

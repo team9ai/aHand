@@ -163,17 +163,7 @@ pub async fn verify_device_hello(
                 });
             }
 
-            let claims = state.auth.verify_jwt(&auth.bearer_token)?;
-            if claims.role != Role::Device || claims.subject != device_id {
-                return Err(HubError::Unauthorized);
-            }
-            Ok(VerifiedDeviceHello {
-                public_key,
-                signed_at_ms: auth.signed_at_ms,
-                auth_method: "bootstrap",
-                allow_registration: true,
-                bootstrap_reservation: None,
-            })
+            Err(HubError::Unauthorized)
         }
     }
 }

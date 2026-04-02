@@ -201,10 +201,7 @@ async fn updating_job_status_records_lifecycle_timestamps() -> anyhow::Result<()
 async fn redis_output_store_roundtrips_history_and_expires_terminal_streams() -> anyhow::Result<()>
 {
     let stack = TestStack::start().await?;
-    let store = RedisJobOutputStore::new(
-        ahand_hub_store::redis::connect_redis(stack.redis_url()).await?,
-        Duration::from_millis(200),
-    );
+    let store = RedisJobOutputStore::new(stack.redis_url(), Duration::from_millis(200)).await?;
 
     let stdout = store
         .append("job-1", JobOutputRecord::Stdout("hello".into()))
@@ -237,6 +234,27 @@ async fn redis_output_store_roundtrips_history_and_expires_terminal_streams() ->
     let expired = store.read_history("job-1").await?;
     assert!(expired.is_empty());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_output_live_reads_do_not_block_appends() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let store = RedisJobOutputStore::new(stack.redis_url(), Duration::from_millis(200)).await?;
+
+    let live_store = store.clone();
+    let reader = tokio::spawn(async move { live_store.read_live("job-live", "$", 500).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        store.append("job-live", JobOutputRecord::Stdout("hello".into())),
+    )
+    .await
+    .expect("append should not block behind live tail")?;
+
+    reader.abort();
+    let _ = reader.await;
     Ok(())
 }
 

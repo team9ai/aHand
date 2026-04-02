@@ -18,6 +18,8 @@ pub struct Config {
     pub device_bootstrap_token: String,
     pub device_bootstrap_device_id: String,
     pub device_hello_max_age_ms: u64,
+    pub device_heartbeat_interval_ms: u64,
+    pub device_heartbeat_timeout_ms: u64,
     pub device_presence_ttl_secs: u64,
     pub device_presence_refresh_ms: u64,
     pub job_timeout_grace_ms: u64,
@@ -59,6 +61,14 @@ impl Config {
                 .map(|value| value.parse())
                 .transpose()?
                 .unwrap_or(300_000),
+            device_heartbeat_interval_ms: getenv("AHAND_HUB_DEVICE_HEARTBEAT_INTERVAL_MS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(30_000),
+            device_heartbeat_timeout_ms: getenv("AHAND_HUB_DEVICE_HEARTBEAT_TIMEOUT_MS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(90_000),
             device_presence_ttl_secs: getenv("AHAND_HUB_DEVICE_PRESENCE_TTL_SECS")
                 .map(|value| value.parse())
                 .transpose()?
@@ -157,6 +167,8 @@ mod tests {
         assert_eq!(config.device_bootstrap_token, "bootstrap-prod-token");
         assert_eq!(config.device_bootstrap_device_id, "device-prod-1");
         assert_eq!(config.device_hello_max_age_ms, 300_000);
+        assert_eq!(config.device_heartbeat_interval_ms, 30_000);
+        assert_eq!(config.device_heartbeat_timeout_ms, 90_000);
         assert_eq!(config.device_presence_ttl_secs, 60);
         assert_eq!(config.device_presence_refresh_ms, 20_000);
         assert_eq!(config.job_timeout_grace_ms, 1_000);

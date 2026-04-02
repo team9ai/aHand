@@ -253,6 +253,53 @@ async fn create_device_preregisters_device_and_returns_bootstrap_data() {
 }
 
 #[tokio::test]
+async fn device_jwt_cannot_be_reused_as_bootstrap_registration_credential() {
+    let state = support::test_state().await;
+    let server = support::spawn_server_with_state(state.clone()).await;
+
+    let response = server
+        .post(
+            "/api/devices",
+            "service-test-token",
+            serde_json::json!({
+                "id": "device-9",
+                "hostname": "edge-box",
+                "os": "linux",
+                "capabilities": ["exec"],
+                "version": "0.1.2"
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+    let device_jwt = state.auth.issue_device_jwt("device-9").unwrap();
+    let mut socket = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap()
+        .0;
+    let challenge = support::read_hello_challenge(&mut socket).await;
+    let hello = support::bootstrap_hello("device-9", &device_jwt, &challenge.nonce);
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            prost::Message::encode_to_vec(&hello).into(),
+        ))
+        .await
+        .unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(1), socket.next())
+        .await
+        .expect("device-jwt bootstrap handshake should terminate");
+    assert!(matches!(
+        response,
+        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | Some(Err(_)) | None
+    ));
+
+    let stored = state.devices.get("device-9").await.unwrap().unwrap();
+    assert!(!stored.online);
+    assert!(stored.public_key.is_none());
+}
+
+#[tokio::test]
 async fn device_token_can_read_only_its_own_device_record() {
     let state = support::test_state().await;
     state

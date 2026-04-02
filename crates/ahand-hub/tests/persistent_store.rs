@@ -24,6 +24,8 @@ fn persistent_config(stack: &TestStack) -> Config {
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,
+        device_heartbeat_interval_ms: 30_000,
+        device_heartbeat_timeout_ms: 90_000,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
         job_timeout_grace_ms: 50,

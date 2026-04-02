@@ -35,6 +35,8 @@ pub struct AppState {
     pub device_bootstrap_token: Arc<String>,
     pub device_bootstrap_device_id: Arc<String>,
     pub device_hello_max_age_ms: u64,
+    pub device_heartbeat_interval_ms: u64,
+    pub device_heartbeat_timeout_ms: u64,
     pub device_presence_refresh_ms: u64,
     pub service_token: Arc<String>,
     pub dashboard_shared_password: Arc<String>,
@@ -68,7 +70,6 @@ impl AppState {
             } => {
                 let pool = ahand_hub_store::postgres::connect_database(database_url).await?;
                 let presence_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
-                let output_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
                 let bootstrap_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
                 let presence = RedisPresenceStore::new_with_ttl(
                     presence_redis,
@@ -80,7 +81,7 @@ impl AppState {
                     )),
                     Arc::new(PgJobStore::new(pool.clone())) as Arc<dyn JobStore>,
                     Arc::new(PgAuditStore::new(pool)) as Arc<dyn AuditStore>,
-                    Some(RedisJobOutputStore::new(output_redis, finished_retention)),
+                    Some(RedisJobOutputStore::new(redis_url, finished_retention).await?),
                     Some(RedisEventFanout::new(redis_url).await?),
                     crate::bootstrap::BootstrapCredentials::redis(RedisBootstrapStore::new(
                         bootstrap_redis,
@@ -132,6 +133,8 @@ impl AppState {
             device_bootstrap_token: Arc::new(config.device_bootstrap_token),
             device_bootstrap_device_id: Arc::new(config.device_bootstrap_device_id),
             device_hello_max_age_ms: config.device_hello_max_age_ms,
+            device_heartbeat_interval_ms: config.device_heartbeat_interval_ms,
+            device_heartbeat_timeout_ms: config.device_heartbeat_timeout_ms,
             device_presence_refresh_ms: config.device_presence_refresh_ms,
             service_token: Arc::new(config.service_token),
             dashboard_shared_password: Arc::new(config.dashboard_shared_password),

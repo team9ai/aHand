@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use ahand_hub_core::{HubError, Result};
 use redis::AsyncCommands;
+use redis::Client;
 use redis::aio::ConnectionManager;
 use redis::streams::{StreamRangeReply, StreamReadOptions, StreamReadReply};
 use tokio::sync::Mutex;
@@ -39,16 +40,20 @@ pub struct StoredJobOutputRecord {
 
 #[derive(Clone)]
 pub struct RedisJobOutputStore {
-    connection: Arc<Mutex<ConnectionManager>>,
+    client: Client,
+    writer: Arc<Mutex<ConnectionManager>>,
     retention: Duration,
 }
 
 impl RedisJobOutputStore {
-    pub fn new(connection: ConnectionManager, retention: Duration) -> Self {
-        Self {
-            connection: Arc::new(Mutex::new(connection)),
+    pub async fn new(redis_url: &str, retention: Duration) -> anyhow::Result<Self> {
+        let client = Client::open(redis_url)?;
+        let writer = crate::redis::connect_redis(redis_url).await?;
+        Ok(Self {
+            client,
+            writer: Arc::new(Mutex::new(writer)),
             retention,
-        }
+        })
     }
 
     pub async fn append(
@@ -58,48 +63,47 @@ impl RedisJobOutputStore {
     ) -> Result<StoredJobOutputRecord> {
         let stream_key = output_stream_key(job_id);
         let seq_key = output_seq_key(job_id);
-        let mut connection = self.connection.lock().await;
-        let seq: u64 = connection
-            .incr(&seq_key, 1)
-            .await
-            .map_err(redis_err)?;
+        let mut connection = self.writer.lock().await;
+        let seq: u64 = connection.incr(&seq_key, 1).await.map_err(redis_err)?;
 
         let stream_id: String = match &record {
-            JobOutputRecord::Stdout(chunk) | JobOutputRecord::Stderr(chunk) => {
-                connection
-                    .xadd(
-                        &stream_key,
-                        "*",
-                        &[("seq", seq.to_string()), ("type", record.kind().into()), ("data", chunk.clone())],
-                    )
-                    .await
-                    .map_err(redis_err)?
-            }
-            JobOutputRecord::Progress(progress) => {
-                connection
-                    .xadd(
-                        &stream_key,
-                        "*",
-                        &[("seq", seq.to_string()), ("type", record.kind().into()), ("data", progress.to_string())],
-                    )
-                    .await
-                    .map_err(redis_err)?
-            }
-            JobOutputRecord::Finished { exit_code, error } => {
-                connection
-                    .xadd(
-                        &stream_key,
-                        "*",
-                        &[
-                            ("seq", seq.to_string()),
-                            ("type", record.kind().into()),
-                            ("exit_code", exit_code.to_string()),
-                            ("error", error.clone()),
-                        ],
-                    )
-                    .await
-                    .map_err(redis_err)?
-            }
+            JobOutputRecord::Stdout(chunk) | JobOutputRecord::Stderr(chunk) => connection
+                .xadd(
+                    &stream_key,
+                    "*",
+                    &[
+                        ("seq", seq.to_string()),
+                        ("type", record.kind().into()),
+                        ("data", chunk.clone()),
+                    ],
+                )
+                .await
+                .map_err(redis_err)?,
+            JobOutputRecord::Progress(progress) => connection
+                .xadd(
+                    &stream_key,
+                    "*",
+                    &[
+                        ("seq", seq.to_string()),
+                        ("type", record.kind().into()),
+                        ("data", progress.to_string()),
+                    ],
+                )
+                .await
+                .map_err(redis_err)?,
+            JobOutputRecord::Finished { exit_code, error } => connection
+                .xadd(
+                    &stream_key,
+                    "*",
+                    &[
+                        ("seq", seq.to_string()),
+                        ("type", record.kind().into()),
+                        ("exit_code", exit_code.to_string()),
+                        ("error", error.clone()),
+                    ],
+                )
+                .await
+                .map_err(redis_err)?,
         };
 
         if record.is_terminal() {
@@ -122,7 +126,7 @@ impl RedisJobOutputStore {
     }
 
     pub async fn read_history(&self, job_id: &str) -> Result<Vec<StoredJobOutputRecord>> {
-        let mut connection = self.connection.lock().await;
+        let mut connection = self.writer.lock().await;
         let reply: StreamRangeReply = connection
             .xrange_all(output_stream_key(job_id))
             .await
@@ -140,7 +144,11 @@ impl RedisJobOutputStore {
         last_stream_id: &str,
         block_ms: usize,
     ) -> Result<Vec<StoredJobOutputRecord>> {
-        let mut connection = self.connection.lock().await;
+        let mut connection = self
+            .client
+            .get_connection_manager()
+            .await
+            .map_err(redis_err)?;
         let reply: Option<StreamReadReply> = connection
             .xread_options(
                 &[output_stream_key(job_id)],
@@ -181,7 +189,7 @@ fn parse_stream_record(record: redis::streams::StreamId) -> Result<StoredJobOutp
         other => {
             return Err(HubError::Internal(format!(
                 "unknown output stream record type: {other}"
-            )))
+            )));
         }
     };
 
