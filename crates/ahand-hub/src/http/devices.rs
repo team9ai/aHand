@@ -3,6 +3,7 @@ use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::traits::DeviceStore;
 use axum::{
     Json,
+    extract::rejection::JsonRejection,
     extract::rejection::QueryRejection,
     extract::{Path, Query, State},
     http::StatusCode,
@@ -59,9 +60,10 @@ pub async fn list_devices(
 pub async fn create_device(
     auth: AuthContextExt,
     State(state): State<AppState>,
-    Json(body): Json<CreateDeviceRequest>,
+    body: Result<Json<CreateDeviceRequest>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<CreateDeviceResponse>)> {
     auth.require_admin()?;
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
     state
         .devices
         .insert(NewDevice {

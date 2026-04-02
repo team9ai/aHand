@@ -108,6 +108,23 @@ async fn create_job_returns_conflict_for_offline_device() {
 }
 
 #[tokio::test]
+async fn create_job_rejects_malformed_json_with_error_envelope() {
+    let server = support::spawn_server_with_state(support::test_state().await).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/jobs", server.http_base_url()))
+        .bearer_auth("service-test-token")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("{\"device_id\":")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "VALIDATION_ERROR");
+}
+
+#[tokio::test]
 async fn create_job_returns_not_found_for_unknown_device() {
     let server = support::spawn_server_with_state(support::test_state().await).await;
     let response = server
@@ -130,6 +147,23 @@ async fn create_job_returns_not_found_for_unknown_device() {
         payload["error"]["message"],
         "Device device-404 was not found"
     );
+}
+
+#[tokio::test]
+async fn create_device_rejects_malformed_json_with_error_envelope() {
+    let server = support::spawn_server_with_state(support::test_state().await).await;
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/devices", server.http_base_url()))
+        .bearer_auth("service-test-token")
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("{\"id\":")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "VALIDATION_ERROR");
 }
 
 #[tokio::test]

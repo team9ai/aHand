@@ -5,6 +5,7 @@ use ahand_hub_core::HubError;
 use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, is_terminal_status};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::JobStore;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Path, Query, State};
 use axum::http::HeaderMap;
@@ -541,9 +542,10 @@ impl JobRuntime {
 pub async fn create_job(
     auth: AuthContextExt,
     State(state): State<AppState>,
-    Json(body): Json<CreateJobRequest>,
+    body: Result<Json<CreateJobRequest>, JsonRejection>,
 ) -> ApiResult<(axum::http::StatusCode, Json<CreateJobResponse>)> {
     auth.require_admin()?;
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
     let job = state
         .jobs
         .create_job(body.into_new_job("service:api"))
