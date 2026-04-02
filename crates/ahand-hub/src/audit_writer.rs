@@ -49,11 +49,22 @@ impl AuditStore for BufferedAuditStore {
     async fn append(&self, entries: &[AuditEntry]) -> Result<()> {
         for entry in entries {
             if self.tx.try_send(entry.clone()).is_err() {
-                tracing::error!(
-                    path = %self.fallback_path.display(),
-                    "audit queue unavailable, writing entry to fallback file"
-                );
-                write_fallback_entries(self.fallback_path.as_ref(), std::slice::from_ref(entry)).await?;
+                let fallback_path = self.fallback_path.clone();
+                let entry = entry.clone();
+                tokio::spawn(async move {
+                    tracing::error!(
+                        path = %fallback_path.display(),
+                        "audit queue unavailable, writing entry to fallback file"
+                    );
+                    if let Err(err) = write_fallback_entries(
+                        fallback_path.as_ref(),
+                        std::slice::from_ref(&entry),
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %err, path = %fallback_path.display(), "failed to write audit fallback entry");
+                    }
+                });
             }
         }
         Ok(())
