@@ -457,16 +457,21 @@ impl JobStore for MemoryJobStore {
         Ok(jobs)
     }
 
-    async fn update_status(&self, job_id: &str, status: JobStatus) -> Result<()> {
+    async fn transition_status(&self, job_id: &str, status: JobStatus) -> Result<Option<JobStatus>> {
         let mut job = self
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
         if job.status == status {
-            return Ok(());
+            return Ok(None);
         }
         let next_status = resolve_status_transition(job.status, status)?;
         job.apply_status_transition(next_status, chrono::Utc::now());
+        Ok(Some(next_status))
+    }
+
+    async fn update_status(&self, job_id: &str, status: JobStatus) -> Result<()> {
+        let _ = self.transition_status(job_id, status).await?;
         Ok(())
     }
 

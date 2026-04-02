@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,8 +11,8 @@ use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
-use ahand_hub_store::test_support::TestStack;
 use sqlx::Row;
+use support::TestStack;
 
 #[tokio::test]
 async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<()> {
@@ -292,6 +294,73 @@ async fn redis_bootstrap_store_enforces_one_time_reservations() -> anyhow::Resul
     assert_ne!(rotated, token);
     store.delete_device("device-7").await?;
     assert!(store.reserve("device-7", &rotated).await?.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_terminal_transitions_do_not_overwrite_each_other() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    stack
+        .devices
+        .insert(NewDevice {
+            id: "device-1".into(),
+            public_key: Some(vec![7; 32]),
+            hostname: "devbox".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+        })
+        .await?;
+    let store = stack.jobs.clone();
+    let job = store
+        .insert(NewJob {
+            device_id: "device-1".into(),
+            tool: "echo".into(),
+            args: vec!["hello".into()],
+            cwd: None,
+            env: Default::default(),
+            timeout_ms: 30_000,
+            requested_by: "service".into(),
+        })
+        .await?;
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let finished_store = store.clone();
+    let finished_job_id = job.id.to_string();
+    let finished_barrier = barrier.clone();
+    let finished = tokio::spawn(async move {
+        finished_barrier.wait().await;
+        finished_store
+            .transition_status(&finished_job_id, JobStatus::Finished)
+            .await
+    });
+    let failed_store = store.clone();
+    let failed_job_id = job.id.to_string();
+    let failed_barrier = barrier.clone();
+    let failed = tokio::spawn(async move {
+        failed_barrier.wait().await;
+        failed_store
+            .transition_status(&failed_job_id, JobStatus::Failed)
+            .await
+    });
+    barrier.wait().await;
+
+    let first = finished.await.unwrap();
+    let second = failed.await.unwrap();
+    let outcomes = [first, second];
+    let success_count = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(
+        success_count, 1,
+        "only one concurrent terminal transition should succeed"
+    );
+
+    let stored = store
+        .get(&job.id.to_string())
+        .await?
+        .expect("job should still exist");
+    assert!(matches!(stored.status, JobStatus::Finished | JobStatus::Failed));
 
     Ok(())
 }

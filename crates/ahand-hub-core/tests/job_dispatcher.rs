@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use ahand_hub_core::HubError;
 use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::{Device, NewDevice};
-use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
+use ahand_hub_core::job::{JobFilter, JobStatus, NewJob, resolve_status_transition};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
 use async_trait::async_trait;
@@ -155,6 +155,24 @@ impl JobStore for MemoryJobStore {
         Ok(jobs)
     }
 
+    async fn transition_status(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+    ) -> ahand_hub_core::Result<Option<JobStatus>> {
+        let mut job = self
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
+        if job.status == status {
+            return Ok(None);
+        }
+
+        let next_status = resolve_status_transition(job.status, status)?;
+        job.apply_status_transition(next_status, chrono::Utc::now());
+        Ok(Some(next_status))
+    }
+
     async fn update_status(&self, job_id: &str, status: JobStatus) -> ahand_hub_core::Result<()> {
         let mut job = self
             .jobs
@@ -261,6 +279,14 @@ impl JobStore for FailingInsertJobStore {
         Ok(Vec::new())
     }
 
+    async fn transition_status(
+        &self,
+        _job_id: &str,
+        _status: JobStatus,
+    ) -> ahand_hub_core::Result<Option<JobStatus>> {
+        Err(HubError::Internal("job update failed".into()))
+    }
+
     async fn update_status(&self, _job_id: &str, _status: JobStatus) -> ahand_hub_core::Result<()> {
         Err(HubError::Internal("job update failed".into()))
     }
@@ -303,6 +329,14 @@ impl JobStore for FailingUpdateJobStore {
         _filter: JobFilter,
     ) -> ahand_hub_core::Result<Vec<ahand_hub_core::job::Job>> {
         Ok(self.job.lock().unwrap().clone().into_iter().collect())
+    }
+
+    async fn transition_status(
+        &self,
+        _job_id: &str,
+        _status: JobStatus,
+    ) -> ahand_hub_core::Result<Option<JobStatus>> {
+        Err(HubError::Internal("job update failed".into()))
     }
 
     async fn update_status(&self, _job_id: &str, _status: JobStatus) -> ahand_hub_core::Result<()> {

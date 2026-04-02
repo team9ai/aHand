@@ -18,6 +18,7 @@ pub trait JobStore: Send + Sync {
     async fn insert(&self, job: NewJob) -> Result<Job>;
     async fn get(&self, job_id: &str) -> Result<Option<Job>>;
     async fn list(&self, filter: JobFilter) -> Result<Vec<Job>>;
+    async fn transition_status(&self, job_id: &str, status: JobStatus) -> Result<Option<JobStatus>>;
     async fn update_status(&self, job_id: &str, status: JobStatus) -> Result<()>;
     async fn update_terminal(
         &self,

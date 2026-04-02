@@ -92,17 +92,38 @@ impl JobStore for PgJobStore {
         rows.into_iter().map(map_job).collect()
     }
 
-    async fn update_status(&self, job_id: &str, status: JobStatus) -> Result<()> {
+    async fn transition_status(&self, job_id: &str, status: JobStatus) -> Result<Option<JobStatus>> {
         let parsed =
             Uuid::parse_str(job_id).map_err(|err| HubError::InvalidToken(err.to_string()))?;
-        let current = self
-            .get(job_id)
-            .await?
-            .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
-        if current.status == status {
-            return Ok(());
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+        let row = sqlx::query(
+            r#"
+            SELECT status
+            FROM jobs
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(parsed)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| HubError::Internal(err.to_string()))?
+        .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
+        let current = decode_status(
+            &row.try_get::<String, _>("status")
+                .map_err(|err| HubError::Internal(err.to_string()))?,
+        )?;
+        if current == status {
+            tx.commit()
+                .await
+                .map_err(|err| HubError::Internal(err.to_string()))?;
+            return Ok(None);
         }
-        let next_status = resolve_status_transition(current.status, status)?;
+        let next_status = resolve_status_transition(current, status)?;
         let transitioned_at = Utc::now();
 
         let result = sqlx::query(
@@ -123,7 +144,7 @@ impl JobStore for PgJobStore {
         .bind(parsed)
         .bind(encode_status(next_status))
         .bind(transitioned_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|err| HubError::Internal(err.to_string()))?;
 
@@ -131,6 +152,15 @@ impl JobStore for PgJobStore {
             return Err(HubError::JobNotFound(job_id.into()));
         }
 
+        tx.commit()
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        Ok(Some(next_status))
+    }
+
+    async fn update_status(&self, job_id: &str, status: JobStatus) -> Result<()> {
+        let _ = self.transition_status(job_id, status).await?;
         Ok(())
     }
 

@@ -6,14 +6,10 @@ license.workspace = true
 
 [features]
 default = []
-test-support = []
+test-support = ["dep:testcontainers"]
 
 [lib]
 doctest = false
-
-[[test]]
-name = "store_roundtrip"
-required-features = ["test-support"]
 
 [dependencies]
 ahand-hub-core = { path = "../ahand-hub-core" }
@@ -26,6 +22,7 @@ redis.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+testcontainers = { workspace = true, optional = true }
 tokio.workspace = true
 uuid.workspace = true
 
