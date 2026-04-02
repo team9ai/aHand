@@ -5,9 +5,9 @@ use ahand_hub_core::HubError;
 use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, is_terminal_status};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::JobStore;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Path, Query, State};
 use axum::http::HeaderMap;
-use axum::http::StatusCode;
 use axum::http::header::HeaderName;
 use axum::response::sse::{Event, Sse};
 use dashmap::DashMap;
@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::auth::AuthContextExt;
 use crate::events::EventBus;
+use crate::http::api_error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::ws::device_gateway::ConnectionRegistry;
 
@@ -541,15 +542,15 @@ pub async fn create_job(
     auth: AuthContextExt,
     State(state): State<AppState>,
     Json(body): Json<CreateJobRequest>,
-) -> Result<(StatusCode, Json<CreateJobResponse>), StatusCode> {
+) -> ApiResult<(axum::http::StatusCode, Json<CreateJobResponse>)> {
     auth.require_admin()?;
     let job = state
         .jobs
         .create_job(body.into_new_job("service:api"))
         .await
-        .map_err(job_error_status)?;
+        .map_err(ApiError::from)?;
     Ok((
-        StatusCode::ACCEPTED,
+        axum::http::StatusCode::ACCEPTED,
         Json(CreateJobResponse {
             job_id: job.id.to_string(),
             status: job_status_name(job.status).into(),
@@ -561,23 +562,27 @@ pub async fn create_job(
 pub struct JobListQuery {
     pub device_id: Option<String>,
     pub status: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 pub async fn list_jobs(
     auth: AuthContextExt,
     State(state): State<AppState>,
-    Query(query): Query<JobListQuery>,
-) -> Result<Json<Vec<DashboardJobResponse>>, StatusCode> {
+    query: Result<Query<JobListQuery>, QueryRejection>,
+) -> ApiResult<Json<Vec<DashboardJobResponse>>> {
     auth.require_read_jobs()?;
+    let Query(query) = query.map_err(ApiError::from_query_rejection)?;
     let filter = JobFilter {
         device_id: query.device_id,
         status: parse_job_status(query.status.as_deref())?,
     };
-    let jobs = state
+    let mut jobs = state
         .jobs_store
         .list(filter)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| ApiError::internal("Failed to list jobs"))?;
+    apply_pagination(&mut jobs, query.offset.unwrap_or(0), query.limit);
     Ok(Json(
         jobs.into_iter().map(DashboardJobResponse::from).collect(),
     ))
@@ -587,14 +592,20 @@ pub async fn get_job(
     auth: AuthContextExt,
     State(state): State<AppState>,
     Path(job_id): Path<String>,
-) -> Result<Json<DashboardJobResponse>, StatusCode> {
+) -> ApiResult<Json<DashboardJobResponse>> {
     auth.require_read_jobs()?;
     let job = state
         .jobs_store
         .get(&job_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .map_err(|_| ApiError::internal("Failed to load job"))?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "JOB_NOT_FOUND",
+                format!("Job {job_id} was not found"),
+            )
+        })?;
     Ok(Json(DashboardJobResponse::from(job)))
 }
 
@@ -602,15 +613,15 @@ pub async fn cancel_job(
     auth: AuthContextExt,
     State(state): State<AppState>,
     Path(job_id): Path<String>,
-) -> Result<(StatusCode, Json<CreateJobResponse>), StatusCode> {
+) -> ApiResult<(axum::http::StatusCode, Json<CreateJobResponse>)> {
     auth.require_admin()?;
     let job = state
         .jobs
         .cancel_job(&job_id)
         .await
-        .map_err(job_error_status)?;
+        .map_err(ApiError::from)?;
     Ok((
-        StatusCode::ACCEPTED,
+        axum::http::StatusCode::ACCEPTED,
         Json(CreateJobResponse {
             job_id,
             status: job_status_name(job.status).into(),
@@ -623,33 +634,27 @@ pub async fn stream_output(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(job_id): Path<String>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     auth.require_read_jobs()?;
     if state
         .jobs
         .get_job(&job_id)
         .await
-        .map_err(job_error_status)?
+        .map_err(ApiError::from)?
         .is_none()
     {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "JOB_NOT_FOUND",
+            format!("Job {job_id} was not found"),
+        ));
     }
     let stream = state
         .output_stream
         .subscribe_from(job_id, parse_last_event_id(&headers)?)
         .await
-        .map_err(job_error_status)?;
+        .map_err(ApiError::from)?;
     Ok(Sse::new(stream))
-}
-
-fn job_error_status(err: anyhow::Error) -> StatusCode {
-    match err.downcast_ref::<HubError>() {
-        Some(HubError::DeviceNotFound(_)) | Some(HubError::JobNotFound(_)) => StatusCode::NOT_FOUND,
-        Some(HubError::DeviceOffline(_)) | Some(HubError::JobNotCancellable(_)) => {
-            StatusCode::CONFLICT
-        }
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
 }
 
 fn job_status_name(status: JobStatus) -> &'static str {
@@ -663,7 +668,7 @@ fn job_status_name(status: JobStatus) -> &'static str {
     }
 }
 
-fn parse_job_status(status: Option<&str>) -> Result<Option<JobStatus>, StatusCode> {
+fn parse_job_status(status: Option<&str>) -> ApiResult<Option<JobStatus>> {
     match status {
         None => Ok(None),
         Some("pending") => Ok(Some(JobStatus::Pending)),
@@ -672,7 +677,7 @@ fn parse_job_status(status: Option<&str>) -> Result<Option<JobStatus>, StatusCod
         Some("finished") => Ok(Some(JobStatus::Finished)),
         Some("failed") => Ok(Some(JobStatus::Failed)),
         Some("cancelled") => Ok(Some(JobStatus::Cancelled)),
-        Some(_) => Err(StatusCode::BAD_REQUEST),
+        Some(other) => Err(ApiError::validation(format!("Invalid job status: {other}"))),
     }
 }
 
@@ -695,13 +700,31 @@ fn build_output_summary(exit_code: i32, error: &str) -> String {
     summary.chars().take(1024).collect()
 }
 
-fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<u64>, StatusCode> {
+fn parse_last_event_id(headers: &HeaderMap) -> ApiResult<Option<u64>> {
     let Some(value) = headers.get(HeaderName::from_static("last-event-id")) else {
         return Ok(None);
     };
-    let value = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
-    let id = value.parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::validation("Invalid Last-Event-ID header"))?;
+    let id = value
+        .parse::<u64>()
+        .map_err(|_| ApiError::validation("Invalid Last-Event-ID header"))?;
     Ok(Some(id))
+}
+
+fn apply_pagination<T>(items: &mut Vec<T>, offset: usize, limit: Option<usize>) {
+    if offset == 0 && limit.is_none() {
+        return;
+    }
+
+    let take = limit.unwrap_or(usize::MAX);
+    let paged = std::mem::take(items)
+        .into_iter()
+        .skip(offset)
+        .take(take)
+        .collect();
+    *items = paged;
 }
 
 impl From<Job> for DashboardJobResponse {

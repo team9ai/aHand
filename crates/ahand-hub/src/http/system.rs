@@ -1,8 +1,9 @@
 use ahand_hub_core::job::JobFilter;
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, extract::State};
 use serde::Serialize;
 
 use crate::auth::AuthContextExt;
+use crate::http::api_error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
@@ -24,13 +25,13 @@ pub async fn health() -> Json<HealthResponse> {
 pub async fn stats(
     auth: AuthContextExt,
     State(state): State<AppState>,
-) -> Result<Json<StatsResponse>, StatusCode> {
+) -> ApiResult<Json<StatsResponse>> {
     auth.require_read_stats()?;
     let devices = state
         .device_manager
         .list_devices()
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| ApiError::internal("Failed to list devices"))?;
     let running_jobs = state
         .jobs_store
         .list(JobFilter {
@@ -38,7 +39,7 @@ pub async fn stats(
             ..Default::default()
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| ApiError::internal("Failed to list jobs"))?;
 
     let online_devices = devices.iter().filter(|device| device.online).count();
     Ok(Json(StatsResponse {

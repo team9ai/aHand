@@ -1,8 +1,9 @@
 use ahand_hub_core::auth::Role;
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthContextExt;
+use crate::http::api_error::{ApiError, ApiResult};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -22,15 +23,10 @@ pub struct VerifyResponse {
     pub iss: String,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub error: &'static str,
-}
-
 pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginRequest>,
-) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> ApiResult<Json<LoginResponse>> {
     if body.password != state.dashboard_shared_password.as_str() {
         state
             .append_audit_entry(
@@ -41,22 +37,13 @@ pub async fn login(
                 serde_json::json!({ "reason": "invalid_credentials" }),
             )
             .await;
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "invalid_credentials",
-            }),
-        ));
+        return Err(ApiError::invalid_credentials());
     }
 
-    let token = state.auth.issue_dashboard_jwt("dashboard").map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "token_issue_failed",
-            }),
-        )
-    })?;
+    let token = state
+        .auth
+        .issue_dashboard_jwt("dashboard")
+        .map_err(|_| ApiError::internal("Failed to issue dashboard token"))?;
 
     state
         .append_audit_entry(
@@ -71,7 +58,7 @@ pub async fn login(
     Ok(Json(LoginResponse { token }))
 }
 
-pub async fn verify(auth: AuthContextExt) -> Result<Json<VerifyResponse>, StatusCode> {
+pub async fn verify(auth: AuthContextExt) -> ApiResult<Json<VerifyResponse>> {
     auth.require_dashboard_access()?;
     Ok(Json(VerifyResponse {
         subject: auth.0.subject,

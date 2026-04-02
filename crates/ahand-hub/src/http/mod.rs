@@ -5,6 +5,7 @@ use axum::{
 
 use crate::state::AppState;
 
+pub mod api_error;
 pub mod audit;
 pub mod auth;
 pub mod devices;

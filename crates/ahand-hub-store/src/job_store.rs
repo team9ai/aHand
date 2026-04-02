@@ -80,7 +80,7 @@ impl JobStore for PgJobStore {
             FROM jobs
             WHERE ($1::text IS NULL OR device_id = $1)
               AND ($2::text IS NULL OR status = $2)
-            ORDER BY id
+            ORDER BY created_at, id
             "#,
         )
         .bind(filter.device_id)

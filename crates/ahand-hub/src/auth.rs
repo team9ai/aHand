@@ -2,10 +2,11 @@ use ahand_hub_core::auth::{AuthContext, Role};
 use ahand_hub_core::{HubError, Result as HubResult};
 use ahand_protocol::{Hello, hello};
 use axum::extract::FromRequestParts;
+use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use axum::http::{StatusCode, header::AUTHORIZATION};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
+use crate::http::api_error::ApiError;
 use crate::state::AppState;
 
 #[derive(Debug, Clone)]
@@ -20,66 +21,66 @@ pub struct VerifiedDeviceHello {
 pub struct AuthContextExt(pub AuthContext);
 
 impl AuthContextExt {
-    pub fn require_dashboard_access(&self) -> Result<(), StatusCode> {
+    pub fn require_dashboard_access(&self) -> Result<(), ApiError> {
         match self.0.role {
             Role::Admin | Role::DashboardUser => Ok(()),
-            _ => Err(StatusCode::FORBIDDEN),
+            _ => Err(ApiError::forbidden()),
         }
     }
 
-    pub fn require_admin(&self) -> Result<(), StatusCode> {
+    pub fn require_admin(&self) -> Result<(), ApiError> {
         if self.0.role == Role::Admin {
             Ok(())
         } else {
-            Err(StatusCode::FORBIDDEN)
+            Err(ApiError::forbidden())
         }
     }
 
-    pub fn require_read_devices(&self) -> Result<(), StatusCode> {
+    pub fn require_read_devices(&self) -> Result<(), ApiError> {
         self.require_dashboard_access()
     }
 
-    pub fn require_read_device(&self, device_id: &str) -> Result<(), StatusCode> {
+    pub fn require_read_device(&self, device_id: &str) -> Result<(), ApiError> {
         match self.0.role {
             Role::Admin | Role::DashboardUser => Ok(()),
             Role::Device if self.0.subject == device_id => Ok(()),
-            _ => Err(StatusCode::FORBIDDEN),
+            _ => Err(ApiError::forbidden()),
         }
     }
 
-    pub fn require_read_jobs(&self) -> Result<(), StatusCode> {
+    pub fn require_read_jobs(&self) -> Result<(), ApiError> {
         self.require_dashboard_access()
     }
 
-    pub fn require_read_audit(&self) -> Result<(), StatusCode> {
+    pub fn require_read_audit(&self) -> Result<(), ApiError> {
         self.require_dashboard_access()
     }
 
-    pub fn require_read_stats(&self) -> Result<(), StatusCode> {
+    pub fn require_read_stats(&self) -> Result<(), ApiError> {
         self.require_dashboard_access()
     }
 }
 
 impl FromRequestParts<AppState> for AuthContextExt {
-    type Rejection = StatusCode;
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let Some(value) = parts.headers.get(AUTHORIZATION) else {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(ApiError::unauthorized());
         };
         let Ok(value) = value.to_str() else {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(ApiError::unauthorized());
         };
         let Some(token) = value.strip_prefix("Bearer ") else {
-            return Err(StatusCode::UNAUTHORIZED);
+            return Err(ApiError::unauthorized());
         };
 
         authenticate_token(state, token)
             .map(Self)
-            .map_err(|_| StatusCode::UNAUTHORIZED)
+            .map_err(|_| ApiError::unauthorized())
     }
 }
 

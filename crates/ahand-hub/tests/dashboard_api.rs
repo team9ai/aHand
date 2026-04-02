@@ -90,7 +90,8 @@ async fn dashboard_login_rejects_invalid_password() {
 
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     let payload: Value = response.json().await.unwrap();
-    assert_eq!(payload["error"], "invalid_credentials");
+    assert_eq!(payload["error"]["code"], "UNAUTHORIZED");
+    assert_eq!(payload["error"]["message"], "Invalid credentials");
     wait_for_audit_event(&state, "auth.login_failed", 1).await;
 }
 
@@ -134,7 +135,7 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
     let finished_job = state
         .jobs_store
         .insert(NewJob {
-            device_id: "device-1".into(),
+            device_id: "device-3".into(),
             tool: "echo".into(),
             args: vec!["done".into()],
             cwd: None,
@@ -167,7 +168,7 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
                 action: "job.finished".into(),
                 resource_type: "job".into(),
                 resource_id: finished_job.id.to_string(),
-                actor: "device:device-1".into(),
+                actor: "device:device-3".into(),
                 detail: serde_json::json!({ "status": "finished" }),
                 source_ip: None,
             },
@@ -201,6 +202,17 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
     assert_eq!(jobs[0]["tool"], "render");
     assert!(jobs[0].get("env").is_none());
     assert!(jobs[0].get("requested_by").is_none());
+
+    let paged_jobs_response = server
+        .get("/api/jobs?device_id=device-3&limit=1&offset=1", &token)
+        .await;
+    assert_eq!(paged_jobs_response.status(), reqwest::StatusCode::OK);
+    let paged_jobs: Value = paged_jobs_response.json().await.unwrap();
+    let paged_jobs = paged_jobs
+        .as_array()
+        .expect("jobs list should remain an array under pagination");
+    assert_eq!(paged_jobs.len(), 1);
+    assert_eq!(paged_jobs[0]["id"], finished_job.id.to_string());
 
     let job_response = server
         .get(&format!("/api/jobs/{}", running_job.id), &token)
@@ -236,6 +248,33 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
         );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test]
+async fn jobs_list_rejects_invalid_status_with_error_envelope() {
+    let state = support::test_state().await;
+    let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
+    let server = spawn_server_with_state(state).await;
+
+    let response = server.get("/api/jobs?status=bogus", &token).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let payload: Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "VALIDATION_ERROR");
+    assert_eq!(payload["error"]["message"], "Invalid job status: bogus");
+}
+
+#[tokio::test]
+async fn jobs_list_rejects_invalid_limit_with_error_envelope() {
+    let state = support::test_state().await;
+    let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
+    let server = spawn_server_with_state(state).await;
+
+    let response = server.get("/api/jobs?limit=abc", &token).await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let payload: Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "VALIDATION_ERROR");
 }
 
 #[tokio::test]

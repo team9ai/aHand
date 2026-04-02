@@ -446,7 +446,11 @@ impl JobStore for MemoryJobStore {
             })
             .map(|entry| entry.value().clone())
             .collect::<Vec<_>>();
-        jobs.sort_by_key(|job| job.id);
+        jobs.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Ok(jobs)
     }
 

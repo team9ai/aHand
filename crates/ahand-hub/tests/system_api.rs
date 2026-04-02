@@ -57,18 +57,16 @@ async fn health_endpoint_reports_ok() {
 
 #[tokio::test]
 async fn devices_endpoint_requires_auth() {
-    let app = support::build_test_app().await;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/devices")
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let server = support::spawn_server_with_state(support::test_state().await).await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/devices", server.http_base_url()))
+        .send()
         .await
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -111,29 +109,27 @@ async fn create_job_returns_conflict_for_offline_device() {
 
 #[tokio::test]
 async fn create_job_returns_not_found_for_unknown_device() {
-    let app = support::build_test_app().await;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/jobs")
-                .header(header::AUTHORIZATION, "Bearer service-test-token")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    serde_json::json!({
-                        "device_id": "device-404",
-                        "tool": "echo",
-                        "args": ["hello"],
-                        "timeout_ms": 30_000
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
+    let server = support::spawn_server_with_state(support::test_state().await).await;
+    let response = server
+        .post(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-404",
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
         )
-        .await
-        .unwrap();
+        .await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "DEVICE_NOT_FOUND");
+    assert_eq!(
+        payload["error"]["message"],
+        "Device device-404 was not found"
+    );
 }
 
 #[tokio::test]
