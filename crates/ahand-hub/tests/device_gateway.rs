@@ -6,7 +6,8 @@ use prost::Message;
 
 use support::{
     bootstrap_hello, read_hello_accepted, read_hello_challenge, signed_hello, signed_hello_at,
-    signed_hello_with_key_at, signed_hello_with_last_ack, spawn_test_server,
+    signed_hello_with_key_at, signed_hello_with_last_ack, spawn_server_with_state,
+    spawn_test_server, test_state,
 };
 
 #[tokio::test]
@@ -644,6 +645,53 @@ async fn superseded_connection_cannot_mutate_job_state() {
 }
 
 #[tokio::test]
+async fn superseded_connection_stops_refreshing_presence() {
+    let mut state = test_state().await;
+    state.device_presence_refresh_ms = 25;
+    let server = spawn_server_with_state(state).await;
+
+    let (mut first_socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let first_challenge = read_hello_challenge(&mut first_socket).await;
+    let first_hello = signed_hello("device-1", &first_challenge.nonce);
+    first_socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            first_hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut first_socket).await;
+
+    let (mut second_socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let second_challenge = read_hello_challenge(&mut second_socket).await;
+    let second_hello = signed_hello("device-1", &second_challenge.nonce);
+    second_socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            second_hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut second_socket).await;
+
+    let _ = second_socket.close(None).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let listed = server.get_json("/api/devices", "service-test-token").await;
+    let device = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "device-1")
+        .unwrap();
+    assert_eq!(device["online"], false);
+
+    let _ = first_socket.close(None).await;
+}
+
+#[tokio::test]
 async fn invalid_frame_ack_does_not_clear_replay_buffer() {
     let server = spawn_test_server().await;
 
@@ -699,6 +747,118 @@ async fn invalid_frame_ack_does_not_clear_replay_buffer() {
 
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     let _ = first_socket.close(None).await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    let (mut reconnect_socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let reconnect_challenge = read_hello_challenge(&mut reconnect_socket).await;
+    let reconnect_hello = signed_hello_with_last_ack("device-1", 0, &reconnect_challenge.nonce);
+    reconnect_socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            reconnect_hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut reconnect_socket).await;
+
+    let replayed = reconnect_socket.next().await.unwrap().unwrap();
+    let tokio_tungstenite::tungstenite::Message::Binary(replayed_data) = replayed else {
+        panic!("expected replayed job request");
+    };
+    let replayed_envelope = ahand_protocol::Envelope::decode(replayed_data.as_ref()).unwrap();
+    let Some(ahand_protocol::envelope::Payload::JobRequest(replayed_job)) =
+        replayed_envelope.payload
+    else {
+        panic!("expected replayed job request payload");
+    };
+    assert_eq!(replayed_job.job_id, job_id);
+
+    let _ = reconnect_socket.close(None).await;
+}
+
+#[tokio::test]
+async fn duplicate_frame_with_invalid_ack_does_not_clear_replay_buffer() {
+    let server = spawn_test_server().await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello_with_last_ack("device-1", 0, &challenge.nonce);
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+
+    let created = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-1",
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+    let job_id = created["job_id"].as_str().unwrap().to_string();
+    let first_frame = socket.next().await.unwrap().unwrap();
+    let tokio_tungstenite::tungstenite::Message::Binary(first_data) = first_frame else {
+        panic!("expected first job request");
+    };
+    let first_envelope = ahand_protocol::Envelope::decode(first_data.as_ref()).unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            ahand_protocol::Envelope {
+                device_id: "device-1".into(),
+                msg_id: format!("{job_id}-stdout"),
+                ts_ms: 0,
+                seq: 1,
+                ack: 0,
+                payload: Some(ahand_protocol::envelope::Payload::JobEvent(
+                    ahand_protocol::JobEvent {
+                        job_id: job_id.clone(),
+                        event: Some(ahand_protocol::job_event::Event::StdoutChunk(b"hello\n".to_vec())),
+                    },
+                )),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            ahand_protocol::Envelope {
+                device_id: "device-1".into(),
+                msg_id: format!("{job_id}-stdout-duplicate"),
+                ts_ms: 0,
+                seq: 1,
+                ack: first_envelope.seq + 98,
+                payload: Some(ahand_protocol::envelope::Payload::JobEvent(
+                    ahand_protocol::JobEvent {
+                        job_id: job_id.clone(),
+                        event: Some(ahand_protocol::job_event::Event::StdoutChunk(b"ignored\n".to_vec())),
+                    },
+                )),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let _ = socket.close(None).await;
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
 
     let (mut reconnect_socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
