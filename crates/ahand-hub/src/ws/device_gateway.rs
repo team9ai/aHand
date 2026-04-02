@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -16,39 +18,87 @@ pub struct ConnectionRegistry {
 }
 
 struct ConnectionEntry {
-    connection_id: uuid::Uuid,
-    sender: mpsc::UnboundedSender<ahand_protocol::Envelope>,
+    connection_id: Option<uuid::Uuid>,
+    sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    outbox: Mutex<ahand_hub_core::Outbox>,
 }
 
 impl ConnectionRegistry {
     pub fn register(
         &self,
         device_id: String,
-    ) -> (
-        uuid::Uuid,
-        mpsc::UnboundedReceiver<ahand_protocol::Envelope>,
-    ) {
+        last_ack: u64,
+    ) -> (uuid::Uuid, mpsc::UnboundedReceiver<Vec<u8>>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let connection_id = uuid::Uuid::new_v4();
-        self.senders.insert(
-            device_id,
-            ConnectionEntry {
-                connection_id,
-                sender: tx,
-            },
-        );
+
+        match self.senders.entry(device_id) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let entry = entry.get_mut();
+                entry.connection_id = Some(connection_id);
+                entry.sender = Some(tx.clone());
+                let replay = {
+                    let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
+                    outbox.on_peer_ack(last_ack);
+                    outbox.replay_from(0)
+                };
+                for frame in replay {
+                    let _ = tx.send(frame);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                let mut outbox = ahand_hub_core::Outbox::new(10_000);
+                outbox.on_peer_ack(last_ack);
+                entry.insert(ConnectionEntry {
+                    connection_id: Some(connection_id),
+                    sender: Some(tx),
+                    outbox: Mutex::new(outbox),
+                });
+            }
+        }
+
         (connection_id, rx)
     }
 
-    pub fn send(&self, device_id: &str, envelope: ahand_protocol::Envelope) -> anyhow::Result<()> {
-        let sender = self
+    pub fn send(
+        &self,
+        device_id: &str,
+        mut envelope: ahand_protocol::Envelope,
+    ) -> anyhow::Result<()> {
+        let entry = self
             .senders
-            .get(device_id)
+            .get_mut(device_id)
             .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
-        sender
+        let sender = entry
             .sender
-            .send(envelope)
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
+        let frame = {
+            let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
+            let seq = outbox.reserve_seq();
+            envelope.seq = seq;
+            envelope.ack = outbox.local_ack();
+            let frame = envelope.encode_to_vec();
+            outbox.store(seq, frame.clone());
+            frame
+        };
+        sender
+            .send(frame)
             .map_err(|_| HubError::DeviceOffline(device_id.into()).into())
+    }
+
+    pub fn observe_inbound(&self, device_id: &str, seq: u64, ack: u64) {
+        let Some(entry) = self.senders.get_mut(device_id) else {
+            return;
+        };
+        let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
+        if seq > 0 {
+            outbox.on_recv(seq);
+        }
+        if ack > 0 {
+            outbox.on_peer_ack(ack);
+        }
     }
 
     pub async fn unregister(
@@ -56,16 +106,14 @@ impl ConnectionRegistry {
         device_id: &str,
         connection_id: uuid::Uuid,
     ) -> anyhow::Result<bool> {
-        let should_remove = self
-            .senders
-            .get(device_id)
-            .is_some_and(|entry| entry.connection_id == connection_id);
-        if should_remove {
-            self.senders.remove(device_id);
-            Ok(true)
-        } else {
-            Ok(false)
+        if let Some(mut entry) = self.senders.get_mut(device_id)
+            && entry.connection_id == Some(connection_id)
+        {
+            entry.connection_id = None;
+            entry.sender = None;
+            return Ok(true);
         }
+        Ok(false)
     }
 }
 
@@ -145,7 +193,8 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             .await?;
         let device_id = envelope.device_id.clone();
         let hostname = hello.hostname.clone();
-        let (connection_id, mut outbound_rx) = state.connections.register(device_id.clone());
+        let (connection_id, mut outbound_rx) =
+            state.connections.register(device_id.clone(), hello.last_ack);
         active_connection = Some((device_id.clone(), connection_id));
         state.devices.mark_online(&device_id, "ws").await?;
         if let Err(err) = state.events.emit_device_online(&device_id, &hostname).await {
@@ -168,9 +217,9 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         }
 
         send_task = Some(tokio::spawn(async move {
-            while let Some(envelope) = outbound_rx.recv().await {
+            while let Some(frame) = outbound_rx.recv().await {
                 if sender
-                    .send(WsMessage::Binary(envelope.encode_to_vec().into()))
+                    .send(WsMessage::Binary(frame.into()))
                     .await
                     .is_err()
                 {
@@ -221,6 +270,109 @@ fn issue_hello_challenge() -> ahand_protocol::HelloChallenge {
         issued_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64,
+        .as_millis() as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+    use std::time::Duration;
+
+    use super::ConnectionRegistry;
+
+    #[tokio::test]
+    async fn register_replays_only_messages_after_last_ack() {
+        let registry = ConnectionRegistry::default();
+        let (_connection_id, initial_rx) = registry.register("device-1".into(), 0);
+
+        registry
+            .send(
+                "device-1",
+                ahand_protocol::Envelope {
+                    device_id: "device-1".into(),
+                    msg_id: "job-1".into(),
+                    payload: Some(ahand_protocol::envelope::Payload::JobRequest(
+                        ahand_protocol::JobRequest {
+                            job_id: "job-1".into(),
+                            tool: "echo".into(),
+                            args: vec!["one".into()],
+                            cwd: String::new(),
+                            env: Default::default(),
+                            timeout_ms: 30_000,
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        registry
+            .send(
+                "device-1",
+                ahand_protocol::Envelope {
+                    device_id: "device-1".into(),
+                    msg_id: "job-2".into(),
+                    payload: Some(ahand_protocol::envelope::Payload::JobRequest(
+                        ahand_protocol::JobRequest {
+                            job_id: "job-2".into(),
+                            tool: "echo".into(),
+                            args: vec!["two".into()],
+                            cwd: String::new(),
+                            env: Default::default(),
+                            timeout_ms: 30_000,
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        drop(initial_rx);
+
+        let (_reconnect_id, mut replay_rx) = registry.register("device-1".into(), 1);
+        let replayed = replay_rx.recv().await.expect("replayed frame should exist");
+        let replayed = ahand_protocol::Envelope::decode(replayed.as_slice()).unwrap();
+        let Some(ahand_protocol::envelope::Payload::JobRequest(job)) = replayed.payload else {
+            panic!("expected replayed job request");
+        };
+        assert_eq!(job.job_id, "job-2");
+        assert_eq!(replayed.seq, 2);
+        assert_eq!(replayed.ack, 0);
+        assert!(tokio::time::timeout(Duration::from_millis(20), replay_rx.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn inbound_seq_updates_outbound_ack() {
+        let registry = ConnectionRegistry::default();
+        let (_connection_id, mut rx) = registry.register("device-1".into(), 0);
+        registry.observe_inbound("device-1", 7, 0);
+
+        registry
+            .send(
+                "device-1",
+                ahand_protocol::Envelope {
+                    device_id: "device-1".into(),
+                    msg_id: "job-1".into(),
+                    payload: Some(ahand_protocol::envelope::Payload::JobRequest(
+                        ahand_protocol::JobRequest {
+                            job_id: "job-1".into(),
+                            tool: "echo".into(),
+                            args: vec!["hello".into()],
+                            cwd: String::new(),
+                            env: Default::default(),
+                            timeout_ms: 30_000,
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let frame = rx.recv().await.expect("outbound frame should exist");
+        let outbound = ahand_protocol::Envelope::decode(frame.as_slice()).unwrap();
+        assert_eq!(outbound.seq, 1);
+        assert_eq!(outbound.ack, 7);
     }
 }

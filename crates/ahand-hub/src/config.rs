@@ -61,7 +61,7 @@ impl Config {
             device_hello_max_age_ms: getenv("AHAND_HUB_DEVICE_HELLO_MAX_AGE_MS")
                 .map(|value| value.parse())
                 .transpose()?
-                .unwrap_or(30_000),
+                .unwrap_or(300_000),
             device_presence_ttl_secs: getenv("AHAND_HUB_DEVICE_PRESENCE_TTL_SECS")
                 .map(|value| value.parse())
                 .transpose()?
@@ -146,6 +146,7 @@ mod tests {
         );
         assert_eq!(config.device_bootstrap_token, "bootstrap-prod-token");
         assert_eq!(config.device_bootstrap_device_id, "device-prod-1");
+        assert_eq!(config.device_hello_max_age_ms, 300_000);
         assert_eq!(config.device_presence_ttl_secs, 60);
         assert_eq!(config.device_presence_refresh_ms, 20_000);
         assert_eq!(config.jwt_secret, "jwt-prod-secret");

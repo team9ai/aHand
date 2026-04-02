@@ -153,6 +153,8 @@ impl JobRuntime {
 
     pub async fn handle_device_frame(&self, device_id: &str, frame: &[u8]) -> anyhow::Result<()> {
         let envelope = ahand_protocol::Envelope::decode(frame)?;
+        self.connections
+            .observe_inbound(device_id, envelope.seq, envelope.ack);
         match envelope.payload {
             Some(ahand_protocol::envelope::Payload::JobEvent(event)) => {
                 let Some(job) = self.job_for_device(device_id, &event.job_id).await? else {
@@ -504,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn create_job_marks_failed_and_emits_terminal_output_when_dispatch_fails() {
         let (runtime, connections, jobs, audit) = build_runtime().await;
-        let (_connection_id, rx) = connections.register("device-1".into());
+        let (_connection_id, rx) = connections.register("device-1".into(), 0);
         drop(rx);
 
         let err = runtime
@@ -555,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn handle_device_frame_rejects_job_updates_for_other_devices() {
         let (runtime, connections, _jobs, _audit) = build_runtime().await;
-        let (_connection_id, _rx) = connections.register("device-2".into());
+        let (_connection_id, _rx) = connections.register("device-2".into(), 0);
         let job = runtime
             .create_job(NewJob {
                 device_id: "device-2".into(),
@@ -603,7 +605,7 @@ mod tests {
     #[tokio::test]
     async fn progress_event_moves_job_to_running_and_writes_audit() {
         let (runtime, connections, jobs, audit) = build_runtime().await;
-        let (_connection_id, _rx) = connections.register("device-1".into());
+        let (_connection_id, _rx) = connections.register("device-1".into(), 0);
         let job = runtime
             .create_job(NewJob {
                 device_id: "device-1".into(),
@@ -650,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_finish_event_marks_job_cancelled_and_writes_audit() {
         let (runtime, connections, jobs, audit) = build_runtime().await;
-        let (_connection_id, _rx) = connections.register("device-1".into());
+        let (_connection_id, _rx) = connections.register("device-1".into(), 0);
         let job = runtime
             .create_job(NewJob {
                 device_id: "device-1".into(),
@@ -698,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn successful_finish_event_marks_job_finished_and_writes_audit() {
         let (runtime, connections, jobs, audit) = build_runtime().await;
-        let (_connection_id, _rx) = connections.register("device-1".into());
+        let (_connection_id, _rx) = connections.register("device-1".into(), 0);
         let job = runtime
             .create_job(NewJob {
                 device_id: "device-1".into(),

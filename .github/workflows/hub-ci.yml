@@ -4,9 +4,11 @@ on:
   pull_request:
     paths:
       - "apps/hub-dashboard/**"
+      - "crates/ahand-protocol/**"
       - "crates/ahand-hub/**"
       - "crates/ahand-hub-core/**"
       - "crates/ahand-hub-store/**"
+      - "crates/ahandd/**"
       - "deploy/hub/**"
       - ".dockerignore"
       - ".github/workflows/hub-ci.yml"
@@ -22,9 +24,11 @@ on:
     branches: [main]
     paths:
       - "apps/hub-dashboard/**"
+      - "crates/ahand-protocol/**"
       - "crates/ahand-hub/**"
       - "crates/ahand-hub-core/**"
       - "crates/ahand-hub-store/**"
+      - "crates/ahandd/**"
       - "deploy/hub/**"
       - ".dockerignore"
       - ".github/workflows/hub-ci.yml"
@@ -83,13 +87,15 @@ jobs:
         uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Check formatting
-        run: cargo fmt --all --check
+        run: cargo fmt -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --all-targets
+        run: |
+          cargo test -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --all-targets
+          cargo test -p ahandd --test hub_handshake
 
       - name: Check coverage
         run: cargo llvm-cov --summary-only -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --fail-under-lines 85

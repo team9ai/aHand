@@ -1,7 +1,7 @@
 mod support;
 
 use ed25519_dalek::SigningKey;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 
 use support::{
@@ -388,4 +388,112 @@ async fn invalid_device_frame_marks_device_offline() {
     assert_eq!(device["online"], false);
 
     let _ = socket.close(None).await;
+}
+
+#[tokio::test]
+async fn reconnect_replays_only_unacked_job_requests() {
+    let server = spawn_test_server().await;
+
+    let (mut first_socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let first_challenge = read_hello_challenge(&mut first_socket).await;
+    let mut first_hello = signed_hello("device-1", &first_challenge.nonce);
+    let Some(ahand_protocol::envelope::Payload::Hello(hello)) = first_hello.payload.as_mut() else {
+        panic!("expected hello payload");
+    };
+    hello.last_ack = 0;
+    first_socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            first_hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut first_socket).await;
+
+    let created_first = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-1",
+                "tool": "echo",
+                "args": ["one"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+    let created_second = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-1",
+                "tool": "echo",
+                "args": ["two"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+
+    let first_frame = first_socket.next().await.unwrap().unwrap();
+    let tokio_tungstenite::tungstenite::Message::Binary(first_data) = first_frame else {
+        panic!("expected first job request");
+    };
+    let first_envelope = ahand_protocol::Envelope::decode(first_data.as_ref()).unwrap();
+    assert_eq!(first_envelope.seq, 1);
+    let first_job_id = created_first["job_id"].as_str().unwrap();
+    let Some(ahand_protocol::envelope::Payload::JobRequest(first_job)) = first_envelope.payload
+    else {
+        panic!("expected first job request payload");
+    };
+    assert_eq!(first_job.job_id, first_job_id);
+
+    let second_frame = first_socket.next().await.unwrap().unwrap();
+    let tokio_tungstenite::tungstenite::Message::Binary(second_data) = second_frame else {
+        panic!("expected second job request");
+    };
+    let second_envelope = ahand_protocol::Envelope::decode(second_data.as_ref()).unwrap();
+    assert_eq!(second_envelope.seq, 2);
+    let second_job_id = created_second["job_id"].as_str().unwrap();
+    let Some(ahand_protocol::envelope::Payload::JobRequest(second_job)) = second_envelope.payload
+    else {
+        panic!("expected second job request payload");
+    };
+    assert_eq!(second_job.job_id, second_job_id);
+
+    let _ = first_socket.close(None).await;
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    let (mut reconnect_socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let reconnect_challenge = read_hello_challenge(&mut reconnect_socket).await;
+    let mut reconnect_hello = signed_hello("device-1", &reconnect_challenge.nonce);
+    let Some(ahand_protocol::envelope::Payload::Hello(hello)) = reconnect_hello.payload.as_mut() else {
+        panic!("expected hello payload");
+    };
+    hello.last_ack = 1;
+    reconnect_socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            reconnect_hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut reconnect_socket).await;
+
+    let replayed = reconnect_socket.next().await.unwrap().unwrap();
+    let tokio_tungstenite::tungstenite::Message::Binary(replayed_data) = replayed else {
+        panic!("expected replayed job request");
+    };
+    let replayed_envelope = ahand_protocol::Envelope::decode(replayed_data.as_ref()).unwrap();
+    assert_eq!(replayed_envelope.seq, 2);
+    let Some(ahand_protocol::envelope::Payload::JobRequest(replayed_job)) =
+        replayed_envelope.payload
+    else {
+        panic!("expected replayed job request payload");
+    };
+    assert_eq!(replayed_job.job_id, second_job_id);
+
+    let _ = reconnect_socket.close(None).await;
 }

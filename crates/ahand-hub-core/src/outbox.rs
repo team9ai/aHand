@@ -20,13 +20,22 @@ impl Outbox {
         }
     }
 
-    pub fn store_raw(&mut self, data: Vec<u8>) -> u64 {
+    pub fn reserve_seq(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
+        seq
+    }
+
+    pub fn store(&mut self, seq: u64, data: Vec<u8>) {
         self.buffer.push_back((seq, data));
         while self.buffer.len() > self.max_buffer {
             self.buffer.pop_front();
         }
+    }
+
+    pub fn store_raw(&mut self, data: Vec<u8>) -> u64 {
+        let seq = self.reserve_seq();
+        self.store(seq, data);
         seq
     }
 
