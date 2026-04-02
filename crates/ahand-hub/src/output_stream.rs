@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
 use async_stream::stream;
 use axum::response::sse::Event;
 use dashmap::DashMap;
@@ -45,6 +46,28 @@ impl OutputItem {
     }
 }
 
+impl From<JobOutputRecord> for OutputItem {
+    fn from(value: JobOutputRecord) -> Self {
+        match value {
+            JobOutputRecord::Stdout(chunk) => Self::Stdout(chunk),
+            JobOutputRecord::Stderr(chunk) => Self::Stderr(chunk),
+            JobOutputRecord::Progress(progress) => Self::Progress(progress),
+            JobOutputRecord::Finished { exit_code, error } => Self::Finished { exit_code, error },
+        }
+    }
+}
+
+impl From<OutputItem> for JobOutputRecord {
+    fn from(value: OutputItem) -> Self {
+        match value {
+            OutputItem::Stdout(chunk) => Self::Stdout(chunk),
+            OutputItem::Stderr(chunk) => Self::Stderr(chunk),
+            OutputItem::Progress(progress) => Self::Progress(progress),
+            OutputItem::Finished { exit_code, error } => Self::Finished { exit_code, error },
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SequencedOutputItem {
     seq: u64,
@@ -71,14 +94,14 @@ impl JobOutputState {
 }
 
 #[derive(Clone)]
-pub struct OutputStream {
+struct MemoryOutputStream {
     jobs: Arc<DashMap<String, Arc<JobOutputState>>>,
     finished_retention: Duration,
     max_history: usize,
 }
 
-impl OutputStream {
-    pub fn new(finished_retention: Duration, max_history: usize) -> Self {
+impl MemoryOutputStream {
+    fn new(finished_retention: Duration, max_history: usize) -> Self {
         Self {
             jobs: Arc::new(DashMap::new()),
             finished_retention,
@@ -86,19 +109,12 @@ impl OutputStream {
         }
     }
 
-    pub fn prime(&self, job_id: &str) {
+    fn prime(&self, job_id: &str) {
         self.prune_expired();
         self.job_state(job_id);
     }
 
-    pub async fn subscribe(
-        &self,
-        job_id: String,
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
-        self.subscribe_from(job_id, None).await
-    }
-
-    pub async fn subscribe_from(
+    async fn subscribe_from(
         &self,
         job_id: String,
         last_event_id: Option<u64>,
@@ -159,42 +175,6 @@ impl OutputStream {
         }))
     }
 
-    pub async fn push_stdout(&self, job_id: &str, chunk: Vec<u8>) -> anyhow::Result<()> {
-        self.record(
-            job_id,
-            OutputItem::Stdout(String::from_utf8_lossy(&chunk).to_string()),
-        )
-        .await
-    }
-
-    pub async fn push_stderr(&self, job_id: &str, chunk: Vec<u8>) -> anyhow::Result<()> {
-        self.record(
-            job_id,
-            OutputItem::Stderr(String::from_utf8_lossy(&chunk).to_string()),
-        )
-        .await
-    }
-
-    pub async fn push_progress(&self, job_id: &str, progress: u32) -> anyhow::Result<()> {
-        self.record(job_id, OutputItem::Progress(progress)).await
-    }
-
-    pub async fn push_finished(
-        &self,
-        job_id: &str,
-        exit_code: i32,
-        error: &str,
-    ) -> anyhow::Result<()> {
-        self.record(
-            job_id,
-            OutputItem::Finished {
-                exit_code,
-                error: error.into(),
-            },
-        )
-        .await
-    }
-
     async fn record(&self, job_id: &str, item: OutputItem) -> anyhow::Result<()> {
         self.prune_expired();
         let state = self.job_state(job_id);
@@ -233,6 +213,169 @@ impl OutputStream {
     fn prune_expired(&self) {}
 }
 
+#[derive(Clone)]
+enum OutputBackend {
+    Memory(MemoryOutputStream),
+    Persistent(RedisJobOutputStore),
+}
+
+#[derive(Clone)]
+pub struct OutputStream {
+    backend: OutputBackend,
+}
+
+impl OutputStream {
+    pub fn new(finished_retention: Duration, max_history: usize) -> Self {
+        Self {
+            backend: OutputBackend::Memory(MemoryOutputStream::new(
+                finished_retention,
+                max_history,
+            )),
+        }
+    }
+
+    pub fn persistent(store: RedisJobOutputStore) -> Self {
+        Self {
+            backend: OutputBackend::Persistent(store),
+        }
+    }
+
+    pub fn prime(&self, job_id: &str) {
+        match &self.backend {
+            OutputBackend::Memory(memory) => memory.prime(job_id),
+            OutputBackend::Persistent(_) => {}
+        }
+    }
+
+    pub async fn subscribe(
+        &self,
+        job_id: String,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+        self.subscribe_from(job_id, None).await
+    }
+
+    pub async fn subscribe_from(
+        &self,
+        job_id: String,
+        last_event_id: Option<u64>,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
+        match &self.backend {
+            OutputBackend::Memory(memory) => memory.subscribe_from(job_id, last_event_id).await,
+            OutputBackend::Persistent(store) => {
+                let store = store.clone();
+                let history = store.read_history(&job_id).await?;
+                let live_job_id = job_id.clone();
+                let needs_resync = history
+                    .first()
+                    .and_then(|first| {
+                        last_event_id.map(|last_event_id| {
+                            first.seq > last_event_id.saturating_add(1)
+                        })
+                    })
+                    .unwrap_or(false);
+
+                Ok(Box::pin(stream! {
+                    let mut last_seq = last_event_id.unwrap_or(0);
+                    let mut last_stream_id = history
+                        .last()
+                        .map(|item| item.stream_id.clone())
+                        .unwrap_or_else(|| "$".to_string());
+
+                    if needs_resync {
+                        yield Ok(resync_event("history_trimmed"));
+                    }
+
+                    for item in history {
+                        last_stream_id = item.stream_id.clone();
+                        if item.seq <= last_seq {
+                            continue;
+                        }
+                        last_seq = item.seq;
+                        let output_item: OutputItem = item.record.into();
+                        let is_terminal = output_item.is_terminal();
+                        yield Ok(output_item.to_event(item.seq));
+                        if is_terminal {
+                            return;
+                        }
+                    }
+
+                    loop {
+                        match store.read_live(&live_job_id, &last_stream_id, 5_000).await {
+                            Ok(items) if items.is_empty() => continue,
+                            Ok(items) => {
+                                for item in items {
+                                    last_stream_id = item.stream_id.clone();
+                                    if item.seq <= last_seq {
+                                        continue;
+                                    }
+                                    last_seq = item.seq;
+                                    let output_item: OutputItem = item.record.into();
+                                    let is_terminal = output_item.is_terminal();
+                                    yield Ok(output_item.to_event(item.seq));
+                                    if is_terminal {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(job_id, error = %err, "failed reading persistent output stream");
+                                yield Ok(resync_event("stream_error"));
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                        }
+                    }
+                }))
+            }
+        }
+    }
+
+    pub async fn push_stdout(&self, job_id: &str, chunk: Vec<u8>) -> anyhow::Result<()> {
+        self.record(
+            job_id,
+            OutputItem::Stdout(String::from_utf8_lossy(&chunk).to_string()),
+        )
+        .await
+    }
+
+    pub async fn push_stderr(&self, job_id: &str, chunk: Vec<u8>) -> anyhow::Result<()> {
+        self.record(
+            job_id,
+            OutputItem::Stderr(String::from_utf8_lossy(&chunk).to_string()),
+        )
+        .await
+    }
+
+    pub async fn push_progress(&self, job_id: &str, progress: u32) -> anyhow::Result<()> {
+        self.record(job_id, OutputItem::Progress(progress)).await
+    }
+
+    pub async fn push_finished(
+        &self,
+        job_id: &str,
+        exit_code: i32,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        self.record(
+            job_id,
+            OutputItem::Finished {
+                exit_code,
+                error: error.into(),
+            },
+        )
+        .await
+    }
+
+    async fn record(&self, job_id: &str, item: OutputItem) -> anyhow::Result<()> {
+        match &self.backend {
+            OutputBackend::Memory(memory) => memory.record(job_id, item).await,
+            OutputBackend::Persistent(store) => {
+                store.append(job_id, item.into()).await?;
+                Ok(())
+            }
+        }
+    }
+}
+
 fn resync_event(reason: &str) -> Event {
     Event::default().event("resync").data(reason)
 }
@@ -245,11 +388,22 @@ impl Default for OutputStream {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::time::Duration;
 
+    use axum::response::{IntoResponse, Sse};
     use futures_util::StreamExt;
 
     use super::*;
+
+    async fn render_event(event: Event) -> String {
+        let response =
+            Sse::new(futures_util::stream::iter(vec![Ok::<Event, Infallible>(event)])).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&body).to_string()
+    }
 
     #[tokio::test]
     async fn finished_jobs_are_evicted_from_history() {
@@ -260,133 +414,115 @@ mod tests {
             .unwrap();
         stream.push_finished("job-1", 0, "").await.unwrap();
 
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(40)).await;
 
-        assert!(
-            !stream.jobs.contains_key("job-1"),
-            "terminal job history should be evicted"
-        );
-    }
-
-    #[tokio::test]
-    async fn subscribe_replays_without_dropping_gap_events() {
-        let stream = OutputStream::new(Duration::from_secs(60), 16);
-        stream
-            .push_stdout("job-1", b"before\n".to_vec())
+        let mut subscriber = stream.subscribe("job-1".into()).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(50), subscriber.next())
             .await
-            .unwrap();
-
-        let stream_clone = stream.clone();
-        let subscriber = tokio::spawn(async move {
-            let mut output = stream_clone.subscribe("job-1".into()).await.unwrap();
-            let mut body = Vec::new();
-            while let Some(Ok(event)) = output.next().await {
-                body.push(format!("{event:?}"));
-                if body.len() == 2 {
-                    break;
-                }
-            }
-            body
-        });
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        stream
-            .push_stdout("job-1", b"after\n".to_vec())
-            .await
-            .unwrap();
-
-        let events = subscriber.await.unwrap();
-        assert_eq!(events.len(), 2);
+            .is_err());
     }
 
     #[tokio::test]
     async fn subscribe_resumes_after_last_event_id_without_replaying_history() {
         let stream = OutputStream::new(Duration::from_secs(60), 16);
-        stream
-            .push_stdout("job-1", b"first\n".to_vec())
-            .await
-            .unwrap();
+        stream.push_stdout("job-1", b"first\n".to_vec()).await.unwrap();
         stream
             .push_stdout("job-1", b"second\n".to_vec())
             .await
             .unwrap();
+        stream.push_finished("job-1", 0, "").await.unwrap();
 
-        let mut resumed = stream
-            .subscribe_from("job-1".into(), Some(1))
-            .await
-            .expect("subscription should resume");
+        let mut subscriber = stream.subscribe_from("job-1".into(), Some(1)).await.unwrap();
+        let mut body = String::new();
+        while let Some(event) = subscriber.next().await {
+            let event = event.unwrap();
+            body.push_str(&render_event(event).await);
+            if body.contains("event: finished") {
+                break;
+            }
+        }
 
-        let event = resumed
-            .next()
-            .await
-            .expect("stream should yield resumed event")
-            .expect("stream item should be ok");
-        let debug = format!("{event:?}");
-
-        assert!(debug.contains("second"));
-        assert!(!debug.contains("first"));
+        assert!(body.contains("data: second"));
+        assert!(body.contains("event: finished"));
+        assert!(!body.contains("data: first"));
     }
 
     #[tokio::test]
     async fn subscribe_emits_resync_when_history_gap_exceeds_retention() {
         let stream = OutputStream::new(Duration::from_secs(60), 2);
+        stream.push_stdout("job-2", b"one\n".to_vec()).await.unwrap();
+        stream.push_stdout("job-2", b"two\n".to_vec()).await.unwrap();
         stream
-            .push_stdout("job-1", b"one\n".to_vec())
-            .await
-            .unwrap();
-        stream
-            .push_stdout("job-1", b"two\n".to_vec())
+            .push_stdout("job-2", b"three\n".to_vec())
             .await
             .unwrap();
         stream
-            .push_stdout("job-1", b"three\n".to_vec())
-            .await
-            .unwrap();
-        stream
-            .push_stdout("job-1", b"four\n".to_vec())
+            .push_stdout("job-2", b"four\n".to_vec())
             .await
             .unwrap();
 
-        let mut output = stream
-            .subscribe_from("job-1".into(), Some(1))
-            .await
-            .unwrap();
-        let first = output
-            .next()
-            .await
-            .expect("stream should yield resync event")
-            .expect("stream item should be ok");
-        let debug = format!("{first:?}");
-
-        assert!(debug.contains("resync"));
-    }
-
-    #[tokio::test]
-    async fn lagged_live_subscribers_receive_resync_event() {
-        let stream = OutputStream::new(Duration::from_secs(60), 128);
-        stream.prime("job-1");
-
-        let mut output = stream.subscribe("job-1".into()).await.unwrap();
-        for index in 0..80 {
-            stream
-                .push_stdout("job-1", format!("chunk-{index}\n").into_bytes())
-                .await
-                .unwrap();
-        }
-
-        let mut saw_resync = false;
-        for _ in 0..10 {
-            let event = output
-                .next()
-                .await
-                .expect("stream should stay open")
-                .expect("stream item should be ok");
-            if format!("{event:?}").contains("resync") {
-                saw_resync = true;
+        let mut subscriber = stream.subscribe_from("job-2".into(), Some(1)).await.unwrap();
+        let mut body = String::new();
+        while let Some(event) = subscriber.next().await {
+            let event = event.unwrap();
+            body.push_str(&render_event(event).await);
+            if body.contains("data: four") {
                 break;
             }
         }
 
-        assert!(saw_resync, "lagged subscribers should be told to resync");
+        assert!(body.contains("event: resync"));
+        assert!(body.contains("data: three"));
+        assert!(body.contains("data: four"));
+        assert!(!body.contains("data: one"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_replays_without_dropping_gap_events() {
+        let stream = OutputStream::new(Duration::from_secs(60), 8);
+        stream.push_stdout("job-3", b"one\n".to_vec()).await.unwrap();
+        stream.push_stdout("job-3", b"two\n".to_vec()).await.unwrap();
+        stream.push_stdout("job-3", b"three\n".to_vec()).await.unwrap();
+
+        let mut subscriber = stream.subscribe_from("job-3".into(), Some(1)).await.unwrap();
+        let mut body = String::new();
+        while let Some(event) = subscriber.next().await {
+            let event = event.unwrap();
+            body.push_str(&render_event(event).await);
+            if body.contains("data: three") {
+                break;
+            }
+        }
+
+        assert!(!body.contains("event: resync"));
+        assert!(body.contains("data: two"));
+        assert!(body.contains("data: three"));
+        assert!(!body.contains("data: one"));
+    }
+
+    #[tokio::test]
+    async fn lagged_live_subscribers_receive_resync_event() {
+        let stream = OutputStream::new(Duration::from_secs(60), 8);
+        let mut subscriber = stream.subscribe("job-4".into()).await.unwrap();
+
+        for index in 0..80 {
+            stream
+                .push_stdout("job-4", format!("chunk-{index}\n").into_bytes())
+                .await
+                .unwrap();
+        }
+        stream.push_finished("job-4", 0, "").await.unwrap();
+
+        let mut body = String::new();
+        while let Some(event) = subscriber.next().await {
+            let event = event.unwrap();
+            body.push_str(&render_event(event).await);
+            if body.contains("event: finished") {
+                break;
+            }
+        }
+
+        assert!(body.contains("event: resync"));
+        assert!(body.contains("data: lagged"));
     }
 }

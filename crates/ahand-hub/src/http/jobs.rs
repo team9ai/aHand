@@ -99,7 +99,7 @@ impl JobRuntime {
     pub async fn create_job(&self, job: NewJob) -> anyhow::Result<Job> {
         let job = self.dispatcher.create_job(job).await?;
         self.output_stream.prime(&job.id.to_string());
-        self.events.publish_job_created(&job);
+        self.events.publish_job_created(&job).await?;
         self.transition_job(&job.id.to_string(), JobStatus::Sent, "service:api")
             .await?;
 

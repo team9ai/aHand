@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ahand_hub_core::audit::AuditFilter;
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
+use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
 use ahand_hub_store::test_support::TestStack;
 use sqlx::Row;
@@ -190,6 +192,45 @@ async fn updating_job_status_records_lifecycle_timestamps() -> anyhow::Result<()
     );
     assert!(stored.started_at.is_some());
     assert!(stored.finished_at.is_some());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_output_store_roundtrips_history_and_expires_terminal_streams() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let store = RedisJobOutputStore::new(
+        ahand_hub_store::redis::connect_redis(stack.redis_url()).await?,
+        Duration::from_millis(200),
+    );
+
+    let stdout = store
+        .append("job-1", JobOutputRecord::Stdout("hello".into()))
+        .await?;
+    let progress = store.append("job-1", JobOutputRecord::Progress(42)).await?;
+    let finished = store
+        .append(
+            "job-1",
+            JobOutputRecord::Finished {
+                exit_code: 0,
+                error: String::new(),
+            },
+        )
+        .await?;
+
+    assert_eq!(stdout.seq, 1);
+    assert_eq!(progress.seq, 2);
+    assert_eq!(finished.seq, 3);
+
+    let history = store.read_history("job-1").await?;
+    assert_eq!(history.len(), 3);
+    assert!(matches!(history[0].record, JobOutputRecord::Stdout(_)));
+    assert!(matches!(history[1].record, JobOutputRecord::Progress(42)));
+    assert!(matches!(history[2].record, JobOutputRecord::Finished { exit_code: 0, .. }));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let expired = store.read_history("job-1").await?;
+    assert!(expired.is_empty());
 
     Ok(())
 }

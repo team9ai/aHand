@@ -11,7 +11,9 @@ use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
 use ahand_hub_core::{HubError, Result};
 use ahand_hub_store::audit_store::PgAuditStore;
 use ahand_hub_store::device_store::PgDeviceStore;
+use ahand_hub_store::event_fanout::RedisEventFanout;
 use ahand_hub_store::job_store::PgJobStore;
+use ahand_hub_store::job_output_store::RedisJobOutputStore;
 use ahand_hub_store::presence_store::RedisPresenceStore;
 use async_trait::async_trait;
 use dashmap::{DashMap, mapref::entry::Entry};
@@ -39,38 +41,50 @@ pub struct AppState {
 
 impl AppState {
     pub async fn from_config(config: crate::config::Config) -> anyhow::Result<Self> {
-        let (devices, jobs_store, raw_audit_store) = match &config.store {
-            crate::config::StoreConfig::Memory => (
+        let finished_retention = Duration::from_millis(config.output_retention_ms);
+        let (devices, jobs_store, raw_audit_store, persistent_output, persistent_fanout) =
+            match &config.store {
+                crate::config::StoreConfig::Memory => (
                 Arc::new(MemoryDeviceStore::default()),
                 Arc::new(MemoryJobStore::default()) as Arc<dyn JobStore>,
                 Arc::new(MemoryAuditStore::default()) as Arc<dyn AuditStore>,
+                None,
+                None,
             ),
-            crate::config::StoreConfig::Persistent {
-                database_url,
-                redis_url,
-            } => {
-                let pool = ahand_hub_store::postgres::connect_database(database_url).await?;
-                let redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
-                let presence =
-                    RedisPresenceStore::new_with_ttl(redis, config.device_presence_ttl_secs);
-                (
+                crate::config::StoreConfig::Persistent {
+                    database_url,
+                    redis_url,
+                } => {
+                    let pool = ahand_hub_store::postgres::connect_database(database_url).await?;
+                    let presence_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
+                    let output_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
+                    let presence = RedisPresenceStore::new_with_ttl(
+                        presence_redis,
+                        config.device_presence_ttl_secs,
+                    );
+                    (
                     Arc::new(MemoryDeviceStore::with_persistent(
                         PgDeviceStore::with_presence(pool.clone(), presence),
                     )),
                     Arc::new(PgJobStore::new(pool.clone())) as Arc<dyn JobStore>,
                     Arc::new(PgAuditStore::new(pool)) as Arc<dyn AuditStore>,
+                    Some(RedisJobOutputStore::new(output_redis, finished_retention)),
+                    Some(RedisEventFanout::new(redis_url).await?),
                 )
-            }
-        };
+                }
+            };
         let audit_store = Arc::new(crate::audit_writer::BufferedAuditStore::new(
             raw_audit_store,
         )) as Arc<dyn AuditStore>;
-        let output_stream = Arc::new(crate::output_stream::OutputStream::new(
-            Duration::from_millis(config.output_retention_ms),
-            256,
-        ));
+        let output_stream = Arc::new(match persistent_output {
+            Some(store) => crate::output_stream::OutputStream::persistent(store),
+            None => crate::output_stream::OutputStream::new(finished_retention, 256),
+        });
         let connections = Arc::new(crate::ws::device_gateway::ConnectionRegistry::default());
-        let events = Arc::new(crate::events::EventBus::new(audit_store.clone()));
+        let events = Arc::new(match persistent_fanout {
+            Some(fanout) => crate::events::EventBus::new_with_fanout(audit_store.clone(), fanout),
+            None => crate::events::EventBus::new(audit_store.clone()),
+        });
         let device_manager = Arc::new(DeviceManager::new(devices.clone()));
         let job_dispatcher = Arc::new(JobDispatcher::new(
             devices.clone(),

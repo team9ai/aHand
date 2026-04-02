@@ -1,18 +1,21 @@
 mod support;
 
+use std::time::Duration;
+
 use ahand_hub::config::{Config, StoreConfig};
 use ahand_hub::state::MemoryDeviceStore;
 use ahand_hub_core::HubError;
 use ahand_hub_core::audit::AuditFilter;
 use ahand_hub_core::job::JobFilter;
 use ahand_hub_store::test_support::TestStack;
+use futures_util::StreamExt;
+use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 
 use support::spawn_server_with_state;
 
-#[tokio::test]
-async fn app_state_uses_persistent_store_backends_across_restart() -> anyhow::Result<()> {
-    let stack = TestStack::start().await?;
-    let config = Config {
+fn persistent_config(stack: &TestStack) -> Config {
+    Config {
         bind_addr: "127.0.0.1:0".into(),
         service_token: "service-test-token".into(),
         dashboard_shared_password: "shared-secret".into(),
@@ -30,7 +33,13 @@ async fn app_state_uses_persistent_store_backends_across_restart() -> anyhow::Re
             database_url: stack.database_url().into(),
             redis_url: stack.redis_url().into(),
         },
-    };
+    }
+}
+
+#[tokio::test]
+async fn app_state_uses_persistent_store_backends_across_restart() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let config = persistent_config(&stack);
 
     let state = ahand_hub::state::AppState::from_config(config.clone()).await?;
     let server = spawn_server_with_state(state).await;
@@ -87,25 +96,9 @@ async fn app_state_uses_persistent_store_backends_across_restart() -> anyhow::Re
 #[tokio::test]
 async fn persistent_presence_is_refreshed_while_device_socket_stays_open() -> anyhow::Result<()> {
     let stack = TestStack::start().await?;
-    let config = Config {
-        bind_addr: "127.0.0.1:0".into(),
-        service_token: "service-test-token".into(),
-        dashboard_shared_password: "shared-secret".into(),
-        dashboard_allowed_origins: Vec::new(),
-        device_bootstrap_token: "bootstrap-test-token".into(),
-        device_bootstrap_device_id: "device-2".into(),
-        device_hello_max_age_ms: 30_000,
-        device_presence_ttl_secs: 1,
-        device_presence_refresh_ms: 100,
-        job_timeout_grace_ms: 50,
-        device_disconnect_grace_ms: 100,
-        jwt_secret: "service-test-secret".into(),
-        output_retention_ms: 60_000,
-        store: StoreConfig::Persistent {
-            database_url: stack.database_url().into(),
-            redis_url: stack.redis_url().into(),
-        },
-    };
+    let mut config = persistent_config(&stack);
+    config.device_presence_ttl_secs = 1;
+    config.device_presence_refresh_ms = 100;
 
     let state = ahand_hub::state::AppState::from_config(config).await?;
     let server = spawn_server_with_state(state).await;
@@ -137,5 +130,114 @@ async fn persistent_mark_online_rejects_missing_device_without_leaking_presence(
     assert_eq!(err, HubError::DeviceNotFound("missing-device".into()));
     assert!(!stack.presence.is_online("missing-device").await?);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_output_history_replays_after_restart() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let config = persistent_config(&stack);
+
+    let state = ahand_hub::state::AppState::from_config(config.clone()).await?;
+    let server = spawn_server_with_state(state).await;
+    let mut device = server
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+
+    let created = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-2",
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+    let job_id = created["job_id"].as_str().unwrap().to_string();
+    let _ = device.recv_job_request().await;
+    device.send_stdout(&job_id, b"hello\n").await;
+    device.send_finished(&job_id, 0, "").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    server.shutdown().await;
+
+    let restarted = ahand_hub::state::AppState::from_config(config).await?;
+    let restarted = spawn_server_with_state(restarted).await;
+    let body = restarted
+        .read_sse_for(
+            &format!("/api/jobs/{job_id}/output"),
+            "service-test-token",
+            Duration::from_millis(500),
+        )
+        .await;
+
+    assert!(body.contains("event: stdout"));
+    assert!(body.contains("data: hello"));
+    assert!(body.contains("event: finished"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_dashboard_fanout_reaches_other_instances() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let config = persistent_config(&stack);
+
+    let publisher_state = ahand_hub::state::AppState::from_config(config.clone()).await?;
+    let subscriber_state = ahand_hub::state::AppState::from_config(config).await?;
+    let dashboard_token = subscriber_state.auth.issue_dashboard_jwt("operator-1")?;
+    let publisher = spawn_server_with_state(publisher_state).await;
+    let subscriber = spawn_server_with_state(subscriber_state).await;
+    let mut dashboard_socket = subscriber.connect_dashboard_socket(Some(&dashboard_token)).await;
+
+    let mut device = publisher
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+    let created = publisher
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-2",
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+    let job_id = created["job_id"].as_str().unwrap().to_string();
+    let _ = device.recv_job_request().await;
+    device.send_stdout(&job_id, b"hello\n").await;
+    device.send_finished(&job_id, 0, "").await;
+
+    let mut events = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let message = tokio::time::timeout(remaining, dashboard_socket.next())
+            .await
+            .expect("dashboard websocket should yield event")
+            .expect("dashboard websocket should stay open")
+            .expect("dashboard websocket should not error");
+
+        if let Message::Text(text) = message {
+            let payload: Value = serde_json::from_str(text.as_str()).unwrap();
+            if let Some(event) = payload["event"].as_str() {
+                events.push(event.to_string());
+            }
+        }
+
+        if events.iter().any(|event| event == "job.created")
+            && events.iter().any(|event| event == "job.running")
+            && events.iter().any(|event| event == "job.finished")
+        {
+            break;
+        }
+    }
+
+    assert!(events.iter().any(|event| event == "job.created"));
+    assert!(events.iter().any(|event| event == "job.running"));
+    assert!(events.iter().any(|event| event == "job.finished"));
     Ok(())
 }
