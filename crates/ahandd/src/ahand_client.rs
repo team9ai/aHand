@@ -755,24 +755,50 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let Some(message) = stream.next().await else {
-        return Err(ConnectError::HandshakeRejected(anyhow::anyhow!(
+        return Err(ConnectError::Session(anyhow::anyhow!(
             "websocket closed before hello accepted"
         )));
     };
     let message = message
         .map_err(anyhow::Error::from)
-        .map_err(ConnectError::HandshakeRejected)?;
+        .map_err(ConnectError::Session)?;
+    classify_hello_accepted_message(message)
+}
+
+fn classify_hello_accepted_message(
+    message: tungstenite::Message,
+) -> Result<HelloAccepted, ConnectError> {
     let tungstenite::Message::Binary(data) = message else {
-        return Err(ConnectError::HandshakeRejected(anyhow::anyhow!(
-            "expected binary hello accepted frame"
-        )));
+        return match message {
+            tungstenite::Message::Close(Some(frame))
+                if frame.code == tungstenite::protocol::frame::coding::CloseCode::Policy
+                    && frame.reason == "auth-rejected" =>
+            {
+                Err(ConnectError::HandshakeRejected(anyhow::anyhow!(
+                    "hello auth rejected"
+                )))
+            }
+            tungstenite::Message::Close(Some(frame)) => Err(ConnectError::Session(
+                anyhow::anyhow!(
+                    "websocket closed before hello accepted: code={} reason={}",
+                    frame.code,
+                    frame.reason
+                ),
+            )),
+            tungstenite::Message::Close(None) => Err(ConnectError::Session(anyhow::anyhow!(
+                "websocket closed before hello accepted"
+            ))),
+            _ => Err(ConnectError::Session(anyhow::anyhow!(
+                "expected binary hello accepted frame"
+            ))),
+        };
     };
     let envelope = Envelope::decode(data.as_ref())
         .map_err(anyhow::Error::from)
-        .map_err(ConnectError::HandshakeRejected)?;
+        .map_err(ConnectError::Session)?;
     match envelope.payload {
         Some(envelope::Payload::HelloAccepted(accepted)) => Ok(accepted),
-        _ => Err(ConnectError::HandshakeRejected(anyhow::anyhow!(
+        _ => Err(ConnectError::Session(anyhow::anyhow!(
             "expected hello accepted envelope"
         ))),
     }
@@ -786,5 +812,35 @@ enum ConnectError {
 impl From<anyhow::Error> for ConnectError {
     fn from(err: anyhow::Error) -> Self {
         Self::Session(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::borrow::Cow;
+
+    use tokio_tungstenite::tungstenite::{
+        Message,
+        protocol::{CloseFrame, frame::coding::CloseCode},
+    };
+
+    use super::{ConnectError, classify_hello_accepted_message};
+
+    #[test]
+    fn auth_rejection_close_frame_is_classified_as_handshake_rejected() {
+        let err = classify_hello_accepted_message(Message::Close(Some(CloseFrame {
+            code: CloseCode::Policy,
+            reason: Cow::Borrowed("auth-rejected"),
+        })))
+        .unwrap_err();
+
+        assert!(matches!(err, ConnectError::HandshakeRejected(_)));
+    }
+
+    #[test]
+    fn generic_close_frame_is_classified_as_session_error() {
+        let err = classify_hello_accepted_message(Message::Close(None)).unwrap_err();
+
+        assert!(matches!(err, ConnectError::Session(_)));
     }
 }

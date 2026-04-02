@@ -7,6 +7,7 @@ use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use ahand_hub_core::traits::DeviceStore;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use support::{
     bootstrap_hello, read_hello_accepted, read_hello_challenge, signed_hello, signed_hello_at,
@@ -297,7 +298,17 @@ async fn device_ws_rejects_bootstrap_token_for_wrong_device_id() {
         .await
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let message = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+        .await
+        .expect("auth rejection should close the socket")
+        .expect("auth rejection should emit a close frame")
+        .expect("auth rejection close frame should not error");
+    let tokio_tungstenite::tungstenite::Message::Close(Some(frame)) = message else {
+        panic!("expected explicit close frame after auth rejection");
+    };
+    assert_eq!(frame.code, CloseCode::Policy);
+    assert_eq!(frame.reason, "auth-rejected");
+
     let listed = server.get_json("/api/devices", "service-test-token").await;
     assert!(
         listed
@@ -306,8 +317,6 @@ async fn device_ws_rejects_bootstrap_token_for_wrong_device_id() {
             .iter()
             .all(|device| device["id"] != "device-999")
     );
-
-    let _ = socket.close(None).await;
 }
 
 #[tokio::test]
@@ -799,12 +808,16 @@ async fn superseded_connection_stops_refreshing_presence() {
     let mut state = test_state().await;
     state.device_presence_refresh_ms = 25;
     let server = spawn_server_with_state(state).await;
+    let first_signed_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
 
     let (mut first_socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
         .await
         .unwrap();
     let first_challenge = read_hello_challenge(&mut first_socket).await;
-    let first_hello = signed_hello("device-1", &first_challenge.nonce);
+    let first_hello = signed_hello_at("device-1", first_signed_at_ms, &first_challenge.nonce);
     first_socket
         .send(tokio_tungstenite::tungstenite::Message::Binary(
             first_hello.encode_to_vec().into(),
@@ -817,7 +830,11 @@ async fn superseded_connection_stops_refreshing_presence() {
         .await
         .unwrap();
     let second_challenge = read_hello_challenge(&mut second_socket).await;
-    let second_hello = signed_hello("device-1", &second_challenge.nonce);
+    let second_hello = signed_hello_at(
+        "device-1",
+        first_signed_at_ms.saturating_add(1),
+        &second_challenge.nonce,
+    );
     second_socket
         .send(tokio_tungstenite::tungstenite::Message::Binary(
             second_hello.encode_to_vec().into(),

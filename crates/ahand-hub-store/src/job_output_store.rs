@@ -126,7 +126,11 @@ impl RedisJobOutputStore {
     }
 
     pub async fn read_history(&self, job_id: &str) -> Result<Vec<StoredJobOutputRecord>> {
-        let mut connection = self.writer.lock().await;
+        let mut connection = self
+            .client
+            .get_connection_manager()
+            .await
+            .map_err(redis_err)?;
         let reply: StreamRangeReply = connection
             .xrange_all(output_stream_key(job_id))
             .await
@@ -210,4 +214,32 @@ fn output_seq_key(job_id: &str) -> String {
 
 fn redis_err(err: redis::RedisError) -> HubError {
     HubError::Internal(err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JobOutputRecord, RedisJobOutputStore};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn read_history_does_not_block_behind_writer_lock() -> anyhow::Result<()> {
+        let stack = crate::test_support::TestStack::start().await?;
+        let store = RedisJobOutputStore::new(stack.redis_url(), Duration::from_millis(200)).await?;
+        store
+            .append("job-history", JobOutputRecord::Stdout("hello".into()))
+            .await?;
+
+        let writer_guard = store.writer.lock().await;
+        let history = tokio::time::timeout(
+            Duration::from_millis(100),
+            store.read_history("job-history"),
+        )
+        .await;
+        drop(writer_guard);
+
+        let history = history.expect("history replay should not block on the writer lock")?;
+        assert_eq!(history.len(), 1);
+        assert!(matches!(history[0].record, JobOutputRecord::Stdout(_)));
+        Ok(())
+    }
 }

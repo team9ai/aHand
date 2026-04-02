@@ -268,9 +268,8 @@ impl OutputStream {
                 let needs_resync = history
                     .first()
                     .and_then(|first| {
-                        last_event_id.map(|last_event_id| {
-                            first.seq > last_event_id.saturating_add(1)
-                        })
+                        last_event_id
+                            .map(|last_event_id| first.seq > last_event_id.saturating_add(1))
                     })
                     .unwrap_or(false);
 
@@ -279,7 +278,7 @@ impl OutputStream {
                     let mut last_stream_id = history
                         .last()
                         .map(|item| item.stream_id.clone())
-                        .unwrap_or_else(|| "$".to_string());
+                        .unwrap_or_else(|| "0-0".to_string());
 
                     if needs_resync {
                         yield Ok(resync_event("history_trimmed"));
@@ -397,8 +396,10 @@ mod tests {
     use super::*;
 
     async fn render_event(event: Event) -> String {
-        let response =
-            Sse::new(futures_util::stream::iter(vec![Ok::<Event, Infallible>(event)])).into_response();
+        let response = Sse::new(futures_util::stream::iter(vec![Ok::<Event, Infallible>(
+            event,
+        )]))
+        .into_response();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -417,22 +418,30 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(40)).await;
 
         let mut subscriber = stream.subscribe("job-1".into()).await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(50), subscriber.next())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), subscriber.next())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn subscribe_resumes_after_last_event_id_without_replaying_history() {
         let stream = OutputStream::new(Duration::from_secs(60), 16);
-        stream.push_stdout("job-1", b"first\n".to_vec()).await.unwrap();
+        stream
+            .push_stdout("job-1", b"first\n".to_vec())
+            .await
+            .unwrap();
         stream
             .push_stdout("job-1", b"second\n".to_vec())
             .await
             .unwrap();
         stream.push_finished("job-1", 0, "").await.unwrap();
 
-        let mut subscriber = stream.subscribe_from("job-1".into(), Some(1)).await.unwrap();
+        let mut subscriber = stream
+            .subscribe_from("job-1".into(), Some(1))
+            .await
+            .unwrap();
         let mut body = String::new();
         while let Some(event) = subscriber.next().await {
             let event = event.unwrap();
@@ -450,8 +459,14 @@ mod tests {
     #[tokio::test]
     async fn subscribe_emits_resync_when_history_gap_exceeds_retention() {
         let stream = OutputStream::new(Duration::from_secs(60), 2);
-        stream.push_stdout("job-2", b"one\n".to_vec()).await.unwrap();
-        stream.push_stdout("job-2", b"two\n".to_vec()).await.unwrap();
+        stream
+            .push_stdout("job-2", b"one\n".to_vec())
+            .await
+            .unwrap();
+        stream
+            .push_stdout("job-2", b"two\n".to_vec())
+            .await
+            .unwrap();
         stream
             .push_stdout("job-2", b"three\n".to_vec())
             .await
@@ -461,7 +476,10 @@ mod tests {
             .await
             .unwrap();
 
-        let mut subscriber = stream.subscribe_from("job-2".into(), Some(1)).await.unwrap();
+        let mut subscriber = stream
+            .subscribe_from("job-2".into(), Some(1))
+            .await
+            .unwrap();
         let mut body = String::new();
         while let Some(event) = subscriber.next().await {
             let event = event.unwrap();
@@ -480,11 +498,23 @@ mod tests {
     #[tokio::test]
     async fn subscribe_replays_without_dropping_gap_events() {
         let stream = OutputStream::new(Duration::from_secs(60), 8);
-        stream.push_stdout("job-3", b"one\n".to_vec()).await.unwrap();
-        stream.push_stdout("job-3", b"two\n".to_vec()).await.unwrap();
-        stream.push_stdout("job-3", b"three\n".to_vec()).await.unwrap();
+        stream
+            .push_stdout("job-3", b"one\n".to_vec())
+            .await
+            .unwrap();
+        stream
+            .push_stdout("job-3", b"two\n".to_vec())
+            .await
+            .unwrap();
+        stream
+            .push_stdout("job-3", b"three\n".to_vec())
+            .await
+            .unwrap();
 
-        let mut subscriber = stream.subscribe_from("job-3".into(), Some(1)).await.unwrap();
+        let mut subscriber = stream
+            .subscribe_from("job-3".into(), Some(1))
+            .await
+            .unwrap();
         let mut body = String::new();
         while let Some(event) = subscriber.next().await {
             let event = event.unwrap();
@@ -524,5 +554,40 @@ mod tests {
 
         assert!(body.contains("event: resync"));
         assert!(body.contains("data: lagged"));
+    }
+
+    #[tokio::test]
+    async fn persistent_subscribe_does_not_miss_first_live_event_after_empty_history() {
+        let stack = ahand_hub_store::test_support::TestStack::start()
+            .await
+            .unwrap();
+        let store = ahand_hub_store::job_output_store::RedisJobOutputStore::new(
+            stack.redis_url(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let stream = OutputStream::persistent(store.clone());
+        let mut subscriber = stream.subscribe("job-persist-gap".into()).await.unwrap();
+
+        store
+            .append(
+                "job-persist-gap",
+                ahand_hub_store::job_output_store::JobOutputRecord::Finished {
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_millis(250), subscriber.next())
+            .await
+            .expect("persistent subscriber should observe the first live event")
+            .expect("persistent subscriber should emit an event")
+            .unwrap();
+        let body = render_event(event).await;
+
+        assert!(body.contains("event: finished"));
     }
 }

@@ -1,5 +1,7 @@
 use ahand_hub_core::HubError;
-use ahand_hub_core::job::{JobStatus, is_terminal_status, resolve_status_transition};
+use ahand_hub_core::job::{Job, JobStatus, NewJob, is_terminal_status, resolve_status_transition};
+use chrono::Utc;
+use std::collections::HashMap;
 
 #[test]
 fn terminal_statuses_are_flagged() {
@@ -85,6 +87,33 @@ fn resolve_status_transition_rejects_illegal_requests() {
         Err(HubError::IllegalJobTransition {
             current: JobStatus::Finished,
             requested: JobStatus::Running,
+        })
+    ));
+}
+
+#[test]
+fn apply_status_transition_rejects_illegal_requests() {
+    let mut job = Job::new_pending(
+        uuid::Uuid::nil(),
+        NewJob {
+            device_id: "device-1".into(),
+            tool: "echo".into(),
+            args: vec!["hello".into()],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: 30_000,
+            requested_by: "service".into(),
+        },
+        Utc::now(),
+    );
+
+    let _ = job.apply_status_transition(JobStatus::Sent, Utc::now()).unwrap();
+
+    assert!(matches!(
+        job.apply_status_transition(JobStatus::Pending, Utc::now()),
+        Err(HubError::IllegalJobTransition {
+            current: JobStatus::Sent,
+            requested: JobStatus::Pending,
         })
     ));
 }

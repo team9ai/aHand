@@ -40,9 +40,27 @@ impl DeviceIdentity {
             return Self::load(path);
         }
 
-        let identity = Self::generate();
-        identity.save(path)?;
-        Ok(identity)
+        let lock_path = creation_lock_path(path);
+        loop {
+            match acquire_creation_lock(&lock_path) {
+                Ok(_guard) => {
+                    if path.exists() {
+                        return Self::load(path);
+                    }
+
+                    let identity = Self::generate();
+                    identity.save(path)?;
+                    return Ok(identity);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if path.exists() {
+                        return Self::load(path);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
     }
 
     pub fn public_key_bytes(&self) -> Vec<u8> {
@@ -160,6 +178,40 @@ fn write_secure_file(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn creation_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "identity".into());
+    path.with_file_name(format!("{file_name}.lock"))
+}
+
+fn acquire_creation_lock(path: &Path) -> std::io::Result<CreationLock> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)?;
+    Ok(CreationLock {
+        path: path.to_path_buf(),
+        _file: file,
+    })
+}
+
+struct CreationLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+impl Drop for CreationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::write_secure_file;
@@ -183,6 +235,54 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn load_or_create_returns_one_stable_identity_during_concurrent_first_run() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ahandd-device-identity-concurrency-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.json");
+        let barrier = Arc::new(Barrier::new(8));
+
+        let mut keys = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    super::DeviceIdentity::load_or_create(&path)
+                        .unwrap()
+                        .public_key_bytes()
+                }));
+            }
+
+            for handle in handles {
+                keys.push(handle.join().unwrap());
+            }
+        });
+
+        let first = keys.first().cloned().unwrap();
+        assert!(
+            keys.iter().all(|key| key == &first),
+            "all concurrent callers should observe the same identity"
+        );
+        let persisted = super::DeviceIdentity::load_or_create(&path)
+            .unwrap()
+            .public_key_bytes();
+        assert_eq!(persisted, first);
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

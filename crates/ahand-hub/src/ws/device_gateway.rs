@@ -7,7 +7,7 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 use ahand_hub_core::HubError;
 use axum::extract::State;
-use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 
 use crate::state::AppState;
@@ -325,21 +325,49 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         let envelope = ahand_protocol::Envelope::decode(first_frame.as_ref())?;
         let hello = match envelope.payload {
             Some(ahand_protocol::envelope::Payload::Hello(hello)) => hello,
-            _ => anyhow::bail!("expected hello envelope"),
+            _ => {
+                let _ = send_handshake_close(
+                    &mut sender,
+                    axum::extract::ws::close_code::PROTOCOL,
+                    "protocol-error",
+                )
+                .await;
+                anyhow::bail!("expected hello envelope");
+            }
         };
 
-        let verified = crate::auth::verify_device_hello(
-            &envelope.device_id,
-            &hello,
-            &state,
-            &challenge.nonce,
-        )
-        .await?;
+        let verified =
+            match crate::auth::verify_device_hello(&envelope.device_id, &hello, &state, &challenge.nonce)
+                .await
+            {
+                Ok(verified) => verified,
+                Err(HubError::Unauthorized | HubError::InvalidSignature) => {
+                    let _ = send_handshake_close(
+                        &mut sender,
+                        axum::extract::ws::close_code::POLICY,
+                        "auth-rejected",
+                    )
+                    .await;
+                    return Err(anyhow::Error::from(HubError::Unauthorized));
+                }
+                Err(err) => return Err(anyhow::Error::from(err)),
+            };
         bootstrap_reservation = verified.bootstrap_reservation.clone();
-        state
+        if let Err(err) = state
             .devices
             .accept_verified_hello(&envelope.device_id, &hello, &verified)
-            .await?;
+            .await
+        {
+            if matches!(err, HubError::Unauthorized | HubError::InvalidSignature) {
+                let _ = send_handshake_close(
+                    &mut sender,
+                    axum::extract::ws::close_code::POLICY,
+                    "auth-rejected",
+                )
+                .await;
+            }
+            return Err(anyhow::Error::from(err));
+        }
         if let Some(reservation) = bootstrap_reservation.as_ref() {
             state.bootstrap_tokens.consume(reservation).await?;
             bootstrap_reservation = None;
@@ -574,6 +602,20 @@ fn issue_hello_challenge() -> ahand_protocol::HelloChallenge {
             .unwrap()
             .as_millis() as u64,
     }
+}
+
+async fn send_handshake_close(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, WsMessage>,
+    code: u16,
+    reason: &'static str,
+) -> anyhow::Result<()> {
+    sender
+        .send(WsMessage::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 #[cfg(test)]

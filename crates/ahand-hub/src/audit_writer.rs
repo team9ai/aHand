@@ -18,6 +18,7 @@ pub struct BufferedAuditStore {
     inner: Arc<dyn AuditStore>,
     tx: mpsc::Sender<AuditEntry>,
     fallback_path: Arc<PathBuf>,
+    fallback_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BufferedAuditStore {
@@ -31,11 +32,18 @@ impl BufferedAuditStore {
     pub fn new_with_fallback_path(inner: Arc<dyn AuditStore>, fallback_path: PathBuf) -> Self {
         let (tx, rx) = mpsc::channel(AUDIT_QUEUE_CAPACITY);
         let fallback_path = Arc::new(fallback_path);
-        tokio::spawn(run_audit_writer(inner.clone(), rx, fallback_path.clone()));
+        let fallback_lock = Arc::new(tokio::sync::Mutex::new(()));
+        tokio::spawn(run_audit_writer(
+            inner.clone(),
+            rx,
+            fallback_path.clone(),
+            fallback_lock.clone(),
+        ));
         Self {
             inner,
             tx,
             fallback_path,
+            fallback_lock,
         }
     }
 }
@@ -46,6 +54,7 @@ impl AuditStore for BufferedAuditStore {
         for entry in entries {
             if self.tx.try_send(entry.clone()).is_err() {
                 let fallback_path = self.fallback_path.clone();
+                let fallback_lock = self.fallback_lock.clone();
                 let entry = entry.clone();
                 tokio::spawn(async move {
                     tracing::error!(
@@ -53,7 +62,11 @@ impl AuditStore for BufferedAuditStore {
                         "audit queue unavailable, writing entry to fallback file"
                     );
                     if let Err(err) =
-                        write_fallback_entries(fallback_path.as_ref(), std::slice::from_ref(&entry))
+                        write_fallback_entries(
+                            fallback_path.as_ref(),
+                            std::slice::from_ref(&entry),
+                            fallback_lock.as_ref(),
+                        )
                             .await
                     {
                         tracing::error!(error = %err, path = %fallback_path.display(), "failed to write audit fallback entry");
@@ -73,13 +86,20 @@ pub async fn run_audit_writer(
     store: Arc<dyn AuditStore>,
     mut rx: mpsc::Receiver<AuditEntry>,
     fallback_path: Arc<PathBuf>,
+    fallback_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     let mut buffer = Vec::with_capacity(AUDIT_BATCH_SIZE);
 
     loop {
         let Some(entry) = rx.recv().await else {
             if !buffer.is_empty() {
-                let _ = flush_batch(store.as_ref(), &buffer, fallback_path.as_ref()).await;
+                let _ = flush_batch(
+                    store.as_ref(),
+                    &buffer,
+                    fallback_path.as_ref(),
+                    fallback_lock.as_ref(),
+                )
+                .await;
             }
             break;
         };
@@ -100,7 +120,14 @@ pub async fn run_audit_writer(
             }
         }
 
-        if let Err(err) = flush_batch(store.as_ref(), &buffer, fallback_path.as_ref()).await {
+        if let Err(err) = flush_batch(
+            store.as_ref(),
+            &buffer,
+            fallback_path.as_ref(),
+            fallback_lock.as_ref(),
+        )
+        .await
+        {
             tracing::error!(error = %err, path = %fallback_path.display(), "failed to flush audit batch");
         }
         buffer.clear();
@@ -111,6 +138,7 @@ async fn flush_batch(
     store: &dyn AuditStore,
     batch: &[AuditEntry],
     fallback_path: &PathBuf,
+    fallback_lock: &tokio::sync::Mutex<()>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -129,10 +157,15 @@ async fn flush_batch(
         path = %fallback_path.display(),
         "audit store remained unavailable after retry, writing fallback batch"
     );
-    write_fallback_entries(fallback_path, batch).await
+    write_fallback_entries(fallback_path, batch, fallback_lock).await
 }
 
-async fn write_fallback_entries(path: &PathBuf, batch: &[AuditEntry]) -> Result<()> {
+async fn write_fallback_entries(
+    path: &PathBuf,
+    batch: &[AuditEntry],
+    fallback_lock: &tokio::sync::Mutex<()>,
+) -> Result<()> {
+    let _guard = fallback_lock.lock().await;
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -140,16 +173,16 @@ async fn write_fallback_entries(path: &PathBuf, batch: &[AuditEntry]) -> Result<
         .await
         .map_err(|err| HubError::Internal(err.to_string()))?;
 
+    let mut body = String::new();
     for entry in batch {
-        let line =
-            serde_json::to_string(entry).map_err(|err| HubError::Internal(err.to_string()))?;
-        file.write_all(line.as_bytes())
-            .await
-            .map_err(|err| HubError::Internal(err.to_string()))?;
-        file.write_all(b"\n")
-            .await
-            .map_err(|err| HubError::Internal(err.to_string()))?;
+        body.push_str(
+            &serde_json::to_string(entry).map_err(|err| HubError::Internal(err.to_string()))?,
+        );
+        body.push('\n');
     }
+    file.write_all(body.as_bytes())
+        .await
+        .map_err(|err| HubError::Internal(err.to_string()))?;
 
     file.flush()
         .await

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use ahand_hub_core::HubError;
 use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::{Device, NewDevice};
-use ahand_hub_core::job::{JobFilter, JobStatus, NewJob, resolve_status_transition};
+use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
 use async_trait::async_trait;
@@ -168,8 +168,7 @@ impl JobStore for MemoryJobStore {
             return Ok(None);
         }
 
-        let next_status = resolve_status_transition(job.status, status)?;
-        job.apply_status_transition(next_status, chrono::Utc::now());
+        let next_status = job.apply_status_transition(status, chrono::Utc::now())?;
         Ok(Some(next_status))
     }
 
@@ -178,7 +177,7 @@ impl JobStore for MemoryJobStore {
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
-        job.apply_status_transition(status, chrono::Utc::now());
+        let _ = job.apply_status_transition(status, chrono::Utc::now())?;
         Ok(())
     }
 

@@ -4,7 +4,7 @@ use std::time::Duration;
 use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::auth::AuthService;
 use ahand_hub_core::device::{Device, NewDevice};
-use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, resolve_status_transition};
+use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::device_manager::DeviceManager;
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
@@ -154,7 +154,7 @@ impl AppState {
         actor: &str,
         detail: serde_json::Value,
     ) {
-        let _ = self
+        if let Err(err) = self
             .audit_store
             .append(&[AuditEntry {
                 timestamp: chrono::Utc::now(),
@@ -165,7 +165,17 @@ impl AppState {
                 detail,
                 source_ip: None,
             }])
-            .await;
+            .await
+        {
+            tracing::warn!(
+                action,
+                resource_type,
+                resource_id,
+                actor,
+                error = %err,
+                "failed to append audit entry"
+            );
+        }
     }
 
     async fn preregister_bootstrap_device(&self, device_id: &str) -> Result<()> {
@@ -465,8 +475,7 @@ impl JobStore for MemoryJobStore {
         if job.status == status {
             return Ok(None);
         }
-        let next_status = resolve_status_transition(job.status, status)?;
-        job.apply_status_transition(next_status, chrono::Utc::now());
+        let next_status = job.apply_status_transition(status, chrono::Utc::now())?;
         Ok(Some(next_status))
     }
 

@@ -88,7 +88,8 @@ impl Job {
         }
     }
 
-    pub fn apply_status_transition(&mut self, next_status: JobStatus, at: DateTime<Utc>) {
+    pub fn apply_status_transition(&mut self, requested_status: JobStatus, at: DateTime<Utc>) -> Result<JobStatus> {
+        let next_status = resolve_status_transition(self.status, requested_status)?;
         if next_status == JobStatus::Running && self.started_at.is_none() {
             self.started_at = Some(at);
         }
@@ -96,6 +97,7 @@ impl Job {
             self.finished_at = Some(at);
         }
         self.status = next_status;
+        Ok(next_status)
     }
 
     pub fn record_terminal_outcome(
