@@ -99,6 +99,7 @@ jobs:
       - name: Run tests
         run: |
           cargo test -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --all-targets
+          cargo test -p ahand-hub-store --features test-support --test store_roundtrip
           cargo test -p ahandd --test hub_handshake
 
       - name: Check core coverage
@@ -118,6 +119,7 @@ jobs:
           AHAND_HUB_DASHBOARD_PASSWORD: ci-dashboard-password
           AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN: ci-bootstrap-token
           AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID: device-ci
+          AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS: http://127.0.0.1:13100
           AHAND_HUB_JWT_SECRET: ci-jwt-secret
           AHAND_HUB_DATABASE_URL: postgres://ci:ci@db.example.internal:5432/ahand_hub
           AHAND_HUB_REDIS_URL: redis://cache.example.internal:6379
@@ -161,6 +163,7 @@ jobs:
           AHAND_HUB_DASHBOARD_PASSWORD: ci-dashboard-password
           AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN: ci-bootstrap-token
           AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID: device-ci
+          AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS: http://127.0.0.1:13100
           AHAND_HUB_JWT_SECRET: ci-jwt-secret
           AHAND_HUB_DATABASE_URL: postgres://ahand_hub:ahand_hub@hub-ci-postgres:5432/ahand_hub
           AHAND_HUB_REDIS_URL: redis://hub-ci-redis:6379
@@ -174,6 +177,7 @@ jobs:
             -e AHAND_HUB_DASHBOARD_PASSWORD \
             -e AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN \
             -e AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID \
+            -e AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS \
             -e AHAND_HUB_JWT_SECRET \
             -e AHAND_HUB_DATABASE_URL \
             -e AHAND_HUB_REDIS_URL \
@@ -237,6 +241,7 @@ jobs:
               Upgrade: "websocket",
               "Sec-WebSocket-Version": "13",
               "Sec-WebSocket-Key": "YWhhbmQtaHViLXNtb2tlIQ==",
+              Origin: "http://127.0.0.1:13100",
               Cookie: `ahand_hub_session=${process.env.DASHBOARD_SESSION ?? ""}`,
             },
           });

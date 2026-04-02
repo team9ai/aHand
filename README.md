@@ -196,6 +196,7 @@ export AHAND_HUB_SERVICE_TOKEN=dev-service-token
 export AHAND_HUB_DASHBOARD_PASSWORD=dev-dashboard-password
 export AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN=dev-bootstrap-token
 export AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID=device-dev-1
+export AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS=http://127.0.0.1:3100
 export AHAND_HUB_JWT_SECRET=dev-jwt-secret
 export AHAND_HUB_DATABASE_URL=postgres://ahand_hub:secret@db.example.internal:5432/ahand_hub
 export AHAND_HUB_REDIS_URL=redis://cache.example.internal:6379
@@ -203,6 +204,7 @@ docker compose -f deploy/hub/docker-compose.yml up --build
 ```
 
 The compose file starts the hub and dashboard containers only. PostgreSQL and Redis remain external dependencies that must already be reachable at the configured URLs.
+If the dashboard is served from a different browser origin than the hub, set `AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS` on the hub to the public dashboard origin list.
 
 For a local smoke environment, build local images, provision disposable external dependencies, wait for them to accept connections, and then run the hub and dashboard containers on the same network:
 
@@ -227,6 +229,7 @@ docker run -d --rm --network ahand-hub-smoke --name ahand-hub \
   -e AHAND_HUB_DASHBOARD_PASSWORD=dev-dashboard-password \
   -e AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN=dev-bootstrap-token \
   -e AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID=device-dev-1 \
+  -e AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS=http://127.0.0.1:13100 \
   -e AHAND_HUB_JWT_SECRET=dev-jwt-secret \
   -e AHAND_HUB_DATABASE_URL=postgres://ahand_hub:ahand_hub@ahand-hub-postgres:5432/ahand_hub \
   -e AHAND_HUB_REDIS_URL=redis://ahand-hub-redis:6379 \
@@ -261,6 +264,7 @@ const request = http.request("http://127.0.0.1:13100/ws/dashboard", {
     Upgrade: "websocket",
     "Sec-WebSocket-Version": "13",
     "Sec-WebSocket-Key": "YWhhbmQtaHViLXNtb2tlIQ==",
+    Origin: "http://127.0.0.1:13100",
     Cookie: `ahand_hub_session=${process.env.DASHBOARD_SESSION ?? ""}`,
   },
 });
