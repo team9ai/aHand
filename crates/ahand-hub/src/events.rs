@@ -5,7 +5,7 @@ use ahand_hub_core::job::Job;
 use ahand_hub_core::traits::AuditStore;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardEvent {
@@ -18,16 +18,14 @@ pub struct DashboardEvent {
 }
 
 pub struct EventBus {
-    audit_tx: mpsc::UnboundedSender<AuditEntry>,
+    audit: Arc<dyn AuditStore>,
     tx: broadcast::Sender<DashboardEvent>,
 }
 
 impl EventBus {
     pub fn new(audit: Arc<dyn AuditStore>) -> Self {
-        let (audit_tx, audit_rx) = mpsc::unbounded_channel();
-        tokio::spawn(crate::audit_writer::run_audit_writer(audit, audit_rx));
         let (tx, _) = broadcast::channel(256);
-        Self { audit_tx, tx }
+        Self { audit, tx }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<DashboardEvent> {
@@ -79,6 +77,25 @@ impl EventBus {
     }
 
     pub fn publish_job_created(&self, job: &Job) {
+        let audit = self.audit.clone();
+        let job = job.clone();
+        tokio::spawn(async move {
+            let _ = audit
+                .append(&[AuditEntry {
+                    timestamp: Utc::now(),
+                    action: "job.created".into(),
+                    resource_type: "job".into(),
+                    resource_id: job.id.to_string(),
+                    actor: job.requested_by.clone(),
+                    detail: serde_json::json!({
+                        "device_id": job.device_id,
+                        "tool": job.tool,
+                        "status": job_status_name(&job),
+                    }),
+                    source_ip: None,
+                }])
+                .await;
+        });
         self.publish(DashboardEvent {
             event: "job.created".into(),
             resource_type: "job".into(),
@@ -102,7 +119,7 @@ impl EventBus {
         detail: serde_json::Value,
     ) -> anyhow::Result<()> {
         let timestamp = Utc::now();
-        let _ = self.audit_tx.send(AuditEntry {
+        let _ = self.audit.append(&[AuditEntry {
             timestamp,
             action: action.into(),
             resource_type: resource_type.into(),
@@ -110,7 +127,7 @@ impl EventBus {
             actor: actor.into(),
             detail: detail.clone(),
             source_ip: None,
-        });
+        }]).await;
         self.publish(DashboardEvent {
             event: action.into(),
             resource_type: resource_type.into(),
