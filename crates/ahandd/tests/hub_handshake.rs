@@ -91,3 +91,41 @@ fn hello_auth_modes_prefer_ed25519_before_bootstrap() {
         ]
     );
 }
+
+#[tokio::test]
+async fn build_hello_envelope_advances_signed_at_ms_on_fast_reconnects() {
+    let identity = DeviceIdentity::generate_for_tests();
+    let first = ahandd::ahand_client::build_hello_envelope(
+        "device-1",
+        &identity,
+        0,
+        false,
+        &[1, 2, 3, 4],
+        None,
+    );
+    let second = ahandd::ahand_client::build_hello_envelope(
+        "device-1",
+        &identity,
+        0,
+        false,
+        &[5, 6, 7, 8],
+        None,
+    );
+
+    let first_auth = match first.payload.unwrap() {
+        ahand_protocol::envelope::Payload::Hello(hello) => match hello.auth.unwrap() {
+            hello::Auth::Ed25519(auth) => auth,
+            other => panic!("unexpected auth payload: {other:?}"),
+        },
+        other => panic!("unexpected payload: {other:?}"),
+    };
+    let second_auth = match second.payload.unwrap() {
+        ahand_protocol::envelope::Payload::Hello(hello) => match hello.auth.unwrap() {
+            hello::Auth::Ed25519(auth) => auth,
+            other => panic!("unexpected auth payload: {other:?}"),
+        },
+        other => panic!("unexpected payload: {other:?}"),
+    };
+
+    assert!(second_auth.signed_at_ms > first_auth.signed_at_ms);
+}

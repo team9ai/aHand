@@ -13,6 +13,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -113,7 +114,9 @@ pub async fn build_test_app() -> axum::Router {
 pub struct TestServer {
     base_http_url: String,
     base_ws_url: String,
-    _task: JoinHandle<()>,
+    state: AppState,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
 }
 
 impl TestServer {
@@ -280,8 +283,18 @@ impl TestServer {
     }
 
     pub async fn shutdown(self) {
-        self._task.abort();
-        let _ = self._task.await;
+        let mut task = self.task;
+        if let Some(shutdown_tx) = self.shutdown_tx {
+            let _ = shutdown_tx.send(());
+        }
+        if tokio::time::timeout(Duration::from_secs(1), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        self.state.shutdown().await.unwrap();
     }
 }
 
@@ -374,9 +387,15 @@ pub async fn spawn_test_server() -> TestServer {
 pub async fn spawn_server_with_state(state: ahand_hub::state::AppState) -> TestServer {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let app = ahand_hub::build_app(state);
+    let app = ahand_hub::build_app(state.clone());
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
     });
 
     tokio::time::sleep(Duration::from_millis(25)).await;
@@ -384,7 +403,9 @@ pub async fn spawn_server_with_state(state: ahand_hub::state::AppState) -> TestS
     TestServer {
         base_http_url: format!("http://{address}"),
         base_ws_url: format!("ws://{address}"),
-        _task: task,
+        state,
+        shutdown_tx: Some(shutdown_tx),
+        task,
     }
 }
 
@@ -425,7 +446,12 @@ pub fn signed_hello_with_last_ack(
     last_ack: u64,
     challenge_nonce: &[u8],
 ) -> Envelope {
-    signed_hello_with_last_ack_at(device_id, last_ack, now_ms(), challenge_nonce)
+    signed_hello_with_last_ack_at(
+        device_id,
+        last_ack,
+        next_test_signed_at_ms(),
+        challenge_nonce,
+    )
 }
 
 pub fn signed_hello_with_last_ack_at(
@@ -527,4 +553,20 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+fn next_test_signed_at_ms() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static LAST_SIGNED_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+    let mut candidate = now_ms();
+    loop {
+        let last = LAST_SIGNED_AT_MS.load(Ordering::Relaxed);
+        let next = candidate.max(last.saturating_add(1));
+        match LAST_SIGNED_AT_MS.compare_exchange(last, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(observed) => candidate = candidate.max(observed.saturating_add(1)),
+        }
+    }
 }

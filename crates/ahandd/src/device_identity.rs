@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs::OpenOptions, io::Write};
 
 use anyhow::{Context, Result};
@@ -12,6 +14,7 @@ const IDENTITY_FILE: &str = "hub-device-identity.json";
 #[derive(Debug, Clone)]
 pub struct DeviceIdentity {
     signing_key: SigningKey,
+    last_hello_signed_at_ms: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +28,7 @@ impl DeviceIdentity {
     pub fn generate() -> Self {
         Self {
             signing_key: SigningKey::generate(&mut OsRng),
+            last_hello_signed_at_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -32,6 +36,7 @@ impl DeviceIdentity {
     pub fn generate_for_tests() -> Self {
         Self {
             signing_key: SigningKey::from_bytes(&[7u8; 32]),
+            last_hello_signed_at_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -83,6 +88,23 @@ impl DeviceIdentity {
         self.signing_key.sign(&payload).to_bytes().to_vec()
     }
 
+    pub fn next_hello_signed_at_ms(&self) -> u64 {
+        let mut candidate = now_ms();
+        loop {
+            let last = self.last_hello_signed_at_ms.load(Ordering::Relaxed);
+            let next = candidate.max(last.saturating_add(1));
+            match self.last_hello_signed_at_ms.compare_exchange(
+                last,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next,
+                Err(observed) => candidate = candidate.max(observed.saturating_add(1)),
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn to_bootstrap_header(&self) -> String {
         STANDARD.encode(self.public_key_bytes())
@@ -108,6 +130,7 @@ impl DeviceIdentity {
 
         Ok(Self {
             signing_key: SigningKey::from_bytes(&secret),
+            last_hello_signed_at_ms: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -191,10 +214,7 @@ fn acquire_creation_lock(path: &Path) -> std::io::Result<CreationLock> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)?;
+    let file = OpenOptions::new().create_new(true).write(true).open(path)?;
     Ok(CreationLock {
         path: path.to_path_buf(),
         _file: file,
@@ -212,9 +232,16 @@ impl Drop for CreationLock {
     }
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
-    use super::write_secure_file;
+    use super::{DeviceIdentity, write_secure_file};
 
     #[cfg(unix)]
     #[test]
@@ -286,5 +313,15 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn hello_timestamps_are_monotonic_across_fast_reuse() {
+        let identity = DeviceIdentity::generate_for_tests();
+
+        let first = identity.next_hello_signed_at_ms();
+        let second = identity.next_hello_signed_at_ms();
+
+        assert!(second > first);
     }
 }

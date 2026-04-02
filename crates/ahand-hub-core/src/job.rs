@@ -88,7 +88,11 @@ impl Job {
         }
     }
 
-    pub fn apply_status_transition(&mut self, requested_status: JobStatus, at: DateTime<Utc>) -> Result<JobStatus> {
+    pub fn apply_status_transition(
+        &mut self,
+        requested_status: JobStatus,
+        at: DateTime<Utc>,
+    ) -> Result<JobStatus> {
         let next_status = resolve_status_transition(self.status, requested_status)?;
         if next_status == JobStatus::Running && self.started_at.is_none() {
             self.started_at = Some(at);
@@ -98,17 +102,6 @@ impl Job {
         }
         self.status = next_status;
         Ok(next_status)
-    }
-
-    pub fn record_terminal_outcome(
-        &mut self,
-        exit_code: i32,
-        error: String,
-        output_summary: String,
-    ) {
-        self.exit_code = Some(exit_code);
-        self.error = Some(error);
-        self.output_summary = Some(output_summary);
     }
 }
 
@@ -127,4 +120,203 @@ pub struct NewJob {
 pub struct JobFilter {
     pub device_id: Option<String>,
     pub status: Option<JobStatus>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Job, JobStatus, NewJob, is_terminal_status, resolve_status_transition};
+    use crate::HubError;
+    use chrono::Utc;
+    use std::collections::HashMap;
+
+    #[test]
+    fn terminal_statuses_are_flagged() {
+        assert!(!is_terminal_status(JobStatus::Pending));
+        assert!(!is_terminal_status(JobStatus::Sent));
+        assert!(!is_terminal_status(JobStatus::Running));
+        assert!(is_terminal_status(JobStatus::Finished));
+        assert!(is_terminal_status(JobStatus::Failed));
+        assert!(is_terminal_status(JobStatus::Cancelled));
+    }
+
+    #[test]
+    fn resolve_status_transition_advances_only_allowed_states() {
+        assert_eq!(
+            resolve_status_transition(JobStatus::Pending, JobStatus::Sent).unwrap(),
+            JobStatus::Sent
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Pending, JobStatus::Running).unwrap(),
+            JobStatus::Running
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Pending, JobStatus::Finished).unwrap(),
+            JobStatus::Finished
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Pending, JobStatus::Failed).unwrap(),
+            JobStatus::Failed
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Pending, JobStatus::Cancelled).unwrap(),
+            JobStatus::Cancelled
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Sent, JobStatus::Running).unwrap(),
+            JobStatus::Running
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Sent, JobStatus::Finished).unwrap(),
+            JobStatus::Finished
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Sent, JobStatus::Failed).unwrap(),
+            JobStatus::Failed
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Sent, JobStatus::Cancelled).unwrap(),
+            JobStatus::Cancelled
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Running, JobStatus::Finished).unwrap(),
+            JobStatus::Finished
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Running, JobStatus::Failed).unwrap(),
+            JobStatus::Failed
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Running, JobStatus::Cancelled).unwrap(),
+            JobStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn resolve_status_transition_keeps_current_for_noop_requests() {
+        assert_eq!(
+            resolve_status_transition(JobStatus::Sent, JobStatus::Sent).unwrap(),
+            JobStatus::Sent
+        );
+    }
+
+    #[test]
+    fn resolve_status_transition_rejects_illegal_requests() {
+        assert_eq!(
+            resolve_status_transition(JobStatus::Sent, JobStatus::Pending),
+            Err(HubError::IllegalJobTransition {
+                current: JobStatus::Sent,
+                requested: JobStatus::Pending,
+            })
+        );
+        assert_eq!(
+            resolve_status_transition(JobStatus::Finished, JobStatus::Running),
+            Err(HubError::IllegalJobTransition {
+                current: JobStatus::Finished,
+                requested: JobStatus::Running,
+            })
+        );
+    }
+
+    #[test]
+    fn apply_status_transition_rejects_illegal_requests() {
+        let mut job = Job::new_pending(
+            uuid::Uuid::nil(),
+            NewJob {
+                device_id: "device-1".into(),
+                tool: "echo".into(),
+                args: vec!["hello".into()],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: 30_000,
+                requested_by: "service".into(),
+            },
+            Utc::now(),
+        );
+
+        let _ = job
+            .apply_status_transition(JobStatus::Sent, Utc::now())
+            .unwrap();
+
+        assert_eq!(
+            job.apply_status_transition(JobStatus::Pending, Utc::now()),
+            Err(HubError::IllegalJobTransition {
+                current: JobStatus::Sent,
+                requested: JobStatus::Pending,
+            })
+        );
+    }
+
+    #[test]
+    fn record_terminal_outcome_persists_exit_metadata() {
+        let mut job = Job::new_pending(
+            uuid::Uuid::nil(),
+            NewJob {
+                device_id: "device-1".into(),
+                tool: "echo".into(),
+                args: vec!["hello".into()],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: 30_000,
+                requested_by: "service".into(),
+            },
+            Utc::now(),
+        );
+
+        job.exit_code = Some(17);
+        job.error = Some("timeout".into());
+        job.output_summary = Some("stderr tail".into());
+
+        assert_eq!(job.exit_code, Some(17));
+        assert_eq!(job.error.as_deref(), Some("timeout"));
+        assert_eq!(job.output_summary.as_deref(), Some("stderr tail"));
+    }
+
+    #[test]
+    fn apply_status_transition_sets_timestamps_without_replacing_existing_start() {
+        let created_at = Utc::now();
+        let started_at = created_at + chrono::Duration::seconds(5);
+        let finished_at = started_at + chrono::Duration::seconds(5);
+        let mut job = Job::new_pending(
+            uuid::Uuid::nil(),
+            NewJob {
+                device_id: "device-1".into(),
+                tool: "echo".into(),
+                args: vec!["hello".into()],
+                cwd: None,
+                env: HashMap::new(),
+                timeout_ms: 30_000,
+                requested_by: "service".into(),
+            },
+            created_at,
+        );
+
+        assert_eq!(
+            job.apply_status_transition(JobStatus::Running, started_at)
+                .unwrap(),
+            JobStatus::Running
+        );
+        assert_eq!(job.started_at, Some(started_at));
+        assert_eq!(job.finished_at, None);
+
+        assert_eq!(
+            job.apply_status_transition(JobStatus::Finished, finished_at)
+                .unwrap(),
+            JobStatus::Finished
+        );
+        assert_eq!(job.started_at, Some(started_at));
+        assert_eq!(job.finished_at, Some(finished_at));
+
+        job.exit_code = Some(0);
+        job.error = Some(String::new());
+        job.output_summary = Some("ok".into());
+        assert_eq!(job.error.as_deref(), Some(""));
+
+        let cloned = job.clone();
+        let json = serde_json::to_string(&job).unwrap();
+        let roundtrip: Job = serde_json::from_str(&json).unwrap();
+        assert!(format!("{cloned:?}").contains("Finished"));
+        assert_eq!(roundtrip.status, JobStatus::Finished);
+        assert_eq!(roundtrip.finished_at, Some(finished_at));
+        assert_eq!(format!("{:?}", roundtrip.status), "Finished");
+    }
 }

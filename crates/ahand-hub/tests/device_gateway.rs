@@ -3,10 +3,10 @@ mod support;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use ahand_hub_core::traits::DeviceStore;
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
-use ahand_hub_core::traits::DeviceStore;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use support::{

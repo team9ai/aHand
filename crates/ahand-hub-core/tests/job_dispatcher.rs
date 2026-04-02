@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use ahand_hub_core::HubError;
 use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::{Device, NewDevice};
-use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
+use ahand_hub_core::job::{
+    Job, JobFilter, JobStatus, NewJob, is_terminal_status, resolve_status_transition,
+};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
 use async_trait::async_trait;
@@ -192,7 +194,9 @@ impl JobStore for MemoryJobStore {
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
-        job.record_terminal_outcome(exit_code, error.into(), output_summary.into());
+        job.exit_code = Some(exit_code);
+        job.error = Some(error.into());
+        job.output_summary = Some(output_summary.into());
         Ok(())
     }
 }
@@ -783,4 +787,45 @@ async fn fake_audit_store_appends_and_queries_entries() {
     assert_eq!(job_entries[0].resource_id, "job-1");
     assert_eq!(delete_entries.len(), 1);
     assert_eq!(delete_entries[0].resource_id, "device-9");
+}
+
+#[test]
+fn job_helpers_roundtrip_inside_dispatcher_target() {
+    let created_at = chrono::Utc::now();
+    let finished_at = created_at + chrono::Duration::seconds(1);
+    let mut job = Job::new_pending(
+        uuid::Uuid::nil(),
+        NewJob {
+            device_id: "device-1".into(),
+            tool: "echo".into(),
+            args: vec!["hello".into()],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: 30_000,
+            requested_by: "service".into(),
+        },
+        created_at,
+    );
+
+    assert_eq!(
+        job.apply_status_transition(JobStatus::Finished, finished_at)
+            .unwrap(),
+        JobStatus::Finished
+    );
+    job.exit_code = Some(0);
+    job.error = Some(String::new());
+    job.output_summary = Some("ok".into());
+
+    let cloned = job.clone();
+    let json = serde_json::to_string(&job).unwrap();
+    let roundtrip: Job = serde_json::from_str(&json).unwrap();
+
+    assert!(format!("{cloned:?}").contains("Finished"));
+    assert!(is_terminal_status(JobStatus::Finished));
+    assert_eq!(
+        resolve_status_transition(JobStatus::Pending, JobStatus::Finished).unwrap(),
+        JobStatus::Finished
+    );
+    assert_eq!(roundtrip.status, JobStatus::Finished);
+    assert_eq!(roundtrip.finished_at, Some(finished_at));
 }

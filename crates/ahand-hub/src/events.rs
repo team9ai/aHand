@@ -309,10 +309,8 @@ mod tests {
     #[tokio::test]
     async fn publish_job_created_ignores_fanout_failures() {
         let publisher = Arc::new(FailingPublisher::default());
-        let bus = EventBus::new_with_publisher_for_tests(
-            Arc::new(NoopAuditStore),
-            publisher.clone(),
-        );
+        let bus =
+            EventBus::new_with_publisher_for_tests(Arc::new(NoopAuditStore), publisher.clone());
         let mut rx = bus.subscribe();
         let job = Job {
             id: uuid::Uuid::new_v4(),

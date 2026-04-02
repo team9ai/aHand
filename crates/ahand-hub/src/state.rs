@@ -27,6 +27,7 @@ pub struct AppState {
     pub devices: Arc<MemoryDeviceStore>,
     pub jobs_store: Arc<dyn JobStore>,
     pub audit_store: Arc<dyn AuditStore>,
+    audit_writer: Arc<crate::audit_writer::BufferedAuditStore>,
     pub jobs: Arc<crate::http::jobs::JobRuntime>,
     pub connections: Arc<crate::ws::device_gateway::ConnectionRegistry>,
     pub events: Arc<crate::events::EventBus>,
@@ -92,12 +93,13 @@ impl AppState {
                 )
             }
         };
-        let audit_store = Arc::new(
+        let audit_writer = Arc::new(
             crate::audit_writer::BufferedAuditStore::new_with_fallback_path(
                 raw_audit_store,
                 audit_fallback_path,
             ),
-        ) as Arc<dyn AuditStore>;
+        );
+        let audit_store = audit_writer.clone() as Arc<dyn AuditStore>;
         spawn_audit_retention_task(audit_store.clone(), audit_retention_days);
         let output_stream = Arc::new(match persistent_output {
             Some(store) => crate::output_stream::OutputStream::persistent(store),
@@ -131,6 +133,7 @@ impl AppState {
             devices,
             jobs_store,
             audit_store,
+            audit_writer,
             jobs,
             connections,
             events,
@@ -150,6 +153,11 @@ impl AppState {
             .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())
             .await?;
         Ok(state)
+    }
+
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.audit_writer.shutdown().await?;
+        Ok(())
     }
 
     pub async fn append_audit_entry(
@@ -505,7 +513,9 @@ impl JobStore for MemoryJobStore {
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
-        job.record_terminal_outcome(exit_code, error.into(), output_summary.into());
+        job.exit_code = Some(exit_code);
+        job.error = Some(error.into());
+        job.output_summary = Some(output_summary.into());
         Ok(())
     }
 }

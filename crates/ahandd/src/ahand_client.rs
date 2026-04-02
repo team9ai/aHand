@@ -349,7 +349,7 @@ pub fn build_hello_envelope(
     challenge_nonce: &[u8],
     bearer_token: Option<String>,
 ) -> Envelope {
-    let signed_at_ms = now_ms();
+    let signed_at_ms = identity.next_hello_signed_at_ms();
     let mut capabilities = vec!["exec".to_string()];
     if browser_enabled {
         capabilities.push("browser".to_string());

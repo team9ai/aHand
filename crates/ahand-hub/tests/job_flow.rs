@@ -310,8 +310,7 @@ async fn sent_job_replays_after_reconnect_within_disconnect_grace() {
     assert_eq!(replayed.job_id, job_id);
     replacement.send_finished(&job_id, 0, "").await;
 
-    let stored =
-        wait_for_job_status(&server, &job_id, "finished", Duration::from_secs(1)).await;
+    let stored = wait_for_job_status(&server, &job_id, "finished", Duration::from_secs(1)).await;
     assert_eq!(stored["status"], "finished");
 }
 
