@@ -161,6 +161,9 @@ pnpm test:ts                # TypeScript tests
 pnpm test:rust              # Rust tests
 pnpm test:hub-dashboard     # hub dashboard tests
 pnpm test:e2e:scripts       # distribution script tests (BATS)
+
+# Persistent store roundtrip against disposable Postgres + Redis
+cargo test -p ahand-hub-store --features test-support --test store_roundtrip
 ```
 
 ### Release Build
@@ -200,6 +203,7 @@ export AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS=http://127.0.0.1:3100
 export AHAND_HUB_JWT_SECRET=dev-jwt-secret
 export AHAND_HUB_DATABASE_URL=postgres://ahand_hub:secret@db.example.internal:5432/ahand_hub
 export AHAND_HUB_REDIS_URL=redis://cache.example.internal:6379
+export AHAND_HUB_AUDIT_FALLBACK_PATH=/var/lib/ahand-hub/audit-fallback.jsonl
 docker compose -f deploy/hub/docker-compose.yml up --build
 ```
 
@@ -233,6 +237,8 @@ docker run -d --rm --network ahand-hub-smoke --name ahand-hub \
   -e AHAND_HUB_JWT_SECRET=dev-jwt-secret \
   -e AHAND_HUB_DATABASE_URL=postgres://ahand_hub:ahand_hub@ahand-hub-postgres:5432/ahand_hub \
   -e AHAND_HUB_REDIS_URL=redis://ahand-hub-redis:6379 \
+  -e AHAND_HUB_AUDIT_FALLBACK_PATH=/var/lib/ahand-hub/audit-fallback.jsonl \
+  -v ahand-hub-audit:/var/lib/ahand-hub \
   ahand-hub:local
 
 docker run -d --rm --network ahand-hub-smoke --name ahand-hub-dashboard \

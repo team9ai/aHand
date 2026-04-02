@@ -17,8 +17,12 @@ services:
       AHAND_HUB_JWT_SECRET: ${AHAND_HUB_JWT_SECRET:?set AHAND_HUB_JWT_SECRET}
       AHAND_HUB_DATABASE_URL: ${AHAND_HUB_DATABASE_URL:?set AHAND_HUB_DATABASE_URL}
       AHAND_HUB_REDIS_URL: ${AHAND_HUB_REDIS_URL:?set AHAND_HUB_REDIS_URL}
+      AHAND_HUB_AUDIT_RETENTION_DAYS: ${AHAND_HUB_AUDIT_RETENTION_DAYS:-90}
+      AHAND_HUB_AUDIT_FALLBACK_PATH: ${AHAND_HUB_AUDIT_FALLBACK_PATH:-/var/lib/ahand-hub/audit-fallback.jsonl}
     ports:
       - "8080:8080"
+    volumes:
+      - hub-audit-data:/var/lib/ahand-hub
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/api/health"]
       interval: 5s
@@ -39,3 +43,6 @@ services:
       NODE_ENV: production
     ports:
       - "3100:3100"
+
+volumes:
+  hub-audit-data:

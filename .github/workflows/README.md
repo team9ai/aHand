@@ -9,6 +9,7 @@ aHand uses per-component release workflows. Each component is released independe
 | Release Rust Binaries | `release-rust.yml` | `rust-v*` tag | `ahandd-{os}-{arch}`, `ahandctl-{os}-{arch}` |
 | Release Admin SPA | `release-admin.yml` | `admin-v*` tag | `admin-spa.tar.gz` |
 | Release Browser Bundle | `release-browser.yml` | `browser-v*` tag | `daemon-bundle.tar.gz`, `setup-browser.sh` |
+| Release Hub Stack | `release-hub.yml` | `hub-v*` tag | `ghcr.io/<owner>/ahand-hub`, `ghcr.io/<owner>/ahand-hub-dashboard` |
 
 All workflows also support `workflow_dispatch` for manual triggering.
 
@@ -20,6 +21,7 @@ All workflows also support `workflow_dispatch` for manual triggering.
 git tag rust-v0.2.0 && git push origin rust-v0.2.0
 git tag admin-v0.2.0 && git push origin admin-v0.2.0
 git tag browser-v0.2.0 && git push origin browser-v0.2.0
+git tag hub-v0.2.0 && git push origin hub-v0.2.0
 ```
 
 ### Release a single component
@@ -67,6 +69,12 @@ Builds the Solid.js admin panel SPA (`apps/admin/`), packages as `admin-spa.tar.
 ### browser-v*
 
 Builds the ncc-bundled browser daemon (`packages/browser-bridge/`), packages as `daemon-bundle.tar.gz` + copies `scripts/dist/setup-browser.sh`.
+
+### hub-v*
+
+Builds and smoke-verifies the hub stack images from `deploy/hub/Dockerfile`, then pushes:
+- `ghcr.io/<owner>/ahand-hub:<tag>`
+- `ghcr.io/<owner>/ahand-hub-dashboard:<tag>`
 
 ## Version Convention
 

@@ -15,7 +15,179 @@ permissions:
   packages: write
 
 jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
+
+      - name: Validate hub compose file
+        env:
+          AHAND_HUB_SERVICE_TOKEN: ci-service-token
+          AHAND_HUB_DASHBOARD_PASSWORD: ci-dashboard-password
+          AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN: ci-bootstrap-token
+          AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID: device-ci
+          AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS: http://127.0.0.1:13100
+          AHAND_HUB_JWT_SECRET: ci-jwt-secret
+          AHAND_HUB_DATABASE_URL: postgres://ci:ci@db.example.internal:5432/ahand_hub
+          AHAND_HUB_REDIS_URL: redis://cache.example.internal:6379
+          AHAND_HUB_AUDIT_FALLBACK_PATH: /var/lib/ahand-hub/audit-fallback.jsonl
+        run: docker compose -f deploy/hub/docker-compose.yml config
+
+      - name: Build hub image target
+        run: docker build -t ahand-hub:release-smoke --target hub -f deploy/hub/Dockerfile .
+
+      - name: Build dashboard image target
+        run: docker build -t ahand-hub-dashboard:release-smoke --target dashboard -f deploy/hub/Dockerfile .
+
+      - name: Create smoke-test network
+        run: docker network create hub-release-smoke
+
+      - name: Start smoke-test postgres
+        run: |
+          docker run -d --rm \
+            --network hub-release-smoke \
+            --name hub-release-postgres \
+            -e POSTGRES_DB=ahand_hub \
+            -e POSTGRES_USER=ahand_hub \
+            -e POSTGRES_PASSWORD=ahand_hub \
+            postgres:16-alpine
+
+      - name: Start smoke-test redis
+        run: |
+          docker run -d --rm \
+            --network hub-release-smoke \
+            --name hub-release-redis \
+            redis:7-alpine
+
+      - name: Wait for smoke-test dependencies
+        run: |
+          until docker exec hub-release-postgres pg_isready -U ahand_hub -d ahand_hub; do sleep 1; done
+          until docker exec hub-release-redis redis-cli ping; do sleep 1; done
+
+      - name: Smoke-test hub startup
+        env:
+          AHAND_HUB_BIND_ADDR: 0.0.0.0:8080
+          AHAND_HUB_SERVICE_TOKEN: ci-service-token
+          AHAND_HUB_DASHBOARD_PASSWORD: ci-dashboard-password
+          AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN: ci-bootstrap-token
+          AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID: device-ci
+          AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS: http://127.0.0.1:13100
+          AHAND_HUB_JWT_SECRET: ci-jwt-secret
+          AHAND_HUB_DATABASE_URL: postgres://ahand_hub:ahand_hub@hub-release-postgres:5432/ahand_hub
+          AHAND_HUB_REDIS_URL: redis://hub-release-redis:6379
+          AHAND_HUB_AUDIT_FALLBACK_PATH: /var/lib/ahand-hub/audit-fallback.jsonl
+        run: |
+          docker run -d --rm \
+            --network hub-release-smoke \
+            --name hub-release-hub \
+            -p 18080:8080 \
+            -e AHAND_HUB_BIND_ADDR \
+            -e AHAND_HUB_SERVICE_TOKEN \
+            -e AHAND_HUB_DASHBOARD_PASSWORD \
+            -e AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN \
+            -e AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID \
+            -e AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS \
+            -e AHAND_HUB_JWT_SECRET \
+            -e AHAND_HUB_DATABASE_URL \
+            -e AHAND_HUB_REDIS_URL \
+            -e AHAND_HUB_AUDIT_FALLBACK_PATH \
+            -v hub-release-audit:/var/lib/ahand-hub \
+            ahand-hub:release-smoke
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/api/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs hub-release-hub
+          exit 1
+
+      - name: Smoke-test dashboard startup
+        env:
+          AHAND_HUB_BASE_URL: http://hub-release-hub:8080
+        run: |
+          docker run -d --rm \
+            --network hub-release-smoke \
+            --name hub-release-dashboard \
+            -p 13100:3100 \
+            -e AHAND_HUB_BASE_URL \
+            ahand-hub-dashboard:release-smoke
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:13100/login >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          dashboard_login=$(
+            curl -fsS \
+              -c /tmp/hub-release-dashboard.cookies \
+              -H 'content-type: application/json' \
+              -d '{"password":"ci-dashboard-password"}' \
+              http://127.0.0.1:13100/api/auth/login
+          )
+          dashboard_token=$(awk '$6 == "ahand_hub_session" { print $7 }' /tmp/hub-release-dashboard.cookies)
+
+          if [ -z "$dashboard_token" ]; then
+            echo "dashboard login did not return a token" >&2
+            printf '%s\n' "$dashboard_login" >&2
+            cat /tmp/hub-release-dashboard.cookies >&2
+            docker logs hub-release-dashboard
+            exit 1
+          fi
+
+          curl -fsS \
+            -b /tmp/hub-release-dashboard.cookies \
+            http://127.0.0.1:13100/api/proxy/api/auth/verify
+
+          DASHBOARD_SESSION="$dashboard_token" node --input-type=module <<'EOF'
+          import http from "node:http";
+
+          const request = http.request("http://127.0.0.1:13100/ws/dashboard", {
+            headers: {
+              Connection: "Upgrade",
+              Upgrade: "websocket",
+              "Sec-WebSocket-Version": "13",
+              "Sec-WebSocket-Key": "YWhhbmQtaHViLXNtb2tlIQ==",
+              Origin: "http://127.0.0.1:13100",
+              Cookie: `ahand_hub_session=${process.env.DASHBOARD_SESSION ?? ""}`,
+            },
+          });
+
+          const timeout = setTimeout(() => {
+            console.error("dashboard websocket handshake timed out");
+            request.destroy(new Error("dashboard websocket timeout"));
+          }, 5_000);
+
+          request.on("upgrade", (_response, socket) => {
+            clearTimeout(timeout);
+            socket.destroy();
+            process.exit(0);
+          });
+
+          request.on("response", (response) => {
+            clearTimeout(timeout);
+            console.error(`expected websocket upgrade, received ${response.statusCode}`);
+            process.exit(1);
+          });
+
+          request.on("error", (error) => {
+            clearTimeout(timeout);
+            console.error(error);
+            process.exit(1);
+          });
+
+          request.end();
+          EOF
+
   build:
+    needs: smoke
     strategy:
       matrix:
         include:
