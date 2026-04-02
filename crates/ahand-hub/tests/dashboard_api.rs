@@ -188,19 +188,29 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
 
     let since = (Utc::now() - ChronoDuration::minutes(5))
         .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let audit_response = server
-        .get(
-            &format!("/api/audit-logs?action=job.finished&since={since}"),
-            &token,
-        )
-        .await;
-    assert_eq!(audit_response.status(), reqwest::StatusCode::OK);
-    let audit: Value = audit_response.json().await.unwrap();
-    let audit = audit
-        .as_array()
-        .expect("audit log response should be an array");
-    assert_eq!(audit.len(), 1);
-    assert_eq!(audit[0]["action"], "job.finished");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        let audit_response = server
+            .get(
+                &format!("/api/audit-logs?action=job.finished&since={since}"),
+                &token,
+            )
+            .await;
+        assert_eq!(audit_response.status(), reqwest::StatusCode::OK);
+        let audit: Value = audit_response.json().await.unwrap();
+        let audit = audit
+            .as_array()
+            .expect("audit log response should be an array");
+        if audit.len() == 1 {
+            assert_eq!(audit[0]["action"], "job.finished");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for buffered audit entry to flush"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]
