@@ -53,10 +53,11 @@ message Hello {
   string os         = 3;
   repeated string capabilities = 4;
   uint64 last_ack   = 5;  // on reconnect, the highest seq received from peer
+  reserved 7;
+  reserved "bearer_token";
 
   oneof auth {
     Ed25519Auth ed25519 = 6;
-    string bearer_token = 7;
     BootstrapAuth bootstrap = 8;
   }
 }

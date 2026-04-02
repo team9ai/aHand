@@ -68,6 +68,7 @@ export interface Envelope {
   seq: number;
   ack: number;
   tsMs: number;
+  helloChallenge?: HelloChallenge | undefined;
   hello?: Hello | undefined;
   jobRequest?: JobRequest | undefined;
   jobEvent?: JobEvent | undefined;
@@ -93,6 +94,18 @@ export interface Envelope {
   sessionQuery?: SessionQuery | undefined;
   browserRequest?: BrowserRequest | undefined;
   browserResponse?: BrowserResponse | undefined;
+  helloAccepted?: HelloAccepted | undefined;
+}
+
+/** HelloChallenge - server nonce that must be signed in the initial Hello response. */
+export interface HelloChallenge {
+  nonce: Buffer;
+  issuedAtMs: number;
+}
+
+/** Hello - initial handshake after WS connection. */
+export interface HelloAccepted {
+  authMethod: string;
 }
 
 /** Hello - initial handshake after WS connection. */
@@ -104,10 +117,17 @@ export interface Hello {
   /** on reconnect, the highest seq received from peer */
   lastAck: number;
   ed25519?: Ed25519Auth | undefined;
-  bearerToken?: string | undefined;
+  bootstrap?: BootstrapAuth | undefined;
 }
 
 export interface Ed25519Auth {
+  publicKey: Buffer;
+  signature: Buffer;
+  signedAtMs: number;
+}
+
+export interface BootstrapAuth {
+  bearerToken: string;
   publicKey: Buffer;
   signature: Buffer;
   signedAtMs: number;
@@ -253,6 +273,7 @@ function createBaseEnvelope(): Envelope {
     seq: 0,
     ack: 0,
     tsMs: 0,
+    helloChallenge: undefined,
     hello: undefined,
     jobRequest: undefined,
     jobEvent: undefined,
@@ -269,6 +290,7 @@ function createBaseEnvelope(): Envelope {
     sessionQuery: undefined,
     browserRequest: undefined,
     browserResponse: undefined,
+    helloAccepted: undefined,
   };
 }
 
@@ -291,6 +313,9 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.tsMs !== 0) {
       writer.uint32(48).uint64(message.tsMs);
+    }
+    if (message.helloChallenge !== undefined) {
+      HelloChallenge.encode(message.helloChallenge, writer.uint32(74).fork()).join();
     }
     if (message.hello !== undefined) {
       Hello.encode(message.hello, writer.uint32(82).fork()).join();
@@ -339,6 +364,9 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.browserResponse !== undefined) {
       BrowserResponse.encode(message.browserResponse, writer.uint32(202).fork()).join();
+    }
+    if (message.helloAccepted !== undefined) {
+      HelloAccepted.encode(message.helloAccepted, writer.uint32(210).fork()).join();
     }
     return writer;
   },
@@ -396,6 +424,14 @@ export const Envelope: MessageFns<Envelope> = {
           }
 
           message.tsMs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.helloChallenge = HelloChallenge.decode(reader, reader.uint32());
           continue;
         }
         case 10: {
@@ -526,6 +562,14 @@ export const Envelope: MessageFns<Envelope> = {
           message.browserResponse = BrowserResponse.decode(reader, reader.uint32());
           continue;
         }
+        case 26: {
+          if (tag !== 210) {
+            break;
+          }
+
+          message.helloAccepted = HelloAccepted.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -559,6 +603,11 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.ts_ms)
         ? globalThis.Number(object.ts_ms)
         : 0,
+      helloChallenge: isSet(object.helloChallenge)
+        ? HelloChallenge.fromJSON(object.helloChallenge)
+        : isSet(object.hello_challenge)
+        ? HelloChallenge.fromJSON(object.hello_challenge)
+        : undefined,
       hello: isSet(object.hello) ? Hello.fromJSON(object.hello) : undefined,
       jobRequest: isSet(object.jobRequest)
         ? JobRequest.fromJSON(object.jobRequest)
@@ -635,6 +684,11 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.browser_response)
         ? BrowserResponse.fromJSON(object.browser_response)
         : undefined,
+      helloAccepted: isSet(object.helloAccepted)
+        ? HelloAccepted.fromJSON(object.helloAccepted)
+        : isSet(object.hello_accepted)
+        ? HelloAccepted.fromJSON(object.hello_accepted)
+        : undefined,
     };
   },
 
@@ -657,6 +711,9 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.tsMs !== 0) {
       obj.tsMs = Math.round(message.tsMs);
+    }
+    if (message.helloChallenge !== undefined) {
+      obj.helloChallenge = HelloChallenge.toJSON(message.helloChallenge);
     }
     if (message.hello !== undefined) {
       obj.hello = Hello.toJSON(message.hello);
@@ -706,6 +763,9 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.browserResponse !== undefined) {
       obj.browserResponse = BrowserResponse.toJSON(message.browserResponse);
     }
+    if (message.helloAccepted !== undefined) {
+      obj.helloAccepted = HelloAccepted.toJSON(message.helloAccepted);
+    }
     return obj;
   },
 
@@ -720,6 +780,9 @@ export const Envelope: MessageFns<Envelope> = {
     message.seq = object.seq ?? 0;
     message.ack = object.ack ?? 0;
     message.tsMs = object.tsMs ?? 0;
+    message.helloChallenge = (object.helloChallenge !== undefined && object.helloChallenge !== null)
+      ? HelloChallenge.fromPartial(object.helloChallenge)
+      : undefined;
     message.hello = (object.hello !== undefined && object.hello !== null) ? Hello.fromPartial(object.hello) : undefined;
     message.jobRequest = (object.jobRequest !== undefined && object.jobRequest !== null)
       ? JobRequest.fromPartial(object.jobRequest)
@@ -766,20 +829,159 @@ export const Envelope: MessageFns<Envelope> = {
     message.browserResponse = (object.browserResponse !== undefined && object.browserResponse !== null)
       ? BrowserResponse.fromPartial(object.browserResponse)
       : undefined;
+    message.helloAccepted = (object.helloAccepted !== undefined && object.helloAccepted !== null)
+      ? HelloAccepted.fromPartial(object.helloAccepted)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseHelloChallenge(): HelloChallenge {
+  return { nonce: Buffer.alloc(0), issuedAtMs: 0 };
+}
+
+export const HelloChallenge: MessageFns<HelloChallenge> = {
+  encode(message: HelloChallenge, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.nonce.length !== 0) {
+      writer.uint32(10).bytes(message.nonce);
+    }
+    if (message.issuedAtMs !== 0) {
+      writer.uint32(16).uint64(message.issuedAtMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): HelloChallenge {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseHelloChallenge();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.nonce = Buffer.from(reader.bytes());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.issuedAtMs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): HelloChallenge {
+    return {
+      nonce: isSet(object.nonce) ? Buffer.from(bytesFromBase64(object.nonce)) : Buffer.alloc(0),
+      issuedAtMs: isSet(object.issuedAtMs)
+        ? globalThis.Number(object.issuedAtMs)
+        : isSet(object.issued_at_ms)
+        ? globalThis.Number(object.issued_at_ms)
+        : 0,
+    };
+  },
+
+  toJSON(message: HelloChallenge): unknown {
+    const obj: any = {};
+    if (message.nonce.length !== 0) {
+      obj.nonce = base64FromBytes(message.nonce);
+    }
+    if (message.issuedAtMs !== 0) {
+      obj.issuedAtMs = Math.round(message.issuedAtMs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<HelloChallenge>): HelloChallenge {
+    return HelloChallenge.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<HelloChallenge>): HelloChallenge {
+    const message = createBaseHelloChallenge();
+    message.nonce = object.nonce ?? Buffer.alloc(0);
+    message.issuedAtMs = object.issuedAtMs ?? 0;
+    return message;
+  },
+};
+
+function createBaseHelloAccepted(): HelloAccepted {
+  return { authMethod: "" };
+}
+
+export const HelloAccepted: MessageFns<HelloAccepted> = {
+  encode(message: HelloAccepted, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.authMethod !== "") {
+      writer.uint32(10).string(message.authMethod);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): HelloAccepted {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseHelloAccepted();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.authMethod = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): HelloAccepted {
+    return {
+      authMethod: isSet(object.authMethod)
+        ? globalThis.String(object.authMethod)
+        : isSet(object.auth_method)
+        ? globalThis.String(object.auth_method)
+        : "",
+    };
+  },
+
+  toJSON(message: HelloAccepted): unknown {
+    const obj: any = {};
+    if (message.authMethod !== "") {
+      obj.authMethod = message.authMethod;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<HelloAccepted>): HelloAccepted {
+    return HelloAccepted.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<HelloAccepted>): HelloAccepted {
+    const message = createBaseHelloAccepted();
+    message.authMethod = object.authMethod ?? "";
     return message;
   },
 };
 
 function createBaseHello(): Hello {
-  return {
-    version: "",
-    hostname: "",
-    os: "",
-    capabilities: [],
-    lastAck: 0,
-    ed25519: undefined,
-    bearerToken: undefined,
-  };
+  return { version: "", hostname: "", os: "", capabilities: [], lastAck: 0, ed25519: undefined, bootstrap: undefined };
 }
 
 export const Hello: MessageFns<Hello> = {
@@ -802,8 +1004,8 @@ export const Hello: MessageFns<Hello> = {
     if (message.ed25519 !== undefined) {
       Ed25519Auth.encode(message.ed25519, writer.uint32(50).fork()).join();
     }
-    if (message.bearerToken !== undefined) {
-      writer.uint32(58).string(message.bearerToken);
+    if (message.bootstrap !== undefined) {
+      BootstrapAuth.encode(message.bootstrap, writer.uint32(66).fork()).join();
     }
     return writer;
   },
@@ -863,12 +1065,12 @@ export const Hello: MessageFns<Hello> = {
           message.ed25519 = Ed25519Auth.decode(reader, reader.uint32());
           continue;
         }
-        case 7: {
-          if (tag !== 58) {
+        case 8: {
+          if (tag !== 66) {
             break;
           }
 
-          message.bearerToken = reader.string();
+          message.bootstrap = BootstrapAuth.decode(reader, reader.uint32());
           continue;
         }
       }
@@ -894,11 +1096,7 @@ export const Hello: MessageFns<Hello> = {
         ? globalThis.Number(object.last_ack)
         : 0,
       ed25519: isSet(object.ed25519) ? Ed25519Auth.fromJSON(object.ed25519) : undefined,
-      bearerToken: isSet(object.bearerToken)
-        ? globalThis.String(object.bearerToken)
-        : isSet(object.bearer_token)
-        ? globalThis.String(object.bearer_token)
-        : undefined,
+      bootstrap: isSet(object.bootstrap) ? BootstrapAuth.fromJSON(object.bootstrap) : undefined,
     };
   },
 
@@ -922,8 +1120,8 @@ export const Hello: MessageFns<Hello> = {
     if (message.ed25519 !== undefined) {
       obj.ed25519 = Ed25519Auth.toJSON(message.ed25519);
     }
-    if (message.bearerToken !== undefined) {
-      obj.bearerToken = message.bearerToken;
+    if (message.bootstrap !== undefined) {
+      obj.bootstrap = BootstrapAuth.toJSON(message.bootstrap);
     }
     return obj;
   },
@@ -941,7 +1139,9 @@ export const Hello: MessageFns<Hello> = {
     message.ed25519 = (object.ed25519 !== undefined && object.ed25519 !== null)
       ? Ed25519Auth.fromPartial(object.ed25519)
       : undefined;
-    message.bearerToken = object.bearerToken ?? undefined;
+    message.bootstrap = (object.bootstrap !== undefined && object.bootstrap !== null)
+      ? BootstrapAuth.fromPartial(object.bootstrap)
+      : undefined;
     return message;
   },
 };
@@ -1039,6 +1239,126 @@ export const Ed25519Auth: MessageFns<Ed25519Auth> = {
   },
   fromPartial(object: DeepPartial<Ed25519Auth>): Ed25519Auth {
     const message = createBaseEd25519Auth();
+    message.publicKey = object.publicKey ?? Buffer.alloc(0);
+    message.signature = object.signature ?? Buffer.alloc(0);
+    message.signedAtMs = object.signedAtMs ?? 0;
+    return message;
+  },
+};
+
+function createBaseBootstrapAuth(): BootstrapAuth {
+  return { bearerToken: "", publicKey: Buffer.alloc(0), signature: Buffer.alloc(0), signedAtMs: 0 };
+}
+
+export const BootstrapAuth: MessageFns<BootstrapAuth> = {
+  encode(message: BootstrapAuth, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.bearerToken !== "") {
+      writer.uint32(10).string(message.bearerToken);
+    }
+    if (message.publicKey.length !== 0) {
+      writer.uint32(18).bytes(message.publicKey);
+    }
+    if (message.signature.length !== 0) {
+      writer.uint32(26).bytes(message.signature);
+    }
+    if (message.signedAtMs !== 0) {
+      writer.uint32(32).uint64(message.signedAtMs);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BootstrapAuth {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseBootstrapAuth();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.bearerToken = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.publicKey = Buffer.from(reader.bytes());
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.signature = Buffer.from(reader.bytes());
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.signedAtMs = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): BootstrapAuth {
+    return {
+      bearerToken: isSet(object.bearerToken)
+        ? globalThis.String(object.bearerToken)
+        : isSet(object.bearer_token)
+        ? globalThis.String(object.bearer_token)
+        : "",
+      publicKey: isSet(object.publicKey)
+        ? Buffer.from(bytesFromBase64(object.publicKey))
+        : isSet(object.public_key)
+        ? Buffer.from(bytesFromBase64(object.public_key))
+        : Buffer.alloc(0),
+      signature: isSet(object.signature) ? Buffer.from(bytesFromBase64(object.signature)) : Buffer.alloc(0),
+      signedAtMs: isSet(object.signedAtMs)
+        ? globalThis.Number(object.signedAtMs)
+        : isSet(object.signed_at_ms)
+        ? globalThis.Number(object.signed_at_ms)
+        : 0,
+    };
+  },
+
+  toJSON(message: BootstrapAuth): unknown {
+    const obj: any = {};
+    if (message.bearerToken !== "") {
+      obj.bearerToken = message.bearerToken;
+    }
+    if (message.publicKey.length !== 0) {
+      obj.publicKey = base64FromBytes(message.publicKey);
+    }
+    if (message.signature.length !== 0) {
+      obj.signature = base64FromBytes(message.signature);
+    }
+    if (message.signedAtMs !== 0) {
+      obj.signedAtMs = Math.round(message.signedAtMs);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BootstrapAuth>): BootstrapAuth {
+    return BootstrapAuth.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BootstrapAuth>): BootstrapAuth {
+    const message = createBaseBootstrapAuth();
+    message.bearerToken = object.bearerToken ?? "";
     message.publicKey = object.publicKey ?? Buffer.alloc(0);
     message.signature = object.signature ?? Buffer.alloc(0);
     message.signedAtMs = object.signedAtMs ?? 0;

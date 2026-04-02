@@ -1,6 +1,8 @@
 mod support;
 
 use ahand_hub::config::{Config, StoreConfig};
+use ahand_hub::state::MemoryDeviceStore;
+use ahand_hub_core::HubError;
 use ahand_hub_core::audit::AuditFilter;
 use ahand_hub_core::job::JobFilter;
 use ahand_hub_store::test_support::TestStack;
@@ -111,6 +113,23 @@ async fn persistent_presence_is_refreshed_while_device_socket_stays_open() -> an
         .get_json("/api/devices/device-2", "service-test-token")
         .await;
     assert_eq!(device["online"], true);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_mark_online_rejects_missing_device_without_leaking_presence()
+-> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let devices = MemoryDeviceStore::with_persistent(stack.devices.clone());
+
+    let err = devices
+        .mark_online("missing-device", "ws")
+        .await
+        .unwrap_err();
+
+    assert_eq!(err, HubError::DeviceNotFound("missing-device".into()));
+    assert!(!stack.presence.is_online("missing-device").await?);
 
     Ok(())
 }

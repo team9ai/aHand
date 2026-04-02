@@ -316,54 +316,71 @@ pub async fn read_hello_accepted(
 }
 
 pub fn signed_hello(device_id: &str, challenge_nonce: &[u8]) -> Envelope {
-    signed_hello_with_key_at(
-        device_id,
-        &SigningKey::from_bytes(&[7u8; 32]),
-        now_ms(),
-        challenge_nonce,
-    )
+    signed_hello_with_last_ack(device_id, 0, challenge_nonce)
 }
 
-pub fn signed_hello_at(device_id: &str, signed_at_ms: u64, challenge_nonce: &[u8]) -> Envelope {
+pub fn signed_hello_with_last_ack(
+    device_id: &str,
+    last_ack: u64,
+    challenge_nonce: &[u8],
+) -> Envelope {
+    signed_hello_with_last_ack_at(device_id, last_ack, now_ms(), challenge_nonce)
+}
+
+pub fn signed_hello_with_last_ack_at(
+    device_id: &str,
+    last_ack: u64,
+    signed_at_ms: u64,
+    challenge_nonce: &[u8],
+) -> Envelope {
     signed_hello_with_key_at(
         device_id,
         &SigningKey::from_bytes(&[7u8; 32]),
+        last_ack,
         signed_at_ms,
         challenge_nonce,
     )
 }
 
+pub fn signed_hello_at(device_id: &str, signed_at_ms: u64, challenge_nonce: &[u8]) -> Envelope {
+    signed_hello_with_last_ack_at(device_id, 0, signed_at_ms, challenge_nonce)
+}
+
 pub fn signed_hello_with_key_at(
     device_id: &str,
     signing_key: &SigningKey,
+    last_ack: u64,
     signed_at_ms: u64,
     challenge_nonce: &[u8],
 ) -> Envelope {
+    let mut hello = Hello {
+        version: "0.1.2".into(),
+        hostname: "devbox".into(),
+        os: "linux".into(),
+        capabilities: vec!["exec".into()],
+        last_ack,
+        auth: None,
+    };
     let signature = signing_key
         .sign(&ahand_protocol::build_hello_auth_payload(
             device_id,
+            &hello,
             signed_at_ms,
             challenge_nonce,
         ))
         .to_bytes()
         .to_vec();
+    hello.auth = Some(hello::Auth::Ed25519(Ed25519Auth {
+        public_key: signing_key.verifying_key().to_bytes().to_vec(),
+        signature,
+        signed_at_ms,
+    }));
 
     Envelope {
         device_id: device_id.into(),
         msg_id: "hello-1".into(),
         ts_ms: signed_at_ms,
-        payload: Some(envelope::Payload::Hello(Hello {
-            version: "0.1.2".into(),
-            hostname: "devbox".into(),
-            os: "linux".into(),
-            capabilities: vec!["exec".into()],
-            last_ack: 0,
-            auth: Some(hello::Auth::Ed25519(Ed25519Auth {
-                public_key: signing_key.verifying_key().to_bytes().to_vec(),
-                signature,
-                signed_at_ms,
-            })),
-        })),
+        payload: Some(envelope::Payload::Hello(hello)),
         ..Default::default()
     }
 }
@@ -371,32 +388,35 @@ pub fn signed_hello_with_key_at(
 pub fn bootstrap_hello(device_id: &str, token: &str, challenge_nonce: &[u8]) -> Envelope {
     let signed_at_ms = now_ms();
     let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let mut hello = Hello {
+        version: "0.1.2".into(),
+        hostname: "bootstrap-box".into(),
+        os: "linux".into(),
+        capabilities: vec!["exec".into()],
+        last_ack: 0,
+        auth: None,
+    };
     let signature = signing_key
         .sign(&ahand_protocol::build_hello_auth_payload(
             device_id,
+            &hello,
             signed_at_ms,
             challenge_nonce,
         ))
         .to_bytes()
         .to_vec();
+    hello.auth = Some(hello::Auth::Bootstrap(BootstrapAuth {
+        bearer_token: token.into(),
+        public_key: signing_key.verifying_key().to_bytes().to_vec(),
+        signature,
+        signed_at_ms,
+    }));
 
     Envelope {
         device_id: device_id.into(),
         msg_id: "hello-bootstrap-1".into(),
         ts_ms: signed_at_ms,
-        payload: Some(envelope::Payload::Hello(Hello {
-            version: "0.1.2".into(),
-            hostname: "bootstrap-box".into(),
-            os: "linux".into(),
-            capabilities: vec!["exec".into()],
-            last_ack: 0,
-            auth: Some(hello::Auth::Bootstrap(BootstrapAuth {
-                bearer_token: token.into(),
-                public_key: signing_key.verifying_key().to_bytes().to_vec(),
-                signature,
-                signed_at_ms,
-            })),
-        })),
+        payload: Some(envelope::Payload::Hello(hello)),
         ..Default::default()
     }
 }

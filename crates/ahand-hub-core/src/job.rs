@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::{HubError, Result};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum JobStatus {
@@ -19,9 +22,13 @@ pub fn is_terminal_status(status: JobStatus) -> bool {
     )
 }
 
-pub fn resolve_status_transition(current: JobStatus, requested: JobStatus) -> JobStatus {
-    if current == requested || is_terminal_status(current) {
-        return current;
+pub fn resolve_status_transition(current: JobStatus, requested: JobStatus) -> Result<JobStatus> {
+    if current == requested {
+        return Ok(current);
+    }
+
+    if is_terminal_status(current) {
+        return Err(HubError::IllegalJobTransition { current, requested });
     }
 
     match (current, requested) {
@@ -36,8 +43,8 @@ pub fn resolve_status_transition(current: JobStatus, requested: JobStatus) -> Jo
         | (JobStatus::Sent, JobStatus::Cancelled)
         | (JobStatus::Running, JobStatus::Finished)
         | (JobStatus::Running, JobStatus::Failed)
-        | (JobStatus::Running, JobStatus::Cancelled) => requested,
-        _ => current,
+        | (JobStatus::Running, JobStatus::Cancelled) => Ok(requested),
+        _ => Err(HubError::IllegalJobTransition { current, requested }),
     }
 }
 
@@ -51,7 +58,60 @@ pub struct Job {
     pub env: HashMap<String, String>,
     pub timeout_ms: u64,
     pub status: JobStatus,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    pub output_summary: Option<String>,
     pub requested_by: String,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl Job {
+    pub fn new_pending(id: uuid::Uuid, job: NewJob, created_at: DateTime<Utc>) -> Self {
+        Self {
+            id,
+            device_id: job.device_id,
+            tool: job.tool,
+            args: job.args,
+            cwd: job.cwd,
+            env: job.env,
+            timeout_ms: job.timeout_ms,
+            status: JobStatus::Pending,
+            exit_code: None,
+            error: None,
+            output_summary: None,
+            requested_by: job.requested_by,
+            created_at,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    pub fn apply_status_transition(&mut self, next_status: JobStatus, at: DateTime<Utc>) {
+        if matches!(
+            next_status,
+            JobStatus::Running | JobStatus::Finished | JobStatus::Failed | JobStatus::Cancelled
+        ) && self.started_at.is_none()
+        {
+            self.started_at = Some(at);
+        }
+        if is_terminal_status(next_status) {
+            self.finished_at = Some(at);
+        }
+        self.status = next_status;
+    }
+
+    pub fn record_terminal_outcome(
+        &mut self,
+        exit_code: i32,
+        error: String,
+        output_summary: String,
+    ) {
+        self.exit_code = Some(exit_code);
+        self.error = Some(error);
+        self.output_summary = Some(output_summary);
+    }
 }
 
 #[derive(Debug, Clone)]

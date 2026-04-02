@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::job::JobStatus;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum HubError {
     #[error("device not found: {0}")]
@@ -10,6 +12,11 @@ pub enum HubError {
     JobNotFound(String),
     #[error("job not cancellable: {0}")]
     JobNotCancellable(String),
+    #[error("illegal job transition: {current:?} -> {requested:?}")]
+    IllegalJobTransition {
+        current: JobStatus,
+        requested: JobStatus,
+    },
     #[error("unauthorized")]
     Unauthorized,
     #[error("forbidden")]

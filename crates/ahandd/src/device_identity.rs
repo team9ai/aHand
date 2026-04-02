@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::{fs::OpenOptions, io::Write};
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -52,11 +52,16 @@ impl DeviceIdentity {
     pub fn sign_hello(
         &self,
         device_id: &str,
+        hello: &ahand_protocol::Hello,
         signed_at_ms: u64,
         challenge_nonce: &[u8],
     ) -> Vec<u8> {
-        let payload =
-            ahand_protocol::build_hello_auth_payload(device_id, signed_at_ms, challenge_nonce);
+        let payload = ahand_protocol::build_hello_auth_payload(
+            device_id,
+            hello,
+            signed_at_ms,
+            challenge_nonce,
+        );
         self.signing_key.sign(&payload).to_bytes().to_vec()
     }
 

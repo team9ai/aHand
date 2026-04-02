@@ -110,6 +110,8 @@ impl JobRuntime {
         if let Err(err) = self.connections.send(&job.device_id, envelope) {
             self.transition_job(&job.id.to_string(), JobStatus::Failed, "hub:dispatch")
                 .await?;
+            self.record_terminal_state(&job.id.to_string(), -1, &err.to_string())
+                .await?;
             self.output_stream
                 .push_finished(&job.id.to_string(), -1, &err.to_string())
                 .await?;
@@ -213,6 +215,8 @@ impl JobRuntime {
                 };
                 self.transition_job(&finished.job_id, status, &format!("device:{device_id}"))
                     .await?;
+                self.record_terminal_state(&finished.job_id, finished.exit_code, &finished.error)
+                    .await?;
                 self.output_stream
                     .push_finished(&finished.job_id, finished.exit_code, &finished.error)
                     .await?;
@@ -230,6 +234,8 @@ impl JobRuntime {
                     &format!("device:{device_id}"),
                 )
                 .await?;
+                self.record_terminal_state(&rejected.job_id, -1, &rejected.reason)
+                    .await?;
                 self.output_stream
                     .push_finished(&rejected.job_id, -1, &rejected.reason)
                     .await?;
@@ -273,6 +279,19 @@ impl JobRuntime {
             tracing::warn!(job_id, error = %err, "failed to write job audit event");
         }
         Ok(job.status)
+    }
+
+    async fn record_terminal_state(
+        &self,
+        job_id: &str,
+        exit_code: i32,
+        error: &str,
+    ) -> anyhow::Result<()> {
+        let output_summary = build_output_summary(exit_code, error);
+        self.jobs
+            .update_terminal(job_id, exit_code, error, &output_summary)
+            .await?;
+        Ok(())
     }
 }
 
@@ -422,6 +441,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn build_output_summary(exit_code: i32, error: &str) -> String {
+    let summary = if !error.is_empty() {
+        error.to_string()
+    } else if exit_code == 0 {
+        "completed successfully".to_string()
+    } else {
+        format!("exit code {exit_code}")
+    };
+
+    summary.chars().take(1024).collect()
+}
+
 fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<u64>, StatusCode> {
     let Some(value) = headers.get(HeaderName::from_static("last-event-id")) else {
         return Ok(None);
@@ -529,6 +560,16 @@ mod tests {
         let jobs = jobs.list(JobFilter::default()).await.unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].status, JobStatus::Failed);
+        assert_eq!(jobs[0].exit_code, Some(-1));
+        assert!(
+            jobs[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("device-1")
+        );
+        assert!(jobs[0].output_summary.is_some());
+        assert!(jobs[0].finished_at.is_some());
         let audit_entries = audit
             .query(AuditFilter {
                 resource_type: Some("job".into()),
@@ -638,6 +679,7 @@ mod tests {
 
         let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
         assert_eq!(stored.status, JobStatus::Running);
+        assert!(stored.started_at.is_some());
         let audit_entries = audit
             .query(AuditFilter {
                 resource_type: Some("job".into()),
@@ -686,6 +728,10 @@ mod tests {
 
         let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
         assert_eq!(stored.status, JobStatus::Cancelled);
+        assert_eq!(stored.exit_code, Some(-1));
+        assert_eq!(stored.error.as_deref(), Some("cancelled"));
+        assert_eq!(stored.output_summary.as_deref(), Some("cancelled"));
+        assert!(stored.finished_at.is_some());
         let audit_entries = audit
             .query(AuditFilter {
                 resource_type: Some("job".into()),
@@ -734,6 +780,13 @@ mod tests {
 
         let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
         assert_eq!(stored.status, JobStatus::Finished);
+        assert_eq!(stored.exit_code, Some(0));
+        assert_eq!(stored.error.as_deref(), Some(""));
+        assert_eq!(
+            stored.output_summary.as_deref(),
+            Some("completed successfully")
+        );
+        assert!(stored.finished_at.is_some());
         let audit_entries = audit
             .query(AuditFilter {
                 resource_type: Some("job".into()),

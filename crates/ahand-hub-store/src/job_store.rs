@@ -2,6 +2,7 @@ use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, resolve_status_tran
 use ahand_hub_core::traits::JobStore;
 use ahand_hub_core::{HubError, Result};
 use async_trait::async_trait;
+use chrono::Utc;
 use sqlx::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
@@ -56,7 +57,8 @@ impl JobStore for PgJobStore {
             Uuid::parse_str(job_id).map_err(|err| HubError::InvalidToken(err.to_string()))?;
         let row = sqlx::query(
             r#"
-            SELECT id, device_id, tool, args, cwd, env, timeout_ms, status, requested_by
+            SELECT id, device_id, tool, args, cwd, env, timeout_ms, status, exit_code, error,
+                   output_summary, requested_by, created_at, started_at, finished_at
             FROM jobs
             WHERE id = $1
             "#,
@@ -73,7 +75,8 @@ impl JobStore for PgJobStore {
         let status = filter.status.map(encode_status);
         let rows = sqlx::query(
             r#"
-            SELECT id, device_id, tool, args, cwd, env, timeout_ms, status, requested_by
+            SELECT id, device_id, tool, args, cwd, env, timeout_ms, status, exit_code, error,
+                   output_summary, requested_by, created_at, started_at, finished_at
             FROM jobs
             WHERE ($1::text IS NULL OR device_id = $1)
               AND ($2::text IS NULL OR status = $2)
@@ -96,17 +99,66 @@ impl JobStore for PgJobStore {
             .get(job_id)
             .await?
             .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
-        let next_status = resolve_status_transition(current.status, status);
-        if next_status == current.status {
+        if current.status == status {
             return Ok(());
         }
+        let next_status = resolve_status_transition(current.status, status)?;
+        let transitioned_at = Utc::now();
 
-        let result = sqlx::query("UPDATE jobs SET status = $2 WHERE id = $1")
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET status = $2,
+                started_at = CASE
+                    WHEN $2 IN ('running', 'finished', 'failed', 'cancelled') AND started_at IS NULL THEN $3
+                    ELSE started_at
+                END,
+                finished_at = CASE
+                    WHEN $2 IN ('finished', 'failed', 'cancelled') THEN $3
+                    ELSE finished_at
+                END
+            WHERE id = $1
+            "#,
+        )
             .bind(parsed)
             .bind(encode_status(next_status))
+            .bind(transitioned_at)
             .execute(&self.pool)
             .await
             .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        if result.rows_affected() == 0 {
+            return Err(HubError::JobNotFound(job_id.into()));
+        }
+
+        Ok(())
+    }
+
+    async fn update_terminal(
+        &self,
+        job_id: &str,
+        exit_code: i32,
+        error: &str,
+        output_summary: &str,
+    ) -> Result<()> {
+        let parsed =
+            Uuid::parse_str(job_id).map_err(|err| HubError::InvalidToken(err.to_string()))?;
+        let result = sqlx::query(
+            r#"
+            UPDATE jobs
+            SET exit_code = $2,
+                error = $3,
+                output_summary = $4
+            WHERE id = $1
+            "#,
+        )
+        .bind(parsed)
+        .bind(exit_code)
+        .bind(error)
+        .bind(output_summary)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| HubError::Internal(err.to_string()))?;
 
         if result.rows_affected() == 0 {
             return Err(HubError::JobNotFound(job_id.into()));
@@ -147,8 +199,26 @@ fn map_job(row: sqlx::postgres::PgRow) -> Result<Job> {
         )
         .map_err(|err| HubError::Internal(err.to_string()))?,
         status: decode_status(&status)?,
+        exit_code: row
+            .try_get("exit_code")
+            .map_err(|err| HubError::Internal(err.to_string()))?,
+        error: row
+            .try_get("error")
+            .map_err(|err| HubError::Internal(err.to_string()))?,
+        output_summary: row
+            .try_get("output_summary")
+            .map_err(|err| HubError::Internal(err.to_string()))?,
         requested_by: row
             .try_get("requested_by")
+            .map_err(|err| HubError::Internal(err.to_string()))?,
+        created_at: row
+            .try_get("created_at")
+            .map_err(|err| HubError::Internal(err.to_string()))?,
+        started_at: row
+            .try_get("started_at")
+            .map_err(|err| HubError::Internal(err.to_string()))?,
+        finished_at: row
+            .try_get("finished_at")
             .map_err(|err| HubError::Internal(err.to_string()))?,
     })
 }

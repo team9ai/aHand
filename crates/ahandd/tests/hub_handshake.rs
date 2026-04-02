@@ -1,6 +1,6 @@
 use ahand_protocol::hello;
-use ahandd::config::Config;
 use ahandd::ahand_client::HelloAuthMode;
+use ahandd::config::Config;
 use ahandd::device_identity::DeviceIdentity;
 
 #[test]

@@ -52,10 +52,11 @@ impl JobDispatcher {
         let Some(job) = self.jobs.get(job_id).await? else {
             return Err(HubError::JobNotFound(job_id.into()));
         };
-        let next_status = resolve_status_transition(job.status, status);
-        if next_status == job.status {
+        if job.status == status {
             return Ok(None);
         }
+
+        let next_status = resolve_status_transition(job.status, status)?;
 
         self.jobs.update_status(job_id, next_status).await?;
         Ok(Some(next_status))

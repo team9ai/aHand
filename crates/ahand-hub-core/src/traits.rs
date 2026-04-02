@@ -19,6 +19,13 @@ pub trait JobStore: Send + Sync {
     async fn get(&self, job_id: &str) -> Result<Option<Job>>;
     async fn list(&self, filter: JobFilter) -> Result<Vec<Job>>;
     async fn update_status(&self, job_id: &str, status: JobStatus) -> Result<()>;
+    async fn update_terminal(
+        &self,
+        job_id: &str,
+        exit_code: i32,
+        error: &str,
+        output_summary: &str,
+    ) -> Result<()>;
 }
 
 #[async_trait]

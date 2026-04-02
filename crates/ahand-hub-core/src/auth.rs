@@ -42,7 +42,11 @@ impl AuthService {
     }
 
     pub fn verify_jwt(&self, token: &str) -> Result<AuthContext> {
-        decode::<AuthContext>(token, &self.decoding_key, &Validation::default())
+        let mut validation = Validation::default();
+        validation.set_issuer(&["ahand-hub"]);
+        validation.set_required_spec_claims(&["exp", "iss"]);
+
+        decode::<AuthContext>(token, &self.decoding_key, &validation)
             .map(|data| data.claims)
             .map_err(|err| HubError::InvalidToken(err.to_string()))
     }

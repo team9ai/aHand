@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use ahand_protocol::{
-    envelope, hello, BrowserResponse, Envelope, Hello, HelloAccepted, HelloChallenge, JobFinished,
-    JobRejected,
+    BrowserResponse, Envelope, Hello, HelloAccepted, HelloChallenge, JobFinished, JobRejected,
+    envelope, hello,
 };
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -15,7 +15,7 @@ use crate::browser::BrowserManager;
 use crate::config::Config;
 use crate::device_identity::DeviceIdentity;
 use crate::executor;
-use crate::outbox::{prepare_outbound, Outbox};
+use crate::outbox::{Outbox, prepare_outbound};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::{Direction, RunStore};
@@ -325,17 +325,27 @@ pub fn build_hello_envelope(
         capabilities.push("browser".to_string());
     }
 
-    let auth = if let Some(token) = bearer_token {
+    let mut hello = Hello {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        hostname: gethostname::gethostname().to_string_lossy().to_string(),
+        os: std::env::consts::OS.to_string(),
+        capabilities,
+        last_ack,
+        auth: None,
+    };
+
+    let signature = identity.sign_hello(device_id, &hello, signed_at_ms, challenge_nonce);
+    hello.auth = if let Some(token) = bearer_token {
         Some(hello::Auth::Bootstrap(ahand_protocol::BootstrapAuth {
             bearer_token: token,
             public_key: identity.public_key_bytes(),
-            signature: identity.sign_hello(device_id, signed_at_ms, challenge_nonce),
+            signature,
             signed_at_ms,
         }))
     } else {
         Some(hello::Auth::Ed25519(ahand_protocol::Ed25519Auth {
             public_key: identity.public_key_bytes(),
-            signature: identity.sign_hello(device_id, signed_at_ms, challenge_nonce),
+            signature,
             signed_at_ms,
         }))
     };
@@ -344,14 +354,7 @@ pub fn build_hello_envelope(
         device_id: device_id.to_string(),
         msg_id: "hello-0".to_string(),
         ts_ms: signed_at_ms,
-        payload: Some(envelope::Payload::Hello(Hello {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            hostname: gethostname::gethostname().to_string_lossy().to_string(),
-            os: std::env::consts::OS.to_string(),
-            capabilities,
-            last_ack,
-            auth,
-        })),
+        payload: Some(envelope::Payload::Hello(hello)),
         ..Default::default()
     }
 }
@@ -726,7 +729,9 @@ where
             "websocket closed before hello challenge"
         )));
     };
-    let message = message.map_err(anyhow::Error::from).map_err(ConnectError::Session)?;
+    let message = message
+        .map_err(anyhow::Error::from)
+        .map_err(ConnectError::Session)?;
     let tungstenite::Message::Binary(data) = message else {
         return Err(ConnectError::Session(anyhow::anyhow!(
             "expected binary hello challenge frame"

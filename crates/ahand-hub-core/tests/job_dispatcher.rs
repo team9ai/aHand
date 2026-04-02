@@ -79,17 +79,8 @@ struct MemoryJobStore {
 #[async_trait]
 impl JobStore for MemoryJobStore {
     async fn insert(&self, job: NewJob) -> ahand_hub_core::Result<ahand_hub_core::job::Job> {
-        let job = ahand_hub_core::job::Job {
-            id: uuid::Uuid::new_v4(),
-            device_id: job.device_id,
-            tool: job.tool,
-            args: job.args,
-            cwd: job.cwd,
-            env: job.env,
-            timeout_ms: job.timeout_ms,
-            status: JobStatus::Pending,
-            requested_by: job.requested_by,
-        };
+        let job =
+            ahand_hub_core::job::Job::new_pending(uuid::Uuid::new_v4(), job, chrono::Utc::now());
         self.jobs.insert(job.id.to_string(), job.clone());
         Ok(job)
     }
@@ -124,7 +115,22 @@ impl JobStore for MemoryJobStore {
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
-        job.status = status;
+        job.apply_status_transition(status, chrono::Utc::now());
+        Ok(())
+    }
+
+    async fn update_terminal(
+        &self,
+        job_id: &str,
+        exit_code: i32,
+        error: &str,
+        output_summary: &str,
+    ) -> ahand_hub_core::Result<()> {
+        let mut job = self
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
+        job.record_terminal_outcome(exit_code, error.into(), output_summary.into());
         Ok(())
     }
 }
@@ -202,10 +208,16 @@ impl JobStore for FailingInsertJobStore {
         Ok(Vec::new())
     }
 
-    async fn update_status(
+    async fn update_status(&self, _job_id: &str, _status: JobStatus) -> ahand_hub_core::Result<()> {
+        Err(HubError::Internal("job update failed".into()))
+    }
+
+    async fn update_terminal(
         &self,
         _job_id: &str,
-        _status: JobStatus,
+        _exit_code: i32,
+        _error: &str,
+        _output_summary: &str,
     ) -> ahand_hub_core::Result<()> {
         Err(HubError::Internal("job update failed".into()))
     }
@@ -240,10 +252,16 @@ impl JobStore for FailingUpdateJobStore {
         Ok(self.job.lock().unwrap().clone().into_iter().collect())
     }
 
-    async fn update_status(
+    async fn update_status(&self, _job_id: &str, _status: JobStatus) -> ahand_hub_core::Result<()> {
+        Err(HubError::Internal("job update failed".into()))
+    }
+
+    async fn update_terminal(
         &self,
         _job_id: &str,
-        _status: JobStatus,
+        _exit_code: i32,
+        _error: &str,
+        _output_summary: &str,
     ) -> ahand_hub_core::Result<()> {
         Err(HubError::Internal("job update failed".into()))
     }
@@ -405,7 +423,7 @@ async fn create_job_does_not_fail_after_job_is_persisted_if_audit_write_fails() 
 }
 
 #[tokio::test]
-async fn transition_does_not_regress_terminal_jobs() {
+async fn transition_returns_error_for_terminal_job_regressions() {
     let devices = Arc::new(OnlineDeviceStore::new("device-1"));
     let jobs = Arc::new(MemoryJobStore::default());
     let audit = Arc::new(RecordingAuditStore::default());
@@ -428,10 +446,19 @@ async fn transition_does_not_regress_terminal_jobs() {
         .transition(&job.id.to_string(), JobStatus::Finished)
         .await
         .unwrap();
-    dispatcher
+
+    let err = dispatcher
         .transition(&job.id.to_string(), JobStatus::Running)
         .await
-        .unwrap();
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        HubError::IllegalJobTransition {
+            current: JobStatus::Finished,
+            requested: JobStatus::Running,
+        }
+    );
 
     let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
     assert_eq!(stored.status, JobStatus::Finished);
@@ -470,6 +497,48 @@ async fn transition_returns_none_when_status_is_unchanged() {
 }
 
 #[tokio::test]
+async fn transition_returns_explicit_error_for_illegal_job_transitions() {
+    let devices = Arc::new(OnlineDeviceStore::new("device-1"));
+    let jobs = Arc::new(MemoryJobStore::default());
+    let audit = Arc::new(RecordingAuditStore::default());
+    let dispatcher = JobDispatcher::new(devices, jobs.clone(), audit);
+
+    let job = dispatcher
+        .create_job(NewJob {
+            device_id: "device-1".into(),
+            tool: "git".into(),
+            args: vec!["status".into()],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap();
+
+    jobs.update_status(&job.id.to_string(), JobStatus::Sent)
+        .await
+        .unwrap();
+
+    let err = dispatcher
+        .transition(&job.id.to_string(), JobStatus::Pending)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        HubError::IllegalJobTransition {
+            current: JobStatus::Sent,
+            requested: JobStatus::Pending,
+        }
+    );
+    assert_eq!(
+        jobs.get(&job.id.to_string()).await.unwrap().unwrap().status,
+        JobStatus::Sent
+    );
+}
+
+#[tokio::test]
 async fn transition_returns_not_found_for_missing_job() {
     let devices = Arc::new(OnlineDeviceStore::new("device-1"));
     let jobs = Arc::new(MemoryJobStore::default());
@@ -497,7 +566,13 @@ async fn transition_propagates_job_store_update_errors() {
         env: HashMap::new(),
         timeout_ms: 30_000,
         status: JobStatus::Pending,
+        exit_code: None,
+        error: None,
+        output_summary: None,
         requested_by: "service:test".into(),
+        created_at: chrono::Utc::now(),
+        started_at: None,
+        finished_at: None,
     };
     let dispatcher = JobDispatcher::new(
         devices,

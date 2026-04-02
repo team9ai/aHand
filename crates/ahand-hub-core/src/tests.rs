@@ -57,17 +57,7 @@ pub mod fakes {
     #[async_trait]
     impl JobStore for MemoryJobStore {
         async fn insert(&self, job: NewJob) -> Result<Job> {
-            let job = Job {
-                id: uuid::Uuid::new_v4(),
-                device_id: job.device_id,
-                tool: job.tool,
-                args: job.args,
-                cwd: job.cwd,
-                env: job.env,
-                timeout_ms: job.timeout_ms,
-                status: JobStatus::Pending,
-                requested_by: job.requested_by,
-            };
+            let job = Job::new_pending(uuid::Uuid::new_v4(), job, chrono::Utc::now());
             self.jobs.insert(job.id.to_string(), job.clone());
             Ok(job)
         }
@@ -99,7 +89,22 @@ pub mod fakes {
                 .jobs
                 .get_mut(job_id)
                 .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
-            job.status = status;
+            job.apply_status_transition(status, chrono::Utc::now());
+            Ok(())
+        }
+
+        async fn update_terminal(
+            &self,
+            job_id: &str,
+            exit_code: i32,
+            error: &str,
+            output_summary: &str,
+        ) -> Result<()> {
+            let mut job = self
+                .jobs
+                .get_mut(job_id)
+                .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
+            job.record_terminal_outcome(exit_code, error.into(), output_summary.into());
             Ok(())
         }
     }

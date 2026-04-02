@@ -112,6 +112,7 @@ pub fn verify_device_hello(
         hello::Auth::Ed25519(auth) => {
             let public_key = verify_signed_auth(
                 device_id,
+                hello,
                 &auth.public_key,
                 &auth.signature,
                 auth.signed_at_ms,
@@ -129,6 +130,7 @@ pub fn verify_device_hello(
             if auth.bearer_token == bootstrap_token && device_id == bootstrap_device_id {
                 let public_key = verify_signed_auth(
                     device_id,
+                    hello,
                     &auth.public_key,
                     &auth.signature,
                     auth.signed_at_ms,
@@ -148,6 +150,7 @@ pub fn verify_device_hello(
                 }
                 let public_key = verify_signed_auth(
                     device_id,
+                    hello,
                     &auth.public_key,
                     &auth.signature,
                     auth.signed_at_ms,
@@ -162,12 +165,12 @@ pub fn verify_device_hello(
                 })
             }
         }
-        hello::Auth::BearerToken(_) => Err(HubError::Unauthorized),
     }
 }
 
 fn verify_signed_auth(
     device_id: &str,
+    hello: &Hello,
     public_key: &[u8],
     signature: &[u8],
     signed_at_ms: u64,
@@ -186,7 +189,7 @@ fn verify_signed_auth(
         VerifyingKey::from_bytes(&public_key).map_err(|_| HubError::InvalidSignature)?;
     let signature = Signature::from_bytes(&signature);
     let payload =
-        ahand_protocol::build_hello_auth_payload(device_id, signed_at_ms, challenge_nonce);
+        ahand_protocol::build_hello_auth_payload(device_id, hello, signed_at_ms, challenge_nonce);
     verifying_key
         .verify(&payload, &signature)
         .map_err(|_| HubError::InvalidSignature)?;

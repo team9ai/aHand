@@ -6,7 +6,7 @@ use prost::Message;
 
 use support::{
     bootstrap_hello, read_hello_accepted, read_hello_challenge, signed_hello, signed_hello_at,
-    signed_hello_with_key_at, spawn_test_server,
+    signed_hello_with_key_at, signed_hello_with_last_ack, spawn_test_server,
 };
 
 #[tokio::test]
@@ -171,6 +171,7 @@ async fn device_ws_rejects_signed_hello_with_unbound_key() {
     let hello = signed_hello_with_key_at(
         "device-1",
         &wrong_key,
+        0,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -311,6 +312,72 @@ async fn bootstrap_registration_is_one_time_and_reconnect_switches_to_ed25519() 
 }
 
 #[tokio::test]
+async fn device_ws_rejects_hello_with_tampered_hostname_after_signing() {
+    let server = spawn_test_server().await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+
+    let challenge = read_hello_challenge(&mut socket).await;
+    let mut hello = signed_hello("device-1", &challenge.nonce);
+    let Some(ahand_protocol::envelope::Payload::Hello(payload)) = hello.payload.as_mut() else {
+        panic!("expected hello payload");
+    };
+    payload.hostname = "tampered-host".into();
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let listed = server.get_json("/api/devices", "service-test-token").await;
+    let device = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "device-1")
+        .unwrap();
+    assert_eq!(device["online"], false);
+
+    let _ = socket.close(None).await;
+}
+
+#[tokio::test]
+async fn device_ws_rejects_hello_with_tampered_last_ack_after_signing() {
+    let server = spawn_test_server().await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+
+    let challenge = read_hello_challenge(&mut socket).await;
+    let mut hello = signed_hello("device-1", &challenge.nonce);
+    let Some(ahand_protocol::envelope::Payload::Hello(payload)) = hello.payload.as_mut() else {
+        panic!("expected hello payload");
+    };
+    payload.last_ack = 99;
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    let listed = server.get_json("/api/devices", "service-test-token").await;
+    let device = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "device-1")
+        .unwrap();
+    assert_eq!(device["online"], false);
+
+    let _ = socket.close(None).await;
+}
+
+#[tokio::test]
 async fn old_connection_closing_does_not_mark_new_connection_offline() {
     let server = spawn_test_server().await;
 
@@ -398,11 +465,7 @@ async fn reconnect_replays_only_unacked_job_requests() {
         .await
         .unwrap();
     let first_challenge = read_hello_challenge(&mut first_socket).await;
-    let mut first_hello = signed_hello("device-1", &first_challenge.nonce);
-    let Some(ahand_protocol::envelope::Payload::Hello(hello)) = first_hello.payload.as_mut() else {
-        panic!("expected hello payload");
-    };
-    hello.last_ack = 0;
+    let first_hello = signed_hello_with_last_ack("device-1", 0, &first_challenge.nonce);
     first_socket
         .send(tokio_tungstenite::tungstenite::Message::Binary(
             first_hello.encode_to_vec().into(),
@@ -469,11 +532,7 @@ async fn reconnect_replays_only_unacked_job_requests() {
         .await
         .unwrap();
     let reconnect_challenge = read_hello_challenge(&mut reconnect_socket).await;
-    let mut reconnect_hello = signed_hello("device-1", &reconnect_challenge.nonce);
-    let Some(ahand_protocol::envelope::Payload::Hello(hello)) = reconnect_hello.payload.as_mut() else {
-        panic!("expected hello payload");
-    };
-    hello.last_ack = 1;
+    let reconnect_hello = signed_hello_with_last_ack("device-1", 1, &reconnect_challenge.nonce);
     reconnect_socket
         .send(tokio_tungstenite::tungstenite::Message::Binary(
             reconnect_hello.encode_to_vec().into(),

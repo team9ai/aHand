@@ -234,6 +234,18 @@ impl MemoryDeviceStore {
     }
 
     pub async fn mark_online(&self, device_id: &str, endpoint: &str) -> Result<()> {
+        let exists = if self.devices.contains_key(device_id) {
+            true
+        } else if let Some(persistent) = &self.persistent {
+            persistent.get(device_id).await?.is_some()
+        } else {
+            false
+        };
+
+        if !exists {
+            return Err(HubError::DeviceNotFound(device_id.into()));
+        }
+
         if let Some(mut device) = self.devices.get_mut(device_id) {
             device.device.online = true;
         }
@@ -241,11 +253,7 @@ impl MemoryDeviceStore {
             persistent.mark_online(device_id, endpoint).await?;
         }
 
-        if self.devices.contains_key(device_id) {
-            Ok(())
-        } else {
-            Err(HubError::DeviceNotFound(device_id.into()))
-        }
+        Ok(())
     }
 
     pub async fn mark_offline(&self, device_id: &str) -> Result<()> {
@@ -399,17 +407,7 @@ pub struct MemoryJobStore {
 #[async_trait]
 impl JobStore for MemoryJobStore {
     async fn insert(&self, job: NewJob) -> Result<Job> {
-        let job = Job {
-            id: uuid::Uuid::new_v4(),
-            device_id: job.device_id,
-            tool: job.tool,
-            args: job.args,
-            cwd: job.cwd,
-            env: job.env,
-            timeout_ms: job.timeout_ms,
-            status: JobStatus::Pending,
-            requested_by: job.requested_by,
-        };
+        let job = Job::new_pending(uuid::Uuid::new_v4(), job, chrono::Utc::now());
         self.jobs.insert(job.id.to_string(), job.clone());
         Ok(job)
     }
@@ -441,7 +439,26 @@ impl JobStore for MemoryJobStore {
             .jobs
             .get_mut(job_id)
             .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
-        job.status = resolve_status_transition(job.status, status);
+        if job.status == status {
+            return Ok(());
+        }
+        let next_status = resolve_status_transition(job.status, status)?;
+        job.apply_status_transition(next_status, chrono::Utc::now());
+        Ok(())
+    }
+
+    async fn update_terminal(
+        &self,
+        job_id: &str,
+        exit_code: i32,
+        error: &str,
+        output_summary: &str,
+    ) -> Result<()> {
+        let mut job = self
+            .jobs
+            .get_mut(job_id)
+            .ok_or_else(|| HubError::JobNotFound(job_id.into()))?;
+        job.record_terminal_outcome(exit_code, error.into(), output_summary.into());
         Ok(())
     }
 }

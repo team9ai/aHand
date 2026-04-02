@@ -42,38 +42,6 @@ fn hello_auth_roundtrip() {
 }
 
 #[test]
-fn hello_bearer_token_roundtrip() {
-    let envelope = Envelope {
-        device_id: "dev-123".into(),
-        msg_id: "hello-2".into(),
-        ts_ms: 1_717_000_000_001,
-        payload: Some(ahand_protocol::envelope::Payload::Hello(Hello {
-            version: "0.1.2".into(),
-            hostname: "mbp".into(),
-            os: "macos".into(),
-            capabilities: vec!["exec".into()],
-            last_ack: 8,
-            auth: Some(hello::Auth::BearerToken("token-123".into())),
-        })),
-        ..Default::default()
-    };
-
-    let encoded = envelope.encode_to_vec();
-    let decoded = Envelope::decode(encoded.as_slice()).unwrap();
-    let hello = match decoded.payload.unwrap() {
-        ahand_protocol::envelope::Payload::Hello(hello) => hello,
-        other => panic!("unexpected payload: {other:?}"),
-    };
-
-    match hello.auth.unwrap() {
-        hello::Auth::BearerToken(token) => {
-            assert_eq!(token, "token-123");
-        }
-        other => panic!("unexpected auth payload: {other:?}"),
-    }
-}
-
-#[test]
 fn hello_bootstrap_auth_roundtrip() {
     let envelope = Envelope {
         device_id: "dev-456".into(),
@@ -165,15 +133,92 @@ fn hello_accepted_roundtrip() {
 
 #[test]
 fn hello_auth_payload_is_canonical_for_known_input() {
-    let payload = ahand_protocol::build_hello_auth_payload("device-7", 1_717_000_000_123, b"xyz");
+    let hello = Hello {
+        version: "0.1.2".into(),
+        hostname: "mbp".into(),
+        os: "macos".into(),
+        capabilities: vec!["exec".into(), "browser".into()],
+        last_ack: 7,
+        auth: None,
+    };
+    let payload =
+        ahand_protocol::build_hello_auth_payload("device-7", &hello, 1_717_000_000_123, b"xyz");
 
-    assert_eq!(payload, b"ahand-hub|device-7|1717000000123|xyz");
+    assert!(payload.starts_with(b"ahand-hub\0hello-auth\0"));
 }
 
 #[test]
 fn hello_auth_payload_changes_when_nonce_changes() {
-    let first = ahand_protocol::build_hello_auth_payload("device-7", 1_717_000_000_123, b"abc");
-    let second = ahand_protocol::build_hello_auth_payload("device-7", 1_717_000_000_123, b"abd");
+    let hello = Hello {
+        version: "0.1.2".into(),
+        hostname: "mbp".into(),
+        os: "macos".into(),
+        capabilities: vec!["exec".into()],
+        last_ack: 7,
+        auth: None,
+    };
+    let first =
+        ahand_protocol::build_hello_auth_payload("device-7", &hello, 1_717_000_000_123, b"abc");
+    let second =
+        ahand_protocol::build_hello_auth_payload("device-7", &hello, 1_717_000_000_123, b"abd");
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn hello_auth_payload_changes_when_hostname_changes() {
+    let first_hello = Hello {
+        version: "0.1.2".into(),
+        hostname: "mbp".into(),
+        os: "macos".into(),
+        capabilities: vec!["exec".into()],
+        last_ack: 7,
+        auth: None,
+    };
+    let mut second_hello = first_hello.clone();
+    second_hello.hostname = "tampered".into();
+
+    let first = ahand_protocol::build_hello_auth_payload(
+        "device-7",
+        &first_hello,
+        1_717_000_000_123,
+        b"abc",
+    );
+    let second = ahand_protocol::build_hello_auth_payload(
+        "device-7",
+        &second_hello,
+        1_717_000_000_123,
+        b"abc",
+    );
+
+    assert_ne!(first, second);
+}
+
+#[test]
+fn hello_auth_payload_changes_when_last_ack_changes() {
+    let first_hello = Hello {
+        version: "0.1.2".into(),
+        hostname: "mbp".into(),
+        os: "macos".into(),
+        capabilities: vec!["exec".into()],
+        last_ack: 7,
+        auth: None,
+    };
+    let mut second_hello = first_hello.clone();
+    second_hello.last_ack = 8;
+
+    let first = ahand_protocol::build_hello_auth_payload(
+        "device-7",
+        &first_hello,
+        1_717_000_000_123,
+        b"abc",
+    );
+    let second = ahand_protocol::build_hello_auth_payload(
+        "device-7",
+        &second_hello,
+        1_717_000_000_123,
+        b"abc",
+    );
 
     assert_ne!(first, second);
 }

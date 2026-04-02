@@ -153,6 +153,7 @@ impl DeviceStore for PgDeviceStore {
             .execute(&self.pool)
             .await
             .map_err(|err| HubError::Internal(err.to_string()))?;
+        self.mark_offline(device_id).await?;
 
         Ok(())
     }
