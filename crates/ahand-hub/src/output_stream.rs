@@ -265,13 +265,10 @@ impl OutputStream {
                 let store = store.clone();
                 let history = store.read_history(&job_id).await?;
                 let live_job_id = job_id.clone();
-                let needs_resync = history
-                    .first()
-                    .and_then(|first| {
-                        last_event_id
-                            .map(|last_event_id| first.seq > last_event_id.saturating_add(1))
-                    })
-                    .unwrap_or(false);
+                let needs_resync = persistent_history_needs_resync(
+                    history.first().map(|item| item.seq),
+                    last_event_id,
+                );
 
                 Ok(Box::pin(stream! {
                     let mut last_seq = last_event_id.unwrap_or(0);
@@ -377,6 +374,14 @@ impl OutputStream {
 
 fn resync_event(reason: &str) -> Event {
     Event::default().event("resync").data(reason)
+}
+
+fn persistent_history_needs_resync(history_first_seq: Option<u64>, last_event_id: Option<u64>) -> bool {
+    match (history_first_seq, last_event_id) {
+        (None, Some(last_event_id)) => last_event_id > 0,
+        (Some(first_seq), Some(last_event_id)) => first_seq > last_event_id.saturating_add(1),
+        _ => false,
+    }
 }
 
 impl Default for OutputStream {
@@ -528,6 +533,15 @@ mod tests {
         assert!(body.contains("data: two"));
         assert!(body.contains("data: three"));
         assert!(!body.contains("data: one"));
+    }
+
+    #[test]
+    fn persistent_history_requires_resync_when_resume_cursor_has_no_remaining_history() {
+        assert!(persistent_history_needs_resync(None, Some(3)));
+        assert!(!persistent_history_needs_resync(None, None));
+        assert!(!persistent_history_needs_resync(None, Some(0)));
+        assert!(persistent_history_needs_resync(Some(5), Some(3)));
+        assert!(!persistent_history_needs_resync(Some(4), Some(3)));
     }
 
     #[tokio::test]
