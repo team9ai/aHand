@@ -83,6 +83,8 @@ impl AppState {
             connections.clone(),
             events.clone(),
             output_stream.clone(),
+            config.job_timeout_grace_ms,
+            config.device_disconnect_grace_ms,
         ));
 
         let state = Self {

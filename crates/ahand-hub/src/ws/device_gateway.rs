@@ -123,7 +123,12 @@ impl ConnectionRegistry {
                     .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
                 (active.sender.clone(), active.connection_id)
             };
-            if sender.send(OutboundFrame { frame: frame.clone() }).is_err() {
+            if sender
+                .send(OutboundFrame {
+                    frame: frame.clone(),
+                })
+                .is_err()
+            {
                 self.clear_current_sender(device_id, connection_id);
                 if !self.has_active(device_id) {
                     if let Some(entry) = self.senders.get_mut(device_id) {
@@ -149,6 +154,10 @@ impl ConnectionRegistry {
                     .unwrap_or(false)
             })
             .unwrap_or(false)
+    }
+
+    pub(crate) fn is_connected(&self, device_id: &str) -> bool {
+        self.has_active(device_id)
     }
 
     pub(crate) fn has_seen_inbound(&self, device_id: &str, seq: u64) -> bool {
@@ -187,7 +196,12 @@ impl ConnectionRegistry {
         Ok(())
     }
 
-    pub(crate) fn observe_inbound(&self, device_id: &str, seq: u64, ack: u64) -> anyhow::Result<()> {
+    pub(crate) fn observe_inbound(
+        &self,
+        device_id: &str,
+        seq: u64,
+        ack: u64,
+    ) -> anyhow::Result<()> {
         let should_cleanup = if let Some(entry) = self.senders.get_mut(device_id) {
             let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
             if seq > 0 {
@@ -256,7 +270,11 @@ impl ConnectionRegistry {
                 entry.active = None;
             }
             entry.active.is_none()
-                && entry.outbox.lock().expect("outbox mutex poisoned").is_empty()
+                && entry
+                    .outbox
+                    .lock()
+                    .expect("outbox mutex poisoned")
+                    .is_empty()
         } else {
             false
         };
@@ -347,6 +365,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             .register(device_id.clone(), hello.last_ack)?;
         active_connection = Some((device_id.clone(), connection_id));
         state.devices.mark_online(&device_id, "ws").await?;
+        state.jobs.handle_device_connected(&device_id).await?;
         if let Err(err) = state.events.emit_device_online(&device_id, &hostname).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.online audit");
         }
@@ -440,6 +459,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             .await?
     {
         state.devices.mark_offline(&device_id).await?;
+        state.jobs.handle_device_disconnected(&device_id).await?;
         if let Err(err) = state.events.emit_device_offline(&device_id).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.offline audit");
         }
@@ -454,7 +474,7 @@ fn issue_hello_challenge() -> ahand_protocol::HelloChallenge {
         issued_at_ms: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-        .as_millis() as u64,
+            .as_millis() as u64,
     }
 }
 
@@ -531,16 +551,17 @@ mod tests {
         assert_eq!(job.job_id, "job-2");
         assert_eq!(replayed.seq, 2);
         assert_eq!(replayed.ack, 0);
-        assert!(tokio::time::timeout(Duration::from_millis(20), replay_rx.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), replay_rx.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn inbound_seq_updates_outbound_ack() {
         let registry = ConnectionRegistry::default();
-        let (_connection_id, mut rx, _close_rx) =
-            registry.register("device-1".into(), 0).unwrap();
+        let (_connection_id, mut rx, _close_rx) = registry.register("device-1".into(), 0).unwrap();
         registry.observe_inbound("device-1", 7, 0).unwrap();
 
         let transport = tokio::spawn(async move {
@@ -585,7 +606,10 @@ mod tests {
         let (connection_id, rx, _close_rx) = registry.register("device-1".into(), 0).unwrap();
         drop(rx);
 
-        let removed = registry.unregister("device-1", connection_id).await.unwrap();
+        let removed = registry
+            .unregister("device-1", connection_id)
+            .await
+            .unwrap();
 
         assert!(removed);
         assert!(registry.senders.is_empty());

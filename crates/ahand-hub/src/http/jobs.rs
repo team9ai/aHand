@@ -10,9 +10,11 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::http::header::HeaderName;
 use axum::response::sse::{Event, Sse};
+use dashmap::DashMap;
 use futures_util::Stream;
 use prost::Message;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
 use crate::auth::AuthContextExt;
 use crate::events::EventBus;
@@ -58,12 +60,17 @@ pub struct DashboardJobResponse {
     pub status: String,
 }
 
+#[derive(Clone)]
 pub struct JobRuntime {
     dispatcher: Arc<JobDispatcher>,
     jobs: Arc<dyn JobStore>,
     connections: Arc<ConnectionRegistry>,
     events: Arc<EventBus>,
     output_stream: Arc<crate::output_stream::OutputStream>,
+    timeout_grace_ms: u64,
+    disconnect_grace_ms: u64,
+    timeout_tasks: Arc<DashMap<String, JoinHandle<()>>>,
+    disconnect_tasks: Arc<DashMap<String, JoinHandle<()>>>,
 }
 
 impl JobRuntime {
@@ -73,6 +80,8 @@ impl JobRuntime {
         connections: Arc<ConnectionRegistry>,
         events: Arc<EventBus>,
         output_stream: Arc<crate::output_stream::OutputStream>,
+        timeout_grace_ms: u64,
+        disconnect_grace_ms: u64,
     ) -> Self {
         Self {
             dispatcher,
@@ -80,6 +89,10 @@ impl JobRuntime {
             connections,
             events,
             output_stream,
+            timeout_grace_ms,
+            disconnect_grace_ms,
+            timeout_tasks: Arc::new(DashMap::new()),
+            disconnect_tasks: Arc::new(DashMap::new()),
         }
     }
 
@@ -116,6 +129,7 @@ impl JobRuntime {
                 .await?;
             return Err(HubError::DeviceOffline(job.device_id.clone()).into());
         }
+        self.schedule_timeout(&job);
         Ok(self.jobs.get(&job.id.to_string()).await?.unwrap_or(job))
     }
 
@@ -150,7 +164,12 @@ impl JobRuntime {
         {
             return Err(HubError::DeviceOffline(job.device_id.clone()).into());
         }
-        Ok(job)
+        self.finish_job(job_id, JobStatus::Cancelled, -1, "cancelled", "service:api")
+            .await?;
+        self.jobs
+            .get(job_id)
+            .await?
+            .ok_or_else(|| HubError::JobNotFound(job_id.into()).into())
     }
 
     pub async fn handle_device_frame(&self, device_id: &str, frame: &[u8]) -> anyhow::Result<()> {
@@ -167,6 +186,7 @@ impl JobRuntime {
                 let Some(job) = self.job_for_device(device_id, &event.job_id).await? else {
                     anyhow::bail!("job {} not found", event.job_id);
                 };
+                self.clear_disconnect_task(&event.job_id);
                 if is_terminal_status(job.status) {
                     self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
@@ -209,6 +229,7 @@ impl JobRuntime {
                 let Some(job) = self.job_for_device(device_id, &finished.job_id).await? else {
                     anyhow::bail!("job {} not found", finished.job_id);
                 };
+                self.clear_disconnect_task(&finished.job_id);
                 if is_terminal_status(job.status) {
                     self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
@@ -228,38 +249,79 @@ impl JobRuntime {
                 } else {
                     JobStatus::Failed
                 };
-                self.transition_job(&finished.job_id, status, &format!("device:{device_id}"))
-                    .await?;
-                self.record_terminal_state(&finished.job_id, finished.exit_code, &finished.error)
-                    .await?;
-                self.output_stream
-                    .push_finished(&finished.job_id, finished.exit_code, &finished.error)
-                    .await?;
+                self.finish_job(
+                    &finished.job_id,
+                    status,
+                    finished.exit_code,
+                    &finished.error,
+                    &format!("device:{device_id}"),
+                )
+                .await?;
             }
             Some(ahand_protocol::envelope::Payload::JobRejected(rejected)) => {
                 let Some(job) = self.job_for_device(device_id, &rejected.job_id).await? else {
                     anyhow::bail!("job {} not found", rejected.job_id);
                 };
+                self.clear_disconnect_task(&rejected.job_id);
                 if is_terminal_status(job.status) {
                     self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
                 }
-                self.transition_job(
+                self.finish_job(
                     &rejected.job_id,
                     JobStatus::Failed,
+                    -1,
+                    &rejected.reason,
                     &format!("device:{device_id}"),
                 )
                 .await?;
-                self.record_terminal_state(&rejected.job_id, -1, &rejected.reason)
-                    .await?;
-                self.output_stream
-                    .push_finished(&rejected.job_id, -1, &rejected.reason)
-                    .await?;
             }
             _ => {}
         }
 
         self.connections.observe_inbound(device_id, seq, ack)?;
+        Ok(())
+    }
+
+    pub async fn handle_device_connected(&self, device_id: &str) -> anyhow::Result<()> {
+        for job in self
+            .jobs
+            .list(JobFilter {
+                device_id: Some(device_id.into()),
+                status: Some(JobStatus::Running),
+            })
+            .await?
+        {
+            self.clear_disconnect_task(&job.id.to_string());
+        }
+        Ok(())
+    }
+
+    pub async fn handle_device_disconnected(&self, device_id: &str) -> anyhow::Result<()> {
+        for job in self
+            .jobs
+            .list(JobFilter {
+                device_id: Some(device_id.into()),
+                status: None,
+            })
+            .await?
+        {
+            let job_id = job.id.to_string();
+            match job.status {
+                JobStatus::Pending | JobStatus::Sent => {
+                    self.finish_job(
+                        &job_id,
+                        JobStatus::Failed,
+                        -1,
+                        "device disconnected",
+                        "hub:disconnect",
+                    )
+                    .await?;
+                }
+                JobStatus::Running => self.schedule_disconnect_failure(&job),
+                JobStatus::Finished | JobStatus::Failed | JobStatus::Cancelled => {}
+            }
+        }
         Ok(())
     }
 
@@ -309,6 +371,169 @@ impl JobRuntime {
             .update_terminal(job_id, exit_code, error, &output_summary)
             .await?;
         Ok(())
+    }
+
+    async fn finish_job(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+        exit_code: i32,
+        error: &str,
+        actor: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(job) = self.jobs.get(job_id).await?
+            && is_terminal_status(job.status)
+        {
+            self.clear_lifecycle_tasks(job_id);
+            return Ok(());
+        }
+        self.clear_lifecycle_tasks(job_id);
+        self.transition_job(job_id, status, actor).await?;
+        self.record_terminal_state(job_id, exit_code, error).await?;
+        self.output_stream
+            .push_finished(job_id, exit_code, error)
+            .await?;
+        Ok(())
+    }
+
+    fn schedule_timeout(&self, job: &Job) {
+        let runtime = self.clone();
+        let job_id = job.id.to_string();
+        let device_id = job.device_id.clone();
+        let timeout_ms = job.timeout_ms;
+        self.replace_task(
+            &self.timeout_tasks,
+            job_id.clone(),
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+                let _ = runtime.handle_job_timeout(&job_id, &device_id).await;
+            }),
+        );
+    }
+
+    fn schedule_disconnect_failure(&self, job: &Job) {
+        let runtime = self.clone();
+        let job_id = job.id.to_string();
+        let device_id = job.device_id.clone();
+        self.replace_task(
+            &self.disconnect_tasks,
+            job_id.clone(),
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    runtime.disconnect_grace_ms,
+                ))
+                .await;
+                let _ = runtime.handle_disconnect_expired(&job_id, &device_id).await;
+            }),
+        );
+    }
+
+    async fn handle_job_timeout(&self, job_id: &str, device_id: &str) -> anyhow::Result<()> {
+        let Some(job) = self.jobs.get(job_id).await? else {
+            self.remove_timeout_task(job_id);
+            return Ok(());
+        };
+        if is_terminal_status(job.status) {
+            self.remove_timeout_task(job_id);
+            return Ok(());
+        }
+
+        let _ = self
+            .connections
+            .send(
+                device_id,
+                ahand_protocol::Envelope {
+                    device_id: device_id.into(),
+                    msg_id: format!("timeout-{job_id}"),
+                    ts_ms: now_ms(),
+                    payload: Some(ahand_protocol::envelope::Payload::CancelJob(
+                        ahand_protocol::CancelJob {
+                            job_id: job_id.into(),
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(self.timeout_grace_ms)).await;
+        let Some(job) = self.jobs.get(job_id).await? else {
+            self.remove_timeout_task(job_id);
+            return Ok(());
+        };
+        if is_terminal_status(job.status) {
+            self.remove_timeout_task(job_id);
+            return Ok(());
+        }
+
+        self.remove_timeout_task(job_id);
+        self.clear_disconnect_task(job_id);
+        self.transition_job(job_id, JobStatus::Failed, "hub:timeout")
+            .await?;
+        self.record_terminal_state(job_id, -1, "timeout").await?;
+        self.output_stream
+            .push_finished(job_id, -1, "timeout")
+            .await
+    }
+
+    async fn handle_disconnect_expired(&self, job_id: &str, device_id: &str) -> anyhow::Result<()> {
+        if self.connections.is_connected(device_id) {
+            self.remove_disconnect_task(job_id);
+            return Ok(());
+        }
+        let Some(job) = self.jobs.get(job_id).await? else {
+            self.remove_disconnect_task(job_id);
+            return Ok(());
+        };
+        if job.status != JobStatus::Running {
+            self.remove_disconnect_task(job_id);
+            return Ok(());
+        }
+        self.remove_disconnect_task(job_id);
+        self.clear_timeout_task(job_id);
+        self.transition_job(job_id, JobStatus::Failed, "hub:disconnect")
+            .await?;
+        self.record_terminal_state(job_id, -1, "device disconnected")
+            .await?;
+        self.output_stream
+            .push_finished(job_id, -1, "device disconnected")
+            .await
+    }
+
+    fn replace_task(
+        &self,
+        tasks: &DashMap<String, JoinHandle<()>>,
+        job_id: String,
+        handle: JoinHandle<()>,
+    ) {
+        if let Some(existing) = tasks.insert(job_id, handle) {
+            existing.abort();
+        }
+    }
+
+    fn clear_lifecycle_tasks(&self, job_id: &str) {
+        self.clear_timeout_task(job_id);
+        self.clear_disconnect_task(job_id);
+    }
+
+    fn clear_timeout_task(&self, job_id: &str) {
+        if let Some((_, task)) = self.timeout_tasks.remove(job_id) {
+            task.abort();
+        }
+    }
+
+    fn clear_disconnect_task(&self, job_id: &str) {
+        if let Some((_, task)) = self.disconnect_tasks.remove(job_id) {
+            task.abort();
+        }
+    }
+
+    fn remove_timeout_task(&self, job_id: &str) {
+        let _ = self.timeout_tasks.remove(job_id);
+    }
+
+    fn remove_disconnect_task(&self, job_id: &str) {
+        let _ = self.disconnect_tasks.remove(job_id);
     }
 }
 
@@ -545,6 +770,8 @@ mod tests {
                 connections.clone(),
                 events,
                 output_stream,
+                100,
+                100,
             ),
             connections,
             jobs,
@@ -737,8 +964,7 @@ mod tests {
         let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
         assert_eq!(stored.status, JobStatus::Running);
         assert!(stored.started_at.is_some());
-        let audit_entries =
-            wait_for_audit_entries(&audit, job.id.to_string(), "job.running").await;
+        let audit_entries = wait_for_audit_entries(&audit, job.id.to_string(), "job.running").await;
         assert_eq!(audit_entries.len(), 1);
     }
 

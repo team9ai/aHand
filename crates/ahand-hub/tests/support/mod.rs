@@ -40,6 +40,8 @@ pub fn test_config() -> Config {
         device_hello_max_age_ms: 30_000,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
+        job_timeout_grace_ms: 50,
+        device_disconnect_grace_ms: 100,
         jwt_secret: "service-test-secret".into(),
         output_retention_ms: 60_000,
         store: StoreConfig::Memory,
@@ -54,7 +56,12 @@ pub async fn test_state() -> AppState {
         .devices
         .insert(NewDevice {
             id: "device-1".into(),
-            public_key: Some(SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes().to_vec()),
+            public_key: Some(
+                SigningKey::from_bytes(&[7u8; 32])
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec(),
+            ),
             hostname: "seeded-device".into(),
             os: "linux".into(),
             capabilities: vec!["exec".into()],

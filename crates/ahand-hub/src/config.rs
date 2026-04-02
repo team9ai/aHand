@@ -20,6 +20,8 @@ pub struct Config {
     pub device_hello_max_age_ms: u64,
     pub device_presence_ttl_secs: u64,
     pub device_presence_refresh_ms: u64,
+    pub job_timeout_grace_ms: u64,
+    pub device_disconnect_grace_ms: u64,
     pub jwt_secret: String,
     pub output_retention_ms: u64,
     pub store: StoreConfig,
@@ -65,6 +67,14 @@ impl Config {
                 .map(|value| value.parse())
                 .transpose()?
                 .unwrap_or(20_000),
+            job_timeout_grace_ms: getenv("AHAND_HUB_JOB_TIMEOUT_GRACE_MS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(1_000),
+            device_disconnect_grace_ms: getenv("AHAND_HUB_DEVICE_DISCONNECT_GRACE_MS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(10 * 60 * 1_000),
             jwt_secret: required_env(&getenv, "AHAND_HUB_JWT_SECRET")?,
             output_retention_ms: getenv("AHAND_HUB_OUTPUT_RETENTION_MS")
                 .map(|value| value.parse())
@@ -149,6 +159,8 @@ mod tests {
         assert_eq!(config.device_hello_max_age_ms, 300_000);
         assert_eq!(config.device_presence_ttl_secs, 60);
         assert_eq!(config.device_presence_refresh_ms, 20_000);
+        assert_eq!(config.job_timeout_grace_ms, 1_000);
+        assert_eq!(config.device_disconnect_grace_ms, 10 * 60 * 1_000);
         assert_eq!(config.jwt_secret, "jwt-prod-secret");
         match config.store {
             StoreConfig::Persistent {

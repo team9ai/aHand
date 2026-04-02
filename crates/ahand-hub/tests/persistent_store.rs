@@ -22,6 +22,8 @@ async fn app_state_uses_persistent_store_backends_across_restart() -> anyhow::Re
         device_hello_max_age_ms: 30_000,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
+        job_timeout_grace_ms: 50,
+        device_disconnect_grace_ms: 100,
         jwt_secret: "service-test-secret".into(),
         output_retention_ms: 60_000,
         store: StoreConfig::Persistent {
@@ -95,6 +97,8 @@ async fn persistent_presence_is_refreshed_while_device_socket_stays_open() -> an
         device_hello_max_age_ms: 30_000,
         device_presence_ttl_secs: 1,
         device_presence_refresh_ms: 100,
+        job_timeout_grace_ms: 50,
+        device_disconnect_grace_ms: 100,
         jwt_secret: "service-test-secret".into(),
         output_retention_ms: 60_000,
         store: StoreConfig::Persistent {
