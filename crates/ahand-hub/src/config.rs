@@ -29,22 +29,6 @@ impl Config {
         Self::from_env_with(|key| std::env::var(key).ok())
     }
 
-    pub fn for_tests() -> Self {
-        Self {
-            bind_addr: "127.0.0.1:0".into(),
-            service_token: "service-test-token".into(),
-            dashboard_shared_password: "shared-secret".into(),
-            device_bootstrap_token: "bootstrap-test-token".into(),
-            device_bootstrap_device_id: "device-2".into(),
-            device_hello_max_age_ms: 30_000,
-            device_presence_ttl_secs: 60,
-            device_presence_refresh_ms: 20_000,
-            jwt_secret: "service-test-secret".into(),
-            output_retention_ms: 60_000,
-            store: StoreConfig::Memory,
-        }
-    }
-
     fn from_env_with<F>(getenv: F) -> anyhow::Result<Self>
     where
         F: Fn(&str) -> Option<String>,
@@ -87,7 +71,11 @@ fn required_env<F>(getenv: &F, key: &str) -> anyhow::Result<String>
 where
     F: Fn(&str) -> Option<String>,
 {
-    getenv(key).ok_or_else(|| anyhow::anyhow!("{key} must be set"))
+    let value = getenv(key).ok_or_else(|| anyhow::anyhow!("{key} must be set"))?;
+    if value.trim().is_empty() {
+        return Err(anyhow::anyhow!("{key} must not be blank"));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -189,5 +177,39 @@ mod tests {
 
         let err = Config::from_env_with(|key| env.get(key).cloned()).unwrap_err();
         assert!(err.to_string().contains("AHAND_HUB_DATABASE_URL"));
+    }
+
+    #[test]
+    fn from_env_with_rejects_blank_secret_inputs() {
+        let env = HashMap::from([
+            ("AHAND_HUB_SERVICE_TOKEN".to_string(), String::new()),
+            (
+                "AHAND_HUB_DASHBOARD_PASSWORD".to_string(),
+                "shared-dashboard-password".to_string(),
+            ),
+            (
+                "AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN".to_string(),
+                "bootstrap-prod-token".to_string(),
+            ),
+            (
+                "AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID".to_string(),
+                "device-prod-1".to_string(),
+            ),
+            (
+                "AHAND_HUB_JWT_SECRET".to_string(),
+                "jwt-prod-secret".to_string(),
+            ),
+            (
+                "AHAND_HUB_DATABASE_URL".to_string(),
+                "postgres://prod".to_string(),
+            ),
+            (
+                "AHAND_HUB_REDIS_URL".to_string(),
+                "redis://prod".to_string(),
+            ),
+        ]);
+
+        let err = Config::from_env_with(|key| env.get(key).cloned()).unwrap_err();
+        assert!(err.to_string().contains("AHAND_HUB_SERVICE_TOKEN"));
     }
 }

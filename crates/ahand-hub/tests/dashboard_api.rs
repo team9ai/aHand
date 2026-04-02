@@ -2,7 +2,6 @@ mod support;
 
 use std::time::Duration;
 
-use ahand_hub::state::AppState;
 use ahand_hub_core::audit::AuditEntry;
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobStatus, NewJob};
@@ -16,7 +15,7 @@ use support::spawn_server_with_state;
 
 #[tokio::test]
 async fn dashboard_login_issues_a_dashboard_token_and_verify_accepts_it() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     let server = spawn_server_with_state(state).await;
 
     let response = server
@@ -42,7 +41,7 @@ async fn dashboard_login_issues_a_dashboard_token_and_verify_accepts_it() {
 
 #[tokio::test]
 async fn dashboard_login_rejects_invalid_password() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     let server = spawn_server_with_state(state).await;
 
     let response = server
@@ -60,7 +59,7 @@ async fn dashboard_login_rejects_invalid_password() {
 
 #[tokio::test]
 async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     state
         .devices
         .insert(NewDevice {
@@ -74,6 +73,7 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
         })
         .await
         .unwrap();
+    state.devices.mark_online("device-2", "ws").await.unwrap();
 
     let running_job = state
         .jobs_store
@@ -193,7 +193,7 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
 
 #[tokio::test]
 async fn dashboard_websocket_rejects_anonymous_clients() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     let server = spawn_server_with_state(state).await;
 
     let result = tokio_tungstenite::connect_async(server.ws_url("/ws/dashboard"))
@@ -205,7 +205,7 @@ async fn dashboard_websocket_rejects_anonymous_clients() {
 
 #[tokio::test]
 async fn dashboard_websocket_streams_device_and_job_events() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
     let server = spawn_server_with_state(state).await;
 
@@ -271,12 +271,21 @@ async fn dashboard_websocket_streams_device_and_job_events() {
         .iter()
         .find(|record| record["event"] == "job.created")
         .expect("job.created event should be present");
-    assert_eq!(created["detail"]["status"], "sent");
+    let created_index = events
+        .iter()
+        .position(|event| event == "job.created")
+        .expect("job.created should be present");
+    let sent_index = events
+        .iter()
+        .position(|event| event == "job.sent")
+        .expect("job.sent should be present");
+    assert!(created_index < sent_index);
+    assert_eq!(created["detail"]["status"], "pending");
 }
 
 #[tokio::test]
 async fn dashboard_websocket_streams_failed_and_cancelled_events() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
     let server = spawn_server_with_state(state).await;
 
@@ -356,7 +365,7 @@ async fn dashboard_websocket_streams_failed_and_cancelled_events() {
 
 #[tokio::test]
 async fn job_api_returns_conflict_when_device_channel_is_stale() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     state
         .devices
         .insert(NewDevice {
@@ -370,6 +379,7 @@ async fn job_api_returns_conflict_when_device_channel_is_stale() {
         })
         .await
         .unwrap();
+    state.devices.mark_offline("device-8").await.unwrap();
     let server = spawn_server_with_state(state).await;
 
     let response = server
@@ -390,7 +400,7 @@ async fn job_api_returns_conflict_when_device_channel_is_stale() {
 
 #[tokio::test]
 async fn cancel_job_returns_conflict_when_device_channel_is_stale() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     state
         .devices
         .insert(NewDevice {
@@ -404,6 +414,7 @@ async fn cancel_job_returns_conflict_when_device_channel_is_stale() {
         })
         .await
         .unwrap();
+    state.devices.mark_offline("device-9").await.unwrap();
     let job = state
         .jobs_store
         .insert(NewJob {
@@ -428,4 +439,31 @@ async fn cancel_job_returns_conflict_when_device_channel_is_stale() {
         .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn dashboard_websocket_rejects_cross_origin_clients() {
+    let state = support::test_state().await;
+    let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
+    let server = spawn_server_with_state(state).await;
+
+    let request = {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let mut request = server.ws_url("/ws/dashboard").into_client_request().unwrap();
+        request.headers_mut().append(
+            "cookie",
+            format!("ahand_hub_session={token}").parse().unwrap(),
+        );
+        request
+            .headers_mut()
+            .append("origin", "https://evil.example".parse().unwrap());
+        request
+    };
+
+    let result = tokio_tungstenite::connect_async(request)
+        .await
+        .expect_err("cross-origin dashboard websocket should fail");
+
+    assert!(result.to_string().contains("403"));
 }

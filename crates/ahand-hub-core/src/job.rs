@@ -89,11 +89,7 @@ impl Job {
     }
 
     pub fn apply_status_transition(&mut self, next_status: JobStatus, at: DateTime<Utc>) {
-        if matches!(
-            next_status,
-            JobStatus::Running | JobStatus::Finished | JobStatus::Failed | JobStatus::Cancelled
-        ) && self.started_at.is_none()
-        {
+        if next_status == JobStatus::Running && self.started_at.is_none() {
             self.started_at = Some(at);
         }
         if is_terminal_status(next_status) {

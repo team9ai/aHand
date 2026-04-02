@@ -1,6 +1,5 @@
 mod support;
 
-use ahand_hub::state::AppState;
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::traits::DeviceStore;
 use axum::body::Body;
@@ -9,7 +8,7 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn health_endpoint_reports_ok() {
-    let app = ahand_hub::build_test_app().await;
+    let app = support::build_test_app().await;
     let response = app
         .oneshot(
             Request::builder()
@@ -25,7 +24,7 @@ async fn health_endpoint_reports_ok() {
 
 #[tokio::test]
 async fn devices_endpoint_requires_auth() {
-    let app = ahand_hub::build_test_app().await;
+    let app = support::build_test_app().await;
     let response = app
         .oneshot(
             Request::builder()
@@ -41,7 +40,7 @@ async fn devices_endpoint_requires_auth() {
 
 #[tokio::test]
 async fn devices_endpoint_accepts_service_token() {
-    let app = ahand_hub::build_test_app().await;
+    let app = support::build_test_app().await;
     let response = app
         .oneshot(support::service_request("/api/devices"))
         .await
@@ -52,7 +51,7 @@ async fn devices_endpoint_accepts_service_token() {
 
 #[tokio::test]
 async fn create_job_returns_conflict_for_offline_device() {
-    let app = ahand_hub::build_test_app().await;
+    let app = support::build_test_app().await;
     let response = app
         .oneshot(
             Request::builder()
@@ -79,7 +78,7 @@ async fn create_job_returns_conflict_for_offline_device() {
 
 #[tokio::test]
 async fn create_job_returns_not_found_for_unknown_device() {
-    let app = ahand_hub::build_test_app().await;
+    let app = support::build_test_app().await;
     let response = app
         .oneshot(
             Request::builder()
@@ -106,7 +105,7 @@ async fn create_job_returns_not_found_for_unknown_device() {
 
 #[tokio::test]
 async fn stream_output_returns_not_found_for_unknown_job() {
-    let app = ahand_hub::build_test_app().await;
+    let app = support::build_test_app().await;
     let response = app
         .oneshot(
             Request::builder()
@@ -123,7 +122,7 @@ async fn stream_output_returns_not_found_for_unknown_job() {
 
 #[tokio::test]
 async fn create_device_preregisters_device_and_returns_bootstrap_data() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     let server = support::spawn_server_with_state(state.clone()).await;
 
     let response = server
@@ -152,7 +151,7 @@ async fn create_device_preregisters_device_and_returns_bootstrap_data() {
 
 #[tokio::test]
 async fn device_token_can_read_only_its_own_device_record() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     state
         .devices
         .insert(NewDevice {
@@ -188,7 +187,7 @@ async fn device_token_can_read_only_its_own_device_record() {
 
 #[tokio::test]
 async fn delete_device_requires_admin_and_removes_device() {
-    let state = AppState::for_tests().await;
+    let state = support::test_state().await;
     state
         .devices
         .insert(NewDevice {
@@ -223,4 +222,64 @@ async fn delete_device_requires_admin_and_removes_device() {
         .unwrap();
     assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
     assert!(state.devices.get("device-7").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn create_device_rejects_duplicate_device_ids() {
+    let state = support::test_state().await;
+    state
+        .devices
+        .insert(NewDevice {
+            id: "device-9".into(),
+            public_key: Some(vec![9; 32]),
+            hostname: "existing-box".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+        })
+        .await
+        .unwrap();
+    state.devices.mark_offline("device-9").await.unwrap();
+    let server = support::spawn_server_with_state(state.clone()).await;
+
+    let response = server
+        .post(
+            "/api/devices",
+            "service-test-token",
+            serde_json::json!({
+                "id": "device-9",
+                "hostname": "replacement-box",
+                "os": "linux",
+                "capabilities": ["browser"],
+                "version": "9.9.9"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+    let stored = state.devices.get("device-9").await.unwrap().unwrap();
+    assert_eq!(stored.hostname, "existing-box");
+    assert_eq!(stored.public_key, Some(vec![9; 32]));
+}
+
+#[tokio::test]
+async fn direct_memory_insert_starts_device_offline_until_presence_is_marked() {
+    let state = support::test_state().await;
+    state
+        .devices
+        .insert(NewDevice {
+            id: "device-10".into(),
+            public_key: Some(vec![10; 32]),
+            hostname: "lab-node".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+        })
+        .await
+        .unwrap();
+
+    let stored = state.devices.get("device-10").await.unwrap().unwrap();
+    assert!(!stored.online);
 }

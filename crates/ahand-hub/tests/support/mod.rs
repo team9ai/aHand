@@ -2,6 +2,10 @@
 
 use std::time::Duration;
 
+use ahand_hub::config::{Config, StoreConfig};
+use ahand_hub::state::AppState;
+use ahand_hub_core::device::NewDevice;
+use ahand_hub_core::traits::DeviceStore;
 use axum::body::Body;
 use axum::http::{Request, header::AUTHORIZATION};
 use ed25519_dalek::{Signer, SigningKey};
@@ -23,6 +27,47 @@ pub fn service_request(uri: &str) -> Request<Body> {
         .header(AUTHORIZATION, "Bearer service-test-token")
         .body(Body::empty())
         .unwrap()
+}
+
+pub fn test_config() -> Config {
+    Config {
+        bind_addr: "127.0.0.1:0".into(),
+        service_token: "service-test-token".into(),
+        dashboard_shared_password: "shared-secret".into(),
+        device_bootstrap_token: "bootstrap-test-token".into(),
+        device_bootstrap_device_id: "device-2".into(),
+        device_hello_max_age_ms: 30_000,
+        device_presence_ttl_secs: 60,
+        device_presence_refresh_ms: 20_000,
+        jwt_secret: "service-test-secret".into(),
+        output_retention_ms: 60_000,
+        store: StoreConfig::Memory,
+    }
+}
+
+pub async fn test_state() -> AppState {
+    let state = AppState::from_config(test_config())
+        .await
+        .expect("test state should build");
+    state
+        .devices
+        .insert(NewDevice {
+            id: "device-1".into(),
+            public_key: Some(SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes().to_vec()),
+            hostname: "seeded-device".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+        })
+        .await
+        .unwrap();
+    state.devices.mark_offline("device-1").await.unwrap();
+    state
+}
+
+pub async fn build_test_app() -> axum::Router {
+    ahand_hub::build_app(test_state().await)
 }
 
 pub struct TestServer {
@@ -101,12 +146,26 @@ impl TestServer {
         &self,
         session_token: Option<&str>,
     ) -> tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
+        self.connect_dashboard_socket_with_origin(session_token, Some(&self.base_http_url))
+            .await
+    }
+
+    pub async fn connect_dashboard_socket_with_origin(
+        &self,
+        session_token: Option<&str>,
+        origin: Option<&str>,
+    ) -> tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
         let mut request = self.ws_url("/ws/dashboard").into_client_request().unwrap();
         if let Some(token) = session_token {
             request.headers_mut().append(
                 "cookie",
                 format!("ahand_hub_session={token}").parse().unwrap(),
             );
+        }
+        if let Some(origin) = origin {
+            request
+                .headers_mut()
+                .append("origin", origin.parse().unwrap());
         }
 
         let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
@@ -267,7 +326,7 @@ impl TestDevice {
 }
 
 pub async fn spawn_test_server() -> TestServer {
-    spawn_server_with_state(ahand_hub::state::AppState::for_tests().await).await
+    spawn_server_with_state(test_state().await).await
 }
 
 pub async fn spawn_server_with_state(state: ahand_hub::state::AppState) -> TestServer {

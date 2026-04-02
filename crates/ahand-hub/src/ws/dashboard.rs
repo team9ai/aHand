@@ -21,6 +21,7 @@ pub async fn handle_dashboard_socket(
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
     let token = session_cookie_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    validate_same_origin(&headers)?;
     let claims = authenticate_token(&state, token).map_err(|_| StatusCode::UNAUTHORIZED)?;
     match claims.role {
         Role::Admin | Role::DashboardUser => {}
@@ -73,6 +74,26 @@ fn session_cookie_token(headers: &HeaderMap) -> Option<&str> {
         .split(';')
         .map(str::trim)
         .find_map(|part| part.strip_prefix("ahand_hub_session="))
+}
+
+fn validate_same_origin(headers: &HeaderMap) -> Result<(), StatusCode> {
+    let origin = headers
+        .get(axum::http::header::ORIGIN)
+        .ok_or(StatusCode::FORBIDDEN)?
+        .to_str()
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+    let host = headers
+        .get(axum::http::header::HOST)
+        .ok_or(StatusCode::FORBIDDEN)?
+        .to_str()
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+
+    let parsed = url::Url::parse(origin).map_err(|_| StatusCode::FORBIDDEN)?;
+    match parsed.port_or_known_default() {
+        Some(port) if format!("{}:{port}", parsed.host_str().unwrap_or_default()) == host => Ok(()),
+        None if parsed.host_str().unwrap_or_default() == host => Ok(()),
+        _ => Err(StatusCode::FORBIDDEN),
+    }
 }
 
 fn resync_event(reason: &str) -> DashboardEvent {

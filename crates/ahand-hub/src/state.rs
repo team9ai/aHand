@@ -15,7 +15,6 @@ use ahand_hub_store::job_store::PgJobStore;
 use ahand_hub_store::presence_store::RedisPresenceStore;
 use async_trait::async_trait;
 use dashmap::{DashMap, mapref::entry::Entry};
-use ed25519_dalek::SigningKey;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -106,18 +105,6 @@ impl AppState {
         Ok(state)
     }
 
-    pub async fn for_tests() -> Self {
-        let state = Self::from_config(crate::config::Config::for_tests())
-            .await
-            .expect("test state should build");
-        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
-        state
-            .devices
-            .seed_registered_device("device-1", signing_key.verifying_key().to_bytes().to_vec())
-            .await;
-        state
-    }
-
     async fn preregister_bootstrap_device(&self, device_id: &str) -> Result<()> {
         if self.devices.get(device_id).await?.is_some() {
             return Ok(());
@@ -155,39 +142,6 @@ impl MemoryDeviceStore {
         Self {
             devices: DashMap::new(),
             persistent: Some(persistent),
-        }
-    }
-
-    pub async fn seed_registered_device(&self, device_id: &str, public_key: Vec<u8>) {
-        let stored_public_key = public_key.clone();
-        self.devices.insert(
-            device_id.into(),
-            StoredDevice {
-                device: Device {
-                    id: device_id.into(),
-                    public_key: Some(stored_public_key),
-                    hostname: "seeded-device".into(),
-                    os: "linux".into(),
-                    capabilities: vec!["exec".into()],
-                    version: Some("0.1.2".into()),
-                    auth_method: "ed25519".into(),
-                    online: false,
-                },
-                last_signed_at_ms: 0,
-            },
-        );
-        if let Some(persistent) = &self.persistent {
-            let _ = persistent
-                .upsert_device(NewDevice {
-                    id: device_id.into(),
-                    public_key: Some(public_key),
-                    hostname: "seeded-device".into(),
-                    os: "linux".into(),
-                    capabilities: vec!["exec".into()],
-                    version: Some("0.1.2".into()),
-                    auth_method: "ed25519".into(),
-                })
-                .await;
         }
     }
 
@@ -355,7 +309,7 @@ impl DeviceStore for MemoryDeviceStore {
             capabilities: device.capabilities,
             version: device.version,
             auth_method: device.auth_method,
-            online: true,
+            online: false,
         };
         self.devices.insert(
             device.id.clone(),

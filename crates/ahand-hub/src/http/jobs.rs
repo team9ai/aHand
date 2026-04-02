@@ -86,9 +86,6 @@ impl JobRuntime {
     pub async fn create_job(&self, job: NewJob) -> anyhow::Result<Job> {
         let job = self.dispatcher.create_job(job).await?;
         self.output_stream.prime(&job.id.to_string());
-        self.transition_job(&job.id.to_string(), JobStatus::Sent, "service:api")
-            .await?;
-        let job = self.jobs.get(&job.id.to_string()).await?.unwrap_or(job);
         self.events.publish_job_created(&job);
 
         let envelope = ahand_protocol::Envelope {
@@ -107,7 +104,7 @@ impl JobRuntime {
             )),
             ..Default::default()
         };
-        if let Err(err) = self.connections.send(&job.device_id, envelope) {
+        if let Err(err) = self.connections.send(&job.device_id, envelope).await {
             self.transition_job(&job.id.to_string(), JobStatus::Failed, "hub:dispatch")
                 .await?;
             self.record_terminal_state(&job.id.to_string(), -1, &err.to_string())
@@ -117,6 +114,8 @@ impl JobRuntime {
                 .await?;
             return Err(HubError::DeviceOffline(job.device_id.clone()).into());
         }
+        self.transition_job(&job.id.to_string(), JobStatus::Sent, "service:api")
+            .await?;
         Ok(self.jobs.get(&job.id.to_string()).await?.unwrap_or(job))
     }
 
@@ -146,6 +145,7 @@ impl JobRuntime {
                     ..Default::default()
                 },
             )
+            .await
             .is_err()
         {
             return Err(HubError::DeviceOffline(job.device_id.clone()).into());
@@ -155,14 +155,20 @@ impl JobRuntime {
 
     pub async fn handle_device_frame(&self, device_id: &str, frame: &[u8]) -> anyhow::Result<()> {
         let envelope = ahand_protocol::Envelope::decode(frame)?;
-        self.connections
-            .observe_inbound(device_id, envelope.seq, envelope.ack);
+        if self.connections.has_seen_inbound(device_id, envelope.seq) {
+            self.connections.observe_ack(device_id, envelope.ack);
+            return Ok(());
+        }
+
+        let seq = envelope.seq;
+        let ack = envelope.ack;
         match envelope.payload {
             Some(ahand_protocol::envelope::Payload::JobEvent(event)) => {
                 let Some(job) = self.job_for_device(device_id, &event.job_id).await? else {
                     anyhow::bail!("job {} not found", event.job_id);
                 };
                 if is_terminal_status(job.status) {
+                    self.connections.observe_inbound(device_id, seq, ack);
                     return Ok(());
                 }
                 if let Some(event_kind) = event.event {
@@ -204,7 +210,16 @@ impl JobRuntime {
                     anyhow::bail!("job {} not found", finished.job_id);
                 };
                 if is_terminal_status(job.status) {
+                    self.connections.observe_inbound(device_id, seq, ack);
                     return Ok(());
+                }
+                if job.status != JobStatus::Running {
+                    self.transition_job(
+                        &finished.job_id,
+                        JobStatus::Running,
+                        &format!("device:{device_id}"),
+                    )
+                    .await?;
                 }
                 let status = if finished.error == "cancelled" {
                     JobStatus::Cancelled
@@ -226,6 +241,7 @@ impl JobRuntime {
                     anyhow::bail!("job {} not found", rejected.job_id);
                 };
                 if is_terminal_status(job.status) {
+                    self.connections.observe_inbound(device_id, seq, ack);
                     return Ok(());
                 }
                 self.transition_job(
@@ -243,6 +259,7 @@ impl JobRuntime {
             _ => {}
         }
 
+        self.connections.observe_inbound(device_id, seq, ack);
         Ok(())
     }
 
@@ -501,6 +518,7 @@ mod tests {
             })
             .await
             .unwrap();
+        devices.mark_online(device_id, "ws").await.unwrap();
     }
 
     async fn build_runtime() -> (
@@ -532,6 +550,42 @@ mod tests {
             jobs,
             audit,
         )
+    }
+
+    async fn wait_for_audit_entries(
+        audit: &Arc<MemoryAuditStore>,
+        resource_id: String,
+        action: &str,
+    ) -> Vec<ahand_hub_core::audit::AuditEntry> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let entries = audit
+                .query(AuditFilter {
+                    resource_type: Some("job".into()),
+                    resource_id: Some(resource_id.clone()),
+                    action: Some(action.into()),
+                })
+                .await
+                .unwrap();
+            if !entries.is_empty() || tokio::time::Instant::now() >= deadline {
+                return entries;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn attach_live_connection(
+        connections: &Arc<ConnectionRegistry>,
+        device_id: &str,
+    ) -> tokio::task::JoinHandle<()> {
+        let (_connection_id, mut rx) = connections.register(device_id.into(), 0);
+        tokio::spawn(async move {
+            while let Some(outbound) = rx.recv().await {
+                if let Some(delivered) = outbound.delivered {
+                    let _ = delivered.send(Ok(()));
+                }
+            }
+        })
     }
 
     #[tokio::test]
@@ -569,16 +623,20 @@ mod tests {
                 .contains("device-1")
         );
         assert!(jobs[0].output_summary.is_some());
+        assert!(jobs[0].started_at.is_none());
         assert!(jobs[0].finished_at.is_some());
-        let audit_entries = audit
+        let audit_entries =
+            wait_for_audit_entries(&audit, jobs[0].id.to_string(), "job.failed").await;
+        assert_eq!(audit_entries.len(), 1);
+        let sent_entries = audit
             .query(AuditFilter {
                 resource_type: Some("job".into()),
                 resource_id: Some(jobs[0].id.to_string()),
-                action: Some("job.failed".into()),
+                action: Some("job.sent".into()),
             })
             .await
             .unwrap();
-        assert_eq!(audit_entries.len(), 1);
+        assert!(sent_entries.is_empty());
 
         let mut stream = runtime
             .output_stream
@@ -598,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn handle_device_frame_rejects_job_updates_for_other_devices() {
         let (runtime, connections, _jobs, _audit) = build_runtime().await;
-        let (_connection_id, _rx) = connections.register("device-2".into(), 0);
+        let _transport = attach_live_connection(&connections, "device-2");
         let job = runtime
             .create_job(NewJob {
                 device_id: "device-2".into(),
@@ -646,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn progress_event_moves_job_to_running_and_writes_audit() {
         let (runtime, connections, jobs, audit) = build_runtime().await;
-        let (_connection_id, _rx) = connections.register("device-1".into(), 0);
+        let _transport = attach_live_connection(&connections, "device-1");
         let job = runtime
             .create_job(NewJob {
                 device_id: "device-1".into(),
@@ -680,21 +738,15 @@ mod tests {
         let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
         assert_eq!(stored.status, JobStatus::Running);
         assert!(stored.started_at.is_some());
-        let audit_entries = audit
-            .query(AuditFilter {
-                resource_type: Some("job".into()),
-                resource_id: Some(job.id.to_string()),
-                action: Some("job.running".into()),
-            })
-            .await
-            .unwrap();
+        let audit_entries =
+            wait_for_audit_entries(&audit, job.id.to_string(), "job.running").await;
         assert_eq!(audit_entries.len(), 1);
     }
 
     #[tokio::test]
     async fn cancelled_finish_event_marks_job_cancelled_and_writes_audit() {
         let (runtime, connections, jobs, audit) = build_runtime().await;
-        let (_connection_id, _rx) = connections.register("device-1".into(), 0);
+        let _transport = attach_live_connection(&connections, "device-1");
         let job = runtime
             .create_job(NewJob {
                 device_id: "device-1".into(),
@@ -732,21 +784,15 @@ mod tests {
         assert_eq!(stored.error.as_deref(), Some("cancelled"));
         assert_eq!(stored.output_summary.as_deref(), Some("cancelled"));
         assert!(stored.finished_at.is_some());
-        let audit_entries = audit
-            .query(AuditFilter {
-                resource_type: Some("job".into()),
-                resource_id: Some(job.id.to_string()),
-                action: Some("job.cancelled".into()),
-            })
-            .await
-            .unwrap();
+        let audit_entries =
+            wait_for_audit_entries(&audit, job.id.to_string(), "job.cancelled").await;
         assert_eq!(audit_entries.len(), 1);
     }
 
     #[tokio::test]
     async fn successful_finish_event_marks_job_finished_and_writes_audit() {
         let (runtime, connections, jobs, audit) = build_runtime().await;
-        let (_connection_id, _rx) = connections.register("device-1".into(), 0);
+        let _transport = attach_live_connection(&connections, "device-1");
         let job = runtime
             .create_job(NewJob {
                 device_id: "device-1".into(),
@@ -780,6 +826,7 @@ mod tests {
 
         let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
         assert_eq!(stored.status, JobStatus::Finished);
+        assert!(stored.started_at.is_some());
         assert_eq!(stored.exit_code, Some(0));
         assert_eq!(stored.error.as_deref(), Some(""));
         assert_eq!(
@@ -787,14 +834,8 @@ mod tests {
             Some("completed successfully")
         );
         assert!(stored.finished_at.is_some());
-        let audit_entries = audit
-            .query(AuditFilter {
-                resource_type: Some("job".into()),
-                resource_id: Some(job.id.to_string()),
-                action: Some("job.finished".into()),
-            })
-            .await
-            .unwrap();
+        let audit_entries =
+            wait_for_audit_entries(&audit, job.id.to_string(), "job.finished").await;
         assert_eq!(audit_entries.len(), 1);
     }
 }

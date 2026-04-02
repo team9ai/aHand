@@ -5,7 +5,7 @@ use ahand_hub_core::job::Job;
 use ahand_hub_core::traits::AuditStore;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardEvent {
@@ -18,14 +18,16 @@ pub struct DashboardEvent {
 }
 
 pub struct EventBus {
-    audit: Arc<dyn AuditStore>,
+    audit_tx: mpsc::UnboundedSender<AuditEntry>,
     tx: broadcast::Sender<DashboardEvent>,
 }
 
 impl EventBus {
     pub fn new(audit: Arc<dyn AuditStore>) -> Self {
+        let (audit_tx, audit_rx) = mpsc::unbounded_channel();
+        tokio::spawn(crate::audit_writer::run_audit_writer(audit, audit_rx));
         let (tx, _) = broadcast::channel(256);
-        Self { audit, tx }
+        Self { audit_tx, tx }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<DashboardEvent> {
@@ -100,17 +102,15 @@ impl EventBus {
         detail: serde_json::Value,
     ) -> anyhow::Result<()> {
         let timestamp = Utc::now();
-        self.audit
-            .append(&[AuditEntry {
-                timestamp,
-                action: action.into(),
-                resource_type: resource_type.into(),
-                resource_id: resource_id.into(),
-                actor: actor.into(),
-                detail: detail.clone(),
-                source_ip: None,
-            }])
-            .await?;
+        let _ = self.audit_tx.send(AuditEntry {
+            timestamp,
+            action: action.into(),
+            resource_type: resource_type.into(),
+            resource_id: resource_id.into(),
+            actor: actor.into(),
+            detail: detail.clone(),
+            source_ip: None,
+        });
         self.publish(DashboardEvent {
             event: action.into(),
             resource_type: resource_type.into(),

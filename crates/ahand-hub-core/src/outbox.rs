@@ -65,4 +65,8 @@ impl Outbox {
     pub fn local_ack(&self) -> u64 {
         self.local_ack
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
 }

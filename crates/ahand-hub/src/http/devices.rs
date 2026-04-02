@@ -52,6 +52,16 @@ pub async fn create_device(
 ) -> Result<(StatusCode, Json<CreateDeviceResponse>), StatusCode> {
     auth.require_admin()?;
 
+    if state
+        .devices
+        .get(&body.id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .is_some()
+    {
+        return Err(StatusCode::CONFLICT);
+    }
+
     state
         .devices
         .insert(NewDevice {

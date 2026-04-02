@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ahand_hub::output_stream::OutputStream;
-use ahand_hub::state::AppState;
 use ahand_hub_core::job::NewJob;
 use futures_util::StreamExt;
 use reqwest::header::{AUTHORIZATION, HeaderName};
@@ -95,7 +94,7 @@ async fn reconnecting_sse_with_last_event_id_does_not_duplicate_output_history()
 
 #[tokio::test]
 async fn reconnecting_sse_with_stale_last_event_id_emits_resync_event() {
-    let mut state = AppState::for_tests().await;
+    let mut state = support::test_state().await;
     state.output_stream = Arc::new(OutputStream::new(Duration::from_secs(60), 2));
     let job = state
         .jobs_store
@@ -167,4 +166,36 @@ async fn reconnecting_sse_with_stale_last_event_id_emits_resync_event() {
     assert!(body.contains("data: three"));
     assert!(body.contains("data: four"));
     assert!(!body.contains("data: one"));
+}
+
+#[tokio::test]
+async fn existing_job_without_live_output_state_still_streams_with_200() {
+    let state = support::test_state().await;
+    let job = state
+        .jobs_store
+        .insert(NewJob {
+            device_id: "device-1".into(),
+            tool: "echo".into(),
+            args: vec!["hello".into()],
+            cwd: None,
+            env: Default::default(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap();
+    let server = spawn_server_with_state(state).await;
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/api/jobs/{}/output",
+            server.http_base_url(),
+            job.id
+        ))
+        .header(AUTHORIZATION, "Bearer service-test-token")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
 }

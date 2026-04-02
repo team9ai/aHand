@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use ahand_hub_core::HubError;
 use async_stream::stream;
 use axum::response::sse::Event;
 use dashmap::DashMap;
@@ -105,11 +104,7 @@ impl OutputStream {
         last_event_id: Option<u64>,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>> {
         self.prune_expired();
-        let state = self
-            .jobs
-            .get(&job_id)
-            .map(|entry| entry.value().clone())
-            .ok_or_else(|| HubError::JobNotFound(job_id.clone()))?;
+        let state = self.job_state(&job_id);
         let finished = state.finished.load(Ordering::Relaxed);
         let mut rx = state.tx.subscribe();
         let history = state.history.lock().await.clone();

@@ -110,7 +110,7 @@ impl JobStore for PgJobStore {
             UPDATE jobs
             SET status = $2,
                 started_at = CASE
-                    WHEN $2 IN ('running', 'finished', 'failed', 'cancelled') AND started_at IS NULL THEN $3
+                    WHEN $2 = 'running' AND started_at IS NULL THEN $3
                     ELSE started_at
                 END,
                 finished_at = CASE
