@@ -40,6 +40,18 @@ async fn dashboard_login_issues_a_dashboard_token_and_verify_accepts_it() {
 }
 
 #[tokio::test]
+async fn service_verify_uses_production_subject_name() {
+    let state = support::test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    let verify = server.get("/api/auth/verify", "service-test-token").await;
+    assert_eq!(verify.status(), reqwest::StatusCode::OK);
+    let verify_payload: Value = verify.json().await.unwrap();
+    assert_eq!(verify_payload["role"], "Admin");
+    assert_eq!(verify_payload["subject"], "service");
+}
+
+#[tokio::test]
 async fn dashboard_login_rejects_invalid_password() {
     let state = support::test_state().await;
     let server = spawn_server_with_state(state).await;
@@ -63,7 +75,7 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
     state
         .devices
         .insert(NewDevice {
-            id: "device-2".into(),
+            id: "device-3".into(),
             public_key: Some(vec![9; 32]),
             hostname: "render-node".into(),
             os: "linux".into(),
@@ -73,12 +85,12 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
         })
         .await
         .unwrap();
-    state.devices.mark_online("device-2", "ws").await.unwrap();
+    state.devices.mark_online("device-3", "ws").await.unwrap();
 
     let running_job = state
         .jobs_store
         .insert(NewJob {
-            device_id: "device-2".into(),
+            device_id: "device-3".into(),
             tool: "render".into(),
             args: vec!["scene.blend".into()],
             cwd: Some("/srv/work".into()),
@@ -120,7 +132,7 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
                 timestamp: Utc::now() - ChronoDuration::minutes(10),
                 action: "device.online".into(),
                 resource_type: "device".into(),
-                resource_id: "device-2".into(),
+                resource_id: "device-3".into(),
                 actor: "device".into(),
                 detail: serde_json::json!({ "hostname": "render-node" }),
                 source_ip: None,
@@ -145,17 +157,17 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
     assert_eq!(stats_response.status(), reqwest::StatusCode::OK);
     let stats: Value = stats_response.json().await.unwrap();
     assert_eq!(stats["online_devices"], 1);
-    assert_eq!(stats["offline_devices"], 1);
+    assert_eq!(stats["offline_devices"], 2);
     assert_eq!(stats["running_jobs"], 1);
 
-    let device_response = server.get("/api/devices/device-2", &token).await;
+    let device_response = server.get("/api/devices/device-3", &token).await;
     assert_eq!(device_response.status(), reqwest::StatusCode::OK);
     let device: Value = device_response.json().await.unwrap();
     assert_eq!(device["hostname"], "render-node");
     assert_eq!(device["online"], true);
 
     let jobs_response = server
-        .get("/api/jobs?status=running&device_id=device-2", &token)
+        .get("/api/jobs?status=running&device_id=device-3", &token)
         .await;
     assert_eq!(jobs_response.status(), reqwest::StatusCode::OK);
     let jobs: Value = jobs_response.json().await.unwrap();
@@ -170,7 +182,7 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
         .await;
     assert_eq!(job_response.status(), reqwest::StatusCode::OK);
     let job: Value = job_response.json().await.unwrap();
-    assert_eq!(job["device_id"], "device-2");
+    assert_eq!(job["device_id"], "device-3");
     assert!(job.get("env").is_none());
     assert!(job.get("requested_by").is_none());
 
@@ -466,4 +478,19 @@ async fn dashboard_websocket_rejects_cross_origin_clients() {
         .expect_err("cross-origin dashboard websocket should fail");
 
     assert!(result.to_string().contains("403"));
+}
+
+#[tokio::test]
+async fn dashboard_websocket_accepts_configured_split_origin_clients() {
+    let mut config = support::test_config();
+    config.dashboard_allowed_origins = vec!["https://dashboard.example".into()];
+    let state = ahand_hub::state::AppState::from_config(config).await.unwrap();
+    let token = state.auth.issue_dashboard_jwt("operator-1").unwrap();
+    let server = spawn_server_with_state(state).await;
+
+    let socket = server
+        .connect_dashboard_socket_with_origin(Some(&token), Some("https://dashboard.example"))
+        .await;
+
+    drop(socket);
 }

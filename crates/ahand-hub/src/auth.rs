@@ -86,7 +86,7 @@ pub fn authenticate_token(state: &AppState, token: &str) -> HubResult<AuthContex
     if token == state.service_token.as_str() {
         return Ok(AuthContext {
             role: Role::Admin,
-            subject: "service:test".into(),
+            subject: "service".into(),
             iss: "ahand-hub".into(),
             exp: usize::MAX,
         });

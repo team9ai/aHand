@@ -34,6 +34,7 @@ pub fn test_config() -> Config {
         bind_addr: "127.0.0.1:0".into(),
         service_token: "service-test-token".into(),
         dashboard_shared_password: "shared-secret".into(),
+        dashboard_allowed_origins: Vec::new(),
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,

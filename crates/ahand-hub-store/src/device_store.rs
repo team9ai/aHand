@@ -94,7 +94,12 @@ impl DeviceStore for PgDeviceStore {
         .bind(&device.auth_method)
         .execute(&self.pool)
         .await
-        .map_err(|err| HubError::Internal(err.to_string()))?;
+        .map_err(|err| match err {
+            sqlx::Error::Database(database_err) if database_err.is_unique_violation() => {
+                HubError::DeviceAlreadyExists(device_id.clone())
+            }
+            other => HubError::Internal(other.to_string()),
+        })?;
 
         self.get(&device_id)
             .await?

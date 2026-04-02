@@ -1,6 +1,7 @@
 use anyhow::Context;
 use redis::aio::ConnectionManager;
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn connect_test_redis() -> ConnectionManager {
     let redis_url = std::env::var("AHAND_HUB_TEST_REDIS_URL")
         .expect("AHAND_HUB_TEST_REDIS_URL must be set by TestStack");

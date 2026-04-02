@@ -1,3 +1,5 @@
+#![cfg(any(test, feature = "test-support"))]
+
 use std::process::Command;
 use std::time::{Duration, Instant};
 

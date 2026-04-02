@@ -4,8 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+test-support = []
+
 [lib]
 doctest = false
+
+[[test]]
+name = "store_roundtrip"
+required-features = ["test-support"]
 
 [dependencies]
 ahand-hub-core = { path = "../ahand-hub-core" }

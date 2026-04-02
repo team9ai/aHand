@@ -87,6 +87,8 @@ impl JobRuntime {
         let job = self.dispatcher.create_job(job).await?;
         self.output_stream.prime(&job.id.to_string());
         self.events.publish_job_created(&job);
+        self.transition_job(&job.id.to_string(), JobStatus::Sent, "service:api")
+            .await?;
 
         let envelope = ahand_protocol::Envelope {
             device_id: job.device_id.clone(),
@@ -114,8 +116,6 @@ impl JobRuntime {
                 .await?;
             return Err(HubError::DeviceOffline(job.device_id.clone()).into());
         }
-        self.transition_job(&job.id.to_string(), JobStatus::Sent, "service:api")
-            .await?;
         Ok(self.jobs.get(&job.id.to_string()).await?.unwrap_or(job))
     }
 
@@ -156,7 +156,7 @@ impl JobRuntime {
     pub async fn handle_device_frame(&self, device_id: &str, frame: &[u8]) -> anyhow::Result<()> {
         let envelope = ahand_protocol::Envelope::decode(frame)?;
         if self.connections.has_seen_inbound(device_id, envelope.seq) {
-            self.connections.observe_ack(device_id, envelope.ack);
+            self.connections.observe_ack(device_id, envelope.ack)?;
             return Ok(());
         }
 
@@ -168,7 +168,7 @@ impl JobRuntime {
                     anyhow::bail!("job {} not found", event.job_id);
                 };
                 if is_terminal_status(job.status) {
-                    self.connections.observe_inbound(device_id, seq, ack);
+                    self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
                 }
                 if let Some(event_kind) = event.event {
@@ -210,7 +210,7 @@ impl JobRuntime {
                     anyhow::bail!("job {} not found", finished.job_id);
                 };
                 if is_terminal_status(job.status) {
-                    self.connections.observe_inbound(device_id, seq, ack);
+                    self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
                 }
                 if job.status != JobStatus::Running {
@@ -241,7 +241,7 @@ impl JobRuntime {
                     anyhow::bail!("job {} not found", rejected.job_id);
                 };
                 if is_terminal_status(job.status) {
-                    self.connections.observe_inbound(device_id, seq, ack);
+                    self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
                 }
                 self.transition_job(
@@ -259,7 +259,7 @@ impl JobRuntime {
             _ => {}
         }
 
-        self.connections.observe_inbound(device_id, seq, ack);
+        self.connections.observe_inbound(device_id, seq, ack)?;
         Ok(())
     }
 
@@ -578,12 +578,11 @@ mod tests {
         connections: &Arc<ConnectionRegistry>,
         device_id: &str,
     ) -> tokio::task::JoinHandle<()> {
-        let (_connection_id, mut rx) = connections.register(device_id.into(), 0);
+        let (_connection_id, mut rx, _close_rx) =
+            connections.register(device_id.into(), 0).unwrap();
         tokio::spawn(async move {
             while let Some(outbound) = rx.recv().await {
-                if let Some(delivered) = outbound.delivered {
-                    let _ = delivered.send(Ok(()));
-                }
+                let _ = outbound;
             }
         })
     }
@@ -591,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn create_job_marks_failed_and_emits_terminal_output_when_dispatch_fails() {
         let (runtime, connections, jobs, audit) = build_runtime().await;
-        let (_connection_id, rx) = connections.register("device-1".into(), 0);
+        let (_connection_id, rx, _close_rx) = connections.register("device-1".into(), 0).unwrap();
         drop(rx);
 
         let err = runtime
@@ -636,7 +635,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(sent_entries.is_empty());
+        assert_eq!(sent_entries.len(), 1);
 
         let mut stream = runtime
             .output_stream

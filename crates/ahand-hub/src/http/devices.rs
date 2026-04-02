@@ -51,17 +51,6 @@ pub async fn create_device(
     Json(body): Json<CreateDeviceRequest>,
 ) -> Result<(StatusCode, Json<CreateDeviceResponse>), StatusCode> {
     auth.require_admin()?;
-
-    if state
-        .devices
-        .get(&body.id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .is_some()
-    {
-        return Err(StatusCode::CONFLICT);
-    }
-
     state
         .devices
         .insert(NewDevice {
@@ -74,7 +63,10 @@ pub async fn create_device(
             auth_method: "bootstrap".into(),
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|err| match err {
+            ahand_hub_core::HubError::DeviceAlreadyExists(_) => StatusCode::CONFLICT,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
     state
         .devices
         .mark_offline(&body.id)

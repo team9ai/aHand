@@ -155,7 +155,7 @@ async fn device_token_can_read_only_its_own_device_record() {
     state
         .devices
         .insert(NewDevice {
-            id: "device-2".into(),
+            id: "device-7".into(),
             public_key: None,
             hostname: "edge-box".into(),
             os: "linux".into(),
@@ -165,22 +165,22 @@ async fn device_token_can_read_only_its_own_device_record() {
         })
         .await
         .unwrap();
-    state.devices.mark_offline("device-2").await.unwrap();
+    state.devices.mark_offline("device-7").await.unwrap();
 
-    let device_token = state.auth.issue_device_jwt("device-2").unwrap();
+    let device_token = state.auth.issue_device_jwt("device-7").unwrap();
     let other_device_token = state.auth.issue_device_jwt("device-1").unwrap();
     let server = support::spawn_server_with_state(state).await;
 
-    let own_response = server.get("/api/devices/device-2", &device_token).await;
+    let own_response = server.get("/api/devices/device-7", &device_token).await;
     assert_eq!(own_response.status(), reqwest::StatusCode::OK);
 
     let capabilities = server
-        .get("/api/devices/device-2/capabilities", &device_token)
+        .get("/api/devices/device-7/capabilities", &device_token)
         .await;
     assert_eq!(capabilities.status(), reqwest::StatusCode::OK);
 
     let other_response = server
-        .get("/api/devices/device-2", &other_device_token)
+        .get("/api/devices/device-7", &other_device_token)
         .await;
     assert_eq!(other_response.status(), reqwest::StatusCode::FORBIDDEN);
 }

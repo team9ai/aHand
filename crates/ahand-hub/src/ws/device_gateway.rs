@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, watch};
 
 use ahand_hub_core::HubError;
 use axum::extract::State;
@@ -18,14 +18,19 @@ pub struct ConnectionRegistry {
 }
 
 struct ConnectionEntry {
-    connection_id: Option<uuid::Uuid>,
-    sender: Option<mpsc::UnboundedSender<OutboundFrame>>,
+    active: Option<ActiveConnection>,
     outbox: Mutex<ahand_hub_core::Outbox>,
+}
+
+#[derive(Clone)]
+struct ActiveConnection {
+    connection_id: uuid::Uuid,
+    sender: mpsc::UnboundedSender<OutboundFrame>,
+    close_tx: watch::Sender<bool>,
 }
 
 pub(crate) struct OutboundFrame {
     pub(crate) frame: Vec<u8>,
-    pub(crate) delivered: Option<oneshot::Sender<Result<(), ()>>>,
 }
 
 impl ConnectionRegistry {
@@ -33,39 +38,58 @@ impl ConnectionRegistry {
         &self,
         device_id: String,
         last_ack: u64,
-    ) -> (uuid::Uuid, mpsc::UnboundedReceiver<OutboundFrame>) {
+    ) -> anyhow::Result<(
+        uuid::Uuid,
+        mpsc::UnboundedReceiver<OutboundFrame>,
+        watch::Receiver<bool>,
+    )> {
         let (tx, rx) = mpsc::unbounded_channel();
         let connection_id = uuid::Uuid::new_v4();
+        let (close_tx, close_rx) = watch::channel(false);
+        let active = ActiveConnection {
+            connection_id,
+            sender: tx.clone(),
+            close_tx,
+        };
 
         match self.senders.entry(device_id) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 let entry = entry.get_mut();
-                entry.connection_id = Some(connection_id);
-                entry.sender = Some(tx.clone());
                 let replay = {
                     let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-                    outbox.on_peer_ack(last_ack);
+                    if !outbox.try_on_peer_ack(last_ack) {
+                        return Err(HubError::InvalidPeerAck {
+                            ack: last_ack,
+                            max: outbox.last_issued_seq(),
+                        }
+                        .into());
+                    }
                     outbox.replay_from(0)
                 };
+                if let Some(previous) = entry.active.replace(active.clone()) {
+                    let _ = previous.close_tx.send(true);
+                }
                 for frame in replay {
-                    let _ = tx.send(OutboundFrame {
-                        frame,
-                        delivered: None,
-                    });
+                    let _ = tx.send(OutboundFrame { frame });
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 let mut outbox = ahand_hub_core::Outbox::new(10_000);
-                outbox.on_peer_ack(last_ack);
+                if !outbox.try_on_peer_ack(last_ack) {
+                    return Err(HubError::InvalidPeerAck {
+                        ack: last_ack,
+                        max: outbox.last_issued_seq(),
+                    }
+                    .into());
+                }
                 entry.insert(ConnectionEntry {
-                    connection_id: Some(connection_id),
-                    sender: Some(tx),
+                    active: Some(active),
                     outbox: Mutex::new(outbox),
                 });
             }
         }
 
-        (connection_id, rx)
+        Ok((connection_id, rx, close_rx))
     }
 
     pub(crate) async fn send(
@@ -73,58 +97,57 @@ impl ConnectionRegistry {
         device_id: &str,
         mut envelope: ahand_protocol::Envelope,
     ) -> anyhow::Result<()> {
-        let (sender, connection_id, seq, frame) = {
+        let (seq, frame) = {
             let entry = self
                 .senders
                 .get_mut(device_id)
-                .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
-            let sender = entry
-                .sender
-                .as_ref()
-                .cloned()
-                .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
-            let connection_id = entry
-                .connection_id
                 .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
             let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
             let seq = outbox.reserve_seq();
             envelope.seq = seq;
             envelope.ack = outbox.local_ack();
-            (sender, connection_id, seq, envelope.encode_to_vec())
+            let frame = envelope.encode_to_vec();
+            outbox.store(seq, frame.clone());
+            (seq, frame)
         };
-        let (delivery_tx, delivery_rx) = oneshot::channel();
-        sender
-            .send(OutboundFrame {
-                frame: frame.clone(),
-                delivered: Some(delivery_tx),
-            })
-            .map_err(|_| HubError::DeviceOffline(device_id.into()))?;
 
-        match delivery_rx.await {
-            Ok(Ok(())) => {
+        loop {
+            let (sender, connection_id) = {
                 let entry = self
                     .senders
-                    .get_mut(device_id)
+                    .get(device_id)
                     .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
-                if entry.connection_id != Some(connection_id) {
+                let active = entry
+                    .active
+                    .as_ref()
+                    .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
+                (active.sender.clone(), active.connection_id)
+            };
+            if sender.send(OutboundFrame { frame: frame.clone() }).is_err() {
+                self.clear_current_sender(device_id, connection_id);
+                if !self.has_active(device_id) {
+                    if let Some(entry) = self.senders.get_mut(device_id) {
+                        let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
+                        outbox.remove(seq);
+                    }
                     return Err(HubError::DeviceOffline(device_id.into()).into());
                 }
-                let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-                outbox.store(seq, frame);
-                Ok(())
+                continue;
             }
-            _ => {
-                let _ = self.unregister(device_id, connection_id).await;
-                self.cleanup_idle_entry(device_id);
-                Err(HubError::DeviceOffline(device_id.into()).into())
-            }
+            return Ok(());
         }
     }
 
     pub(crate) fn is_current(&self, device_id: &str, connection_id: uuid::Uuid) -> bool {
         self.senders
             .get(device_id)
-            .map(|entry| entry.connection_id == Some(connection_id))
+            .map(|entry| {
+                entry
+                    .active
+                    .as_ref()
+                    .map(|active| active.connection_id == connection_id)
+                    .unwrap_or(false)
+            })
             .unwrap_or(false)
     }
 
@@ -141,38 +164,50 @@ impl ConnectionRegistry {
             .unwrap_or(false)
     }
 
-    pub(crate) fn observe_ack(&self, device_id: &str, ack: u64) {
+    pub(crate) fn observe_ack(&self, device_id: &str, ack: u64) -> anyhow::Result<()> {
         if ack == 0 {
-            return;
+            return Ok(());
         }
         let should_cleanup = if let Some(entry) = self.senders.get_mut(device_id) {
             let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-            outbox.on_peer_ack(ack);
-            entry.sender.is_none() && entry.connection_id.is_none() && outbox.is_empty()
+            if !outbox.try_on_peer_ack(ack) {
+                return Err(HubError::InvalidPeerAck {
+                    ack,
+                    max: outbox.last_issued_seq(),
+                }
+                .into());
+            }
+            entry.active.is_none() && outbox.is_empty()
         } else {
             false
         };
         if should_cleanup {
             self.senders.remove(device_id);
         }
+        Ok(())
     }
 
-    pub(crate) fn observe_inbound(&self, device_id: &str, seq: u64, ack: u64) {
+    pub(crate) fn observe_inbound(&self, device_id: &str, seq: u64, ack: u64) -> anyhow::Result<()> {
         let should_cleanup = if let Some(entry) = self.senders.get_mut(device_id) {
             let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
             if seq > 0 {
                 outbox.on_recv(seq);
             }
-            if ack > 0 {
-                outbox.on_peer_ack(ack);
+            if ack > 0 && !outbox.try_on_peer_ack(ack) {
+                return Err(HubError::InvalidPeerAck {
+                    ack,
+                    max: outbox.last_issued_seq(),
+                }
+                .into());
             }
-            entry.sender.is_none() && entry.connection_id.is_none() && outbox.is_empty()
+            entry.active.is_none() && outbox.is_empty()
         } else {
             false
         };
         if should_cleanup {
             self.senders.remove(device_id);
         }
+        Ok(())
     }
 
     pub(crate) async fn unregister(
@@ -181,10 +216,15 @@ impl ConnectionRegistry {
         connection_id: uuid::Uuid,
     ) -> anyhow::Result<bool> {
         if let Some(mut entry) = self.senders.get_mut(device_id)
-            && entry.connection_id == Some(connection_id)
+            && entry
+                .active
+                .as_ref()
+                .map(|active| active.connection_id == connection_id)
+                .unwrap_or(false)
         {
-            entry.connection_id = None;
-            entry.sender = None;
+            if let Some(active) = entry.active.take() {
+                let _ = active.close_tx.send(true);
+            }
             let should_remove = {
                 let outbox = entry.outbox.lock().expect("outbox mutex poisoned");
                 outbox.is_empty()
@@ -198,17 +238,29 @@ impl ConnectionRegistry {
         Ok(false)
     }
 
-    fn cleanup_idle_entry(&self, device_id: &str) {
-        let remove = self
-            .senders
+    fn has_active(&self, device_id: &str) -> bool {
+        self.senders
             .get(device_id)
-            .map(|entry| {
-                entry.sender.is_none()
-                    && entry.connection_id.is_none()
-                    && entry.outbox.lock().expect("outbox mutex poisoned").is_empty()
-            })
-            .unwrap_or(false);
-        if remove {
+            .map(|entry| entry.active.is_some())
+            .unwrap_or(false)
+    }
+
+    fn clear_current_sender(&self, device_id: &str, connection_id: uuid::Uuid) {
+        let should_cleanup = if let Some(mut entry) = self.senders.get_mut(device_id) {
+            if entry
+                .active
+                .as_ref()
+                .map(|active| active.connection_id == connection_id)
+                .unwrap_or(false)
+            {
+                entry.active = None;
+            }
+            entry.active.is_none()
+                && entry.outbox.lock().expect("outbox mutex poisoned").is_empty()
+        } else {
+            false
+        };
+        if should_cleanup {
             self.senders.remove(device_id);
         }
     }
@@ -290,8 +342,9 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             .await?;
         let device_id = envelope.device_id.clone();
         let hostname = hello.hostname.clone();
-        let (connection_id, mut outbound_rx) =
-            state.connections.register(device_id.clone(), hello.last_ack);
+        let (connection_id, mut outbound_rx, close_rx) = state
+            .connections
+            .register(device_id.clone(), hello.last_ack)?;
         active_connection = Some((device_id.clone(), connection_id));
         state.devices.mark_online(&device_id, "ws").await?;
         if let Err(err) = state.events.emit_device_online(&device_id, &hostname).await {
@@ -302,37 +355,62 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             let devices = state.devices.clone();
             let refresh_ms = state.device_presence_refresh_ms;
             let refresh_device_id = device_id.clone();
+            let mut refresh_close_rx = close_rx.clone();
             presence_task = Some(tokio::spawn(async move {
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(refresh_ms)).await;
-                    if let Err(err) = devices.mark_online(&refresh_device_id, "ws").await {
-                        tracing::warn!(device_id = %refresh_device_id, error = %err, "failed to refresh device presence");
-                        break;
+                    tokio::select! {
+                        biased;
+                        _ = refresh_close_rx.changed() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(refresh_ms)) => {
+                            if let Err(err) = devices.mark_online(&refresh_device_id, "ws").await {
+                                tracing::warn!(device_id = %refresh_device_id, error = %err, "failed to refresh device presence");
+                                break;
+                            }
+                        }
                     }
                 }
             }));
         }
 
+        let connections = state.connections.clone();
+        let send_device_id = device_id.clone();
+        let mut send_close_rx = close_rx.clone();
         send_task = Some(tokio::spawn(async move {
-            while let Some(outbound) = outbound_rx.recv().await {
-                if sender
-                    .send(WsMessage::Binary(outbound.frame.into()))
-                    .await
-                    .is_err()
-                {
-                    if let Some(delivered) = outbound.delivered {
-                        let _ = delivered.send(Err(()));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = send_close_rx.changed() => break,
+                    outbound = outbound_rx.recv() => {
+                        let Some(outbound) = outbound else {
+                            break;
+                        };
+                        if !connections.is_current(&send_device_id, connection_id) {
+                            break;
+                        }
+                        if sender
+                            .send(WsMessage::Binary(outbound.frame.into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
-                    break;
-                }
-                if let Some(delivered) = outbound.delivered {
-                    let _ = delivered.send(Ok(()));
                 }
             }
         }));
 
-        while let Some(message) = receiver.next().await {
-            let message = message?;
+        let mut recv_close_rx = close_rx;
+        loop {
+            let message = tokio::select! {
+                biased;
+                _ = recv_close_rx.changed() => break,
+                message = receiver.next() => {
+                    let Some(message) = message else {
+                        break;
+                    };
+                    message?
+                }
+            };
             if !state.connections.is_current(&device_id, connection_id) {
                 break;
             }
@@ -390,12 +468,11 @@ mod tests {
     #[tokio::test]
     async fn register_replays_only_messages_after_last_ack() {
         let registry = ConnectionRegistry::default();
-        let (_connection_id, mut initial_rx) = registry.register("device-1".into(), 0);
+        let (_connection_id, mut initial_rx, _close_rx) =
+            registry.register("device-1".into(), 0).unwrap();
         let transport = tokio::spawn(async move {
             while let Some(outbound) = initial_rx.recv().await {
-                if let Some(delivered) = outbound.delivered {
-                    let _ = delivered.send(Ok(()));
-                }
+                let _ = outbound;
             }
         });
 
@@ -444,7 +521,8 @@ mod tests {
 
         transport.abort();
 
-        let (_reconnect_id, mut replay_rx) = registry.register("device-1".into(), 1);
+        let (_reconnect_id, mut replay_rx, _close_rx) =
+            registry.register("device-1".into(), 1).unwrap();
         let replayed = replay_rx.recv().await.expect("replayed frame should exist");
         let replayed = ahand_protocol::Envelope::decode(replayed.frame.as_slice()).unwrap();
         let Some(ahand_protocol::envelope::Payload::JobRequest(job)) = replayed.payload else {
@@ -461,14 +539,13 @@ mod tests {
     #[tokio::test]
     async fn inbound_seq_updates_outbound_ack() {
         let registry = ConnectionRegistry::default();
-        let (_connection_id, mut rx) = registry.register("device-1".into(), 0);
-        registry.observe_inbound("device-1", 7, 0);
+        let (_connection_id, mut rx, _close_rx) =
+            registry.register("device-1".into(), 0).unwrap();
+        registry.observe_inbound("device-1", 7, 0).unwrap();
 
         let transport = tokio::spawn(async move {
             while let Some(outbound) = rx.recv().await {
-                if let Some(delivered) = outbound.delivered {
-                    let _ = delivered.send(Ok(()));
-                }
+                let _ = outbound;
             }
         });
 
@@ -505,7 +582,7 @@ mod tests {
     #[tokio::test]
     async fn unregister_removes_idle_entries() {
         let registry = ConnectionRegistry::default();
-        let (connection_id, rx) = registry.register("device-1".into(), 0);
+        let (connection_id, rx, _close_rx) = registry.register("device-1".into(), 0).unwrap();
         drop(rx);
 
         let removed = registry.unregister("device-1", connection_id).await.unwrap();

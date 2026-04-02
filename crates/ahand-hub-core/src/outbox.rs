@@ -54,6 +54,14 @@ impl Outbox {
         }
     }
 
+    pub fn try_on_peer_ack(&mut self, ack: u64) -> bool {
+        if ack > self.last_issued_seq() {
+            return false;
+        }
+        self.on_peer_ack(ack);
+        true
+    }
+
     pub fn replay_from(&self, last_ack: u64) -> Vec<Vec<u8>> {
         self.buffer
             .iter()
@@ -64,6 +72,20 @@ impl Outbox {
 
     pub fn local_ack(&self) -> u64 {
         self.local_ack
+    }
+
+    pub fn last_issued_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+
+    pub fn remove(&mut self, seq: u64) {
+        if let Some(index) = self
+            .buffer
+            .iter()
+            .position(|(buffered_seq, _)| *buffered_seq == seq)
+        {
+            self.buffer.remove(index);
+        }
     }
 
     pub fn is_empty(&self) -> bool {

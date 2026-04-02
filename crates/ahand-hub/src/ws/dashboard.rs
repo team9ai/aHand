@@ -21,7 +21,7 @@ pub async fn handle_dashboard_socket(
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
     let token = session_cookie_token(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    validate_same_origin(&headers)?;
+    validate_same_origin(&headers, state.dashboard_allowed_origins.as_slice())?;
     let claims = authenticate_token(&state, token).map_err(|_| StatusCode::UNAUTHORIZED)?;
     match claims.role {
         Role::Admin | Role::DashboardUser => {}
@@ -76,7 +76,7 @@ fn session_cookie_token(headers: &HeaderMap) -> Option<&str> {
         .find_map(|part| part.strip_prefix("ahand_hub_session="))
 }
 
-fn validate_same_origin(headers: &HeaderMap) -> Result<(), StatusCode> {
+fn validate_same_origin(headers: &HeaderMap, allowed_origins: &[String]) -> Result<(), StatusCode> {
     let origin = headers
         .get(axum::http::header::ORIGIN)
         .ok_or(StatusCode::FORBIDDEN)?
@@ -89,11 +89,35 @@ fn validate_same_origin(headers: &HeaderMap) -> Result<(), StatusCode> {
         .map_err(|_| StatusCode::FORBIDDEN)?;
 
     let parsed = url::Url::parse(origin).map_err(|_| StatusCode::FORBIDDEN)?;
-    match parsed.port_or_known_default() {
-        Some(port) if format!("{}:{port}", parsed.host_str().unwrap_or_default()) == host => Ok(()),
-        None if parsed.host_str().unwrap_or_default() == host => Ok(()),
-        _ => Err(StatusCode::FORBIDDEN),
+    if matches_host(&parsed, host) {
+        return Ok(());
     }
+
+    if allowed_origins
+        .iter()
+        .any(|allowed| allowed_origin_matches(allowed, &parsed))
+    {
+        return Ok(());
+    }
+
+    Err(StatusCode::FORBIDDEN)
+}
+
+fn matches_host(origin: &url::Url, host: &str) -> bool {
+    match origin.port_or_known_default() {
+        Some(port) => format!("{}:{port}", origin.host_str().unwrap_or_default()) == host,
+        None => origin.host_str().unwrap_or_default() == host,
+    }
+}
+
+fn allowed_origin_matches(allowed: &str, origin: &url::Url) -> bool {
+    let Ok(allowed) = url::Url::parse(allowed) else {
+        return false;
+    };
+
+    allowed.scheme() == origin.scheme()
+        && allowed.host_str() == origin.host_str()
+        && allowed.port_or_known_default() == origin.port_or_known_default()
 }
 
 fn resync_event(reason: &str) -> DashboardEvent {

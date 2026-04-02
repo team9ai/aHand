@@ -34,6 +34,7 @@ pub struct AppState {
     pub device_presence_refresh_ms: u64,
     pub service_token: Arc<String>,
     pub dashboard_shared_password: Arc<String>,
+    pub dashboard_allowed_origins: Arc<Vec<String>>,
 }
 
 impl AppState {
@@ -98,6 +99,7 @@ impl AppState {
             device_presence_refresh_ms: config.device_presence_refresh_ms,
             service_token: Arc::new(config.service_token),
             dashboard_shared_password: Arc::new(config.dashboard_shared_password),
+            dashboard_allowed_origins: Arc::new(config.dashboard_allowed_origins),
         };
         state
             .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())
@@ -290,7 +292,7 @@ impl Default for MemoryDeviceStore {
 impl DeviceStore for MemoryDeviceStore {
     async fn insert(&self, device: NewDevice) -> Result<Device> {
         if let Some(persistent) = &self.persistent {
-            let device = persistent.upsert_device(device).await?;
+            let device = persistent.insert(device).await?;
             self.devices.insert(
                 device.id.clone(),
                 StoredDevice {
@@ -301,24 +303,26 @@ impl DeviceStore for MemoryDeviceStore {
             return Ok(device);
         }
 
-        let device = Device {
-            id: device.id,
-            public_key: device.public_key,
-            hostname: device.hostname,
-            os: device.os,
-            capabilities: device.capabilities,
-            version: device.version,
-            auth_method: device.auth_method,
-            online: false,
-        };
-        self.devices.insert(
-            device.id.clone(),
-            StoredDevice {
-                device: device.clone(),
-                last_signed_at_ms: 0,
-            },
-        );
-        Ok(device)
+        match self.devices.entry(device.id.clone()) {
+            Entry::Occupied(_) => Err(HubError::DeviceAlreadyExists(device.id)),
+            Entry::Vacant(entry) => {
+                let device = Device {
+                    id: device.id,
+                    public_key: device.public_key,
+                    hostname: device.hostname,
+                    os: device.os,
+                    capabilities: device.capabilities,
+                    version: device.version,
+                    auth_method: device.auth_method,
+                    online: false,
+                };
+                entry.insert(StoredDevice {
+                    device: device.clone(),
+                    last_signed_at_ms: 0,
+                });
+                Ok(device)
+            }
+        }
     }
 
     async fn get(&self, device_id: &str) -> Result<Option<Device>> {

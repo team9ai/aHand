@@ -3,6 +3,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::time::{Duration, sleep};
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn connect_test_database() -> PgPool {
     let database_url = std::env::var("AHAND_HUB_TEST_DATABASE_URL")
         .expect("AHAND_HUB_TEST_DATABASE_URL must be set by TestStack");

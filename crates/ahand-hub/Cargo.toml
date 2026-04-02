@@ -28,6 +28,7 @@ url = "2"
 uuid.workspace = true
 
 [dev-dependencies]
+ahand-hub-store = { path = "../ahand-hub-store", features = ["test-support"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = "0.3"
 prost.workspace = true
