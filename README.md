@@ -33,7 +33,7 @@ The deployment assets live under [`deploy/hub`](deploy/hub). That stack exposes 
 - `hub` for the Rust service image
 - `dashboard` for the Next.js dashboard image
 
-The dashboard can be deployed independently first, but the compose stack also brings up the full hub environment for local or integrated validation.
+The dashboard can be deployed independently first. The compose stack runs the hub and dashboard against externally managed PostgreSQL and Redis endpoints.
 
 ## Quick Start
 
@@ -121,7 +121,7 @@ ahand/
 ├─ scripts/
 │  └─ dist/                    # Distribution scripts (install, upgrade, setup-browser)
 ├─ e2e/scripts/                # E2E tests for distribution scripts (BATS)
-├─ .github/workflows/          # CI/CD (release-rust, release-admin, release-browser, release-hub)
+├─ .github/workflows/          # CI/CD (hub-ci, release-rust, release-admin, release-browser, release-hub)
 ├─ turbo.json                  # Turborepo pipeline
 ├─ Cargo.toml                  # Rust workspace
 └─ pnpm-workspace.yaml         # pnpm monorepo
@@ -182,9 +182,14 @@ git tag hub-v0.2.0 && git push origin hub-v0.2.0         # production control ce
 
 Each tag triggers a GitHub Actions workflow that builds and publishes the relevant release artifacts. The hub release workflow pushes the `ahand-hub` and `ahand-hub-dashboard` images to GitHub Container Registry.
 
+`release-hub.yml` is tag-provenance preserving by default:
+
+- `git push origin hub-vX.Y.Z` builds from that pushed tag
+- `workflow_dispatch` is only for rebuilding an existing `hub-v*` tag, not for publishing an arbitrary branch under a release tag
+
 ### Hub deployment
 
-To validate the full hub stack locally:
+To validate the hub stack against external PostgreSQL and Redis endpoints:
 
 ```bash
 export AHAND_HUB_SERVICE_TOKEN=dev-service-token
@@ -192,10 +197,100 @@ export AHAND_HUB_DASHBOARD_PASSWORD=dev-dashboard-password
 export AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN=dev-bootstrap-token
 export AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID=device-dev-1
 export AHAND_HUB_JWT_SECRET=dev-jwt-secret
+export AHAND_HUB_DATABASE_URL=postgres://ahand_hub:secret@db.example.internal:5432/ahand_hub
+export AHAND_HUB_REDIS_URL=redis://cache.example.internal:6379
 docker compose -f deploy/hub/docker-compose.yml up --build
 ```
 
-The compose file provisions PostgreSQL and Redis alongside the hub and dashboard containers.
+The compose file starts the hub and dashboard containers only. PostgreSQL and Redis remain external dependencies that must already be reachable at the configured URLs.
+
+For a local smoke environment, build local images, provision disposable external dependencies, wait for them to accept connections, and then run the hub and dashboard containers on the same network:
+
+```bash
+docker build -t ahand-hub:local --target hub -f deploy/hub/Dockerfile .
+docker build -t ahand-hub-dashboard:local --target dashboard -f deploy/hub/Dockerfile .
+
+docker network create ahand-hub-smoke
+docker run -d --rm --network ahand-hub-smoke --name ahand-hub-postgres \
+  -e POSTGRES_DB=ahand_hub \
+  -e POSTGRES_USER=ahand_hub \
+  -e POSTGRES_PASSWORD=ahand_hub \
+  postgres:16-alpine
+docker run -d --rm --network ahand-hub-smoke --name ahand-hub-redis redis:7-alpine
+until docker exec ahand-hub-postgres pg_isready -U ahand_hub -d ahand_hub; do sleep 1; done
+until docker exec ahand-hub-redis redis-cli ping; do sleep 1; done
+
+docker run -d --rm --network ahand-hub-smoke --name ahand-hub \
+  -p 18080:8080 \
+  -e AHAND_HUB_BIND_ADDR=0.0.0.0:8080 \
+  -e AHAND_HUB_SERVICE_TOKEN=dev-service-token \
+  -e AHAND_HUB_DASHBOARD_PASSWORD=dev-dashboard-password \
+  -e AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN=dev-bootstrap-token \
+  -e AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID=device-dev-1 \
+  -e AHAND_HUB_JWT_SECRET=dev-jwt-secret \
+  -e AHAND_HUB_DATABASE_URL=postgres://ahand_hub:ahand_hub@ahand-hub-postgres:5432/ahand_hub \
+  -e AHAND_HUB_REDIS_URL=redis://ahand-hub-redis:6379 \
+  ahand-hub:local
+
+docker run -d --rm --network ahand-hub-smoke --name ahand-hub-dashboard \
+  -p 13100:3100 \
+  -e AHAND_HUB_BASE_URL=http://ahand-hub:8080 \
+  ahand-hub-dashboard:local
+
+curl -fsS http://127.0.0.1:18080/api/health
+curl -fsS http://127.0.0.1:13100/login >/dev/null
+curl -fsS \
+  -c /tmp/ahand-hub-dashboard.cookies \
+  -H 'content-type: application/json' \
+  -d '{"password":"dev-dashboard-password"}' \
+  http://127.0.0.1:13100/api/auth/login >/tmp/ahand-hub-dashboard-login.json
+TOKEN=$(awk '$6 == "ahand_hub_session" { print $7 }' /tmp/ahand-hub-dashboard.cookies)
+if [ -z "$TOKEN" ]; then
+  cat /tmp/ahand-hub-dashboard-login.json >&2
+  exit 1
+fi
+curl -fsS \
+  -b /tmp/ahand-hub-dashboard.cookies \
+  http://127.0.0.1:13100/api/proxy/api/auth/verify
+DASHBOARD_SESSION="$TOKEN" node --input-type=module <<'EOF'
+import http from "node:http";
+
+const request = http.request("http://127.0.0.1:13100/ws/dashboard", {
+  headers: {
+    Connection: "Upgrade",
+    Upgrade: "websocket",
+    "Sec-WebSocket-Version": "13",
+    "Sec-WebSocket-Key": "YWhhbmQtaHViLXNtb2tlIQ==",
+    Cookie: `ahand_hub_session=${process.env.DASHBOARD_SESSION ?? ""}`,
+  },
+});
+
+const timeout = setTimeout(() => {
+  console.error("dashboard websocket handshake timed out");
+  request.destroy(new Error("dashboard websocket timeout"));
+}, 5_000);
+
+request.on("upgrade", (_response, socket) => {
+  clearTimeout(timeout);
+  socket.destroy();
+  process.exit(0);
+});
+
+request.on("response", (response) => {
+  clearTimeout(timeout);
+  console.error(`unexpected dashboard websocket response: ${response.statusCode}`);
+  process.exit(1);
+});
+
+request.on("error", (error) => {
+  clearTimeout(timeout);
+  console.error(error.message);
+  process.exit(1);
+});
+
+request.end();
+EOF
+```
 
 ## License
 

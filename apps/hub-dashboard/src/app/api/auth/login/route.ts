@@ -33,9 +33,22 @@ export async function POST(request: NextRequest) {
       httpOnly: true,
       path: "/",
       sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
+      secure: requestIsSecure(request),
     });
   }
 
   return next;
+}
+
+function requestIsSecure(request: NextRequest) {
+  if (request.nextUrl.protocol === "https:") {
+    return true;
+  }
+
+  const forwardedProto = request.headers.get("x-forwarded-proto");
+  if (!forwardedProto) {
+    return false;
+  }
+
+  return forwardedProto.split(",")[0]?.trim().toLowerCase() === "https";
 }

@@ -20,6 +20,8 @@ on:
       - "package.json"
       - "proto/**"
       - "README.md"
+      - "tsconfig.base.json"
+      - "turbo.json"
   push:
     branches: [main]
     paths:
@@ -40,6 +42,8 @@ on:
       - "package.json"
       - "proto/**"
       - "README.md"
+      - "tsconfig.base.json"
+      - "turbo.json"
   workflow_dispatch:
 
 permissions:
@@ -65,7 +69,7 @@ jobs:
         run: pnpm --filter @ahand/hub-dashboard lint
 
       - name: Test hub dashboard
-        run: pnpm --filter @ahand/hub-dashboard test
+        run: pnpm --filter @ahand/hub-dashboard test --coverage
 
       - name: Build hub dashboard
         run: pnpm --filter @ahand/hub-dashboard build
@@ -97,7 +101,10 @@ jobs:
           cargo test -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --all-targets
           cargo test -p ahandd --test hub_handshake
 
-      - name: Check coverage
+      - name: Check core coverage
+        run: cargo llvm-cov --summary-only -p ahand-hub-core --all-features --fail-under-lines 99
+
+      - name: Check hub-stack coverage
         run: cargo llvm-cov --summary-only -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --fail-under-lines 85
 
   compose:
@@ -112,12 +119,156 @@ jobs:
           AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN: ci-bootstrap-token
           AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID: device-ci
           AHAND_HUB_JWT_SECRET: ci-jwt-secret
-          AHAND_HUB_DATABASE_URL: postgres://ci:ci@postgres:5432/ahand_hub
-          AHAND_HUB_REDIS_URL: redis://redis:6379
+          AHAND_HUB_DATABASE_URL: postgres://ci:ci@db.example.internal:5432/ahand_hub
+          AHAND_HUB_REDIS_URL: redis://cache.example.internal:6379
         run: docker compose -f deploy/hub/docker-compose.yml config
 
       - name: Build hub image target
-        run: docker build --target hub -f deploy/hub/Dockerfile .
+        run: docker build -t ahand-hub:local --target hub -f deploy/hub/Dockerfile .
 
       - name: Build dashboard image target
-        run: docker build --target dashboard -f deploy/hub/Dockerfile .
+        run: docker build -t ahand-hub-dashboard:local --target dashboard -f deploy/hub/Dockerfile .
+
+      - name: Create smoke-test network
+        run: docker network create hub-ci
+
+      - name: Start smoke-test postgres
+        run: |
+          docker run -d --rm \
+            --network hub-ci \
+            --name hub-ci-postgres \
+            -e POSTGRES_DB=ahand_hub \
+            -e POSTGRES_USER=ahand_hub \
+            -e POSTGRES_PASSWORD=ahand_hub \
+            postgres:16-alpine
+
+      - name: Start smoke-test redis
+        run: |
+          docker run -d --rm \
+            --network hub-ci \
+            --name hub-ci-redis \
+            redis:7-alpine
+
+      - name: Wait for smoke-test dependencies
+        run: |
+          until docker exec hub-ci-postgres pg_isready -U ahand_hub -d ahand_hub; do sleep 1; done
+          until docker exec hub-ci-redis redis-cli ping; do sleep 1; done
+
+      - name: Smoke-test hub startup
+        env:
+          AHAND_HUB_BIND_ADDR: 0.0.0.0:8080
+          AHAND_HUB_SERVICE_TOKEN: ci-service-token
+          AHAND_HUB_DASHBOARD_PASSWORD: ci-dashboard-password
+          AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN: ci-bootstrap-token
+          AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID: device-ci
+          AHAND_HUB_JWT_SECRET: ci-jwt-secret
+          AHAND_HUB_DATABASE_URL: postgres://ahand_hub:ahand_hub@hub-ci-postgres:5432/ahand_hub
+          AHAND_HUB_REDIS_URL: redis://hub-ci-redis:6379
+        run: |
+          docker run -d --rm \
+            --network hub-ci \
+            --name hub-ci-hub \
+            -p 18080:8080 \
+            -e AHAND_HUB_BIND_ADDR \
+            -e AHAND_HUB_SERVICE_TOKEN \
+            -e AHAND_HUB_DASHBOARD_PASSWORD \
+            -e AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN \
+            -e AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID \
+            -e AHAND_HUB_JWT_SECRET \
+            -e AHAND_HUB_DATABASE_URL \
+            -e AHAND_HUB_REDIS_URL \
+            ahand-hub:local
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18080/api/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+
+          docker logs hub-ci-hub
+          exit 1
+
+      - name: Smoke-test dashboard startup
+        env:
+          AHAND_HUB_BASE_URL: http://hub-ci-hub:8080
+        run: |
+          docker run -d --rm \
+            --network hub-ci \
+            --name hub-ci-dashboard \
+            -p 13100:3100 \
+            -e AHAND_HUB_BASE_URL \
+            ahand-hub-dashboard:local
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:13100/login >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          dashboard_login=$(
+            curl -fsS \
+              -c /tmp/hub-dashboard.cookies \
+              -H 'content-type: application/json' \
+              -d '{"password":"ci-dashboard-password"}' \
+              http://127.0.0.1:13100/api/auth/login
+          )
+          dashboard_token=$(awk '$6 == "ahand_hub_session" { print $7 }' /tmp/hub-dashboard.cookies)
+
+          if [ -z "$dashboard_token" ]; then
+            echo "dashboard login did not return a token" >&2
+            printf '%s\n' "$dashboard_login" >&2
+            cat /tmp/hub-dashboard.cookies >&2
+            docker logs hub-ci-dashboard
+            exit 1
+          fi
+
+          curl -fsS \
+            -b /tmp/hub-dashboard.cookies \
+            http://127.0.0.1:13100/api/proxy/api/auth/verify
+
+          DASHBOARD_SESSION="$dashboard_token" node --input-type=module <<'EOF'
+          import http from "node:http";
+
+          const request = http.request("http://127.0.0.1:13100/ws/dashboard", {
+            headers: {
+              Connection: "Upgrade",
+              Upgrade: "websocket",
+              "Sec-WebSocket-Version": "13",
+              "Sec-WebSocket-Key": "YWhhbmQtaHViLXNtb2tlIQ==",
+              Cookie: `ahand_hub_session=${process.env.DASHBOARD_SESSION ?? ""}`,
+            },
+          });
+
+          const timeout = setTimeout(() => {
+            console.error("dashboard websocket handshake timed out");
+            request.destroy(new Error("dashboard websocket timeout"));
+          }, 5_000);
+
+          request.on("upgrade", (_response, socket) => {
+            clearTimeout(timeout);
+            socket.destroy();
+            process.exit(0);
+          });
+
+          request.on("response", (response) => {
+            clearTimeout(timeout);
+            console.error(`unexpected dashboard websocket response: ${response.statusCode}`);
+            process.exit(1);
+          });
+
+          request.on("error", (error) => {
+            clearTimeout(timeout);
+            console.error(error.message);
+            process.exit(1);
+          });
+
+          request.end();
+          EOF
+
+      - name: Cleanup smoke-test containers
+        if: always()
+        run: |
+          docker rm -f hub-ci-dashboard hub-ci-hub hub-ci-postgres hub-ci-redis || true
+          docker network rm hub-ci || true

@@ -1,3 +1,4 @@
+use ahand_hub_core::HubError;
 use ahand_hub_core::auth::{AuthService, Role};
 
 #[test]
@@ -18,4 +19,14 @@ fn device_jwt_roundtrip_preserves_role() {
 
     assert_eq!(claims.role, Role::Device);
     assert_eq!(claims.subject, "device-7");
+    assert_eq!(claims.iss, "ahand-hub");
+    assert!(claims.exp > 0);
+}
+
+#[test]
+fn verify_jwt_rejects_invalid_tokens() {
+    let service = AuthService::new_for_tests("unit-test-secret");
+    let err = service.verify_jwt("not-a-jwt").unwrap_err();
+
+    assert!(matches!(err, HubError::InvalidToken(_)));
 }

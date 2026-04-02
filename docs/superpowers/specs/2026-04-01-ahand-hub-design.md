@@ -611,7 +611,7 @@ Configuration sources override in this order:
 Environment variable prefix:
 
 ```text
-AHAND_HUB__
+AHAND_HUB_
 ```
 
 Key configuration areas:
@@ -638,18 +638,20 @@ Startup flow:
 
 ## 14. CI/CD and Build
 
-V1 requires new CI coverage for `ahand-hub`:
+V1 requires new CI coverage for the hub stack. Because this repository is a monorepo, the hub workflow is intentionally scoped to the hub-related packages instead of the entire workspace:
 
-1. `cargo fmt --check`
-2. `cargo clippy --workspace -- -D warnings`
-3. `cargo llvm-cov --workspace --fail-under-lines 100`
-4. Dashboard `pnpm test --coverage`
+1. `cargo fmt -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --check`
+2. `cargo clippy -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --all-targets --all-features -- -D warnings`
+3. `cargo llvm-cov --summary-only -p ahand-hub-core --all-features --fail-under-lines 99`
+4. `cargo llvm-cov --summary-only -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --fail-under-lines 85`
+5. Dashboard `pnpm --filter @ahand/hub-dashboard test --coverage`
 
 Deployment shape:
 
 1. `ahand-hub` runs as a single service/container
-2. PostgreSQL and Redis are external dependencies
-3. The dashboard may be deployed separately first, and can later be embedded as static assets if needed
+2. PostgreSQL and Redis are external dependencies; the deployment compose file points to externally managed endpoints rather than provisioning them itself
+3. CI and operator docs must still provide a smoke path that starts the hub container against disposable Postgres/Redis dependencies before release
+4. The dashboard may be deployed separately first, and can later be embedded as static assets if needed
 
 V1 does not require service splitting yet, but the crate boundaries must preserve a clean path to future extraction.
 

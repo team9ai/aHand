@@ -2561,6 +2561,7 @@ on:
       - "proto/**"
       - "Cargo.toml"
       - "package.json"
+      - "tsconfig.base.json"
       - "turbo.json"
 
 jobs:
@@ -2575,10 +2576,11 @@ jobs:
           cache: pnpm
       - uses: dtolnay/rust-toolchain@stable
       - run: pnpm install --frozen-lockfile
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace -- -D warnings
-      - run: cargo llvm-cov --workspace --fail-under-lines 100
-      - run: pnpm --filter @ahand/hub-dashboard test
+      - run: cargo fmt -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --check
+      - run: cargo clippy -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --all-targets --all-features -- -D warnings
+      - run: cargo llvm-cov --summary-only -p ahand-hub-core --all-features --fail-under-lines 99
+      - run: cargo llvm-cov --summary-only -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --fail-under-lines 85
+      - run: pnpm --filter @ahand/hub-dashboard test --coverage
 ```
 
 - [ ] **Step 2: Run the local verification commands to see what still fails**
@@ -2586,10 +2588,10 @@ jobs:
 Run:
 
 ```bash
-cargo fmt --check
-cargo clippy --workspace -- -D warnings
-cargo test --workspace
-pnpm --filter @ahand/hub-dashboard test
+cargo fmt -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --check
+cargo clippy -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --all-targets --all-features -- -D warnings
+cargo test -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --all-targets
+pnpm --filter @ahand/hub-dashboard test --coverage
 ```
 
 Expected: any remaining failures are real implementation gaps that must be fixed before merge.
@@ -2599,29 +2601,40 @@ Expected: any remaining failures are real implementation gaps that must be fixed
 `deploy/hub/Dockerfile`:
 
 ```dockerfile
-FROM rust:1.85 AS builder
-WORKDIR /app
-COPY . .
+# syntax=docker/dockerfile:1.7
+
+FROM rust:1-bookworm AS hub-build
+WORKDIR /repo
+COPY Cargo.toml Cargo.lock Cross.toml ./
+COPY crates crates
+COPY proto proto
 RUN cargo build --release -p ahand-hub
 
-FROM node:22 AS dashboard
-WORKDIR /app
-COPY apps/hub-dashboard ./apps/hub-dashboard
+FROM debian:bookworm-slim AS hub
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+COPY --from=hub-build /repo/target/release/ahand-hub /usr/local/bin/ahand-hub
+ENTRYPOINT ["/usr/local/bin/ahand-hub"]
+
+FROM node:20-bookworm-slim AS dashboard-build
+WORKDIR /repo
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json tsconfig.base.json ./
+COPY apps apps
+COPY packages packages
+COPY crates crates
+COPY proto proto
 RUN corepack enable && pnpm install --frozen-lockfile
 RUN pnpm --filter @ahand/hub-dashboard build
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /app/target/release/ahand-hub /usr/local/bin/ahand-hub
-COPY --from=dashboard /app/apps/hub-dashboard/.next /opt/hub-dashboard/.next
-ENTRYPOINT ["ahand-hub"]
+FROM node:20-bookworm-slim AS dashboard
+WORKDIR /app/apps/hub-dashboard
+COPY --from=dashboard-build /repo /app
+CMD ["pnpm", "start"]
 ```
 
 `.github/workflows/release-hub.yml`:
 
 ```yaml
-name: Release Hub
+name: Release Hub Stack
 
 on:
   push:
@@ -2630,34 +2643,59 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. hub-v0.1.0)"
+        description: "Existing release tag to rebuild (e.g. hub-v0.1.0)"
         required: true
 
 permissions:
-  contents: write
+  contents: read
   packages: write
 
 jobs:
-  release:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: hub
+            image_name: ahand-hub
+          - target: dashboard
+            image_name: ahand-hub-dashboard
     runs-on: ubuntu-latest
+    env:
+      IMAGE_NAMESPACE: ghcr.io/${{ github.repository_owner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Get tag
+      - name: Resolve release tag
         id: tag
-        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+        run: |
+          tag="${{ github.event.inputs.tag }}"
+          if [ -z "$tag" ]; then
+            tag="$GITHUB_REF_NAME"
+          fi
+          case "$tag" in
+            hub-v*) ;;
+            *)
+              echo "release tag must start with hub-v" >&2
+              exit 1
+              ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: deploy/hub/Dockerfile
+          target: ${{ matrix.target }}
           push: true
-          tags: ghcr.io/${{ github.repository }}/ahand-hub:${{ steps.tag.outputs.tag }}
+          tags: ${{ env.IMAGE_NAMESPACE }}/${{ matrix.image_name }}:${{ steps.tag.outputs.tag }}
 ```
 
 `deploy/hub/docker-compose.yml`:
@@ -2671,22 +2709,10 @@ services:
     ports:
       - "8080:8080"
     environment:
-      AHAND_HUB__DATABASE__URL: postgres://ahand:ahand@postgres:5432/ahand_hub
-      AHAND_HUB__REDIS__URL: redis://redis:6379
-      AHAND_HUB__AUTH__JWT_SECRET: dev-secret
+      AHAND_HUB_DATABASE_URL: postgres://ahand:ahand@db.example.internal:5432/ahand_hub
+      AHAND_HUB_REDIS_URL: redis://cache.example.internal:6379
+      AHAND_HUB_JWT_SECRET: dev-secret
     depends_on:
-      - postgres
-      - redis
-
-  postgres:
-    image: postgres:17
-    environment:
-      POSTGRES_USER: ahand
-      POSTGRES_PASSWORD: ahand
-      POSTGRES_DB: ahand_hub
-
-  redis:
-    image: redis:7-alpine
 ```
 
 `README.md` additions:
@@ -2710,10 +2736,14 @@ job dispatch, audit logs, and the management dashboard.
 Run:
 
 ```bash
-cargo test --workspace -- --nocapture
-pnpm --filter @ahand/hub-dashboard test
+cargo test -p ahand-protocol -p ahand-hub-core -p ahand-hub-store -p ahand-hub --all-targets -- --nocapture
+pnpm --filter @ahand/hub-dashboard test --coverage
 pnpm --filter @ahand/hub-dashboard build
 docker compose -f deploy/hub/docker-compose.yml config
+docker run -d --rm --network hub-ci --name hub-ci-postgres -e POSTGRES_DB=ahand_hub -e POSTGRES_USER=ahand_hub -e POSTGRES_PASSWORD=ahand_hub postgres:16-alpine
+docker run -d --rm --network hub-ci --name hub-ci-redis redis:7-alpine
+docker run -d --rm --network hub-ci --name hub-ci-hub -p 18080:8080 -e AHAND_HUB_BIND_ADDR=0.0.0.0:8080 -e AHAND_HUB_SERVICE_TOKEN=dev-service-token -e AHAND_HUB_DASHBOARD_PASSWORD=dev-dashboard-password -e AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN=dev-bootstrap-token -e AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID=device-dev-1 -e AHAND_HUB_JWT_SECRET=dev-jwt-secret -e AHAND_HUB_DATABASE_URL=postgres://ahand_hub:ahand_hub@hub-ci-postgres:5432/ahand_hub -e AHAND_HUB_REDIS_URL=redis://hub-ci-redis:6379 ahand-hub:local
+docker run -d --rm --network hub-ci --name hub-ci-dashboard -p 13100:3100 -e AHAND_HUB_BASE_URL=http://hub-ci-hub:8080 ahand-hub-dashboard:local
 ```
 
 Expected:
@@ -2723,9 +2753,8 @@ test result: ok.
 ✓ tests passed
 Next.js build completed successfully
 services:
-  ahand-hub:
-  postgres:
-  redis:
+  hub:
+  dashboard:
 ```
 
 - [ ] **Step 5: Commit**

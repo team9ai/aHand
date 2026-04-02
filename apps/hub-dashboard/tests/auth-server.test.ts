@@ -6,12 +6,12 @@ import { POST as loginPost } from "@/app/api/auth/login/route";
 import { POST as logoutPost } from "@/app/api/auth/logout/route";
 import { GET as proxyGet } from "@/app/api/proxy/[...path]/route";
 import { middleware } from "@/middleware";
-import nextConfig from "../next.config";
 
 const HUB_BASE_URL = "https://hub.example";
 
 describe("hub dashboard auth server flow", () => {
   const originalBaseUrl = process.env.AHAND_HUB_BASE_URL;
+  const originalNodeEnv = process.env.NODE_ENV;
 
   beforeEach(() => {
     process.env.AHAND_HUB_BASE_URL = HUB_BASE_URL;
@@ -23,10 +23,15 @@ describe("hub dashboard auth server flow", () => {
 
     if (originalBaseUrl === undefined) {
       delete process.env.AHAND_HUB_BASE_URL;
-      return;
+    } else {
+      process.env.AHAND_HUB_BASE_URL = originalBaseUrl;
     }
 
-    process.env.AHAND_HUB_BASE_URL = originalBaseUrl;
+    if (originalNodeEnv === undefined) {
+      delete process.env.NODE_ENV;
+    } else {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
   });
 
   it("redirects unauthenticated dashboard requests to /login", () => {
@@ -87,6 +92,81 @@ describe("hub dashboard auth server flow", () => {
     });
     expect(response.cookies.get("ahand_hub_session")?.value).toBe("session-token");
     expect(response.cookies.get("ahand_hub_ws_token")).toBeUndefined();
+  });
+
+  it("does not mark session cookies as secure for plain-http login requests", async () => {
+    process.env.NODE_ENV = "production";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ token: "session-token" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const request = new NextRequest("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "shared-secret" }),
+    });
+
+    const response = await loginPost(request);
+
+    expect(response.headers.get("set-cookie")).not.toContain("Secure");
+  });
+
+  it("marks session cookies as secure when the login request is forwarded over https", async () => {
+    process.env.NODE_ENV = "production";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ token: "session-token" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const request = new NextRequest("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-forwarded-proto": "https",
+      },
+      body: JSON.stringify({ password: "shared-secret" }),
+    });
+
+    const response = await loginPost(request);
+
+    expect(response.headers.get("set-cookie")).toContain("Secure");
+  });
+
+  it("does not mark session cookies as secure when the trusted forwarded proto is plain http", async () => {
+    process.env.NODE_ENV = "production";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ token: "session-token" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const request = new NextRequest("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-forwarded-proto": "http, https",
+      },
+      body: JSON.stringify({ password: "shared-secret" }),
+    });
+
+    const response = await loginPost(request);
+
+    expect(response.headers.get("set-cookie")).not.toContain("Secure");
   });
 
   it("does not set cookies when the upstream login payload has no token", async () => {
@@ -324,17 +404,32 @@ describe("hub dashboard auth server flow", () => {
     await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
   });
 
-  it("declares a websocket rewrite for /ws/dashboard", async () => {
-    const rewrites = typeof nextConfig.rewrites === "function" ? await nextConfig.rewrites() : [];
-    const routes = Array.isArray(rewrites) ? rewrites : [...rewrites.beforeFiles, ...rewrites.afterFiles, ...rewrites.fallback];
+  it("rewrites authenticated dashboard websocket requests to the hub at runtime", () => {
+    const request = new NextRequest("http://localhost/ws/dashboard", {
+      headers: { cookie: "ahand_hub_session=session-token" },
+    });
 
-    expect(routes).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          source: "/ws/dashboard",
-          destination: `${HUB_BASE_URL}/ws/dashboard`,
-        }),
-      ]),
-    );
+    const response = middleware(request);
+
+    expect(response.headers.get("x-middleware-rewrite")).toBe(`${HUB_BASE_URL}/ws/dashboard`);
+  });
+
+  it("rejects unauthenticated dashboard websocket requests", async () => {
+    const response = middleware(new NextRequest("http://localhost/ws/dashboard"));
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ error: "unauthorized" });
+  });
+
+  it("returns 503 for dashboard websocket requests when the hub base URL is missing", async () => {
+    delete process.env.AHAND_HUB_BASE_URL;
+
+    const request = new NextRequest("http://localhost/ws/dashboard", {
+      headers: { cookie: "ahand_hub_session=session-token" },
+    });
+    const response = middleware(request);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({ error: "hub_unavailable" });
   });
 });

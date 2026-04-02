@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. hub-v0.1.0)"
+        description: "Existing release tag to rebuild (e.g. hub-v0.1.0)"
         required: true
 
 permissions:
@@ -29,7 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
 
       - uses: docker/setup-buildx-action@v3
 
@@ -47,6 +48,13 @@ jobs:
           if [ -z "$tag" ]; then
             tag="$GITHUB_REF_NAME"
           fi
+          case "$tag" in
+            hub-v*) ;;
+            *)
+              echo "release tag must start with hub-v" >&2
+              exit 1
+              ;;
+          esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Build and push ${{ matrix.target }} image

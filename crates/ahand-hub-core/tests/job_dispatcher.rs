@@ -50,6 +50,27 @@ impl DeviceStore for OnlineDeviceStore {
     }
 }
 
+struct ErrorDeviceStore;
+
+#[async_trait]
+impl DeviceStore for ErrorDeviceStore {
+    async fn insert(&self, _device: NewDevice) -> ahand_hub_core::Result<Device> {
+        Err(HubError::Internal("device store unavailable".into()))
+    }
+
+    async fn get(&self, _device_id: &str) -> ahand_hub_core::Result<Option<Device>> {
+        Err(HubError::Internal("device store unavailable".into()))
+    }
+
+    async fn list(&self) -> ahand_hub_core::Result<Vec<Device>> {
+        Err(HubError::Internal("device store unavailable".into()))
+    }
+
+    async fn delete(&self, _device_id: &str) -> ahand_hub_core::Result<()> {
+        Err(HubError::Internal("device store unavailable".into()))
+    }
+}
+
 #[derive(Default)]
 struct MemoryJobStore {
     jobs: DashMap<String, ahand_hub_core::job::Job>,
@@ -162,6 +183,72 @@ impl AuditStore for FailingAuditStore {
     }
 }
 
+struct FailingInsertJobStore;
+
+#[async_trait]
+impl JobStore for FailingInsertJobStore {
+    async fn insert(&self, _job: NewJob) -> ahand_hub_core::Result<ahand_hub_core::job::Job> {
+        Err(HubError::Internal("job insert failed".into()))
+    }
+
+    async fn get(&self, _job_id: &str) -> ahand_hub_core::Result<Option<ahand_hub_core::job::Job>> {
+        Ok(None)
+    }
+
+    async fn list(
+        &self,
+        _filter: JobFilter,
+    ) -> ahand_hub_core::Result<Vec<ahand_hub_core::job::Job>> {
+        Ok(Vec::new())
+    }
+
+    async fn update_status(
+        &self,
+        _job_id: &str,
+        _status: JobStatus,
+    ) -> ahand_hub_core::Result<()> {
+        Err(HubError::Internal("job update failed".into()))
+    }
+}
+
+struct FailingUpdateJobStore {
+    job: Mutex<Option<ahand_hub_core::job::Job>>,
+}
+
+impl FailingUpdateJobStore {
+    fn new(job: ahand_hub_core::job::Job) -> Self {
+        Self {
+            job: Mutex::new(Some(job)),
+        }
+    }
+}
+
+#[async_trait]
+impl JobStore for FailingUpdateJobStore {
+    async fn insert(&self, _job: NewJob) -> ahand_hub_core::Result<ahand_hub_core::job::Job> {
+        unreachable!("insert is not used in this test")
+    }
+
+    async fn get(&self, _job_id: &str) -> ahand_hub_core::Result<Option<ahand_hub_core::job::Job>> {
+        Ok(self.job.lock().unwrap().clone())
+    }
+
+    async fn list(
+        &self,
+        _filter: JobFilter,
+    ) -> ahand_hub_core::Result<Vec<ahand_hub_core::job::Job>> {
+        Ok(self.job.lock().unwrap().clone().into_iter().collect())
+    }
+
+    async fn update_status(
+        &self,
+        _job_id: &str,
+        _status: JobStatus,
+    ) -> ahand_hub_core::Result<()> {
+        Err(HubError::Internal("job update failed".into()))
+    }
+}
+
 #[tokio::test]
 async fn create_job_requires_online_device() {
     let stores = ahand_hub_core::tests::fakes::offline_job_stores();
@@ -181,6 +268,73 @@ async fn create_job_requires_online_device() {
         .unwrap_err();
 
     assert_eq!(err, HubError::DeviceOffline("device-1".into()));
+}
+
+#[tokio::test]
+async fn create_job_returns_not_found_for_unknown_device() {
+    let devices = Arc::new(OnlineDeviceStore::new("device-1"));
+    let jobs = Arc::new(MemoryJobStore::default());
+    let audit = Arc::new(RecordingAuditStore::default());
+    let dispatcher = JobDispatcher::new(devices, jobs, audit);
+
+    let err = dispatcher
+        .create_job(NewJob {
+            device_id: "device-missing".into(),
+            tool: "git".into(),
+            args: vec!["status".into()],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(err, HubError::DeviceNotFound("device-missing".into()));
+}
+
+#[tokio::test]
+async fn create_job_propagates_device_store_errors() {
+    let jobs = Arc::new(MemoryJobStore::default());
+    let audit = Arc::new(RecordingAuditStore::default());
+    let dispatcher = JobDispatcher::new(Arc::new(ErrorDeviceStore), jobs, audit);
+
+    let err = dispatcher
+        .create_job(NewJob {
+            device_id: "device-1".into(),
+            tool: "git".into(),
+            args: vec!["status".into()],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(err, HubError::Internal("device store unavailable".into()));
+}
+
+#[tokio::test]
+async fn create_job_propagates_job_insert_errors() {
+    let devices = Arc::new(OnlineDeviceStore::new("device-1"));
+    let audit = Arc::new(RecordingAuditStore::default());
+    let dispatcher = JobDispatcher::new(devices, Arc::new(FailingInsertJobStore), audit);
+
+    let err = dispatcher
+        .create_job(NewJob {
+            device_id: "device-1".into(),
+            tool: "git".into(),
+            args: vec!["status".into()],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap_err();
+
+    assert_eq!(err, HubError::Internal("job insert failed".into()));
 }
 
 #[tokio::test]
@@ -281,6 +435,82 @@ async fn transition_does_not_regress_terminal_jobs() {
 
     let stored = jobs.get(&job.id.to_string()).await.unwrap().unwrap();
     assert_eq!(stored.status, JobStatus::Finished);
+}
+
+#[tokio::test]
+async fn transition_returns_none_when_status_is_unchanged() {
+    let devices = Arc::new(OnlineDeviceStore::new("device-1"));
+    let jobs = Arc::new(MemoryJobStore::default());
+    let audit = Arc::new(RecordingAuditStore::default());
+    let dispatcher = JobDispatcher::new(devices, jobs.clone(), audit);
+
+    let job = dispatcher
+        .create_job(NewJob {
+            device_id: "device-1".into(),
+            tool: "git".into(),
+            args: vec!["status".into()],
+            cwd: None,
+            env: HashMap::new(),
+            timeout_ms: 30_000,
+            requested_by: "service:test".into(),
+        })
+        .await
+        .unwrap();
+
+    let transitioned = dispatcher
+        .transition(&job.id.to_string(), JobStatus::Pending)
+        .await
+        .unwrap();
+
+    assert_eq!(transitioned, None);
+    assert_eq!(
+        jobs.get(&job.id.to_string()).await.unwrap().unwrap().status,
+        JobStatus::Pending
+    );
+}
+
+#[tokio::test]
+async fn transition_returns_not_found_for_missing_job() {
+    let devices = Arc::new(OnlineDeviceStore::new("device-1"));
+    let jobs = Arc::new(MemoryJobStore::default());
+    let audit = Arc::new(RecordingAuditStore::default());
+    let dispatcher = JobDispatcher::new(devices, jobs, audit);
+
+    let err = dispatcher
+        .transition("missing-job", JobStatus::Running)
+        .await
+        .unwrap_err();
+
+    assert_eq!(err, HubError::JobNotFound("missing-job".into()));
+}
+
+#[tokio::test]
+async fn transition_propagates_job_store_update_errors() {
+    let devices = Arc::new(OnlineDeviceStore::new("device-1"));
+    let audit = Arc::new(RecordingAuditStore::default());
+    let job = ahand_hub_core::job::Job {
+        id: uuid::Uuid::new_v4(),
+        device_id: "device-1".into(),
+        tool: "git".into(),
+        args: vec!["status".into()],
+        cwd: None,
+        env: HashMap::new(),
+        timeout_ms: 30_000,
+        status: JobStatus::Pending,
+        requested_by: "service:test".into(),
+    };
+    let dispatcher = JobDispatcher::new(
+        devices,
+        Arc::new(FailingUpdateJobStore::new(job.clone())),
+        audit,
+    );
+
+    let err = dispatcher
+        .transition(&job.id.to_string(), JobStatus::Running)
+        .await
+        .unwrap_err();
+
+    assert_eq!(err, HubError::Internal("job update failed".into()));
 }
 
 #[tokio::test]

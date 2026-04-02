@@ -55,7 +55,24 @@ impl AuthService {
             exp: (Utc::now() + Duration::hours(24)).timestamp() as usize,
         };
 
-        encode(&Header::default(), &claims, &self.encoding_key)
-            .map_err(|err| HubError::InvalidToken(err.to_string()))
+        let token = encode(&Header::default(), &claims, &self.encoding_key)
+            .expect("AuthContext should always serialize into a JWT");
+        Ok(token)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthService, Role};
+
+    #[test]
+    fn issue_jwt_supports_admin_claims() {
+        let service = AuthService::new_for_tests("unit-test-secret");
+        let token = service.issue_jwt(Role::Admin, "service:test").unwrap();
+        let claims = service.verify_jwt(&token).unwrap();
+
+        assert_eq!(claims.role, Role::Admin);
+        assert_eq!(claims.subject, "service:test");
+        assert_eq!(claims.iss, "ahand-hub");
     }
 }

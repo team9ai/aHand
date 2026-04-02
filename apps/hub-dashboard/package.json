@@ -23,12 +23,13 @@
     "@types/node": "^20.19.17",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
+    "@vitest/coverage-v8": "4.0.18",
     "eslint": "^9.38.0",
     "eslint-config-next": "16.1.6",
     "jsdom": "^26.1.0",
     "msw": "^2.11.5",
     "tailwindcss": "^4.1.17",
     "typescript": "^5.9.3",
-    "vitest": "^4.0.7"
+    "vitest": "4.0.18"
   }
 }
