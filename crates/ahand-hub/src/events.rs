@@ -77,25 +77,6 @@ impl EventBus {
     }
 
     pub fn publish_job_created(&self, job: &Job) {
-        let audit = self.audit.clone();
-        let audit_job = job.clone();
-        tokio::spawn(async move {
-            let _ = audit
-                .append(&[AuditEntry {
-                    timestamp: Utc::now(),
-                    action: "job.created".into(),
-                    resource_type: "job".into(),
-                    resource_id: audit_job.id.to_string(),
-                    actor: audit_job.requested_by.clone(),
-                    detail: serde_json::json!({
-                        "device_id": audit_job.device_id,
-                        "tool": audit_job.tool,
-                        "status": job_status_name(&audit_job),
-                    }),
-                    source_ip: None,
-                }])
-                .await;
-        });
         self.publish(DashboardEvent {
             event: "job.created".into(),
             resource_type: "job".into(),
