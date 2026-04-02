@@ -96,6 +96,24 @@ async fn dashboard_login_rejects_invalid_password() {
 }
 
 #[tokio::test]
+async fn dashboard_login_rejects_malformed_json_with_error_envelope() {
+    let state = support::test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/auth/login", server.http_base_url()))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("{\"password\":")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let payload: Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "VALIDATION_ERROR");
+}
+
+#[tokio::test]
 async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users() {
     let state = support::test_state().await;
     state

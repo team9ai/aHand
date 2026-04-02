@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use ahand_hub_core::HubError;
 use axum::Json;
-use axum::extract::rejection::QueryRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
@@ -58,6 +58,10 @@ impl ApiError {
 
     pub fn from_query_rejection(_value: QueryRejection) -> Self {
         Self::validation("Invalid query parameters")
+    }
+
+    pub fn from_json_rejection(_value: JsonRejection) -> Self {
+        Self::validation("Invalid JSON request body")
     }
 
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {

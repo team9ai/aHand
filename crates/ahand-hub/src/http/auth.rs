@@ -1,5 +1,5 @@
 use ahand_hub_core::auth::Role;
-use axum::{Json, extract::State};
+use axum::{Json, extract::State, extract::rejection::JsonRejection};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthContextExt;
@@ -25,8 +25,9 @@ pub struct VerifyResponse {
 
 pub async fn login(
     State(state): State<AppState>,
-    Json(body): Json<LoginRequest>,
+    body: Result<Json<LoginRequest>, JsonRejection>,
 ) -> ApiResult<Json<LoginResponse>> {
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
     if body.password != state.dashboard_shared_password.as_str() {
         state
             .append_audit_entry(
