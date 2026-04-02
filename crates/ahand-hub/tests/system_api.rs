@@ -1,10 +1,43 @@
 mod support;
 
+use std::time::Duration;
+
+use ahand_hub_core::audit::AuditFilter;
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::traits::DeviceStore;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use futures_util::{SinkExt, StreamExt};
 use tower::ServiceExt;
+
+async fn wait_for_audit_count(
+    state: &ahand_hub::state::AppState,
+    action: &str,
+    resource_id: &str,
+    expected: usize,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let entries = state
+            .audit_store
+            .query(AuditFilter {
+                action: Some(action.into()),
+                resource_type: None,
+                resource_id: Some(resource_id.into()),
+            })
+            .await
+            .unwrap();
+        if entries.len() == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {expected} audit entries for {action} {resource_id}, got {}",
+            entries.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 #[tokio::test]
 async fn health_endpoint_reports_ok() {
@@ -143,10 +176,50 @@ async fn create_device_preregisters_device_and_returns_bootstrap_data() {
     let payload: serde_json::Value = response.json().await.unwrap();
     assert_eq!(payload["device_id"], "device-9");
     assert!(payload["bootstrap_token"].is_string());
+    let bootstrap_token = payload["bootstrap_token"].as_str().unwrap();
+    assert!(state.auth.verify_jwt(bootstrap_token).is_err());
 
     let stored = state.devices.get("device-9").await.unwrap().unwrap();
     assert!(!stored.online);
     assert!(stored.public_key.is_none());
+
+    let mut first = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap()
+        .0;
+    let challenge = support::read_hello_challenge(&mut first).await;
+    let hello = support::bootstrap_hello("device-9", bootstrap_token, &challenge.nonce);
+    first
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            prost::Message::encode_to_vec(&hello).into(),
+        ))
+        .await
+        .unwrap();
+    let _accepted = support::read_hello_accepted(&mut first).await;
+    let _ = first.close(None).await;
+
+    let mut replay = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap()
+        .0;
+    let replay_challenge = support::read_hello_challenge(&mut replay).await;
+    let replay_hello =
+        support::bootstrap_hello("device-9", bootstrap_token, &replay_challenge.nonce);
+    replay
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            prost::Message::encode_to_vec(&replay_hello).into(),
+        ))
+        .await
+        .unwrap();
+    let replay_response = tokio::time::timeout(Duration::from_secs(1), replay.next())
+        .await
+        .expect("replay bootstrap handshake should terminate");
+    assert!(matches!(
+        replay_response,
+        Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | Some(Err(_)) | None
+    ));
+
+    wait_for_audit_count(&state, "device.registered", "device-9", 1).await;
 }
 
 #[tokio::test]
@@ -222,6 +295,7 @@ async fn delete_device_requires_admin_and_removes_device() {
         .unwrap();
     assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
     assert!(state.devices.get("device-7").await.unwrap().is_none());
+    wait_for_audit_count(&state, "device.deleted", "device-7", 1).await;
 }
 
 #[tokio::test]

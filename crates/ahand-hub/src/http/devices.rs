@@ -73,10 +73,13 @@ pub async fn create_device(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    let bootstrap_token = state
-        .auth
-        .issue_device_jwt(&body.id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let bootstrap_token = match state.bootstrap_tokens.issue(&body.id).await {
+        Ok(token) => token,
+        Err(_) => {
+            let _ = state.devices.delete(&body.id).await;
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
     Ok((
         StatusCode::CREATED,
@@ -131,5 +134,15 @@ pub async fn delete_device(
         .delete(&device_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let _ = state.bootstrap_tokens.delete_device(&device_id).await;
+    state
+        .append_audit_entry(
+            "device.deleted",
+            "device",
+            &device_id,
+            &auth.0.subject,
+            serde_json::json!({}),
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT)
 }

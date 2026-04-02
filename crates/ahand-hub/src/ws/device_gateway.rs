@@ -295,6 +295,7 @@ pub async fn handle_device_socket(ws: WebSocketUpgrade, State(state): State<AppS
 async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
     let (mut sender, mut receiver) = socket.split();
     let mut active_connection: Option<(String, uuid::Uuid)> = None;
+    let mut bootstrap_reservation: Option<crate::bootstrap::BootstrapReservation> = None;
     let mut send_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -328,16 +329,36 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         let verified = crate::auth::verify_device_hello(
             &envelope.device_id,
             &hello,
-            state.auth.as_ref(),
+            &state,
             &challenge.nonce,
-            state.device_bootstrap_token.as_str(),
-            state.device_bootstrap_device_id.as_str(),
-            state.device_hello_max_age_ms,
-        )?;
+        )
+        .await?;
+        bootstrap_reservation = verified.bootstrap_reservation.clone();
         state
             .devices
             .accept_verified_hello(&envelope.device_id, &hello, &verified)
             .await?;
+        if let Some(reservation) = bootstrap_reservation.as_ref() {
+            state.bootstrap_tokens.consume(reservation).await?;
+            bootstrap_reservation = None;
+        }
+        if verified.allow_registration {
+            state
+                .append_audit_entry(
+                    "device.registered",
+                    "device",
+                    &envelope.device_id,
+                    &envelope.device_id,
+                    serde_json::json!({
+                        "hostname": hello.hostname,
+                        "os": hello.os,
+                        "capabilities": hello.capabilities,
+                        "version": hello.version,
+                        "auth_method": verified.auth_method,
+                    }),
+                )
+                .await;
+        }
         sender
             .send(WsMessage::Binary(
                 ahand_protocol::Envelope {
@@ -451,6 +472,15 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     }
     if let Some(task) = presence_task.take() {
         task.abort();
+    }
+    if let Some(reservation) = bootstrap_reservation.take() {
+        if let Err(err) = state.bootstrap_tokens.release(&reservation).await {
+            tracing::warn!(
+                device_id = %reservation.device_id,
+                error = %err,
+                "failed to release bootstrap reservation"
+            );
+        }
     }
     if let Some((device_id, connection_id)) = active_connection.take()
         && state

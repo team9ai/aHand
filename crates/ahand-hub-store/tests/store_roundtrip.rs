@@ -6,8 +6,9 @@ use ahand_hub_core::audit::AuditFilter;
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
-use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
+use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
+use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
 use ahand_hub_store::test_support::TestStack;
 use sqlx::Row;
 
@@ -197,7 +198,8 @@ async fn updating_job_status_records_lifecycle_timestamps() -> anyhow::Result<()
 }
 
 #[tokio::test]
-async fn redis_output_store_roundtrips_history_and_expires_terminal_streams() -> anyhow::Result<()> {
+async fn redis_output_store_roundtrips_history_and_expires_terminal_streams() -> anyhow::Result<()>
+{
     let stack = TestStack::start().await?;
     let store = RedisJobOutputStore::new(
         ahand_hub_store::redis::connect_redis(stack.redis_url()).await?,
@@ -226,11 +228,52 @@ async fn redis_output_store_roundtrips_history_and_expires_terminal_streams() ->
     assert_eq!(history.len(), 3);
     assert!(matches!(history[0].record, JobOutputRecord::Stdout(_)));
     assert!(matches!(history[1].record, JobOutputRecord::Progress(42)));
-    assert!(matches!(history[2].record, JobOutputRecord::Finished { exit_code: 0, .. }));
+    assert!(matches!(
+        history[2].record,
+        JobOutputRecord::Finished { exit_code: 0, .. }
+    ));
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     let expired = store.read_history("job-1").await?;
     assert!(expired.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_bootstrap_store_enforces_one_time_reservations() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let store = RedisBootstrapStore::new(
+        ahand_hub_store::redis::connect_redis(stack.redis_url()).await?,
+        Duration::from_secs(5),
+    );
+
+    let token = store.issue("device-7").await?;
+    let reservation = store
+        .reserve("device-7", &token)
+        .await?
+        .expect("issued token should reserve");
+    assert!(
+        store.reserve("device-7", &token).await?.is_none(),
+        "reserved token should not reserve twice before release"
+    );
+
+    store.release(&reservation).await?;
+
+    let reservation = store
+        .reserve("device-7", &token)
+        .await?
+        .expect("released token should reserve again");
+    store.consume(&reservation).await?;
+    assert!(
+        store.reserve("device-7", &token).await?.is_none(),
+        "consumed token should not reserve again"
+    );
+
+    let rotated = store.issue("device-7").await?;
+    assert_ne!(rotated, token);
+    store.delete_device("device-7").await?;
+    assert!(store.reserve("device-7", &rotated).await?.is_none());
 
     Ok(())
 }

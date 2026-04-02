@@ -2,7 +2,7 @@ mod support;
 
 use std::time::Duration;
 
-use ahand_hub_core::audit::AuditEntry;
+use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobStatus, NewJob};
 use ahand_hub_core::traits::DeviceStore;
@@ -13,10 +13,33 @@ use tokio_tungstenite::tungstenite::Message;
 
 use support::{persistent_test_config, spawn_server_with_state};
 
+async fn wait_for_audit_event(state: &ahand_hub::state::AppState, action: &str, expected: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let entries = state
+            .audit_store
+            .query(AuditFilter {
+                action: Some(action.into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        if entries.len() == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {expected} audit entries for {action}, got {}",
+            entries.len()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn dashboard_login_issues_a_dashboard_token_and_verify_accepts_it() {
     let state = support::test_state().await;
-    let server = spawn_server_with_state(state).await;
+    let server = spawn_server_with_state(state.clone()).await;
 
     let response = server
         .post(
@@ -37,6 +60,7 @@ async fn dashboard_login_issues_a_dashboard_token_and_verify_accepts_it() {
     let verify_payload: Value = verify.json().await.unwrap();
     assert_eq!(verify_payload["role"], "DashboardUser");
     assert_eq!(verify_payload["subject"], "dashboard");
+    wait_for_audit_event(&state, "auth.login_success", 1).await;
 }
 
 #[tokio::test]
@@ -54,7 +78,7 @@ async fn service_verify_uses_production_subject_name() {
 #[tokio::test]
 async fn dashboard_login_rejects_invalid_password() {
     let state = support::test_state().await;
-    let server = spawn_server_with_state(state).await;
+    let server = spawn_server_with_state(state.clone()).await;
 
     let response = server
         .post(
@@ -67,6 +91,7 @@ async fn dashboard_login_rejects_invalid_password() {
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     let payload: Value = response.json().await.unwrap();
     assert_eq!(payload["error"], "invalid_credentials");
+    wait_for_audit_event(&state, "auth.login_failed", 1).await;
 }
 
 #[tokio::test]
@@ -511,8 +536,8 @@ async fn dashboard_websocket_accepts_configured_split_origin_clients() {
 }
 
 #[tokio::test]
-async fn dashboard_websocket_receives_events_from_another_persistent_instance(
-) -> anyhow::Result<()> {
+async fn dashboard_websocket_receives_events_from_another_persistent_instance() -> anyhow::Result<()>
+{
     let stack = ahand_hub_store::test_support::TestStack::start().await?;
     let config = persistent_test_config(&stack);
 

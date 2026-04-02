@@ -8,7 +8,8 @@ use ahand_hub_core::HubError;
 use ahand_hub_core::audit::AuditFilter;
 use ahand_hub_core::job::JobFilter;
 use ahand_hub_store::test_support::TestStack;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
+use prost::Message as _;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -89,6 +90,50 @@ async fn app_state_uses_persistent_store_backends_across_restart() -> anyhow::Re
         })
         .await?;
     assert_eq!(audit_entries.len(), 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn persistent_bootstrap_tokens_survive_restart_until_first_use() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let config = persistent_config(&stack);
+
+    let state = ahand_hub::state::AppState::from_config(config.clone()).await?;
+    let server = spawn_server_with_state(state).await;
+    let response = server
+        .post(
+            "/api/devices",
+            "service-test-token",
+            serde_json::json!({
+                "id": "device-9",
+                "hostname": "edge-box",
+                "os": "linux",
+                "capabilities": ["exec"],
+                "version": "0.1.2"
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let payload: Value = response.json().await?;
+    let bootstrap_token = payload["bootstrap_token"]
+        .as_str()
+        .expect("create device should return bootstrap token")
+        .to_string();
+    server.shutdown().await;
+
+    let restarted = ahand_hub::state::AppState::from_config(config).await?;
+    assert!(restarted.auth.verify_jwt(&bootstrap_token).is_err());
+    let restarted = spawn_server_with_state(restarted).await;
+    let mut socket = tokio_tungstenite::connect_async(restarted.ws_url("/ws"))
+        .await?
+        .0;
+    let challenge = support::read_hello_challenge(&mut socket).await;
+    let hello = support::bootstrap_hello("device-9", &bootstrap_token, &challenge.nonce);
+    socket
+        .send(Message::Binary(hello.encode_to_vec().into()))
+        .await?;
+    let _accepted = support::read_hello_accepted(&mut socket).await;
 
     Ok(())
 }
@@ -189,7 +234,9 @@ async fn persistent_dashboard_fanout_reaches_other_instances() -> anyhow::Result
     let dashboard_token = subscriber_state.auth.issue_dashboard_jwt("operator-1")?;
     let publisher = spawn_server_with_state(publisher_state).await;
     let subscriber = spawn_server_with_state(subscriber_state).await;
-    let mut dashboard_socket = subscriber.connect_dashboard_socket(Some(&dashboard_token)).await;
+    let mut dashboard_socket = subscriber
+        .connect_dashboard_socket(Some(&dashboard_token))
+        .await;
 
     let mut device = publisher
         .attach_bootstrap_device("device-2", "bootstrap-test-token")

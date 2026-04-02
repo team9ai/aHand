@@ -32,6 +32,15 @@ pub async fn login(
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, (StatusCode, Json<ErrorResponse>)> {
     if body.password != state.dashboard_shared_password.as_str() {
+        state
+            .append_audit_entry(
+                "auth.login_failed",
+                "auth",
+                "dashboard",
+                "dashboard",
+                serde_json::json!({ "reason": "invalid_credentials" }),
+            )
+            .await;
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -48,6 +57,16 @@ pub async fn login(
             }),
         )
     })?;
+
+    state
+        .append_audit_entry(
+            "auth.login_success",
+            "auth",
+            "dashboard",
+            "dashboard",
+            serde_json::json!({}),
+        )
+        .await;
 
     Ok(Json(LoginResponse { token }))
 }

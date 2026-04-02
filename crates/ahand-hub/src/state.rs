@@ -10,10 +10,11 @@ use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
 use ahand_hub_core::{HubError, Result};
 use ahand_hub_store::audit_store::PgAuditStore;
+use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::device_store::PgDeviceStore;
 use ahand_hub_store::event_fanout::RedisEventFanout;
-use ahand_hub_store::job_store::PgJobStore;
 use ahand_hub_store::job_output_store::RedisJobOutputStore;
+use ahand_hub_store::job_store::PgJobStore;
 use ahand_hub_store::presence_store::RedisPresenceStore;
 use async_trait::async_trait;
 use dashmap::{DashMap, mapref::entry::Entry};
@@ -30,6 +31,7 @@ pub struct AppState {
     pub connections: Arc<crate::ws::device_gateway::ConnectionRegistry>,
     pub events: Arc<crate::events::EventBus>,
     pub output_stream: Arc<crate::output_stream::OutputStream>,
+    pub bootstrap_tokens: Arc<crate::bootstrap::BootstrapCredentials>,
     pub device_bootstrap_token: Arc<String>,
     pub device_bootstrap_device_id: Arc<String>,
     pub device_hello_max_age_ms: u64,
@@ -42,27 +44,37 @@ pub struct AppState {
 impl AppState {
     pub async fn from_config(config: crate::config::Config) -> anyhow::Result<Self> {
         let finished_retention = Duration::from_millis(config.output_retention_ms);
-        let (devices, jobs_store, raw_audit_store, persistent_output, persistent_fanout) =
-            match &config.store {
-                crate::config::StoreConfig::Memory => (
+        let bootstrap_reservation_ttl =
+            crate::bootstrap::BootstrapCredentials::reservation_ttl(config.device_hello_max_age_ms);
+        let (
+            devices,
+            jobs_store,
+            raw_audit_store,
+            persistent_output,
+            persistent_fanout,
+            bootstrap_tokens,
+        ) = match &config.store {
+            crate::config::StoreConfig::Memory => (
                 Arc::new(MemoryDeviceStore::default()),
                 Arc::new(MemoryJobStore::default()) as Arc<dyn JobStore>,
                 Arc::new(MemoryAuditStore::default()) as Arc<dyn AuditStore>,
                 None,
                 None,
+                crate::bootstrap::BootstrapCredentials::memory(),
             ),
-                crate::config::StoreConfig::Persistent {
-                    database_url,
-                    redis_url,
-                } => {
-                    let pool = ahand_hub_store::postgres::connect_database(database_url).await?;
-                    let presence_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
-                    let output_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
-                    let presence = RedisPresenceStore::new_with_ttl(
-                        presence_redis,
-                        config.device_presence_ttl_secs,
-                    );
-                    (
+            crate::config::StoreConfig::Persistent {
+                database_url,
+                redis_url,
+            } => {
+                let pool = ahand_hub_store::postgres::connect_database(database_url).await?;
+                let presence_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
+                let output_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
+                let bootstrap_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
+                let presence = RedisPresenceStore::new_with_ttl(
+                    presence_redis,
+                    config.device_presence_ttl_secs,
+                );
+                (
                     Arc::new(MemoryDeviceStore::with_persistent(
                         PgDeviceStore::with_presence(pool.clone(), presence),
                     )),
@@ -70,9 +82,13 @@ impl AppState {
                     Arc::new(PgAuditStore::new(pool)) as Arc<dyn AuditStore>,
                     Some(RedisJobOutputStore::new(output_redis, finished_retention)),
                     Some(RedisEventFanout::new(redis_url).await?),
+                    crate::bootstrap::BootstrapCredentials::redis(RedisBootstrapStore::new(
+                        bootstrap_redis,
+                        bootstrap_reservation_ttl,
+                    )),
                 )
-                }
-            };
+            }
+        };
         let audit_store = Arc::new(crate::audit_writer::BufferedAuditStore::new(
             raw_audit_store,
         )) as Arc<dyn AuditStore>;
@@ -112,6 +128,7 @@ impl AppState {
             connections,
             events,
             output_stream,
+            bootstrap_tokens: Arc::new(bootstrap_tokens),
             device_bootstrap_token: Arc::new(config.device_bootstrap_token),
             device_bootstrap_device_id: Arc::new(config.device_bootstrap_device_id),
             device_hello_max_age_ms: config.device_hello_max_age_ms,
@@ -124,6 +141,28 @@ impl AppState {
             .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())
             .await?;
         Ok(state)
+    }
+
+    pub async fn append_audit_entry(
+        &self,
+        action: &str,
+        resource_type: &str,
+        resource_id: &str,
+        actor: &str,
+        detail: serde_json::Value,
+    ) {
+        let _ = self
+            .audit_store
+            .append(&[AuditEntry {
+                timestamp: chrono::Utc::now(),
+                action: action.into(),
+                resource_type: resource_type.into(),
+                resource_id: resource_id.into(),
+                actor: actor.into(),
+                detail,
+                source_ip: None,
+            }])
+            .await;
     }
 
     async fn preregister_bootstrap_device(&self, device_id: &str) -> Result<()> {

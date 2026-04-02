@@ -1,5 +1,6 @@
 pub mod audit_writer;
 pub mod auth;
+pub mod bootstrap;
 pub mod config;
 pub mod events;
 pub mod http;

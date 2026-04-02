@@ -14,6 +14,7 @@ pub struct VerifiedDeviceHello {
     pub signed_at_ms: u64,
     pub auth_method: &'static str,
     pub allow_registration: bool,
+    pub bootstrap_reservation: Option<crate::bootstrap::BootstrapReservation>,
 }
 
 pub struct AuthContextExt(pub AuthContext);
@@ -95,14 +96,11 @@ pub fn authenticate_token(state: &AppState, token: &str) -> HubResult<AuthContex
     state.auth.verify_jwt(token)
 }
 
-pub fn verify_device_hello(
+pub async fn verify_device_hello(
     device_id: &str,
     hello: &Hello,
-    auth_service: &ahand_hub_core::auth::AuthService,
+    state: &AppState,
     challenge_nonce: &[u8],
-    bootstrap_token: &str,
-    bootstrap_device_id: &str,
-    max_age_ms: u64,
 ) -> HubResult<VerifiedDeviceHello> {
     let Some(auth) = hello.auth.as_ref() else {
         return Err(HubError::Unauthorized);
@@ -117,53 +115,64 @@ pub fn verify_device_hello(
                 &auth.signature,
                 auth.signed_at_ms,
                 challenge_nonce,
-                max_age_ms,
+                state.device_hello_max_age_ms,
             )?;
             Ok(VerifiedDeviceHello {
                 public_key,
                 signed_at_ms: auth.signed_at_ms,
                 auth_method: "ed25519",
                 allow_registration: false,
+                bootstrap_reservation: None,
             })
         }
         hello::Auth::Bootstrap(auth) => {
-            if auth.bearer_token == bootstrap_token && device_id == bootstrap_device_id {
-                let public_key = verify_signed_auth(
-                    device_id,
-                    hello,
-                    &auth.public_key,
-                    &auth.signature,
-                    auth.signed_at_ms,
-                    challenge_nonce,
-                    max_age_ms,
-                )?;
-                Ok(VerifiedDeviceHello {
+            let public_key = verify_signed_auth(
+                device_id,
+                hello,
+                &auth.public_key,
+                &auth.signature,
+                auth.signed_at_ms,
+                challenge_nonce,
+                state.device_hello_max_age_ms,
+            )?;
+
+            if auth.bearer_token == state.device_bootstrap_token.as_str()
+                && device_id == state.device_bootstrap_device_id.as_str()
+            {
+                return Ok(VerifiedDeviceHello {
                     public_key,
                     signed_at_ms: auth.signed_at_ms,
                     auth_method: "bootstrap",
                     allow_registration: true,
-                })
-            } else {
-                let claims = auth_service.verify_jwt(&auth.bearer_token)?;
-                if claims.role != Role::Device || claims.subject != device_id {
-                    return Err(HubError::Unauthorized);
-                }
-                let public_key = verify_signed_auth(
-                    device_id,
-                    hello,
-                    &auth.public_key,
-                    &auth.signature,
-                    auth.signed_at_ms,
-                    challenge_nonce,
-                    max_age_ms,
-                )?;
-                Ok(VerifiedDeviceHello {
-                    public_key,
-                    signed_at_ms: auth.signed_at_ms,
-                    auth_method: "bootstrap",
-                    allow_registration: true,
-                })
+                    bootstrap_reservation: None,
+                });
             }
+
+            if let Some(reservation) = state
+                .bootstrap_tokens
+                .reserve(device_id, &auth.bearer_token)
+                .await?
+            {
+                return Ok(VerifiedDeviceHello {
+                    public_key,
+                    signed_at_ms: auth.signed_at_ms,
+                    auth_method: "bootstrap",
+                    allow_registration: true,
+                    bootstrap_reservation: Some(reservation),
+                });
+            }
+
+            let claims = state.auth.verify_jwt(&auth.bearer_token)?;
+            if claims.role != Role::Device || claims.subject != device_id {
+                return Err(HubError::Unauthorized);
+            }
+            Ok(VerifiedDeviceHello {
+                public_key,
+                signed_at_ms: auth.signed_at_ms,
+                auth_method: "bootstrap",
+                allow_registration: true,
+                bootstrap_reservation: None,
+            })
         }
     }
 }
