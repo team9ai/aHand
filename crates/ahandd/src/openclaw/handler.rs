@@ -1521,6 +1521,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn strict_mode_denial_broadcasts_request_and_does_not_execute() {
+        let (handler, session_mgr, approval_mgr, approval_broadcast_tx) = test_handler(1);
+        session_mgr
+            .set_mode("session-1", SessionMode::Strict, 0)
+            .await;
+        let mut approval_rx = approval_broadcast_tx.subscribe();
+        let output_path = unique_output_path();
+        let command = format!("printf should-not-run > {}", output_path.display());
+
+        let resolver = tokio::spawn(async move {
+            let envelope = approval_rx.recv().await.unwrap();
+            let request = match envelope.payload.unwrap() {
+                envelope::Payload::ApprovalRequest(request) => request,
+                other => panic!("unexpected payload: {other:?}"),
+            };
+            approval_mgr
+                .resolve(&ApprovalResponse {
+                    job_id: request.job_id,
+                    approved: false,
+                    remember: false,
+                    reason: "operator rejected".to_string(),
+                })
+                .await;
+        });
+
+        let (result, event) = handler
+            .handle_invoke(system_run_invoke("session-1", command, None, None))
+            .await;
+
+        resolver.await.unwrap();
+        assert!(!output_path.exists());
+        let payload = payload_json(&result);
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["error"], "approval denied: operator rejected");
+        let event = event.unwrap();
+        assert_eq!(event.kind, ExecEventKind::Denied);
+        assert_eq!(
+            event.payload.reason.as_deref(),
+            Some("approval denied: operator rejected")
+        );
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[tokio::test]
+    async fn strict_mode_timeout_broadcasts_request_and_does_not_execute() {
+        let (handler, session_mgr, _approval_mgr, approval_broadcast_tx) = test_handler(0);
+        session_mgr
+            .set_mode("session-1", SessionMode::Strict, 0)
+            .await;
+        let mut approval_rx = approval_broadcast_tx.subscribe();
+        let output_path = unique_output_path();
+        let command = format!("printf should-not-run > {}", output_path.display());
+
+        let (result, event) = handler
+            .handle_invoke(system_run_invoke("session-1", command, None, None))
+            .await;
+
+        let envelope = approval_rx.recv().await.unwrap();
+        match envelope.payload.unwrap() {
+            envelope::Payload::ApprovalRequest(request) => {
+                assert_eq!(request.caller_uid, "session-1");
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        assert!(!output_path.exists());
+        let payload = payload_json(&result);
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["error"], "approval timed out");
+        let event = event.unwrap();
+        assert_eq!(event.kind, ExecEventKind::Denied);
+        assert_eq!(event.payload.reason.as_deref(), Some("approval timed out"));
+
+        let _ = std::fs::remove_file(output_path);
+    }
+
+    #[tokio::test]
     async fn execution_failures_emit_finished_events_not_denied() {
         let (handler, session_mgr, _approval_mgr, _broadcast_tx) = test_handler(1);
         session_mgr

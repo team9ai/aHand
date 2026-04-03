@@ -265,3 +265,66 @@ async fn persistent_output_history_survives_restart() -> anyhow::Result<()> {
     assert!(body.contains("event: finished"));
     Ok(())
 }
+
+#[tokio::test]
+async fn persistent_resume_with_expired_history_emits_resync_event() -> anyhow::Result<()> {
+    let stack = ahand_hub_store::test_support::TestStack::start().await?;
+    let mut config = persistent_test_config(&stack);
+    config.output_retention_ms = 50;
+
+    let state = ahand_hub::state::AppState::from_config(config).await?;
+    let server = spawn_server_with_state(state).await;
+    let mut device = server
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+
+    let created = server
+        .post_json(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-2",
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+    let job_id = created["job_id"].as_str().unwrap().to_string();
+    let _ = device.recv_job_request().await;
+    device.send_stdout(&job_id, b"first\n").await;
+    device.send_finished(&job_id, 0, "").await;
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/api/jobs/{job_id}/output",
+            server.http_base_url()
+        ))
+        .header(AUTHORIZATION, "Bearer service-test-token")
+        .header(HeaderName::from_static("last-event-id"), "1")
+        .send()
+        .await?;
+
+    let mut stream = response.bytes_stream();
+    let mut body = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(chunk))) => {
+                body.push_str(&String::from_utf8_lossy(&chunk));
+                if body.contains("event: resync") {
+                    break;
+                }
+            }
+            Ok(Some(Err(err))) => panic!("failed reading SSE chunk after history expiry: {err}"),
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    assert!(body.contains("event: resync"));
+    assert!(body.contains("data: history_trimmed"));
+    Ok(())
+}
