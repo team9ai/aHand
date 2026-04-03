@@ -190,4 +190,68 @@ describe("realtime hooks", () => {
 
     expect(screen.getByTestId("entries")).toHaveTextContent("hello|again");
   });
+
+  it("reports an error state when the websocket emits an error event", async () => {
+    function ErrorHarness() {
+      const { connectionState, error } = useDashboardWs({ reconnectDelayMs: 200 });
+      return (
+        <div>
+          <div data-testid="state">{connectionState}</div>
+          <div data-testid="error">{error ?? ""}</div>
+        </div>
+      );
+    }
+
+    render(<ErrorHarness />);
+
+    act(() => {
+      FakeWebSocket.instances[0]?.emit("error");
+    });
+
+    expect(screen.getByTestId("state")).toHaveTextContent("error");
+    expect(screen.getByTestId("error")).toHaveTextContent("dashboard_ws_error");
+  });
+
+  it("reports a parse error when a websocket message contains invalid JSON", async () => {
+    function ParseErrorHarness() {
+      const { error } = useDashboardWs({ reconnectDelayMs: 200 });
+      return <div data-testid="error">{error ?? ""}</div>;
+    }
+
+    render(<ParseErrorHarness />);
+
+    act(() => {
+      FakeWebSocket.instances[0]?.emit("open");
+      FakeWebSocket.instances[0]?.emit("message", { data: "not-json{{{" });
+    });
+
+    expect(screen.getByTestId("error")).toHaveTextContent("dashboard_event_parse_failed");
+  });
+
+  it("falls back to generic finished message when finished event has invalid JSON", async () => {
+    render(<JobOutputHarness jobId="job-1" />);
+
+    act(() => {
+      FakeEventSource.instances[0]?.emit("finished", "not-valid-json");
+    });
+
+    expect(screen.getByTestId("entries")).toHaveTextContent("Command finished");
+    expect(screen.getByTestId("status")).toHaveTextContent("complete");
+  });
+
+  it("does not overwrite complete status when event source errors after finishing", async () => {
+    render(<JobOutputHarness jobId="job-1" />);
+
+    act(() => {
+      FakeEventSource.instances[0]?.emit("finished", JSON.stringify({ exit_code: 0, error: "" }));
+    });
+
+    expect(screen.getByTestId("status")).toHaveTextContent("complete");
+
+    act(() => {
+      FakeEventSource.instances[0]?.onerror?.();
+    });
+
+    expect(screen.getByTestId("status")).toHaveTextContent("complete");
+  });
 });

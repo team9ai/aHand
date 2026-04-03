@@ -17,6 +17,16 @@ vi.mock("@/lib/api", async (importOriginal) => {
   };
 });
 
+const { redirectMock } = vi.hoisted(() => ({
+  redirectMock: vi.fn((path: string) => {
+    throw new Error(`REDIRECT:${path}`);
+  }),
+}));
+
+vi.mock("next/navigation", () => ({
+  redirect: redirectMock,
+}));
+
 vi.mock("@/hooks/use-job-output", () => ({
   useJobOutput: vi.fn(),
 }));
@@ -130,5 +140,31 @@ describe("jobs surfaces", () => {
 
     expect(screen.getByText("starting")).toBeInTheDocument();
     expect(screen.getByText("warning")).toBeInTheDocument();
+  });
+
+  it("renders job not found when the job does not exist", async () => {
+    vi.mocked(getJob).mockResolvedValue(null);
+    vi.mocked(getAuditLogs).mockResolvedValue([]);
+    vi.mocked(useJobOutput).mockReturnValue({
+      entries: [],
+      status: "idle",
+      error: null,
+    });
+
+    render(
+      await JobDetailPage({
+        params: Promise.resolve({ id: "job-404" }),
+      }),
+    );
+
+    expect(screen.getByRole("heading", { name: /job not found/i })).toBeInTheDocument();
+  });
+
+  it("redirects to login when the jobs API returns an auth error", async () => {
+    vi.mocked(getJobs).mockRejectedValue(new Error("api_401"));
+
+    await expect(
+      JobsPage({ searchParams: Promise.resolve({}) }),
+    ).rejects.toThrow("REDIRECT:/login");
   });
 });

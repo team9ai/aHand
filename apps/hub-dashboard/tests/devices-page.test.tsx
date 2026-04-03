@@ -16,8 +16,15 @@ vi.mock("@/lib/api", async (importOriginal) => {
   };
 });
 
+const { redirectMock } = vi.hoisted(() => ({
+  redirectMock: vi.fn((path: string) => {
+    throw new Error(`REDIRECT:${path}`);
+  }),
+}));
+
 vi.mock("next/navigation", () => ({
   usePathname: () => "/devices",
+  redirect: redirectMock,
 }));
 
 describe("devices surfaces", () => {
@@ -108,5 +115,26 @@ describe("devices surfaces", () => {
     render(<Sidebar />);
 
     expect(screen.getByRole("link", { name: /devices/i })).toHaveAttribute("data-active", "true");
+  });
+
+  it("renders device not found when the device does not exist", async () => {
+    vi.mocked(getDevice).mockResolvedValue(null);
+    vi.mocked(getJobs).mockResolvedValue([]);
+
+    render(
+      await DeviceDetailPage({
+        params: Promise.resolve({ id: "device-404" }),
+      }),
+    );
+
+    expect(screen.getByRole("heading", { name: /device not found/i })).toBeInTheDocument();
+  });
+
+  it("redirects to login when the devices API returns an auth error", async () => {
+    vi.mocked(getDevices).mockRejectedValue(new Error("api_401"));
+
+    await expect(
+      DevicesPage({ searchParams: Promise.resolve({}) }),
+    ).rejects.toThrow("REDIRECT:/login");
   });
 });

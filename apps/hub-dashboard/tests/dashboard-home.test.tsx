@@ -72,4 +72,22 @@ describe("dashboard overview page", () => {
 
     await expect(DashboardHomePage()).rejects.toThrow("REDIRECT:/login");
   });
+
+  it("propagates hub_unavailable errors without redirecting", async () => {
+    vi.mocked(getDashboardStats).mockRejectedValue(new Error("hub_unavailable"));
+
+    await expect(DashboardHomePage()).rejects.toThrow("hub_unavailable");
+    expect(redirectMock).not.toHaveBeenCalled();
+  });
+
+  it("throws when audit log fetch fails even if stats succeed", async () => {
+    vi.mocked(getDashboardStats).mockResolvedValue({
+      online_devices: 1,
+      offline_devices: 0,
+      running_jobs: 0,
+    });
+    vi.mocked(getAuditLogs).mockRejectedValue(new Error("api_500"));
+
+    await expect(DashboardHomePage()).rejects.toThrow("api_500");
+  });
 });
