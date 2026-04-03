@@ -435,3 +435,72 @@ async fn direct_memory_insert_starts_device_offline_until_presence_is_marked() {
     let stored = state.devices.get("device-10").await.unwrap().unwrap();
     assert!(!stored.online);
 }
+
+#[tokio::test]
+async fn create_job_rejects_missing_device_id() {
+    let server = support::spawn_server_with_state(support::test_state().await).await;
+    let response = server
+        .post(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "tool": "echo",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "VALIDATION_ERROR");
+}
+
+#[tokio::test]
+async fn create_job_rejects_missing_tool_field() {
+    let server = support::spawn_server_with_state(support::test_state().await).await;
+    let response = server
+        .post(
+            "/api/jobs",
+            "service-test-token",
+            serde_json::json!({
+                "device_id": "device-1",
+                "args": ["hello"],
+                "timeout_ms": 30_000
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "VALIDATION_ERROR");
+}
+
+#[tokio::test]
+async fn create_device_rejects_missing_id_field() {
+    let server = support::spawn_server_with_state(support::test_state().await).await;
+    let response = server
+        .post(
+            "/api/devices",
+            "service-test-token",
+            serde_json::json!({
+                "hostname": "edge-box",
+                "os": "linux",
+                "capabilities": ["exec"],
+                "version": "0.1.2"
+            }),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["error"]["code"], "VALIDATION_ERROR");
+}
+
+#[tokio::test]
+async fn get_device_returns_not_found_for_unknown_device() {
+    let server = support::spawn_server_with_state(support::test_state().await).await;
+    let response = server.get("/api/devices/device-nonexistent", "service-test-token").await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+}

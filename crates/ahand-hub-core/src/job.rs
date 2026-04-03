@@ -319,4 +319,29 @@ mod tests {
         assert_eq!(roundtrip.finished_at, Some(finished_at));
         assert_eq!(format!("{:?}", roundtrip.status), "Finished");
     }
+
+    #[test]
+    fn resolve_status_transition_rejects_all_backward_transitions() {
+        let backward_cases = vec![
+            (JobStatus::Running, JobStatus::Sent),
+            (JobStatus::Running, JobStatus::Pending),
+            (JobStatus::Cancelled, JobStatus::Running),
+            (JobStatus::Cancelled, JobStatus::Pending),
+            (JobStatus::Cancelled, JobStatus::Sent),
+            (JobStatus::Failed, JobStatus::Sent),
+            (JobStatus::Failed, JobStatus::Pending),
+            (JobStatus::Failed, JobStatus::Running),
+            (JobStatus::Finished, JobStatus::Sent),
+            (JobStatus::Finished, JobStatus::Pending),
+        ];
+
+        for (current, requested) in backward_cases {
+            let result = resolve_status_transition(current, requested);
+            assert_eq!(
+                result,
+                Err(HubError::IllegalJobTransition { current, requested }),
+                "expected {current:?} -> {requested:?} to be rejected"
+            );
+        }
+    }
 }

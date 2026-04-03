@@ -288,3 +288,83 @@ fn audit_entry_clone_debug_and_serde_roundtrip() {
     assert_eq!(roundtrip.detail, entry.detail);
     assert_eq!(roundtrip.source_ip, entry.source_ip);
 }
+
+#[test]
+fn default_filter_matches_all_entries() {
+    let base = chrono::Utc::now();
+    let entries = vec![
+        AuditEntry {
+            timestamp: base,
+            action: "job.created".into(),
+            resource_type: "job".into(),
+            resource_id: "job-1".into(),
+            actor: "service-a".into(),
+            detail: serde_json::json!({}),
+            source_ip: None,
+        },
+        AuditEntry {
+            timestamp: base,
+            action: "device.online".into(),
+            resource_type: "device".into(),
+            resource_id: "device-1".into(),
+            actor: "service-b".into(),
+            detail: serde_json::json!({}),
+            source_ip: None,
+        },
+    ];
+
+    let result = AuditFilter::default().apply(entries.clone());
+
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn audit_filter_zero_limit_returns_empty() {
+    let entries = vec![AuditEntry {
+        timestamp: chrono::Utc::now(),
+        action: "job.created".into(),
+        resource_type: "job".into(),
+        resource_id: "job-1".into(),
+        actor: "service-a".into(),
+        detail: serde_json::json!({}),
+        source_ip: None,
+    }];
+
+    let filter = AuditFilter {
+        limit: Some(0),
+        ..Default::default()
+    };
+
+    assert!(filter.apply(entries).is_empty());
+}
+
+#[test]
+fn audit_filter_offset_beyond_entries_returns_empty() {
+    let entries = vec![AuditEntry {
+        timestamp: chrono::Utc::now(),
+        action: "job.created".into(),
+        resource_type: "job".into(),
+        resource_id: "job-1".into(),
+        actor: "service-a".into(),
+        detail: serde_json::json!({}),
+        source_ip: None,
+    }];
+
+    let filter = AuditFilter {
+        offset: Some(100),
+        ..Default::default()
+    };
+
+    assert!(filter.apply(entries).is_empty());
+}
+
+#[test]
+fn audit_filter_apply_on_empty_input_returns_empty() {
+    let filter = AuditFilter {
+        resource_type: Some("job".into()),
+        action: Some("job.created".into()),
+        ..Default::default()
+    };
+
+    assert!(filter.apply(Vec::new()).is_empty());
+}
