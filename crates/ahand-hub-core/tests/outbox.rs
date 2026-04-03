@@ -69,3 +69,45 @@ fn outbox_remove_missing_sequence_is_a_noop() {
     assert_eq!(outbox.replay_from(0), vec![vec![7]]);
     assert!(!outbox.is_empty());
 }
+
+#[test]
+fn outbox_evicts_oldest_when_buffer_exceeds_capacity() {
+    let mut outbox = Outbox::new(2);
+    outbox.store_raw(vec![1]);
+    outbox.store_raw(vec![2]);
+    outbox.store_raw(vec![3]);
+
+    let replay = outbox.replay_from(0);
+
+    assert_eq!(replay, vec![vec![2], vec![3]]);
+}
+
+#[test]
+fn outbox_replay_from_exact_seq_excludes_that_message() {
+    let mut outbox = Outbox::new(4);
+    let seq1 = outbox.store_raw(vec![10]);
+    let _seq2 = outbox.store_raw(vec![20]);
+
+    let replay = outbox.replay_from(seq1);
+
+    assert_eq!(replay, vec![vec![20]]);
+}
+
+#[test]
+fn outbox_zero_capacity_evicts_every_message_immediately() {
+    let mut outbox = Outbox::new(0);
+    outbox.store_raw(vec![1]);
+    outbox.store_raw(vec![2]);
+
+    assert!(outbox.is_empty());
+    assert_eq!(outbox.replay_from(0), Vec::<Vec<u8>>::new());
+    assert_eq!(outbox.last_issued_seq(), 2);
+}
+
+#[test]
+fn outbox_last_issued_seq_is_zero_on_fresh_outbox() {
+    let outbox = Outbox::new(4);
+
+    assert_eq!(outbox.last_issued_seq(), 0);
+    assert!(outbox.is_empty());
+}
