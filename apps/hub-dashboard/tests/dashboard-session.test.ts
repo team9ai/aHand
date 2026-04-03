@@ -77,4 +77,33 @@ describe("dashboard shell session verification", () => {
       cache: "no-store",
     });
   });
+
+  it("returns null when the hub base URL is not configured", async () => {
+    delete process.env.AHAND_HUB_BASE_URL;
+    requestCookies.get.mockReturnValue({ value: "session-token" });
+
+    await expect(verifyDashboardSession()).resolves.toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("returns null when the verification fetch throws a network error", async () => {
+    requestCookies.get.mockReturnValue({ value: "session-token" });
+    vi.mocked(fetch).mockRejectedValue(new TypeError("fetch failed"));
+
+    await expect(verifyDashboardSession()).resolves.toBeNull();
+  });
+
+  it("returns null for server error responses from the hub", async () => {
+    requestCookies.get.mockReturnValue({ value: "session-token" });
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 500 }));
+
+    await expect(verifyDashboardSession()).resolves.toBeNull();
+  });
+
+  it("redirects to login when verification fetch throws", async () => {
+    requestCookies.get.mockReturnValue({ value: "session-token" });
+    vi.mocked(fetch).mockRejectedValue(new TypeError("fetch failed"));
+
+    await expect(DashboardLayout({ children: "child" })).rejects.toThrow("redirect:/login");
+  });
 });

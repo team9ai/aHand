@@ -472,4 +472,72 @@ describe("hub dashboard auth server flow", () => {
       },
     });
   });
+
+  it("does not set cookies when the upstream login token is an empty string", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ token: "" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const request = new NextRequest("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "shared-secret" }),
+    });
+
+    const response = await loginPost(request);
+
+    expect(response.cookies.get("ahand_hub_session")).toBeUndefined();
+  });
+
+  it("handles non-JSON upstream responses without crashing", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response("<html>Bad Gateway</html>", {
+          status: 502,
+          headers: { "content-type": "text/html" },
+        }),
+      ),
+    );
+
+    const request = new NextRequest("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "shared-secret" }),
+    });
+
+    const response = await loginPost(request);
+
+    expect(response.status).toBe(502);
+    expect(response.cookies.get("ahand_hub_session")).toBeUndefined();
+  });
+
+  it("returns 503 when the login hub base URL is missing", async () => {
+    delete process.env.AHAND_HUB_BASE_URL;
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const request = new NextRequest("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: "shared-secret" }),
+    });
+
+    const response = await loginPost(request);
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: {
+        code: "hub_unavailable",
+        message: "Unable to reach the hub right now.",
+      },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
