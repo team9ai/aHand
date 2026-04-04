@@ -1,0 +1,78 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-04-bad-case-test-coverage.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: AuthService JWT Bad Cases",
+      "status": "pending",
+      "description": "**Goal:** Cover expired tokens, wrong secret, missing claims, and empty secret edge cases.\n\n**Files:**\n- Modify: `crates/ahand-hub-core/tests/auth_service.rs`\n\n**Acceptance Criteria:**\n- Expired JWT is rejected with InvalidToken\n- JWT signed with a different secret is rejected\n- JWT with missing exp claim is rejected\n- AuthService with empty secret still roundtrips\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-core/tests/auth_service.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub-core --test auth_service\", \"acceptanceCriteria\": [\"Expired JWT rejected\", \"Wrong secret rejected\", \"Missing exp rejected\", \"Empty secret roundtrips\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: DeviceManager Store Error Propagation",
+      "status": "pending",
+      "description": "**Goal:** Cover DeviceStore error propagation and empty-list edge case.\n\n**Files:**\n- Modify: `crates/ahand-hub-core/tests/device_manager.rs`\n\n**Acceptance Criteria:**\n- list_devices propagates HubError::Internal from failing store\n- list_devices returns empty vec for empty store\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-core/tests/device_manager.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub-core --test device_manager\", \"acceptanceCriteria\": [\"Store error propagation\", \"Empty list returns empty vec\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Outbox Buffer Overflow and Sequence Boundaries",
+      "status": "pending",
+      "description": "**Goal:** Cover buffer capacity eviction, replay-from boundary, zero-capacity, and fresh outbox.\n\n**Files:**\n- Modify: `crates/ahand-hub-core/tests/outbox.rs`\n\n**Acceptance Criteria:**\n- Storing beyond max_buffer evicts oldest\n- replay_from exact last_ack excludes that seq\n- Zero-capacity outbox evicts immediately\n- Fresh outbox last_issued_seq is 0\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-core/tests/outbox.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub-core --test outbox\", \"acceptanceCriteria\": [\"Buffer overflow eviction\", \"Replay-from boundary\", \"Zero capacity\", \"Fresh outbox seq\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: System API Input Validation Bad Cases",
+      "status": "pending",
+      "description": "**Goal:** Add missing API-level bad case tests: missing fields, nonexistent device.\n\n**Files:**\n- Modify: `crates/ahand-hub/tests/system_api.rs`\n\n**Acceptance Criteria:**\n- Missing device_id returns 400 VALIDATION_ERROR\n- Missing tool returns 400 VALIDATION_ERROR\n- Missing device id field returns 400 VALIDATION_ERROR\n- GET nonexistent device returns 404\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/tests/system_api.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --test system_api\", \"acceptanceCriteria\": [\"Missing device_id 400\", \"Missing tool 400\", \"Missing id 400\", \"Nonexistent device 404\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: AuditFilter Boundary Cases",
+      "status": "pending",
+      "description": "**Goal:** Cover default filter match-all, zero limit, offset beyond entries, empty input.\n\n**Files:**\n- Modify: `crates/ahand-hub-core/tests/audit_service.rs`\n\n**Acceptance Criteria:**\n- Default filter matches all entries\n- limit: 0 returns empty\n- offset beyond count returns empty\n- apply on empty input returns empty\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-core/tests/audit_service.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub-core --test audit_service\", \"acceptanceCriteria\": [\"Default filter match-all\", \"Zero limit\", \"Offset overflow\", \"Empty input\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Job Status Transition Backward Regression",
+      "status": "pending",
+      "description": "**Goal:** Cover all backward/terminal job status transitions.\n\n**Files:**\n- Modify: `crates/ahand-hub-core/src/job.rs` (test module only)\n\n**Acceptance Criteria:**\n- Running→Sent rejected\n- Running→Pending rejected\n- Cancelled→Running rejected\n- Failed→Sent rejected\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-core/src/job.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub-core -- job::tests\", \"acceptanceCriteria\": [\"Running->Sent rejected\", \"Running->Pending rejected\", \"Cancelled->Running rejected\", \"Failed->Sent rejected\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: Dashboard Session Verification Bad Cases",
+      "status": "pending",
+      "description": "**Goal:** Cover fetch failure, missing base URL, and non-401 error responses.\n\n**Files:**\n- Modify: `apps/hub-dashboard/tests/dashboard-session.test.ts`\n\n**Acceptance Criteria:**\n- Returns null when AHAND_HUB_BASE_URL missing\n- Returns null when fetch throws\n- Returns null for 500 responses\n- Layout redirects on fetch throw\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/tests/dashboard-session.test.ts\"], \"verifyCommand\": \"cd apps/hub-dashboard && npx vitest run tests/dashboard-session.test.ts\", \"acceptanceCriteria\": [\"Missing base URL returns null\", \"Fetch throws returns null\", \"500 returns null\", \"Layout redirects on fetch throw\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: Auth Server Route Bad Cases",
+      "status": "pending",
+      "description": "**Goal:** Cover empty token, non-JSON upstream, and missing login config.\n\n**Files:**\n- Modify: `apps/hub-dashboard/tests/auth-server.test.ts`\n\n**Acceptance Criteria:**\n- Empty-string token does not set cookies\n- Non-JSON upstream handled gracefully\n- Missing base URL returns 503\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/tests/auth-server.test.ts\"], \"verifyCommand\": \"cd apps/hub-dashboard && npx vitest run tests/auth-server.test.ts\", \"acceptanceCriteria\": [\"Empty token no cookies\", \"Non-JSON upstream handled\", \"Missing config 503\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: Login Page UI Bad Cases",
+      "status": "pending",
+      "description": "**Goal:** Cover network error, 500 server error, and disabled submit state.\n\n**Files:**\n- Modify: `apps/hub-dashboard/tests/auth-flow.test.tsx`\n\n**Acceptance Criteria:**\n- Network error shows hub error message\n- 500 shows hub error message\n- Submit button disabled while submitting\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/tests/auth-flow.test.tsx\"], \"verifyCommand\": \"cd apps/hub-dashboard && npx vitest run tests/auth-flow.test.tsx\", \"acceptanceCriteria\": [\"Network error message\", \"500 error message\", \"Button disabled during submit\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 10: Dashboard Home Page Bad Cases",
+      "status": "pending",
+      "description": "**Goal:** Cover hub_unavailable error propagation and partial API failure.\n\n**Files:**\n- Modify: `apps/hub-dashboard/tests/dashboard-home.test.tsx`\n\n**Acceptance Criteria:**\n- hub_unavailable propagates without redirect\n- Audit failure propagates even if stats succeed\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/tests/dashboard-home.test.tsx\"], \"verifyCommand\": \"cd apps/hub-dashboard && npx vitest run tests/dashboard-home.test.tsx\", \"acceptanceCriteria\": [\"hub_unavailable propagates\", \"Partial failure propagates\"]}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 11: Device and Job Page Bad Cases",
+      "status": "pending",
+      "description": "**Goal:** Cover not-found rendering and auth error redirects for device and job pages.\n\n**Files:**\n- Modify: `apps/hub-dashboard/tests/devices-page.test.tsx`\n- Modify: `apps/hub-dashboard/tests/jobs-page.test.tsx`\n\n**Acceptance Criteria:**\n- Device not found renders heading\n- Devices page redirects on auth error\n- Job not found renders heading\n- Jobs page redirects on auth error\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/tests/devices-page.test.tsx\", \"apps/hub-dashboard/tests/jobs-page.test.tsx\"], \"verifyCommand\": \"cd apps/hub-dashboard && npx vitest run tests/devices-page.test.tsx tests/jobs-page.test.tsx\", \"acceptanceCriteria\": [\"Device not found\", \"Devices auth redirect\", \"Job not found\", \"Jobs auth redirect\"]}\n```"
+    },
+    {
+      "id": 12,
+      "subject": "Task 12: Realtime Hooks Bad Cases",
+      "status": "pending",
+      "description": "**Goal:** Cover WS error event, malformed JSON, and finished parse error fallback.\n\n**Files:**\n- Modify: `apps/hub-dashboard/tests/realtime-hooks.test.tsx`\n\n**Acceptance Criteria:**\n- WS error event sets error state\n- Malformed JSON sets parse error\n- Invalid finished JSON falls back to generic message\n- Error after complete does not overwrite status\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/tests/realtime-hooks.test.tsx\"], \"verifyCommand\": \"cd apps/hub-dashboard && npx vitest run tests/realtime-hooks.test.tsx\", \"acceptanceCriteria\": [\"WS error state\", \"Parse error state\", \"Finished fallback\", \"Complete not overwritten\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-04T12:00:00Z"
+}
