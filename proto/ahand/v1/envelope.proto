@@ -208,9 +208,9 @@ enum UpdateState {
   UPDATE_STATE_PENDING     = 0;  // update queued, not yet started
   UPDATE_STATE_DOWNLOADING = 1;  // binary is being fetched
   UPDATE_STATE_VERIFYING   = 2;  // checksum / signature check
-  UPDATE_STATE_STAGING     = 3;  // binary staged, ready to swap
-  UPDATE_STATE_APPLYING    = 4;  // process replacing itself
-  UPDATE_STATE_DONE        = 5;  // update complete, new version running
+  UPDATE_STATE_INSTALLING  = 3;  // installing new binary
+  UPDATE_STATE_RESTARTING  = 4;  // process replacing itself
+  UPDATE_STATE_COMPLETED   = 5;  // update complete, new version running
   UPDATE_STATE_FAILED      = 6;  // update failed — see error field
 }
 
