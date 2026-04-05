@@ -1,0 +1,89 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-05-windows-support.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Dependencies & Config Scaffolding",
+      "status": "pending",
+      "description": "**Goal:** Add Windows-only crate dependencies and platform-aware socket path.\n\n**Files:**\n- Modify: crates/ahandd/Cargo.toml\n- Modify: crates/ahandd/src/config.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandd/Cargo.toml\", \"crates/ahandd/src/config.rs\"], \"verifyCommand\": \"cargo check -p ahandd\", \"acceptanceCriteria\": [\"windows-sys and zip are conditional deps\", \"ipc_socket_path returns Named Pipe path on Windows\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Cross-Platform File Permissions Module",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Create fs_perms.rs with restrict_owner_only and restrict_owner_and_group.\n\n**Files:**\n- Create: crates/ahandd/src/fs_perms.rs\n- Create: crates/ahandd/src/lib.rs\n- Create: crates/ahandd/tests/fs_perms_test.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/fs_perms.rs\", \"crates/ahandd/src/lib.rs\", \"crates/ahandd/tests/fs_perms_test.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test fs_perms_test\", \"acceptanceCriteria\": [\"restrict_owner_only sets 0o600 on Unix\", \"Windows uses SetNamedSecurityInfoW ACL\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: DPAPI Key Encryption Module",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Create dpapi.rs with protect/unprotect for Windows key encryption.\n\n**Files:**\n- Create: crates/ahandd/src/dpapi.rs\n- Create: crates/ahandd/tests/dpapi_test.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/dpapi.rs\", \"crates/ahandd/tests/dpapi_test.rs\"], \"verifyCommand\": \"cargo check -p ahandd\", \"acceptanceCriteria\": [\"protect returns encrypted bytes\", \"unprotect returns original\", \"module only compiles on Windows\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: IPC Server Refactor — Generic + Windows Named Pipes",
+      "status": "pending",
+      "blockedBy": [0, 1],
+      "description": "**Goal:** Refactor ipc.rs to generic AsyncRead/AsyncWrite + Windows Named Pipe server with peer identity.\n\n**Files:**\n- Modify: crates/ahandd/src/ipc.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ipc.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"serve_ipc dispatches by platform\", \"handle_ipc_conn is generic\", \"Windows peer identity via Win32 API\", \"Unix behavior unchanged\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: IPC Client Refactor — Extract ipc_connect()",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Extract cross-platform ipc_connect() and replace 5 UnixStream::connect calls.\n\n**Files:**\n- Modify: crates/ahandctl/src/main.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandctl/src/main.rs\"], \"verifyCommand\": \"cargo check -p ahandctl\", \"acceptanceCriteria\": [\"ipc_connect returns impl AsyncRead+AsyncWrite\", \"all 5 IPC functions use ipc_connect\", \"no direct UnixStream usage\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Signal Handling & Process Management",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Cross-platform daemon shutdown and process lifecycle.\n\n**Files:**\n- Modify: crates/ahandd/src/main.rs\n- Modify: crates/ahandctl/src/daemon.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/main.rs\", \"crates/ahandctl/src/daemon.rs\"], \"verifyCommand\": \"cargo check -p ahandd -p ahandctl\", \"acceptanceCriteria\": [\"Windows uses ctrl_c\", \"tasklist/taskkill on Windows\", \"CREATE_NO_WINDOW daemon start\", \"find_ahandd_binary handles .exe\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Device Identity & OpenClaw Permissions",
+      "status": "pending",
+      "blockedBy": [1, 2],
+      "description": "**Goal:** Integrate fs_perms and DPAPI into key storage and openclaw files.\n\n**Files:**\n- Modify: crates/ahandd/src/openclaw/device_identity.rs\n- Modify: crates/ahandd/src/openclaw/exec_approvals.rs\n- Modify: crates/ahandd/src/openclaw/pairing.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/openclaw/device_identity.rs\", \"crates/ahandd/src/openclaw/exec_approvals.rs\", \"crates/ahandd/src/openclaw/pairing.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"save uses fs_perms\", \"Windows key content DPAPI-encrypted\", \"load DPAPI-decrypts on Windows\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: browser-init Windows Adaptation",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Make browser-init work on Windows: Node.js .zip, Chrome/Edge detection, taskkill clean.\n\n**Files:**\n- Modify: crates/ahandd/src/browser_init.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/browser_init.rs\"], \"verifyCommand\": \"cargo check -p ahandd\", \"acceptanceCriteria\": [\"install_node downloads .zip on Windows\", \"detect_system_chrome checks Windows paths\", \"clean uses taskkill on Windows\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: Upgrade Rust Rewrite & Admin Bash Removal",
+      "status": "pending",
+      "blockedBy": [5],
+      "description": "**Goal:** Rewrite upgrade in Rust, remove bash dependency from admin.\n\n**Files:**\n- Modify: crates/ahandctl/src/upgrade.rs\n- Modify: crates/ahandctl/src/admin.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandctl/src/upgrade.rs\", \"crates/ahandctl/src/admin.rs\", \"crates/ahandctl/src/browser_init.rs\"], \"verifyCommand\": \"cargo check -p ahandctl\", \"acceptanceCriteria\": [\"upgrade works without bash\", \"supports --check and --version\", \"admin browser setup no bash\", \"Windows .exe handling\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: install.ps1 & ahandctl install-daemon",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** PowerShell install script and Rust install-daemon subcommand.\n\n**Files:**\n- Create: scripts/dist/install.ps1\n- Modify: crates/ahandctl/src/main.rs\n- Create: crates/ahandctl/src/install_daemon.rs\n\n```json:metadata\n{\"files\": [\"scripts/dist/install.ps1\", \"crates/ahandctl/src/main.rs\", \"crates/ahandctl/src/install_daemon.rs\"], \"verifyCommand\": \"cargo check -p ahandctl\", \"acceptanceCriteria\": [\"install.ps1 downloads and verifies binaries\", \"install.ps1 adds to PATH\", \"install-daemon subcommand works cross-platform\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 10: CI Workflows — Windows Build & Test",
+      "status": "pending",
+      "blockedBy": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+      "description": "**Goal:** Add Windows to release build matrix and create cross-platform test workflow.\n\n**Files:**\n- Modify: .github/workflows/release-rust.yml\n- Create: .github/workflows/test-rust.yml\n\n```json:metadata\n{\"files\": [\".github/workflows/release-rust.yml\", \".github/workflows/test-rust.yml\"], \"verifyCommand\": \"yamllint .github/workflows/\", \"acceptanceCriteria\": [\"Windows build target in release\", \"protoc install for Windows\", \".exe artifact handling\", \"test workflow runs on 3 OSes\"]}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 11: IPC Integration Tests",
+      "status": "pending",
+      "blockedBy": [3, 4],
+      "description": "**Goal:** Full IPC roundtrip integration tests on both platforms.\n\n**Files:**\n- Create: crates/ahandd/tests/ipc_roundtrip.rs\n- Modify: crates/ahandd/src/lib.rs\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/ipc_roundtrip.rs\", \"crates/ahandd/src/lib.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test ipc_roundtrip\", \"acceptanceCriteria\": [\"JobRequest→JobFinished roundtrip\", \"caller_uid format verified per platform\", \"SessionQuery roundtrip\", \"same test code both platforms\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-05T00:00:00Z"
+}
