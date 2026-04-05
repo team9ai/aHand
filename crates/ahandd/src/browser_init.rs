@@ -40,7 +40,10 @@ pub async fn run(force: bool) -> Result<()> {
     println!();
     println!("Setup complete!");
     println!("  Node.js:        {}", node_bin.display());
+    #[cfg(unix)]
     let cli_path = dirs.node.join("bin").join("playwright-cli");
+    #[cfg(windows)]
+    let cli_path = dirs.node.join("playwright-cli.cmd");
     println!("  playwright-cli: {}", cli_path.display());
     println!();
     println!("playwright-cli will use the browser installed on your system (Chrome, Edge, etc.).");
@@ -48,24 +51,54 @@ pub async fn run(force: bool) -> Result<()> {
 }
 
 async fn clean(dirs: &Dirs) {
-    // Uninstall playwright-cli from our managed prefix
-    let npm = dirs.node.join("bin").join("npm");
-    if npm.exists() {
-        let prefix = dirs.node.to_string_lossy().to_string();
-        let _ = tokio::process::Command::new(&npm)
-            .args(["uninstall", "-g", "--prefix", &prefix, "@playwright/cli"])
+    #[cfg(unix)]
+    {
+        // Uninstall playwright-cli from our managed prefix
+        let npm = dirs.node.join("bin").join("npm");
+        if npm.exists() {
+            let prefix = dirs.node.to_string_lossy().to_string();
+            let _ = tokio::process::Command::new(&npm)
+                .args(["uninstall", "-g", "--prefix", &prefix, "@playwright/cli"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Kill any lingering Node.js processes before cleaning
+        let _ = tokio::process::Command::new("taskkill")
+            .args(["/F", "/IM", "node.exe"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .await;
+
+        // Uninstall playwright-cli from our managed prefix
+        let npm = dirs.node.join("npm.cmd");
+        if npm.exists() {
+            let prefix = dirs.node.to_string_lossy().to_string();
+            let _ = tokio::process::Command::new(&npm)
+                .args(["uninstall", "-g", "--prefix", &prefix, "@playwright/cli"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
     }
-    println!("  Cleaned playwright-cli installation.");
+
+    println!("  Cleaned browser installation.");
 }
 
 // Step 1: Node.js
 
 async fn ensure_node(dirs: &Dirs) -> Result<PathBuf> {
+    #[cfg(unix)]
     let local_node = dirs.node.join("bin").join("node");
+    #[cfg(windows)]
+    let local_node = dirs.node.join("node.exe");
 
     // Check if we already have a suitable local node
     if local_node.exists() {
@@ -133,40 +166,82 @@ async fn node_major_version(node_bin: &Path) -> Option<u32> {
 }
 
 async fn install_node(dirs: &Dirs) -> Result<()> {
-    let (os, arch) = platform_info();
-    let tarball = format!("node-v{NODE_LTS_VERSION}-{os}-{arch}.tar.xz");
-    let url = format!("https://nodejs.org/dist/v{NODE_LTS_VERSION}/{tarball}");
-
-    let bytes = download_bytes(&url).await.context(format!(
-        "Failed to download Node.js from {url} — check your network connection"
-    ))?;
-
-    std::fs::create_dir_all(&dirs.node).context(format!(
-        "Failed to create directory {}: permission denied or disk full",
-        dirs.node.display()
-    ))?;
-    let decoder = xz2::read::XzDecoder::new(std::io::Cursor::new(bytes));
-    let mut archive = tar::Archive::new(decoder);
-    archive.set_preserve_permissions(true);
-    for entry in archive
-        .entries()
-        .context("Failed to read Node.js archive — download may be corrupted")?
+    #[cfg(windows)]
     {
-        let mut entry = entry.context("Corrupted entry in Node.js archive")?;
-        let path = entry.path()?.into_owned();
-        // Strip first component (e.g. "node-v24.13.0-darwin-arm64/bin/node" -> "bin/node")
-        let stripped: PathBuf = path.components().skip(1).collect();
-        if stripped.components().count() == 0 {
-            continue;
-        }
-        let dest = dirs.node.join(&stripped);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        entry.unpack(&dest).context(format!(
-            "Failed to extract {} — disk may be full",
-            dest.display()
+        let (_os, arch) = platform_info();
+        let zipfile = format!("node-v{NODE_LTS_VERSION}-win-{arch}.zip");
+        let url = format!("https://nodejs.org/dist/v{NODE_LTS_VERSION}/{zipfile}");
+
+        let bytes = download_bytes(&url).await.context(format!(
+            "Failed to download Node.js from {url} — check your network connection"
         ))?;
+
+        std::fs::create_dir_all(&dirs.node).context(format!(
+            "Failed to create directory {}: permission denied or disk full",
+            dirs.node.display()
+        ))?;
+
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(cursor)
+            .context("Failed to read Node.js zip archive")?;
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let path = file.mangled_name();
+            // Strip first component (e.g. "node-v24.13.0-win-x64/node.exe" -> "node.exe")
+            let stripped: PathBuf = path.components().skip(1).collect();
+            if stripped.components().count() == 0 {
+                continue;
+            }
+            let dest = dirs.node.join(&stripped);
+            if file.is_dir() {
+                std::fs::create_dir_all(&dest)?;
+            } else {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let mut outfile = std::fs::File::create(&dest)?;
+                std::io::copy(&mut file, &mut outfile)?;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        let (os, arch) = platform_info();
+        let tarball = format!("node-v{NODE_LTS_VERSION}-{os}-{arch}.tar.xz");
+        let url = format!("https://nodejs.org/dist/v{NODE_LTS_VERSION}/{tarball}");
+
+        let bytes = download_bytes(&url).await.context(format!(
+            "Failed to download Node.js from {url} — check your network connection"
+        ))?;
+
+        std::fs::create_dir_all(&dirs.node).context(format!(
+            "Failed to create directory {}: permission denied or disk full",
+            dirs.node.display()
+        ))?;
+        let decoder = xz2::read::XzDecoder::new(std::io::Cursor::new(bytes));
+        let mut archive = tar::Archive::new(decoder);
+        archive.set_preserve_permissions(true);
+        for entry in archive
+            .entries()
+            .context("Failed to read Node.js archive — download may be corrupted")?
+        {
+            let mut entry = entry.context("Corrupted entry in Node.js archive")?;
+            let path = entry.path()?.into_owned();
+            // Strip first component (e.g. "node-v24.13.0-darwin-arm64/bin/node" -> "bin/node")
+            let stripped: PathBuf = path.components().skip(1).collect();
+            if stripped.components().count() == 0 {
+                continue;
+            }
+            let dest = dirs.node.join(&stripped);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            entry.unpack(&dest).context(format!(
+                "Failed to extract {} — disk may be full",
+                dest.display()
+            ))?;
+        }
     }
 
     Ok(())
@@ -175,13 +250,22 @@ async fn install_node(dirs: &Dirs) -> Result<()> {
 // Step 2: playwright-cli via npm
 
 async fn install_playwright_cli(dirs: &Dirs, node_bin: &Path) -> Result<()> {
+    #[cfg(unix)]
     let npm = node_bin
         .parent()
         .map(|p| p.join("npm"))
         .unwrap_or_else(|| PathBuf::from("npm"));
+    #[cfg(windows)]
+    let npm = node_bin
+        .parent()
+        .map(|p| p.join("npm.cmd"))
+        .unwrap_or_else(|| PathBuf::from("npm.cmd"));
 
     // Check if already installed at the correct version
+    #[cfg(unix)]
     let cli_path = dirs.node.join("bin").join("playwright-cli");
+    #[cfg(windows)]
+    let cli_path = dirs.node.join("playwright-cli.cmd");
     if cli_path.exists() {
         // Verify version
         let output = tokio::process::Command::new(&cli_path)
