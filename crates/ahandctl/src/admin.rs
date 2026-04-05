@@ -660,12 +660,25 @@ fn is_process_running(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), unix))]
 fn is_process_running(pid: u32) -> bool {
     use std::process::Command;
     Command::new("ps")
         .args(&["-p", &pid.to_string()])
         .output()
         .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn is_process_running(pid: u32) -> bool {
+    use std::process::Command;
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            output.status.success() && !stdout.contains("No tasks are running")
+        })
         .unwrap_or(false)
 }

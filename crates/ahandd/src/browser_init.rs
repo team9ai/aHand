@@ -186,7 +186,10 @@ async fn install_node(dirs: &Dirs) -> Result<()> {
             .context("Failed to read Node.js zip archive")?;
         for i in 0..archive.len() {
             let mut file = archive.by_index(i)?;
-            let path = file.mangled_name();
+            let path = match file.enclosed_name() {
+                Some(p) => p.to_owned(),
+                None => continue,
+            };
             // Strip first component (e.g. "node-v24.13.0-win-x64/node.exe" -> "node.exe")
             let stripped: PathBuf = path.components().skip(1).collect();
             if stripped.components().count() == 0 {

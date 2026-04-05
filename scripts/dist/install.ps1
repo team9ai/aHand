@@ -77,6 +77,12 @@ foreach ($binary in @("ahandd", "ahandctl")) {
 
 # ── Verify checksums ────────────────────────────────────────────────
 
+# Build a lookup from asset names (in checksum file) to installed paths.
+$nameToPath = @{
+    "ahandd-$suffix.exe"   = Join-Path $InstallDir "ahandd.exe"
+    "ahandctl-$suffix.exe" = Join-Path $InstallDir "ahandctl.exe"
+}
+
 $checksumUrl = "$baseUrl/checksums-rust-$suffix.txt"
 try {
     $checksums = Invoke-RestMethod -Uri $checksumUrl -Headers @{ "User-Agent" = "ahand-installer" }
@@ -84,16 +90,16 @@ try {
         $line = $line.Trim()
         if ($line -match "^([0-9a-f]+)\s+(.+)$") {
             $expected = $Matches[1]
-            $fileName = $Matches[2].Trim()
-            $filePath = Join-Path $InstallDir $fileName
-            if (Test-Path $filePath) {
+            $assetName = $Matches[2].Trim()
+            $filePath = $nameToPath[$assetName]
+            if ($filePath -and (Test-Path $filePath)) {
                 $actual = (Get-FileHash $filePath -Algorithm SHA256).Hash.ToLower()
                 if ($actual -ne $expected) {
                     Remove-Item $filePath -Force -ErrorAction SilentlyContinue
-                    Write-Error "Checksum mismatch for $fileName! Expected $expected, got $actual. File removed."
+                    Write-Error "Checksum mismatch for $assetName! Expected $expected, got $actual. File removed."
                     exit 1
                 } else {
-                    Write-Host "  Checksum OK: $fileName"
+                    Write-Host "  Checksum OK: $assetName"
                 }
             }
         }

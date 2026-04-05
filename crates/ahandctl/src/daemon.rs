@@ -82,7 +82,7 @@ fn is_process_running(pid: u32) -> bool {
         .output()
         .map(|output| {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            output.status.success() && !stdout.contains("No tasks")
+            output.status.success() && !stdout.contains("No tasks are running")
         })
         .unwrap_or(false)
 }

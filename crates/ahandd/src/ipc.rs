@@ -122,9 +122,28 @@ async fn serve_ipc_windows(
         .create(&pipe_name)?;
 
     loop {
-        server.connect().await?;
+        if let Err(e) = server.connect().await {
+            error!(error = %e, "IPC pipe connect error");
+            // Rebuild server instance and retry
+            match ServerOptions::new().create(&pipe_name) {
+                Ok(s) => server = s,
+                Err(e) => {
+                    error!(error = %e, "IPC pipe recreate failed, retrying in 100ms");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            }
+            continue;
+        }
+
         let connected = server;
-        server = ServerOptions::new().create(&pipe_name)?;
+        server = match ServerOptions::new().create(&pipe_name) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "IPC pipe create failed");
+                continue;
+            }
+        };
 
         let caller_uid = get_pipe_caller_identity(&connected);
         let (reader, writer) = tokio::io::split(connected);
@@ -627,6 +646,12 @@ async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<
 
 /// Write a length-prefixed frame.
 async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> std::io::Result<()> {
+    if data.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "outgoing frame too large",
+        ));
+    }
     writer.write_u32(data.len() as u32).await?;
     writer.write_all(data).await?;
     writer.flush().await?;

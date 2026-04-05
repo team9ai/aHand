@@ -435,8 +435,14 @@ mod serve_ipc_integration {
             browser_mgr,
         ));
 
-        // Give the server time to bind the socket.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Wait for socket to be ready (poll instead of fixed sleep).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !sock_path.exists() {
+            if tokio::time::Instant::now() > deadline {
+                panic!("IPC server did not start within 5 seconds");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         (sock_path, handle)
     }
@@ -574,7 +580,7 @@ mod serve_ipc_integration {
         let mut reader = tokio::io::BufReader::new(reader);
 
         // Give the server a moment to register our peer_cred via register_caller.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Query our own session state using our UID.
         // The server registers the caller_uid from peer_cred on connect, so

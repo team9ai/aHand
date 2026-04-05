@@ -12,6 +12,8 @@ use tracing::info;
 mod admin;
 mod browser_init;
 mod daemon;
+mod github_release;
+mod install_daemon;
 mod upgrade;
 
 #[derive(Parser)]
@@ -81,6 +83,12 @@ enum Cmd {
         #[arg(long)]
         check: bool,
         /// Upgrade to a specific version
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Install the ahandd daemon binary from GitHub Releases
+    InstallDaemon {
+        /// Specific version to install (default: latest)
         #[arg(long)]
         version: Option<String>,
     },
@@ -187,6 +195,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Upgrade { check, version } => {
             return upgrade::run(*check, version.clone()).await;
         }
+        Cmd::InstallDaemon { version } => {
+            return install_daemon::run(version.clone()).await;
+        }
         Cmd::Start { config } => {
             return daemon::start(config.clone()).await;
         }
@@ -230,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
             Cmd::Configure { .. }
             | Cmd::BrowserInit { .. }
             | Cmd::Upgrade { .. }
+            | Cmd::InstallDaemon { .. }
             | Cmd::Start { .. }
             | Cmd::Stop
             | Cmd::Restart { .. }
@@ -265,6 +277,7 @@ async fn main() -> anyhow::Result<()> {
             Cmd::Configure { .. }
             | Cmd::BrowserInit { .. }
             | Cmd::Upgrade { .. }
+            | Cmd::InstallDaemon { .. }
             | Cmd::Start { .. }
             | Cmd::Stop
             | Cmd::Restart { .. }
@@ -293,6 +306,12 @@ async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<
 }
 
 async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> std::io::Result<()> {
+    if data.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "outgoing frame too large",
+        ));
+    }
     writer.write_u32(data.len() as u32).await?;
     writer.write_all(data).await?;
     writer.flush().await?;
