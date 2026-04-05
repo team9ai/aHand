@@ -236,3 +236,108 @@ mod hex {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_identity_has_valid_fields() {
+        let id = DeviceIdentity::generate();
+        assert!(!id.device_id.is_empty());
+        assert_eq!(id.public_key_raw().len(), 32);
+        assert!(!id.public_key_base64url().is_empty());
+    }
+
+    #[test]
+    fn sign_produces_nonempty_signature() {
+        let id = DeviceIdentity::generate();
+        let sig = id.sign("test payload");
+        assert!(!sig.is_empty());
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("device-identity.json");
+
+        let original = DeviceIdentity::generate();
+        original.save(&path).unwrap();
+
+        let loaded = DeviceIdentity::load(&path).unwrap();
+        assert_eq!(original.device_id, loaded.device_id);
+        assert_eq!(original.public_key_raw(), loaded.public_key_raw());
+    }
+
+    #[test]
+    fn load_or_create_generates_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new-identity.json");
+        assert!(!path.exists());
+
+        let id = DeviceIdentity::load_or_create(&path).unwrap();
+        assert!(path.exists());
+        assert!(!id.device_id.is_empty());
+    }
+
+    #[test]
+    fn load_or_create_loads_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.json");
+
+        let original = DeviceIdentity::generate();
+        original.save(&path).unwrap();
+
+        let loaded = DeviceIdentity::load_or_create(&path).unwrap();
+        assert_eq!(original.device_id, loaded.device_id);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_and_load_roundtrip_with_dpapi() {
+        // On Windows, save() encrypts with DPAPI and load() decrypts.
+        // This tests the full integration.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dpapi-identity.json");
+
+        let original = DeviceIdentity::generate();
+        original.save(&path).unwrap();
+
+        // File should be encrypted (not valid JSON)
+        let raw = std::fs::read(&path).unwrap();
+        assert!(serde_json::from_slice::<serde_json::Value>(&raw).is_err(),
+            "file should be DPAPI-encrypted, not plain JSON");
+
+        let loaded = DeviceIdentity::load(&path).unwrap();
+        assert_eq!(original.device_id, loaded.device_id);
+    }
+
+    #[test]
+    fn load_rejects_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(DeviceIdentity::load(&path).is_err());
+    }
+
+    #[test]
+    fn build_auth_payload_v1_format() {
+        let payload = build_auth_payload(
+            "dev1", "cli1", "tool", "user", &["read".to_string()],
+            1234567890, None, None,
+        );
+        assert!(payload.starts_with("v1|"));
+        assert!(payload.contains("dev1"));
+        assert!(payload.contains("1234567890"));
+    }
+
+    #[test]
+    fn build_auth_payload_v2_with_nonce() {
+        let payload = build_auth_payload(
+            "dev1", "cli1", "tool", "user", &[],
+            1234567890, Some("token"), Some("nonce123"),
+        );
+        assert!(payload.starts_with("v2|"));
+        assert!(payload.contains("nonce123"));
+    }
+}

@@ -421,3 +421,36 @@ fn which(bin: &str) -> Result<PathBuf> {
     }
     anyhow::bail!("{bin} not found in PATH")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_info_returns_valid() {
+        let (os, arch) = platform_info();
+        assert!(
+            ["darwin", "linux", "win", "unknown"].contains(&os),
+            "unexpected os: {os}"
+        );
+        assert!(
+            ["arm64", "x64", "unknown"].contains(&arch),
+            "unexpected arch: {arch}"
+        );
+    }
+
+    #[test]
+    fn dirs_new_succeeds() {
+        // Should not panic as long as home dir is available
+        let dirs = Dirs::new();
+        assert!(dirs.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dirs_node_path_is_under_ahand() {
+        let dirs = Dirs::new().unwrap();
+        assert!(dirs.node.to_string_lossy().contains(".ahand"));
+        assert!(dirs.node.to_string_lossy().ends_with("node"));
+    }
+}
