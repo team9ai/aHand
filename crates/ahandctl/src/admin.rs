@@ -3,7 +3,6 @@ use serde::Serialize;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use warp::http::StatusCode;
 use warp::{Filter, Rejection, Reply, reject};
 
@@ -356,83 +355,12 @@ fn browser_init_stream()
 -> impl futures_util::Stream<Item = std::result::Result<warp::sse::Event, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<warp::sse::Event>();
 
+    // Instead of spawning bash, direct user to the Rust-native command
     tokio::spawn(async move {
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => {
-                let _ = tx.send(
-                    warp::sse::Event::default()
-                        .data(r#"{"line":"ERROR: Failed to find home directory","status":"error","exit_code":1}"#),
-                );
-                return;
-            }
-        };
-
-        let script_path = home.join(".ahand").join("bin").join("setup-browser.sh");
-        if !script_path.exists() {
-            let msg = format!(
-                r#"{{"line":"ERROR: setup-browser.sh not found at {}","status":"error","exit_code":1}}"#,
-                script_path.display()
-            );
-            let _ = tx.send(warp::sse::Event::default().data(msg));
-            return;
-        }
-
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg(&script_path);
-        cmd.arg("--from-release");
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!(
-                    r#"{{"line":"ERROR: Failed to spawn setup-browser.sh: {}","status":"error","exit_code":1}}"#,
-                    e
-                );
-                let _ = tx.send(warp::sse::Event::default().data(msg));
-                return;
-            }
-        };
-
-        let stdout = child.stdout.take().expect("stdout");
-        let stderr = child.stderr.take().expect("stderr");
-
-        let tx_out = tx.clone();
-        let stdout_task = tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
-                let data = format!(r#"{{"line":"{}"}}"#, escaped);
-                if tx_out.send(warp::sse::Event::default().data(data)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let tx_err = tx.clone();
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
-                let data = format!(r#"{{"line":"[stderr] {}"}}"#, escaped);
-                if tx_err.send(warp::sse::Event::default().data(data)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let status = child.wait().await;
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-
-        let exit_code = status.map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-        let status_str = if exit_code == 0 { "done" } else { "error" };
-        let data = format!(r#"{{"status":"{}","exit_code":{}}}"#, status_str, exit_code);
-        let _ = tx.send(warp::sse::Event::default().data(data));
+        let msg = r#"{"line":"Browser setup is now built into the daemon. Run: ahandd browser-init","status":"info"}"#;
+        let _ = tx.send(warp::sse::Event::default().data(msg));
+        let msg = r#"{"line":"For force reinstall: ahandd browser-init --force","status":"complete","exit_code":0}"#;
+        let _ = tx.send(warp::sse::Event::default().data(msg));
     });
 
     futures_util::stream::unfold(rx, |mut rx| async move {
