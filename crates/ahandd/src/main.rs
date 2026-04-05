@@ -5,6 +5,7 @@ mod browser_init;
 mod config;
 mod device_identity;
 mod executor;
+mod fs_perms;
 mod ipc;
 mod openclaw;
 mod outbox;
