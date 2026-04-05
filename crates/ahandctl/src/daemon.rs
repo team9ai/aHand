@@ -226,3 +226,75 @@ pub async fn status() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_data_dir_returns_ahand_data() {
+        let dir = get_data_dir().unwrap();
+        assert!(dir.to_string_lossy().contains(".ahand"));
+        assert!(dir.to_string_lossy().ends_with("data"));
+    }
+
+    #[test]
+    fn get_pid_path_under_data_dir() {
+        let pid = get_pid_path().unwrap();
+        assert!(pid.to_string_lossy().ends_with("daemon.pid"));
+    }
+
+    #[test]
+    fn get_log_path_under_data_dir() {
+        let log = get_log_path().unwrap();
+        assert!(log.to_string_lossy().ends_with("daemon.log"));
+    }
+
+    #[test]
+    fn is_process_running_with_zero_pid() {
+        // PID 0 should not be running (it's the system idle process / kernel)
+        assert!(!is_process_running(0));
+    }
+
+    #[test]
+    fn is_process_running_with_current_pid() {
+        let pid = std::process::id();
+        assert!(is_process_running(pid));
+    }
+
+    #[test]
+    fn is_process_running_with_nonexistent_pid() {
+        // Very high PID unlikely to exist
+        assert!(!is_process_running(4_000_000));
+    }
+
+    #[test]
+    fn read_running_pid_no_pid_file() {
+        // This test depends on whether there's actually a PID file.
+        // If daemon is not running, should return Ok(None) or Ok(Some(pid)).
+        // At minimum, it should not panic.
+        let result = read_running_pid();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn find_ahandd_binary_does_not_panic() {
+        // May succeed or fail depending on environment,
+        // but should never panic.
+        let _result = find_ahandd_binary();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_signal_to_nonexistent_process() {
+        let result = send_signal(4_000_000, "-0");
+        assert!(result.is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn send_signal_to_nonexistent_process_windows() {
+        let result = send_signal(4_000_000, "-TERM");
+        assert!(result.is_err());
+    }
+}

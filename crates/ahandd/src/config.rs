@@ -294,3 +294,93 @@ fn uuid_v4() -> String {
         .as_nanos();
     format!("{:032x}", ts)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_config() -> Config {
+        Config {
+            mode: None,
+            server_url: "ws://localhost:3000/ws".to_string(),
+            device_id: None,
+            max_concurrent_jobs: None,
+            data_dir: None,
+            debug_ipc: None,
+            ipc_socket_path: None,
+            ipc_socket_mode: None,
+            trust_timeout_mins: None,
+            default_session_mode: None,
+            policy: Default::default(),
+            openclaw: None,
+            browser: None,
+            hub: None,
+        }
+    }
+
+    #[test]
+    fn ipc_socket_path_custom() {
+        let mut cfg = minimal_config();
+        cfg.ipc_socket_path = Some("/custom/path.sock".to_string());
+        assert_eq!(cfg.ipc_socket_path(), PathBuf::from("/custom/path.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipc_socket_path_unix_default() {
+        let cfg = minimal_config();
+        let path = cfg.ipc_socket_path();
+        assert!(path.to_string_lossy().ends_with("ahandd.sock"));
+        assert!(path.to_string_lossy().contains(".ahand"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ipc_socket_path_windows_default() {
+        let cfg = minimal_config();
+        let path = cfg.ipc_socket_path();
+        assert_eq!(path, PathBuf::from(r"\\.\pipe\ahandd"));
+    }
+
+    #[test]
+    fn ipc_socket_mode_default() {
+        let cfg = minimal_config();
+        assert_eq!(cfg.ipc_socket_mode(), 0o660);
+    }
+
+    #[test]
+    fn ipc_socket_mode_custom() {
+        let mut cfg = minimal_config();
+        cfg.ipc_socket_mode = Some(0o600);
+        assert_eq!(cfg.ipc_socket_mode(), 0o600);
+    }
+
+    #[test]
+    fn device_id_auto_generated_when_none() {
+        let cfg = minimal_config();
+        let id = cfg.device_id();
+        assert!(!id.is_empty());
+    }
+
+    #[test]
+    fn device_id_custom() {
+        let mut cfg = minimal_config();
+        cfg.device_id = Some("my-device".to_string());
+        assert_eq!(cfg.device_id(), "my-device");
+    }
+
+    #[test]
+    fn data_dir_default() {
+        let cfg = minimal_config();
+        let dir = cfg.data_dir();
+        assert!(dir.is_some());
+        assert!(dir.unwrap().to_string_lossy().contains(".ahand"));
+    }
+
+    #[test]
+    fn data_dir_empty_disables() {
+        let mut cfg = minimal_config();
+        cfg.data_dir = Some("".to_string());
+        assert!(cfg.data_dir().is_none());
+    }
+}
