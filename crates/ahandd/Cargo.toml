@@ -31,3 +31,5 @@ tar = "0.4"
 flate2 = "1"
 xz2 = { version = "0.1", features = ["static"] }
 tokio-util = { version = "0.7", features = ["io"] }
+semver = "1"
+hex = "0.4"

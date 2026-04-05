@@ -12,6 +12,7 @@ mod policy;
 mod registry;
 mod session;
 mod store;
+pub mod updater;
 
 use std::path::PathBuf;
 use std::sync::Arc;
