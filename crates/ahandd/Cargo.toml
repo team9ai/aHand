@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "ahandd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ahandd"
+path = "src/main.rs"
+
 [dependencies]
 ahand-protocol = { path = "../ahand-protocol" }
 tokio.workspace = true
