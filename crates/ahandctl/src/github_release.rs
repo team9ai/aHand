@@ -33,6 +33,8 @@ pub fn platform_suffix() -> (&'static str, &'static str) {
         ("linux-arm64", "")
     } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
         ("windows-x64", ".exe")
+    } else if cfg!(target_os = "windows") && cfg!(target_arch = "aarch64") {
+        ("windows-arm64", ".exe")
     } else {
         ("unknown", "")
     }
