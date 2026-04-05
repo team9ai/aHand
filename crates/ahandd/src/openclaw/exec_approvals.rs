@@ -62,13 +62,7 @@ pub fn save_exec_approvals(path: &Path, file: &ExecApprovalsFile) -> Result<()> 
     std::fs::write(path, format!("{}\n", content))
         .with_context(|| format!("failed to write {}", path.display()))?;
 
-    // Set file permissions to 0600 (user read/write only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
-    }
+    let _ = crate::fs_perms::restrict_owner_only(path);
 
     Ok(())
 }

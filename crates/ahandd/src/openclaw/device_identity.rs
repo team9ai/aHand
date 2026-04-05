@@ -65,6 +65,16 @@ impl DeviceIdentity {
 
     /// Load from file
     fn load(path: &PathBuf) -> Result<Self> {
+        #[cfg(windows)]
+        let content = {
+            let encrypted = std::fs::read(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let decrypted = crate::dpapi::unprotect(&encrypted)
+                .map_err(|e| anyhow::anyhow!("DPAPI decrypt failed for {}: {}", path.display(), e))?;
+            String::from_utf8(decrypted)
+                .with_context(|| "decrypted identity is not valid UTF-8")?
+        };
+        #[cfg(unix)]
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
 
@@ -127,15 +137,21 @@ impl DeviceIdentity {
         let content =
             serde_json::to_string_pretty(&stored).context("failed to serialize identity")?;
 
-        std::fs::write(path, format!("{}\n", content))
-            .with_context(|| format!("failed to write {}", path.display()))?;
-
-        // Set file permissions to 0600 (user read/write only)
+        #[cfg(windows)]
+        {
+            let encrypted = crate::dpapi::protect(format!("{}\n", content).as_bytes())
+                .map_err(|e| anyhow::anyhow!("DPAPI encrypt failed: {}", e))?;
+            std::fs::write(path, &encrypted)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            crate::fs_perms::restrict_owner_only(path)
+                .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
+            std::fs::write(path, format!("{}\n", content))
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            crate::fs_perms::restrict_owner_only(path)
+                .with_context(|| format!("failed to set permissions on {}", path.display()))?;
         }
 
         Ok(())
