@@ -16,9 +16,11 @@ fn get_log_path() -> Result<PathBuf> {
 
 /// Find the ahandd binary: installed path → sibling of current exe → error.
 fn find_ahandd_binary() -> Result<PathBuf> {
+    let binary_name = if cfg!(windows) { "ahandd.exe" } else { "ahandd" };
+
     // 1. Installed location: ~/.ahand/bin/ahandd
     if let Some(home) = dirs::home_dir() {
-        let installed = home.join(".ahand").join("bin").join("ahandd");
+        let installed = home.join(".ahand").join("bin").join(binary_name);
         if installed.exists() {
             return Ok(installed);
         }
@@ -27,7 +29,7 @@ fn find_ahandd_binary() -> Result<PathBuf> {
     // 2. Sibling of current executable (dev builds: target/debug/)
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(dir) = current_exe.parent() {
-            let sibling = dir.join("ahandd");
+            let sibling = dir.join(binary_name);
             if sibling.exists() {
                 return Ok(sibling);
             }
@@ -62,7 +64,7 @@ fn is_process_running(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), unix))]
 fn is_process_running(pid: u32) -> bool {
     std::process::Command::new("ps")
         .args(["-p", &pid.to_string()])
@@ -73,6 +75,19 @@ fn is_process_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(windows)]
+fn is_process_running(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            output.status.success() && !stdout.contains("No tasks")
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
 fn send_signal(pid: u32, sig: &str) -> Result<()> {
     let status = std::process::Command::new("kill")
         .args([sig, &pid.to_string()])
@@ -80,6 +95,18 @@ fn send_signal(pid: u32, sig: &str) -> Result<()> {
         .context("Failed to run kill command")?;
     if !status.success() {
         anyhow::bail!("kill {} {} failed", sig, pid);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn send_signal(pid: u32, _sig: &str) -> Result<()> {
+    let status = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status()
+        .context("Failed to run taskkill command")?;
+    if !status.success() {
+        anyhow::bail!("taskkill /PID {} failed", pid);
     }
     Ok(())
 }
@@ -118,6 +145,12 @@ pub async fn start(config: Option<String>) -> Result<()> {
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
     }
 
     let child = cmd
