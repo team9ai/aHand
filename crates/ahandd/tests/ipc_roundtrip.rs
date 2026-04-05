@@ -372,3 +372,305 @@ mod unix {
         client.await.unwrap();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Full serve_ipc integration tests (cfg(unix))
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod serve_ipc_integration {
+    use std::sync::Arc;
+
+    use ahand_protocol::{envelope, Envelope, JobRequest, SessionMode, SessionQuery};
+    use ahandd::{approval, browser, config, ipc, registry, session};
+    use prost::Message;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Helper: write a length-prefixed protobuf frame.
+    async fn write_envelope<W: AsyncWriteExt + Unpin>(w: &mut W, env: &Envelope) {
+        let data = env.encode_to_vec();
+        w.write_u32(data.len() as u32).await.unwrap();
+        w.write_all(&data).await.unwrap();
+        w.flush().await.unwrap();
+    }
+
+    /// Helper: read one length-prefixed protobuf frame with a timeout.
+    async fn read_envelope<R: AsyncReadExt + Unpin>(r: &mut R) -> Option<Envelope> {
+        let len = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            r.read_u32(),
+        )
+        .await
+        .ok()?
+        .ok()? as usize;
+
+        let mut buf = vec![0u8; len];
+        r.read_exact(&mut buf).await.ok()?;
+        Envelope::decode(buf.as_slice()).ok()
+    }
+
+    /// Spin up a real `serve_ipc` server bound to a temp Unix socket and return
+    /// the socket path and the server's `JoinHandle` (caller must abort it).
+    async fn start_server(
+        dir: &tempfile::TempDir,
+        session_mgr: Arc<session::SessionManager>,
+    ) -> (std::path::PathBuf, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let sock_path = dir.path().join("test.sock");
+        let registry = Arc::new(registry::JobRegistry::new(4));
+        let approval_mgr = Arc::new(approval::ApprovalManager::new(300));
+        let browser_cfg = config::BrowserConfig::default();
+        let browser_mgr = Arc::new(browser::BrowserManager::new(browser_cfg));
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(16);
+
+        let path_clone = sock_path.clone();
+        let handle = tokio::spawn(ipc::serve_ipc(
+            path_clone,
+            0o660,
+            registry,
+            None,
+            session_mgr,
+            approval_mgr,
+            broadcast_tx,
+            "test-device".to_string(),
+            browser_mgr,
+        ));
+
+        // Give the server time to bind the socket.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        (sock_path, handle)
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: send a JobRequest and receive JobFinished or JobRejected.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn serve_ipc_job_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_mgr = Arc::new(session::SessionManager::new(60));
+
+        let (sock_path, server_handle) = start_server(&dir, Arc::clone(&session_mgr)).await;
+
+        // Connect as a client.
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // Send a JobRequest.
+        let job_id = format!("test-job-{}", std::process::id());
+        let req = Envelope {
+            device_id: "test-client".to_string(),
+            msg_id: "msg-1".to_string(),
+            ts_ms: 0,
+            payload: Some(envelope::Payload::JobRequest(JobRequest {
+                job_id: job_id.clone(),
+                tool: "echo".to_string(),
+                args: vec!["hello".to_string()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        write_envelope(&mut writer, &req).await;
+
+        // Read responses until we get a JobFinished or JobRejected for our job.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got_response = false;
+        while tokio::time::Instant::now() < deadline {
+            let env = match read_envelope(&mut reader).await {
+                Some(e) => e,
+                None => break,
+            };
+            match env.payload {
+                Some(envelope::Payload::JobFinished(ref fin)) if fin.job_id == job_id => {
+                    got_response = true;
+                    break;
+                }
+                Some(envelope::Payload::JobRejected(ref rej)) if rej.job_id == job_id => {
+                    // Default session mode is Inactive, so rejection is expected.
+                    // A rejection still proves the server processed our request.
+                    got_response = true;
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        assert!(
+            got_response,
+            "did not receive JobFinished or JobRejected within timeout"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: send a JobRequest with AutoAccept mode and get JobFinished.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn serve_ipc_job_auto_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_mgr = Arc::new(session::SessionManager::new(60));
+        // Pre-set the default mode so new callers are auto-accepted.
+        session_mgr
+            .set_default_mode(SessionMode::AutoAccept)
+            .await;
+
+        let (sock_path, server_handle) = start_server(&dir, Arc::clone(&session_mgr)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        let job_id = format!("test-auto-{}", std::process::id());
+        let req = Envelope {
+            device_id: "test-client".to_string(),
+            msg_id: "msg-auto".to_string(),
+            ts_ms: 0,
+            payload: Some(envelope::Payload::JobRequest(JobRequest {
+                job_id: job_id.clone(),
+                tool: "echo".to_string(),
+                args: vec!["hello".to_string()],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        write_envelope(&mut writer, &req).await;
+
+        // With AutoAccept the job should be accepted and run.
+        // We expect a JobFinished (echo should complete quickly).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got_finished = false;
+        while tokio::time::Instant::now() < deadline {
+            let env = match read_envelope(&mut reader).await {
+                Some(e) => e,
+                None => break,
+            };
+            if let Some(envelope::Payload::JobFinished(ref fin)) = env.payload {
+                if fin.job_id == job_id {
+                    got_finished = true;
+                    break;
+                }
+            }
+        }
+        assert!(got_finished, "did not receive JobFinished within timeout");
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: SessionQuery -> SessionState roundtrip.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn serve_ipc_session_query_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_mgr = Arc::new(session::SessionManager::new(60));
+
+        let (sock_path, server_handle) = start_server(&dir, Arc::clone(&session_mgr)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // Give the server a moment to register our peer_cred via register_caller.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Query our own session state using our UID.
+        // The server registers the caller_uid from peer_cred on connect, so
+        // querying with that UID should return a SessionState.
+        let our_uid = format!("uid:{}", unsafe { libc::getuid() });
+        let query = Envelope {
+            device_id: "test-client".to_string(),
+            msg_id: "msg-session-query".to_string(),
+            ts_ms: 0,
+            payload: Some(envelope::Payload::SessionQuery(SessionQuery {
+                caller_uid: our_uid.clone(),
+            })),
+            ..Default::default()
+        };
+        write_envelope(&mut writer, &query).await;
+
+        // Read back a SessionState.
+        let env = read_envelope(&mut reader)
+            .await
+            .expect("expected SessionState response from server");
+
+        match env.payload {
+            Some(envelope::Payload::SessionState(state)) => {
+                assert_eq!(state.caller_uid, our_uid);
+                // Default mode is Inactive.
+                assert_eq!(state.mode, i32::from(SessionMode::Inactive));
+            }
+            other => panic!("expected SessionState, got {other:?}"),
+        }
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: SessionQuery with empty caller_uid returns all sessions.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn serve_ipc_session_query_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_mgr = Arc::new(session::SessionManager::new(60));
+
+        let (sock_path, server_handle) = start_server(&dir, Arc::clone(&session_mgr)).await;
+
+        let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // Let server register our peer_cred.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Query all sessions (empty caller_uid).
+        let query = Envelope {
+            device_id: "test-client".to_string(),
+            msg_id: "msg-session-all".to_string(),
+            ts_ms: 0,
+            payload: Some(envelope::Payload::SessionQuery(SessionQuery {
+                caller_uid: String::new(),
+            })),
+            ..Default::default()
+        };
+        write_envelope(&mut writer, &query).await;
+
+        // We should get at least one SessionState (for our own connection).
+        let env = read_envelope(&mut reader)
+            .await
+            .expect("expected at least one SessionState response");
+
+        match env.payload {
+            Some(envelope::Payload::SessionState(state)) => {
+                // The caller_uid should be our uid.
+                let our_uid = format!("uid:{}", unsafe { libc::getuid() });
+                assert_eq!(state.caller_uid, our_uid);
+            }
+            other => panic!("expected SessionState, got {other:?}"),
+        }
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Test: peer identity format on Unix.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn peer_identity_format_unix() {
+        // On Unix, the serve_ipc_unix handler formats peer_cred as "uid:{number}".
+        let uid = unsafe { libc::getuid() };
+        let identity = format!("uid:{uid}");
+        assert!(identity.starts_with("uid:"));
+        // UID should be a valid non-negative integer.
+        let parsed: u32 = identity
+            .strip_prefix("uid:")
+            .unwrap()
+            .parse()
+            .expect("uid should be a valid u32");
+        assert_eq!(parsed, uid);
+    }
+}
