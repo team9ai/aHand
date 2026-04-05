@@ -14,7 +14,7 @@ use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::config::Config;
 use crate::device_identity::DeviceIdentity;
-use crate::executor;
+use crate::executor::{self, EnvelopeSink as _};
 use crate::outbox::{Outbox, prepare_outbound};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
@@ -226,6 +226,13 @@ async fn connect_with_auth(
     let tx = BufferedEnvelopeSender::new(raw_tx, Arc::clone(outbox));
     let store_send = store.clone();
 
+    if let Some(suggestion) = accepted.update_suggestion {
+        info!(update_id = %suggestion.update_id, target = %suggestion.target_version,
+            "hub suggests update during registration");
+        let params = crate::updater::UpdateParams::from(suggestion);
+        crate::updater::spawn_update(params, device_id.to_string(), tx.clone());
+    }
+
     // Task: receive Envelope from executors, stamp with outbox, encode, send over WS.
     let send_handle = tokio::spawn(async move {
         while let Some(queued) = rx.recv().await {
@@ -329,6 +336,28 @@ async fn connect_with_auth(
             Some(envelope::Payload::BrowserRequest(req)) => {
                 handle_browser_request(device_id, caller_uid, &req, &tx, session_mgr, browser_mgr)
                     .await;
+            }
+            Some(envelope::Payload::UpdateCommand(cmd)) => {
+                info!(update_id = %cmd.update_id, target = %cmd.target_version,
+                    "received update command from hub");
+                let params = crate::updater::UpdateParams::from(cmd);
+                if !crate::updater::spawn_update(params, device_id.to_string(), tx.clone()) {
+                    let _ = tx.send(Envelope {
+                        device_id: device_id.to_string(),
+                        msg_id: format!("update-reject-{}", device_id),
+                        payload: Some(envelope::Payload::UpdateStatus(
+                            ahand_protocol::UpdateStatus {
+                                update_id: String::new(),
+                                state: ahand_protocol::UpdateState::Failed as i32,
+                                current_version: env!("CARGO_PKG_VERSION").into(),
+                                target_version: String::new(),
+                                progress: 0,
+                                error: "another update is already in progress".into(),
+                            },
+                        )),
+                        ..Default::default()
+                    });
+                }
             }
             _ => {}
         }
