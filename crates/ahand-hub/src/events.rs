@@ -320,6 +320,7 @@ mod tests {
             cwd: None,
             env: Default::default(),
             timeout_ms: 30_000,
+            interactive: false,
             status: JobStatus::Pending,
             exit_code: None,
             error: None,

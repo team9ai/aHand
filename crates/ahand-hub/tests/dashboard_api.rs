@@ -141,6 +141,7 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
             env: Default::default(),
             timeout_ms: 30_000,
             requested_by: "operator".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -160,6 +161,7 @@ async fn dashboard_read_endpoints_return_filtered_resources_for_dashboard_users(
             env: Default::default(),
             timeout_ms: 5_000,
             requested_by: "operator".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -602,6 +604,7 @@ async fn cancel_job_returns_conflict_when_device_channel_is_stale() {
             env: Default::default(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap();

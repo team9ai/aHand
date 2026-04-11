@@ -29,6 +29,8 @@ pub struct CreateJobRequest {
     pub tool: String,
     pub args: Vec<String>,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 impl CreateJobRequest {
@@ -41,6 +43,7 @@ impl CreateJobRequest {
             env: Default::default(),
             timeout_ms: self.timeout_ms,
             requested_by: requested_by.into(),
+            interactive: self.interactive,
         }
     }
 }
@@ -117,6 +120,7 @@ impl JobRuntime {
                     cwd: job.cwd.clone().unwrap_or_default(),
                     env: job.env.clone(),
                     timeout_ms: job.timeout_ms,
+                    interactive: job.interactive,
                 },
             )),
             ..Default::default()
@@ -590,11 +594,11 @@ pub async fn create_job(
     State(state): State<AppState>,
     body: Result<Json<CreateJobRequest>, JsonRejection>,
 ) -> ApiResult<(axum::http::StatusCode, Json<CreateJobResponse>)> {
-    auth.require_admin()?;
+    auth.require_dashboard_access()?;
     let Json(body) = body.map_err(ApiError::from_json_rejection)?;
     let job = state
         .jobs
-        .create_job(body.into_new_job("service:api"))
+        .create_job(body.into_new_job(&format!("dashboard:{}", auth.0.subject)))
         .await
         .map_err(ApiError::from)?;
     Ok((
@@ -994,6 +998,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap_err();
@@ -1058,6 +1063,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();
@@ -1106,6 +1112,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();
@@ -1151,6 +1158,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();
@@ -1189,6 +1197,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();
@@ -1235,6 +1244,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();

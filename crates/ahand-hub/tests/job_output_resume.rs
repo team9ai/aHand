@@ -106,6 +106,7 @@ async fn reconnecting_sse_with_stale_last_event_id_emits_resync_event() {
             env: Default::default(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -181,6 +182,7 @@ async fn existing_job_without_live_output_state_still_streams_with_200() {
             env: Default::default(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap();

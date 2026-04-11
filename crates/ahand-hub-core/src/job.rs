@@ -57,6 +57,7 @@ pub struct Job {
     pub cwd: Option<String>,
     pub env: HashMap<String, String>,
     pub timeout_ms: u64,
+    pub interactive: bool,
     pub status: JobStatus,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
@@ -77,6 +78,7 @@ impl Job {
             cwd: job.cwd,
             env: job.env,
             timeout_ms: job.timeout_ms,
+            interactive: job.interactive,
             status: JobStatus::Pending,
             exit_code: None,
             error: None,
@@ -114,6 +116,7 @@ pub struct NewJob {
     pub env: HashMap<String, String>,
     pub timeout_ms: u64,
     pub requested_by: String,
+    pub interactive: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -229,6 +232,7 @@ mod tests {
                 env: HashMap::new(),
                 timeout_ms: 30_000,
                 requested_by: "service".into(),
+                interactive: false,
             },
             Utc::now(),
         );
@@ -258,6 +262,7 @@ mod tests {
                 env: HashMap::new(),
                 timeout_ms: 30_000,
                 requested_by: "service".into(),
+                interactive: false,
             },
             Utc::now(),
         );
@@ -286,6 +291,7 @@ mod tests {
                 env: HashMap::new(),
                 timeout_ms: 30_000,
                 requested_by: "service".into(),
+                interactive: false,
             },
             created_at,
         );

@@ -30,8 +30,8 @@ impl JobStore for PgJobStore {
 
         sqlx::query(
             r#"
-            INSERT INTO jobs (id, device_id, tool, args, cwd, env, timeout_ms, status, requested_by)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            INSERT INTO jobs (id, device_id, tool, args, cwd, env, timeout_ms, interactive, status, requested_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             "#,
         )
         .bind(job_id)
@@ -41,6 +41,7 @@ impl JobStore for PgJobStore {
         .bind(&job.cwd)
         .bind(env)
         .bind(timeout_ms)
+        .bind(job.interactive)
         .bind(status)
         .bind(&job.requested_by)
         .execute(&self.pool)
@@ -57,7 +58,7 @@ impl JobStore for PgJobStore {
             Uuid::parse_str(job_id).map_err(|err| HubError::InvalidToken(err.to_string()))?;
         let row = sqlx::query(
             r#"
-            SELECT id, device_id, tool, args, cwd, env, timeout_ms, status, exit_code, error,
+            SELECT id, device_id, tool, args, cwd, env, timeout_ms, interactive, status, exit_code, error,
                    output_summary, requested_by, created_at, started_at, finished_at
             FROM jobs
             WHERE id = $1
@@ -75,7 +76,7 @@ impl JobStore for PgJobStore {
         let status = filter.status.map(encode_status);
         let rows = sqlx::query(
             r#"
-            SELECT id, device_id, tool, args, cwd, env, timeout_ms, status, exit_code, error,
+            SELECT id, device_id, tool, args, cwd, env, timeout_ms, interactive, status, exit_code, error,
                    output_summary, requested_by, created_at, started_at, finished_at
             FROM jobs
             WHERE ($1::text IS NULL OR device_id = $1)
@@ -228,6 +229,9 @@ fn map_job(row: sqlx::postgres::PgRow) -> Result<Job> {
                 .map_err(|err| HubError::Internal(err.to_string()))?,
         )
         .map_err(|err| HubError::Internal(err.to_string()))?,
+        interactive: row
+            .try_get("interactive")
+            .map_err(|err| HubError::Internal(err.to_string()))?,
         status: decode_status(&status)?,
         exit_code: row
             .try_get("exit_code")

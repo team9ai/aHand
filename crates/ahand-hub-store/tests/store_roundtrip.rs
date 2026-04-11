@@ -63,6 +63,7 @@ async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await?;
 
@@ -171,6 +172,7 @@ async fn updating_job_status_records_lifecycle_timestamps() -> anyhow::Result<()
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await?;
 
@@ -353,6 +355,7 @@ async fn concurrent_terminal_transitions_do_not_overwrite_each_other() -> anyhow
             env: Default::default(),
             timeout_ms: 30_000,
             requested_by: "service".into(),
+            interactive: false,
         })
         .await?;
 
