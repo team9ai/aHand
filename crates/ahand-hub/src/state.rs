@@ -30,6 +30,7 @@ pub struct AppState {
     audit_writer: Arc<crate::audit_writer::BufferedAuditStore>,
     pub jobs: Arc<crate::http::jobs::JobRuntime>,
     pub connections: Arc<crate::ws::device_gateway::ConnectionRegistry>,
+    pub browser_pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::BrowserResponse>>>,
     pub events: Arc<crate::events::EventBus>,
     pub output_stream: Arc<crate::output_stream::OutputStream>,
     pub bootstrap_tokens: Arc<crate::bootstrap::BootstrapCredentials>,
@@ -126,6 +127,8 @@ impl AppState {
             config.device_disconnect_grace_ms,
         ));
 
+        let browser_pending = Arc::new(DashMap::new());
+
         let state = Self {
             auth: Arc::new(AuthService::new(&config.jwt_secret)),
             device_manager,
@@ -136,6 +139,7 @@ impl AppState {
             audit_writer,
             jobs,
             connections,
+            browser_pending,
             events,
             output_stream,
             bootstrap_tokens: Arc::new(bootstrap_tokens),

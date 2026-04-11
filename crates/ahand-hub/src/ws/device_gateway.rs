@@ -539,7 +539,20 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             match message {
                 WsMessage::Binary(frame) => {
                     *last_inbound_at.lock().await = tokio::time::Instant::now();
-                    state.jobs.handle_device_frame(&device_id, &frame).await?;
+                    let envelope = ahand_protocol::Envelope::decode(frame.as_ref())?;
+                    if let Some(ahand_protocol::envelope::Payload::BrowserResponse(ref browser_resp)) = envelope.payload {
+                        if let Some((_, sender)) = state.browser_pending.remove(&browser_resp.request_id) {
+                            let _ = sender.send(browser_resp.clone());
+                        } else {
+                            tracing::warn!(
+                                request_id = %browser_resp.request_id,
+                                "received BrowserResponse with no pending request"
+                            );
+                        }
+                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                    } else {
+                        state.jobs.handle_device_frame(&device_id, &frame).await?;
+                    }
                 }
                 WsMessage::Ping(payload) => {
                     *last_inbound_at.lock().await = tokio::time::Instant::now();
