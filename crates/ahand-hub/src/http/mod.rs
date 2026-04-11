@@ -33,6 +33,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/jobs", get(jobs::list_jobs).post(jobs::create_job))
         .route("/api/jobs/{job_id}", get(jobs::get_job))
         .route("/api/jobs/{job_id}/cancel", post(jobs::cancel_job))
+        .route("/api/jobs/{job_id}/stdin", post(jobs::send_stdin))
+        .route("/api/jobs/{job_id}/resize", post(jobs::send_resize))
         .route("/api/jobs/{job_id}/output", get(jobs::stream_output))
         .route("/api/audit-logs", get(audit::list_audit_logs))
         .route("/ws", get(crate::ws::device_gateway::handle_device_socket))

@@ -5,6 +5,7 @@ use ahand_hub_core::HubError;
 use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, is_terminal_status};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::JobStore;
+use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Path, Query, State};
@@ -679,6 +680,102 @@ pub async fn cancel_job(
             status: job_status_name(job.status).into(),
         }),
     ))
+}
+
+#[derive(Deserialize)]
+pub struct ResizeRequest {
+    pub cols: u32,
+    pub rows: u32,
+}
+
+pub async fn send_stdin(
+    auth: AuthContextExt,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    body: Bytes,
+) -> ApiResult<axum::http::StatusCode> {
+    auth.require_dashboard_access()?;
+    let job = state
+        .jobs
+        .jobs
+        .get(&job_id)
+        .await
+        .map_err(|_| ApiError::internal("Failed to load job"))?
+        .ok_or_else(|| ApiError::not_found(format!("Job {job_id} was not found")))?;
+    if is_terminal_status(job.status) {
+        return Err(ApiError::gone(format!("Job {job_id} has already finished")));
+    }
+    state
+        .jobs
+        .connections
+        .send(
+            &job.device_id,
+            ahand_protocol::Envelope {
+                device_id: job.device_id.clone(),
+                msg_id: format!("stdin-{job_id}"),
+                ts_ms: now_ms(),
+                payload: Some(ahand_protocol::envelope::Payload::StdinChunk(
+                    ahand_protocol::StdinChunk {
+                        job_id: job_id.clone(),
+                        data: body.to_vec(),
+                    },
+                )),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|_| ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "DEVICE_OFFLINE",
+            format!("Device {} is not currently connected", job.device_id),
+        ))?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+pub async fn send_resize(
+    auth: AuthContextExt,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    body: Result<Json<ResizeRequest>, JsonRejection>,
+) -> ApiResult<axum::http::StatusCode> {
+    auth.require_dashboard_access()?;
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
+    let job = state
+        .jobs
+        .jobs
+        .get(&job_id)
+        .await
+        .map_err(|_| ApiError::internal("Failed to load job"))?
+        .ok_or_else(|| ApiError::not_found(format!("Job {job_id} was not found")))?;
+    if is_terminal_status(job.status) {
+        return Err(ApiError::gone(format!("Job {job_id} has already finished")));
+    }
+    state
+        .jobs
+        .connections
+        .send(
+            &job.device_id,
+            ahand_protocol::Envelope {
+                device_id: job.device_id.clone(),
+                msg_id: format!("resize-{job_id}"),
+                ts_ms: now_ms(),
+                payload: Some(ahand_protocol::envelope::Payload::TerminalResize(
+                    ahand_protocol::TerminalResize {
+                        job_id: job_id.clone(),
+                        cols: body.cols,
+                        rows: body.rows,
+                    },
+                )),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|_| ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "DEVICE_OFFLINE",
+            format!("Device {} is not currently connected", job.device_id),
+        ))?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 pub async fn stream_output(
