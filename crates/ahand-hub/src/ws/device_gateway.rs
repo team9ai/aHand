@@ -401,6 +401,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(
                         ahand_protocol::HelloAccepted {
                             auth_method: verified.auth_method.into(),
+                            update_suggestion: None,
                         },
                     )),
                     ..Default::default()
@@ -540,7 +541,9 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                 WsMessage::Binary(frame) => {
                     *last_inbound_at.lock().await = tokio::time::Instant::now();
                     let envelope = ahand_protocol::Envelope::decode(frame.as_ref())?;
-                    if let Some(ahand_protocol::envelope::Payload::BrowserResponse(ref browser_resp)) = envelope.payload {
+                    if state.connections.has_seen_inbound(&device_id, envelope.seq) {
+                        state.connections.observe_ack(&device_id, envelope.ack)?;
+                    } else if let Some(ahand_protocol::envelope::Payload::BrowserResponse(ref browser_resp)) = envelope.payload {
                         if let Some((_, sender)) = state.browser_pending.remove(&browser_resp.request_id) {
                             let _ = sender.send(browser_resp.clone());
                         } else {
