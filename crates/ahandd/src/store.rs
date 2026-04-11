@@ -152,6 +152,8 @@ fn describe_payload(envelope: &Envelope) -> &'static str {
         Some(Payload::BrowserResponse(_)) => "BrowserResponse",
         Some(Payload::UpdateCommand(_)) => "UpdateCommand",
         Some(Payload::UpdateStatus(_)) => "UpdateStatus",
+        Some(Payload::StdinChunk(_)) => "StdinChunk",
+        Some(Payload::TerminalResize(_)) => "TerminalResize",
         None => "none",
     }
 }

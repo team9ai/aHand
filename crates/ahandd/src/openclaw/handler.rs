@@ -898,6 +898,7 @@ fn build_job_request(invoke: &NodeInvokeRequest, params: &SystemRunParams, run_i
         cwd: params.cwd.clone().unwrap_or_default(),
         env: params.env.clone().unwrap_or_default(),
         timeout_ms: params.timeout_ms.or(invoke.timeout_ms).unwrap_or(120_000),
+        interactive: false,
     }
 }
 
