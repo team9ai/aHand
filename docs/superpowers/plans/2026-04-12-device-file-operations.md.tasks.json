@@ -1,0 +1,75 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-12-device-file-operations.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Proto Definitions & Compilation",
+      "status": "pending",
+      "description": "**Goal:** Define all file operation messages in protobuf and verify they compile to Rust + TypeScript types.\n\n**Files:**\n- Create: `proto/ahand/v1/file_ops.proto`\n- Modify: `proto/ahand/v1/envelope.proto`\n- Modify: `crates/ahand-protocol/build.rs`\n\n```json:metadata\n{\"files\": [\"proto/ahand/v1/file_ops.proto\", \"proto/ahand/v1/envelope.proto\", \"crates/ahand-protocol/build.rs\"], \"verifyCommand\": \"cargo build -p ahand-protocol\", \"acceptanceCriteria\": [\"file_ops.proto contains all message types from spec\", \"envelope.proto has file_request = 31 and file_response = 32\", \"cargo build -p ahand-protocol succeeds\", \"TypeScript types generate without error\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Daemon FileManager Skeleton, Config & Routing",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Create FileManager module structure, add file_policy config, wire up FileRequest routing.\n\n**Files:**\n- Create: `crates/ahandd/src/file_manager/mod.rs`\n- Create: `crates/ahandd/src/file_manager/policy.rs`\n- Modify: `crates/ahandd/src/config.rs`\n- Modify: `crates/ahandd/src/main.rs`\n- Modify: `crates/ahandd/src/ahand_client.rs`\n- Modify: `crates/ahandd/Cargo.toml`\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/file_manager/policy.rs\", \"crates/ahandd/src/config.rs\", \"crates/ahandd/src/main.rs\", \"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo test -p ahandd -- file_manager\", \"acceptanceCriteria\": [\"FilePolicyConfig parses from TOML\", \"FileManager::new() constructs\", \"FileRequest routing dispatches to handler\", \"Policy rejects paths outside allowlist\", \"Path traversal detected\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: FileStat, FileList, FileGlob, FileMkdir",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Implement simplest file operations: metadata queries and directory creation.\n\n**Files:**\n- Create: `crates/ahandd/src/file_manager/fs_ops.rs`\n- Modify: `crates/ahandd/src/file_manager/mod.rs`\n- Test: `crates/ahandd/tests/file_ops.rs`\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/fs_ops.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd -- fs_ops\", \"acceptanceCriteria\": [\"FileStat returns correct metadata\", \"FileList paginates correctly\", \"FileGlob matches patterns\", \"FileMkdir creates directories\", \"All respect file policy\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: FileReadText \u2014 Triple-Limit Text Pagination",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Implement text reading with triple-limit pagination, per-line truncation, precise position reporting.\n\n**Files:**\n- Create: `crates/ahandd/src/file_manager/text_read.rs`\n- Modify: `crates/ahandd/src/file_manager/mod.rs`\n- Modify: `crates/ahandd/Cargo.toml` (encoding_rs, chardetng)\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd -- text_read\", \"acceptanceCriteria\": [\"Start position by line/byte/line_col works\", \"Stops at max_lines/max_bytes/target_end\", \"Per-line truncation with remaining_bytes\", \"PositionInfo accurate for start and end\", \"Encoding auto-detection works\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: FileReadBinary & FileReadImage",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Implement binary byte-range reading and image reading with on-device compression.\n\n**Files:**\n- Create: `crates/ahandd/src/file_manager/binary_read.rs`\n- Modify: `crates/ahandd/src/file_manager/mod.rs`\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/binary_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd -- binary_read\", \"acceptanceCriteria\": [\"Binary read returns exact byte range\", \"Image resize preserves aspect ratio\", \"Image format conversion works\", \"Image max_bytes iteratively compresses\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: FileWrite & FileEdit",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Implement all write/edit operations: full write, append, string replace, line range, byte range.\n\n**Files:**\n- Create: `crates/ahandd/src/file_manager/write_ops.rs`\n- Modify: `crates/ahandd/src/file_manager/mod.rs`\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/write_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd -- write_ops\", \"acceptanceCriteria\": [\"FullWrite creates/overwrites files\", \"create_parents works\", \"StringReplace handles single/all/not-found/multiple\", \"LineRangeReplace works\", \"ByteRangeReplace works\", \"FileEdit rejects non-existent files\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: FileDelete, FileCopy, FileMove, FileCreateSymlink, FileChmod",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Implement remaining mutation operations with trash/permanent, recursive, platform permissions.\n\n**Files:**\n- Modify: `crates/ahandd/src/file_manager/fs_ops.rs`\n- Modify: `crates/ahandd/src/file_manager/mod.rs`\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/fs_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd -- fs_mutation\", \"acceptanceCriteria\": [\"Delete TRASH moves to trash\", \"Delete PERMANENT removes\", \"Recursive delete works\", \"Copy/Move with overwrite control\", \"Symlink creation\", \"Chmod sets Unix mode\", \"Chmod recursive\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: Hub HTTP Endpoints & Message Forwarding",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Add REST API on hub for file operations, handle FileResponse from devices.\n\n**Files:**\n- Create: `crates/ahand-hub/src/http/files.rs`\n- Modify: `crates/ahand-hub/src/http/mod.rs`\n- Modify: `crates/ahand-hub/src/ws/device_gateway.rs`\n- Modify: `crates/ahand-hub/src/state.rs`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\", \"crates/ahand-hub/src/http/mod.rs\", \"crates/ahand-hub/src/ws/device_gateway.rs\", \"crates/ahand-hub/src/state.rs\"], \"verifyCommand\": \"cargo build -p ahand-hub\", \"acceptanceCriteria\": [\"POST /api/devices/{id}/files forwards to device\", \"FileResponse routed back via request_id correlation\", \"Timeout returns 504\", \"Auth required\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: S3 Large File Transfer",
+      "status": "pending",
+      "blockedBy": [7],
+      "description": "**Goal:** Implement pre-signed URL flow for files exceeding transfer threshold.\n\n**Files:**\n- Modify: `crates/ahand-hub/Cargo.toml`\n- Modify: `crates/ahand-hub/src/config.rs`\n- Create: `crates/ahand-hub/src/s3.rs`\n- Modify: `crates/ahand-hub/src/http/files.rs`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/s3.rs\", \"crates/ahand-hub/src/config.rs\", \"crates/ahand-hub/src/http/files.rs\"], \"verifyCommand\": \"cargo build -p ahand-hub\", \"acceptanceCriteria\": [\"S3Config parses correctly\", \"Upload URL generation works\", \"Download URL generation works\", \"Hub uploads large responses to S3\", \"Hub downloads S3 content for large writes\", \"Graceful fallback when S3 not configured\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: End-to-End Integration Testing",
+      "status": "pending",
+      "blockedBy": [2, 3, 4, 5, 6, 7],
+      "description": "**Goal:** Verify full pipeline: HTTP request \u2192 hub \u2192 daemon \u2192 filesystem \u2192 response.\n\n**Files:**\n- Create: `crates/ahandd/tests/file_ops_e2e.rs`\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/file_ops_e2e.rs\"], \"verifyCommand\": \"cargo test -p ahandd -- file_ops\", \"acceptanceCriteria\": [\"Full roundtrip works for all 13 operations\", \"Policy rejection returns POLICY_DENIED\", \"Session STRICT triggers approval\", \"Error cases return proper codes\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-12T12:00:00Z"
+}
