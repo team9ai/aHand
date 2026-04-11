@@ -666,6 +666,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()
@@ -687,6 +688,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()
@@ -740,6 +742,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()
