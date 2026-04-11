@@ -1,6 +1,10 @@
 import "./globals.css";
-import type { ReactNode } from "react";
+import type { Metadata, ReactNode } from "react";
 import { Providers } from "@/components/providers";
+
+export const metadata: Metadata = {
+  title: "aHand Hub Dashboard",
+};
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
