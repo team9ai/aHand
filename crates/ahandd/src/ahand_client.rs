@@ -359,6 +359,22 @@ async fn connect_with_auth(
                     });
                 }
             }
+            Some(envelope::Payload::StdinChunk(chunk)) => {
+                use crate::executor::StdinInput;
+                registry.send_stdin(&chunk.job_id, StdinInput::Data(chunk.data)).await;
+            }
+            Some(envelope::Payload::TerminalResize(resize)) => {
+                use crate::executor::StdinInput;
+                registry
+                    .send_stdin(
+                        &resize.job_id,
+                        StdinInput::Resize {
+                            cols: resize.cols as u16,
+                            rows: resize.rows as u16,
+                        },
+                    )
+                    .await;
+            }
             _ => {}
         }
     }
@@ -585,19 +601,38 @@ async fn spawn_job<T>(
     let did = device_id.to_string();
     let reg = Arc::clone(registry);
     let st = store.clone();
+    let interactive = req.interactive;
 
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
-    reg.register(job_id.clone(), cancel_tx).await;
 
-    let active = reg.active_count().await;
-    info!(job_id = %job_id, active_jobs = active, "job accepted, acquiring permit");
+    if interactive {
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<executor::StdinInput>();
+        reg.register_interactive(job_id.clone(), cancel_tx, stdin_tx)
+            .await;
 
-    tokio::spawn(async move {
-        let _permit = reg.acquire_permit().await;
-        let (exit_code, error) = executor::run_job(did, req, tx_clone, cancel_rx, st).await;
-        reg.remove(&job_id).await;
-        reg.mark_completed(job_id, exit_code, error).await;
-    });
+        let active = reg.active_count().await;
+        info!(job_id = %job_id, active_jobs = active, interactive = true, "interactive job accepted, acquiring permit");
+
+        tokio::spawn(async move {
+            let _permit = reg.acquire_permit().await;
+            let (exit_code, error) =
+                executor::run_job_pty(did, req, tx_clone, cancel_rx, stdin_rx, st).await;
+            reg.remove(&job_id).await;
+            reg.mark_completed(job_id, exit_code, error).await;
+        });
+    } else {
+        reg.register(job_id.clone(), cancel_tx).await;
+
+        let active = reg.active_count().await;
+        info!(job_id = %job_id, active_jobs = active, "job accepted, acquiring permit");
+
+        tokio::spawn(async move {
+            let _permit = reg.acquire_permit().await;
+            let (exit_code, error) = executor::run_job(did, req, tx_clone, cancel_rx, st).await;
+            reg.remove(&job_id).await;
+            reg.mark_completed(job_id, exit_code, error).await;
+        });
+    }
 }
 
 async fn handle_set_session_mode<T>(
