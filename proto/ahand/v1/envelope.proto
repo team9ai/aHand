@@ -34,6 +34,8 @@ message Envelope {
     HelloAccepted    hello_accepted    = 26;
     UpdateCommand    update_command    = 27;
     UpdateStatus     update_status     = 28;
+    StdinChunk       stdin_chunk       = 29;
+    TerminalResize   terminal_resize   = 30;
   }
 }
 
@@ -86,6 +88,7 @@ message JobRequest {
   string cwd    = 4;
   map<string, string> env = 5;
   uint64 timeout_ms = 6;
+  bool   interactive = 7;  // request a PTY / interactive session
 }
 
 // JobEvent - streaming output from a running job.
@@ -242,4 +245,19 @@ message UpdateStatus {
   string      target_version  = 4;
   uint32      progress        = 5;  // 0-100
   string      error           = 6;  // non-empty on FAILED
+}
+
+// ── Interactive / PTY Support ───────────────────────────────────
+
+// StdinChunk — sends a chunk of stdin data to a running interactive job.
+message StdinChunk {
+  string job_id = 1;
+  bytes  data   = 2;
+}
+
+// TerminalResize — notifies the daemon of a terminal size change for a PTY job.
+message TerminalResize {
+  string job_id = 1;
+  uint32 cols   = 2;
+  uint32 rows   = 3;
 }
