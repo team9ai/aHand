@@ -146,6 +146,14 @@ async fn serve_ipc_windows(
         };
 
         let caller_uid = get_pipe_caller_identity(&connected);
+
+        // Security: reject connections from other users
+        if caller_uid == "user:unknown" {
+            warn!("IPC: rejecting connection — could not verify caller identity");
+            drop(connected);
+            continue;
+        }
+
         let (reader, writer) = tokio::io::split(connected);
         spawn_ipc_handler(
             reader, writer,
@@ -185,6 +193,11 @@ fn get_pipe_caller_identity(pipe: &tokio::net::windows::named_pipe::NamedPipeSer
 
         let mut info_len = 0u32;
         GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut info_len);
+        if info_len == 0 {
+            CloseHandle(token);
+            CloseHandle(process);
+            return format!("pid:{pid}");
+        }
         let mut buffer = vec![0u8; info_len as usize];
         if GetTokenInformation(
             token, TokenUser, buffer.as_mut_ptr() as *mut _,

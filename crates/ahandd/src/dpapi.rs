@@ -70,6 +70,8 @@ pub fn unprotect(ciphertext: &[u8]) -> io::Result<Vec<u8>> {
 
         let decrypted =
             std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        // Zero plaintext before freeing to prevent key material lingering in heap
+        std::ptr::write_bytes(output.pbData, 0, output.cbData as usize);
         LocalFree(output.pbData as *mut _);
         Ok(decrypted)
     }

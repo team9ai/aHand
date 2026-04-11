@@ -62,10 +62,10 @@ async fn download_and_install(version: &str) -> Result<()> {
     let checksums_url = format!(
         "https://github.com/{GITHUB_REPO}/releases/download/rust-v{version}/checksums-rust-{suffix}.txt"
     );
-    let checksums_text = github_release::download_bytes(&checksums_url)
+    let checksums_bytes = github_release::download_bytes(&checksums_url)
         .await
-        .map(|b| String::from_utf8_lossy(&b).to_string())
-        .unwrap_or_default();
+        .context("Failed to download checksums — cannot verify binary integrity")?;
+    let checksums_text = String::from_utf8_lossy(&checksums_bytes).to_string();
 
     for binary in &["ahandd", "ahandctl"] {
         let asset = format!("{binary}-{suffix}{exe_ext}");
@@ -90,7 +90,7 @@ async fn download_and_install(version: &str) -> Result<()> {
             }
             println!("  Checksum OK: {asset}");
         } else {
-            eprintln!("  Warning: no checksum available for {asset}");
+            anyhow::bail!("Checksum entry missing for {asset} — cannot verify binary integrity");
         }
 
         let dest = bin_dir.join(format!("{binary}{exe_ext}"));
