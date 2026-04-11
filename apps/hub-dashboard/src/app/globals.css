@@ -707,6 +707,33 @@ input {
   cursor: pointer;
 }
 
+.xterm-container {
+  padding: 8px;
+  background: #020617;
+  min-height: 400px;
+}
+
+.terminal-mode-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.82rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.terminal-mode-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.terminal-mode-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 @media (max-width: 860px) {
   .auth-panel {
     padding: 28px;
