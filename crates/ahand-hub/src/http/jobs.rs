@@ -701,7 +701,11 @@ pub async fn send_stdin(
         .get(&job_id)
         .await
         .map_err(|_| ApiError::internal("Failed to load job"))?
-        .ok_or_else(|| ApiError::not_found(format!("Job {job_id} was not found")))?;
+        .ok_or_else(|| ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "JOB_NOT_FOUND",
+            format!("Job {job_id} was not found"),
+        ))?;
     if is_terminal_status(job.status) {
         return Err(ApiError::gone(format!("Job {job_id} has already finished")));
     }
@@ -746,7 +750,11 @@ pub async fn send_resize(
         .get(&job_id)
         .await
         .map_err(|_| ApiError::internal("Failed to load job"))?
-        .ok_or_else(|| ApiError::not_found(format!("Job {job_id} was not found")))?;
+        .ok_or_else(|| ApiError::new(
+            axum::http::StatusCode::NOT_FOUND,
+            "JOB_NOT_FOUND",
+            format!("Job {job_id} was not found"),
+        ))?;
     if is_terminal_status(job.status) {
         return Err(ApiError::gone(format!("Job {job_id} has already finished")));
     }

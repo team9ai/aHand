@@ -64,9 +64,6 @@ impl ApiError {
         Self::new(StatusCode::GONE, "JOB_FINISHED", message)
     }
 
-    pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", message)
-    }
 
     pub fn from_json_rejection(_value: JsonRejection) -> Self {
         Self::validation("Invalid JSON request body")
