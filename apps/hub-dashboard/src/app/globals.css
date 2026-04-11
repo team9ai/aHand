@@ -478,8 +478,9 @@ input {
 
 .detail-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 3fr 2fr;
   gap: 16px;
+  align-items: start;
 }
 
 .detail-list {
@@ -497,6 +498,8 @@ input {
 
 .detail-list dd {
   margin: 6px 0 0;
+  overflow-wrap: break-word;
+  word-break: break-all;
 }
 
 .tag-list {
@@ -513,10 +516,42 @@ input {
   background: rgba(94, 234, 212, 0.08);
 }
 
-.terminal-panel {
-  border: 1px solid rgba(15, 23, 42, 0.92);
-  border-radius: 22px;
+.device-tabs-panel {
   overflow: hidden;
+}
+
+.device-tabs-header {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.device-tab {
+  padding: 12px 20px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.92rem;
+  font-weight: 600;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.device-tab:hover {
+  color: var(--text);
+}
+
+.device-tab-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.device-tab-content {
+  padding: 0 24px 24px;
+}
+
+.terminal-panel-inner {
   background: #020617;
 }
 
@@ -538,6 +573,7 @@ input {
 
 .terminal-output {
   min-height: 300px;
+  max-height: 500px;
   margin: 0;
   padding: 18px;
   overflow: auto;
@@ -545,6 +581,92 @@ input {
   font-family: "SFMono-Regular", "Menlo", "Monaco", monospace;
   font-size: 0.92rem;
   line-height: 1.5;
+}
+
+.terminal-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.terminal-cmd {
+  color: var(--accent);
+  margin-top: 8px;
+}
+
+.terminal-cmd:first-child {
+  margin-top: 0;
+}
+
+.terminal-prompt {
+  color: var(--muted);
+  margin-right: 6px;
+}
+
+.terminal-stdout {
+  color: #dbeafe;
+}
+
+.terminal-stderr {
+  color: #f87171;
+}
+
+.terminal-exit {
+  color: var(--muted);
+  font-style: italic;
+  margin-bottom: 4px;
+}
+
+.terminal-hint {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.terminal-input-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 18px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+  background: rgba(15, 23, 42, 0.86);
+}
+
+.terminal-tool-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
+.terminal-tool-input {
+  width: 90px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(8, 15, 29, 0.7);
+  color: var(--text);
+  font-family: "SFMono-Regular", "Menlo", "Monaco", monospace;
+  font-size: 0.85rem;
+}
+
+.terminal-cmd-input-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: "SFMono-Regular", "Menlo", "Monaco", monospace;
+}
+
+.terminal-cmd-input {
+  flex: 1;
+  padding: 4px 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.92rem;
+  outline: none;
 }
 
 .inline-error,
