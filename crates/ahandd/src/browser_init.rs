@@ -68,13 +68,8 @@ async fn clean(dirs: &Dirs) {
 
     #[cfg(windows)]
     {
-        // Kill any lingering Node.js processes before cleaning
-        let _ = tokio::process::Command::new("taskkill")
-            .args(["/F", "/IM", "node.exe"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
+        // Note: we intentionally do NOT kill all node.exe processes system-wide
+        // as that would affect unrelated Node.js applications running on the machine.
 
         // Uninstall playwright-cli from our managed prefix
         let npm = dirs.node.join("npm.cmd");
@@ -196,6 +191,10 @@ async fn install_node(dirs: &Dirs) -> Result<()> {
                 continue;
             }
             let dest = dirs.node.join(&stripped);
+            // Defense-in-depth: ensure destination stays inside extraction root
+            if !dest.starts_with(&dirs.node) {
+                continue;
+            }
             if file.is_dir() {
                 std::fs::create_dir_all(&dest)?;
             } else {

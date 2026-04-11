@@ -86,6 +86,7 @@ $nameToPath = @{
 $checksumUrl = "$baseUrl/checksums-rust-$suffix.txt"
 try {
     $checksums = Invoke-RestMethod -Uri $checksumUrl -Headers @{ "User-Agent" = "ahand-installer" }
+    $verified = @{}
     foreach ($line in $checksums -split "`n") {
         $line = $line.Trim()
         if ($line -match "^([0-9a-f]+)\s+(.+)$") {
@@ -100,8 +101,16 @@ try {
                     exit 1
                 } else {
                     Write-Host "  Checksum OK: $assetName"
+                    $verified[$assetName] = $true
                 }
             }
+        }
+    }
+    # Ensure both binaries were actually verified
+    foreach ($asset in $nameToPath.Keys) {
+        if (-not $verified.ContainsKey($asset)) {
+            Write-Error "Checksum entry missing for $asset — cannot verify binary integrity."
+            exit 1
         }
     }
 } catch {

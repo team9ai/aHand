@@ -58,6 +58,15 @@ async fn download_and_install(version: &str) -> Result<()> {
         eprintln!("Note: could not stop daemon: {e}");
     }
 
+    // Download checksums for verification
+    let checksums_url = format!(
+        "https://github.com/{GITHUB_REPO}/releases/download/rust-v{version}/checksums-rust-{suffix}.txt"
+    );
+    let checksums_text = github_release::download_bytes(&checksums_url)
+        .await
+        .map(|b| String::from_utf8_lossy(&b).to_string())
+        .unwrap_or_default();
+
     for binary in &["ahandd", "ahandctl"] {
         let asset = format!("{binary}-{suffix}{exe_ext}");
         let url = format!(
@@ -67,6 +76,23 @@ async fn download_and_install(version: &str) -> Result<()> {
         let bytes = github_release::download_bytes(&url)
             .await
             .with_context(|| format!("Failed to download {asset}"))?;
+
+        // Verify checksum if available
+        if let Some(expected) = checksums_text
+            .lines()
+            .find(|line| line.ends_with(&asset))
+            .and_then(|line| line.split_whitespace().next())
+        {
+            use sha2::{Digest, Sha256};
+            let actual = format!("{:x}", Sha256::digest(&bytes));
+            if actual != expected {
+                anyhow::bail!("Checksum mismatch for {asset}: expected {expected}, got {actual}");
+            }
+            println!("  Checksum OK: {asset}");
+        } else {
+            eprintln!("  Warning: no checksum available for {asset}");
+        }
+
         let dest = bin_dir.join(format!("{binary}{exe_ext}"));
 
         // On Windows, rename current binary before overwriting (can't overwrite running exe)
