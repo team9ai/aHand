@@ -160,6 +160,9 @@ async fn install_node(dirs: &Dirs) -> Result<()> {
             continue;
         }
         let dest = dirs.node.join(&stripped);
+        if !dest.starts_with(&dirs.node) {
+            continue; // skip entries that would escape extraction root
+        }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
