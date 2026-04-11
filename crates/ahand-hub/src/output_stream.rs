@@ -11,6 +11,14 @@ use dashmap::DashMap;
 use futures_util::Stream;
 use tokio::sync::{Mutex, broadcast};
 
+/// Public output event for terminal WebSocket subscribers.
+#[derive(Clone, Debug)]
+pub enum OutputEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Finished { exit_code: i32, error: String },
+}
+
 #[derive(Clone)]
 enum OutputItem {
     Stdout(String),
@@ -20,6 +28,18 @@ enum OutputItem {
 }
 
 impl OutputItem {
+    fn to_output_event(&self) -> Option<OutputEvent> {
+        match self {
+            Self::Stdout(chunk) => Some(OutputEvent::Stdout(chunk.as_bytes().to_vec())),
+            Self::Stderr(chunk) => Some(OutputEvent::Stderr(chunk.as_bytes().to_vec())),
+            Self::Progress(_) => None,
+            Self::Finished { exit_code, error } => Some(OutputEvent::Finished {
+                exit_code: *exit_code,
+                error: error.clone(),
+            }),
+        }
+    }
+
     fn to_event(&self, seq: u64) -> Event {
         match self {
             Self::Stdout(chunk) => Event::default()
@@ -175,6 +195,51 @@ impl MemoryOutputStream {
         }))
     }
 
+    async fn subscribe_terminal(
+        &self,
+        job_id: String,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = OutputEvent> + Send>>> {
+        self.prune_expired();
+        let state = self.job_state(&job_id);
+        let finished = state.finished.load(Ordering::Relaxed);
+        let mut rx = state.tx.subscribe();
+        let history = state.history.lock().await.clone();
+
+        Ok(Box::pin(stream! {
+            for item in history {
+                if let Some(event) = item.item.to_output_event() {
+                    let is_terminal = item.item.is_terminal();
+                    yield event;
+                    if is_terminal {
+                        return;
+                    }
+                }
+            }
+
+            if finished {
+                return;
+            }
+
+            loop {
+                match rx.recv().await {
+                    Ok(item) => {
+                        let is_terminal = item.item.is_terminal();
+                        if let Some(event) = item.item.to_output_event() {
+                            yield event;
+                        }
+                        if is_terminal {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // For terminal WS, we just skip lagged items
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }))
+    }
+
     async fn record(&self, job_id: &str, item: OutputItem) -> anyhow::Result<()> {
         self.prune_expired();
         let state = self.job_state(job_id);
@@ -244,6 +309,64 @@ impl OutputStream {
         match &self.backend {
             OutputBackend::Memory(memory) => memory.prime(job_id),
             OutputBackend::Persistent(_) => {}
+        }
+    }
+
+    /// Subscribe to raw output events for a terminal WebSocket bridge.
+    /// Returns `OutputEvent` items (stdout/stderr bytes, finished) without SSE framing.
+    pub async fn subscribe_terminal(
+        &self,
+        job_id: String,
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = OutputEvent> + Send>>> {
+        match &self.backend {
+            OutputBackend::Memory(memory) => memory.subscribe_terminal(job_id).await,
+            OutputBackend::Persistent(store) => {
+                let store = store.clone();
+                let history = store.read_history(&job_id).await?;
+                let live_job_id = job_id.clone();
+
+                Ok(Box::pin(stream! {
+                    let mut last_stream_id = history
+                        .last()
+                        .map(|item| item.stream_id.clone())
+                        .unwrap_or_else(|| "0-0".to_string());
+
+                    for item in history {
+                        last_stream_id = item.stream_id.clone();
+                        let output_item: OutputItem = item.record.into();
+                        if let Some(event) = output_item.to_output_event() {
+                            let is_terminal = output_item.is_terminal();
+                            yield event;
+                            if is_terminal {
+                                return;
+                            }
+                        }
+                    }
+
+                    loop {
+                        match store.read_live(&live_job_id, &last_stream_id, 5_000).await {
+                            Ok(items) if items.is_empty() => continue,
+                            Ok(items) => {
+                                for item in items {
+                                    last_stream_id = item.stream_id.clone();
+                                    let output_item: OutputItem = item.record.into();
+                                    if let Some(event) = output_item.to_output_event() {
+                                        let is_terminal = output_item.is_terminal();
+                                        yield event;
+                                        if is_terminal {
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(job_id, error = %err, "failed reading persistent terminal output");
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                        }
+                    }
+                }))
+            }
         }
     }
 

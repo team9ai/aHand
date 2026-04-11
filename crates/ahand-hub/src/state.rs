@@ -42,6 +42,7 @@ pub struct AppState {
     pub service_token: Arc<String>,
     pub dashboard_shared_password: Arc<String>,
     pub dashboard_allowed_origins: Arc<Vec<String>>,
+    pub terminal_tokens: Arc<DashMap<String, crate::http::terminal::TerminalToken>>,
 }
 
 impl AppState {
@@ -148,6 +149,7 @@ impl AppState {
             service_token: Arc::new(config.service_token),
             dashboard_shared_password: Arc::new(config.dashboard_shared_password),
             dashboard_allowed_origins: Arc::new(config.dashboard_allowed_origins),
+            terminal_tokens: Arc::new(DashMap::new()),
         };
         state
             .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())

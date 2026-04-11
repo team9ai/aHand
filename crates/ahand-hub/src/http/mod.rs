@@ -11,6 +11,7 @@ pub mod auth;
 pub mod devices;
 pub mod jobs;
 pub mod system;
+pub mod terminal;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -37,7 +38,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/jobs/{job_id}/resize", post(jobs::send_resize))
         .route("/api/jobs/{job_id}/output", get(jobs::stream_output))
         .route("/api/audit-logs", get(audit::list_audit_logs))
+        .route("/api/terminal/token", post(terminal::create_token))
         .route("/ws", get(crate::ws::device_gateway::handle_device_socket))
+        .route("/ws/terminal", get(terminal::handle_terminal_ws))
         .route(
             "/ws/dashboard",
             get(crate::ws::dashboard::handle_dashboard_socket),
