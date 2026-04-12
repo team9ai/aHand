@@ -138,3 +138,124 @@ fn expires_at_ms(expiration: Duration) -> u64 {
         .as_millis() as u64;
     now + expiration.as_millis() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::S3Config;
+
+    /// Set synthetic AWS credentials for the test process so the aws-sdk-s3
+    /// presigner has something to sign with. The presigner itself is a pure
+    /// local computation (HMAC-SHA256 of a canonical request), so the values
+    /// only need to exist — they do not need to be real.
+    ///
+    /// `std::env::set_var` is `unsafe` on Rust 2024 edition because setting
+    /// env vars from multiple threads is not guaranteed to be sound on every
+    /// platform. Inside a single-threaded test setup this is fine.
+    fn ensure_fake_aws_creds() {
+        unsafe {
+            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+            // Some SDK code paths look for a session token even when unused.
+            std::env::remove_var("AWS_SESSION_TOKEN");
+            // Prevent the default credential provider chain from trying to
+            // hit IMDS / SSO / profile files on the dev machine.
+            std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
+        }
+    }
+
+    fn fake_endpoint_config() -> S3Config {
+        S3Config {
+            bucket: "test-bucket".into(),
+            region: "us-east-1".into(),
+            endpoint: Some("http://127.0.0.1:1".into()),
+            file_transfer_threshold_bytes: 1_048_576,
+            url_expiration_secs: 3_600,
+        }
+    }
+
+    #[test]
+    fn s3_config_default_values() {
+        let config = S3Config::default();
+        assert!(config.bucket.is_empty());
+        assert_eq!(config.region, "us-east-1");
+        assert!(config.endpoint.is_none());
+        assert_eq!(config.file_transfer_threshold_bytes, 1_048_576);
+        assert_eq!(config.url_expiration_secs, 3_600);
+    }
+
+    #[tokio::test]
+    async fn s3_client_constructs_with_fake_endpoint() {
+        ensure_fake_aws_creds();
+        let config = fake_endpoint_config();
+        let client = S3Client::new(&config).await;
+        assert_eq!(client.bucket(), "test-bucket");
+        assert_eq!(client.threshold(), 1_048_576);
+    }
+
+    #[tokio::test]
+    async fn s3_client_generate_upload_url_returns_populated_url() {
+        ensure_fake_aws_creds();
+        let config = fake_endpoint_config();
+        let client = S3Client::new(&config).await;
+
+        let key = "file-ops/device-1/obj-key";
+        let result = client.generate_upload_url(key).await;
+        assert!(
+            result.is_ok(),
+            "generate_upload_url should succeed locally: {:?}",
+            result.err()
+        );
+        let presigned = result.unwrap();
+        assert!(
+            presigned.url.starts_with("http://127.0.0.1:1/"),
+            "url should start with the forced endpoint, got: {}",
+            presigned.url
+        );
+        assert!(
+            presigned.url.contains("test-bucket"),
+            "url should contain the bucket in path-style form, got: {}",
+            presigned.url
+        );
+        assert!(
+            presigned.url.contains("file-ops/device-1/obj-key"),
+            "url should contain the object key, got: {}",
+            presigned.url
+        );
+        assert!(presigned.expires_at_ms > 0);
+        assert_eq!(presigned.object_key, key);
+    }
+
+    #[tokio::test]
+    async fn s3_client_generate_download_url_returns_populated_url() {
+        ensure_fake_aws_creds();
+        let config = fake_endpoint_config();
+        let client = S3Client::new(&config).await;
+
+        let key = "file-ops/device-1/obj-key";
+        let result = client.generate_download_url(key).await;
+        assert!(
+            result.is_ok(),
+            "generate_download_url should succeed locally: {:?}",
+            result.err()
+        );
+        let presigned = result.unwrap();
+        assert!(
+            presigned.url.starts_with("http://127.0.0.1:1/"),
+            "url should start with the forced endpoint, got: {}",
+            presigned.url
+        );
+        assert!(
+            presigned.url.contains("test-bucket"),
+            "url should contain the bucket in path-style form, got: {}",
+            presigned.url
+        );
+        assert!(
+            presigned.url.contains("file-ops/device-1/obj-key"),
+            "url should contain the object key, got: {}",
+            presigned.url
+        );
+        assert!(presigned.expires_at_ms > 0);
+        assert_eq!(presigned.object_key, key);
+    }
+}

@@ -138,7 +138,7 @@
     {
       "id": 21,
       "subject": "T21: Unit tests for s3.rs (config, construction, accessors, presign smoke test)",
-      "status": "pending",
+      "status": "completed",
       "description": "Add unit tests for s3.rs that don't need a real S3 endpoint: (a) S3Config defaults, (b) S3Client::new with a localhost fake endpoint doesn't panic, (c) threshold()/bucket() return configured values, (d) generate_upload_url/generate_download_url produce plausibly-shaped URLs when pointed at the fake endpoint. Full round-trip tests (upload/download) remain a follow-up PR. Addresses review issue #17.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/s3.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib s3\", \"acceptanceCriteria\": [\"S3Config default test\", \"S3Client construction test with fake endpoint\", \"Accessor tests for threshold and bucket\", \"Presign URL format smoke test\", \"Tests pass without real AWS credentials\"]}\n```"
     }
   ],
