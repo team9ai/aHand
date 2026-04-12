@@ -143,26 +143,42 @@ impl FileManager {
                 Ok(file_response::Result::Edit(result))
             }
             file_request::Operation::Delete(req) => {
-                let _result = self.policy.check_path(&req.path, true)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, true)?;
+                let result = fs_ops::handle_delete(req, checked.resolved_path.as_path()).await?;
+                Ok(file_response::Result::Delete(result))
             }
             file_request::Operation::Chmod(req) => {
-                let _result = self.policy.check_path(&req.path, true)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, true)?;
+                let result = fs_ops::handle_chmod(req, checked.resolved_path.as_path()).await?;
+                Ok(file_response::Result::Chmod(result))
             }
             file_request::Operation::Copy(req) => {
-                self.policy.check_path(&req.source, false)?;
-                self.policy.check_path(&req.destination, true)?;
-                Err(unimplemented_error(&req.destination))
+                let source = self.policy.check_path(&req.source, false)?;
+                let dest = self.policy.check_path(&req.destination, true)?;
+                let result = fs_ops::handle_copy(
+                    req,
+                    source.resolved_path.as_path(),
+                    dest.resolved_path.as_path(),
+                )
+                .await?;
+                Ok(file_response::Result::Copy(result))
             }
             file_request::Operation::Move(req) => {
-                self.policy.check_path(&req.source, true)?;
-                self.policy.check_path(&req.destination, true)?;
-                Err(unimplemented_error(&req.destination))
+                let source = self.policy.check_path(&req.source, true)?;
+                let dest = self.policy.check_path(&req.destination, true)?;
+                let result = fs_ops::handle_move(
+                    req,
+                    source.resolved_path.as_path(),
+                    dest.resolved_path.as_path(),
+                )
+                .await?;
+                Ok(file_response::Result::MoveResult(result))
             }
             file_request::Operation::CreateSymlink(req) => {
-                let _result = self.policy.check_path(&req.link_path, true)?;
-                Err(unimplemented_error(&req.link_path))
+                let checked = self.policy.check_path(&req.link_path, true)?;
+                let result =
+                    fs_ops::handle_create_symlink(req, checked.resolved_path.as_path()).await?;
+                Ok(file_response::Result::CreateSymlink(result))
             }
         }
     }

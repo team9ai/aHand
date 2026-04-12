@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ahand_protocol::{
-    file_edit, file_position, file_read_text, file_request, file_response, file_write, full_write,
-    ByteRangeReplace, FileAppend, FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir,
-    FilePosition, FileReadBinary, FileReadImage, FileReadText, FileRequest, FileStat, FileType,
-    FileWrite, FullWrite, ImageFormat, LineCol, LineRangeReplace, StopReason, StringReplace,
-    WriteAction,
+    file_chmod, file_edit, file_position, file_read_text, file_request, file_response, file_write,
+    full_write, ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy,
+    FileCreateSymlink, FileDelete, FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir,
+    FileMove, FilePosition, FileReadBinary, FileReadImage, FileReadText, FileRequest, FileStat,
+    FileType, FileWrite, FullWrite, ImageFormat, LineCol, LineRangeReplace, StopReason,
+    StringReplace, UnixPermission, WriteAction,
 };
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
@@ -153,6 +154,43 @@ fn expect_edit(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileEditRe
     match resp.result {
         Some(file_response::Result::Edit(r)) => r,
         other => panic!("expected edit result, got {other:?}"),
+    }
+}
+
+fn expect_delete(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileDeleteResult {
+    match resp.result {
+        Some(file_response::Result::Delete(r)) => r,
+        other => panic!("expected delete result, got {other:?}"),
+    }
+}
+
+fn expect_copy(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileCopyResult {
+    match resp.result {
+        Some(file_response::Result::Copy(r)) => r,
+        other => panic!("expected copy result, got {other:?}"),
+    }
+}
+
+fn expect_move(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileMoveResult {
+    match resp.result {
+        Some(file_response::Result::MoveResult(r)) => r,
+        other => panic!("expected move result, got {other:?}"),
+    }
+}
+
+fn expect_symlink(
+    resp: ahand_protocol::FileResponse,
+) -> ahand_protocol::FileCreateSymlinkResult {
+    match resp.result {
+        Some(file_response::Result::CreateSymlink(r)) => r,
+        other => panic!("expected create_symlink result, got {other:?}"),
+    }
+}
+
+fn expect_chmod(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileChmodResult {
+    match resp.result {
+        Some(file_response::Result::Chmod(r)) => r,
+        other => panic!("expected chmod result, got {other:?}"),
     }
 }
 
@@ -1382,4 +1420,291 @@ async fn edit_string_replace_single_succeeds() {
     assert_eq!(result.replacements_made, Some(1));
     assert!(result.match_error.is_none());
     assert_eq!(fs::read_to_string(&file).unwrap(), "hello friend");
+}
+
+// ── FileDelete tests ───────────────────────────────────────────────────────
+
+fn delete_req(path: &Path, permanent: bool, recursive: bool) -> FileRequest {
+    FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Delete(FileDelete {
+            path: path.to_string_lossy().into_owned(),
+            recursive,
+            mode: if permanent {
+                DeleteMode::Permanent as i32
+            } else {
+                DeleteMode::Trash as i32
+            },
+            no_follow_symlink: false,
+        })),
+    }
+}
+
+#[tokio::test]
+async fn delete_permanent_removes_file() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("del.txt");
+    fs::write(&file, "x").unwrap();
+
+    let resp = mgr.handle(&delete_req(&file, true, false)).await;
+    let result = expect_delete(resp);
+    assert_eq!(result.items_deleted, 1);
+    assert_eq!(result.mode, DeleteMode::Permanent as i32);
+    assert!(!file.exists());
+}
+
+#[tokio::test]
+async fn delete_permanent_recursive_directory() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let sub = root.join("recdir");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("a.txt"), "a").unwrap();
+    fs::write(sub.join("b.txt"), "b").unwrap();
+
+    let resp = mgr.handle(&delete_req(&sub, true, true)).await;
+    let result = expect_delete(resp);
+    assert!(result.items_deleted >= 3); // dir + 2 files
+    assert!(!sub.exists());
+}
+
+#[tokio::test]
+async fn delete_non_recursive_on_non_empty_dir_returns_not_empty() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let sub = root.join("notempty");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("x"), "x").unwrap();
+
+    let resp = mgr.handle(&delete_req(&sub, true, false)).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::NotEmpty as i32);
+    assert!(sub.exists());
+}
+
+// ── FileCopy tests ─────────────────────────────────────────────────────────
+
+fn copy_req(src: &Path, dst: &Path, recursive: bool, overwrite: bool) -> FileRequest {
+    FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Copy(FileCopy {
+            source: src.to_string_lossy().into_owned(),
+            destination: dst.to_string_lossy().into_owned(),
+            recursive,
+            overwrite,
+        })),
+    }
+}
+
+#[tokio::test]
+async fn copy_file_creates_destination() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let src = root.join("src.txt");
+    let dst = root.join("dst.txt");
+    fs::write(&src, "hello").unwrap();
+
+    let resp = mgr.handle(&copy_req(&src, &dst, false, false)).await;
+    let result = expect_copy(resp);
+    assert_eq!(result.items_copied, 1);
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "hello");
+    assert!(src.exists());
+}
+
+#[tokio::test]
+async fn copy_without_overwrite_fails_when_destination_exists() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let src = root.join("src.txt");
+    let dst = root.join("dst.txt");
+    fs::write(&src, "new").unwrap();
+    fs::write(&dst, "old").unwrap();
+
+    let resp = mgr.handle(&copy_req(&src, &dst, false, false)).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::AlreadyExists as i32);
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "old");
+}
+
+#[tokio::test]
+async fn copy_recursive_directory() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let src_dir = root.join("src");
+    let dst_dir = root.join("dst");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("a.txt"), "a").unwrap();
+    fs::create_dir(src_dir.join("sub")).unwrap();
+    fs::write(src_dir.join("sub/b.txt"), "b").unwrap();
+
+    let resp = mgr.handle(&copy_req(&src_dir, &dst_dir, true, false)).await;
+    let result = expect_copy(resp);
+    assert!(result.items_copied >= 3);
+    assert_eq!(fs::read_to_string(dst_dir.join("a.txt")).unwrap(), "a");
+    assert_eq!(
+        fs::read_to_string(dst_dir.join("sub/b.txt")).unwrap(),
+        "b"
+    );
+}
+
+// ── FileMove tests ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn move_file_removes_source_and_creates_destination() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let src = root.join("src.txt");
+    let dst = root.join("moved.txt");
+    fs::write(&src, "content").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Move(FileMove {
+            source: src.to_string_lossy().into_owned(),
+            destination: dst.to_string_lossy().into_owned(),
+            overwrite: false,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_move(resp);
+    assert!(!src.exists());
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "content");
+}
+
+#[tokio::test]
+async fn move_with_overwrite_replaces_destination() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let src = root.join("src.txt");
+    let dst = root.join("dst.txt");
+    fs::write(&src, "new").unwrap();
+    fs::write(&dst, "old").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Move(FileMove {
+            source: src.to_string_lossy().into_owned(),
+            destination: dst.to_string_lossy().into_owned(),
+            overwrite: true,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_move(resp);
+    assert!(!src.exists());
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "new");
+}
+
+// ── FileCreateSymlink tests ────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[tokio::test]
+async fn create_symlink_creates_link() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    let link = root.join("link");
+    fs::write(&target, "x").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: target.to_string_lossy().into_owned(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_symlink(resp);
+    let metadata = fs::symlink_metadata(&link).unwrap();
+    assert!(metadata.file_type().is_symlink());
+    assert_eq!(fs::read_link(&link).unwrap(), target);
+}
+
+// ── FileChmod tests ────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_sets_unix_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("modmode.txt");
+    fs::write(&file, "x").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: file.to_string_lossy().into_owned(),
+            recursive: false,
+            no_follow_symlink: false,
+            permission: Some(file_chmod::Permission::Unix(UnixPermission {
+                mode: Some(0o600),
+                owner: None,
+                group: None,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_chmod(resp);
+    assert_eq!(result.items_modified, 1);
+    assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_recursive_applies_to_children() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let sub = root.join("chmodrec");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("a.txt"), "x").unwrap();
+    fs::write(sub.join("b.txt"), "x").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: sub.to_string_lossy().into_owned(),
+            recursive: true,
+            no_follow_symlink: false,
+            permission: Some(file_chmod::Permission::Unix(UnixPermission {
+                mode: Some(0o700),
+                owner: None,
+                group: None,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_chmod(resp);
+    assert_eq!(result.items_modified, 3);
+    assert_eq!(
+        fs::metadata(sub.join("a.txt")).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_chown_not_supported_returns_permission_denied() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("own.txt");
+    fs::write(&file, "x").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: file.to_string_lossy().into_owned(),
+            recursive: false,
+            no_follow_symlink: false,
+            permission: Some(file_chmod::Permission::Unix(UnixPermission {
+                mode: None,
+                owner: Some("root".into()),
+                group: None,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::PermissionDenied as i32);
 }
