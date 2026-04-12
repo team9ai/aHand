@@ -401,6 +401,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(
                         ahand_protocol::HelloAccepted {
                             auth_method: verified.auth_method.into(),
+                            update_suggestion: None,
                         },
                     )),
                     ..Default::default()
@@ -650,6 +651,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()
@@ -671,6 +673,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()
@@ -724,6 +727,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()

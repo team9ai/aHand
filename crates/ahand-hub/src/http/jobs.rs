@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 use crate::auth::AuthContextExt;
 use crate::events::EventBus;
 use crate::http::api_error::{ApiError, ApiResult};
+use crate::http::files::PendingFileRequests;
 use crate::state::AppState;
 use crate::ws::device_gateway::ConnectionRegistry;
 
@@ -77,6 +78,7 @@ pub struct JobRuntime {
     disconnect_grace_ms: u64,
     timeout_tasks: Arc<DashMap<String, JoinHandle<()>>>,
     disconnect_tasks: Arc<DashMap<String, JoinHandle<()>>>,
+    pending_file_requests: Arc<PendingFileRequests>,
 }
 
 impl JobRuntime {
@@ -88,6 +90,7 @@ impl JobRuntime {
         output_stream: Arc<crate::output_stream::OutputStream>,
         timeout_grace_ms: u64,
         disconnect_grace_ms: u64,
+        pending_file_requests: Arc<PendingFileRequests>,
     ) -> Self {
         Self {
             dispatcher,
@@ -99,6 +102,7 @@ impl JobRuntime {
             disconnect_grace_ms,
             timeout_tasks: Arc::new(DashMap::new()),
             disconnect_tasks: Arc::new(DashMap::new()),
+            pending_file_requests,
         }
     }
 
@@ -309,6 +313,10 @@ impl JobRuntime {
                 {
                     return self.handle_stale_device_frame_error(device_id, seq, ack, err);
                 }
+            }
+            Some(ahand_protocol::envelope::Payload::FileResponse(response)) => {
+                let request_id = response.request_id.clone();
+                self.pending_file_requests.resolve(&request_id, response);
             }
             _ => {}
         }
@@ -1017,6 +1025,7 @@ mod tests {
                 output_stream,
                 100,
                 100,
+                Arc::new(PendingFileRequests::default()),
             ),
             connections,
             jobs,
@@ -1046,6 +1055,7 @@ mod tests {
                 output_stream,
                 100,
                 100,
+                Arc::new(PendingFileRequests::default()),
             ),
             connections,
             audit,

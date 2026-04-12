@@ -43,6 +43,7 @@ pub struct AppState {
     pub dashboard_shared_password: Arc<String>,
     pub dashboard_allowed_origins: Arc<Vec<String>>,
     pub terminal_tokens: Arc<DashMap<String, crate::http::terminal::TerminalToken>>,
+    pub pending_file_requests: Arc<crate::http::files::PendingFileRequests>,
 }
 
 impl AppState {
@@ -117,6 +118,7 @@ impl AppState {
             jobs_store.clone(),
             audit_store.clone(),
         ));
+        let pending_file_requests = crate::http::files::new_pending_requests();
         let jobs = Arc::new(crate::http::jobs::JobRuntime::new(
             job_dispatcher.clone(),
             jobs_store.clone(),
@@ -125,6 +127,7 @@ impl AppState {
             output_stream.clone(),
             config.job_timeout_grace_ms,
             config.device_disconnect_grace_ms,
+            pending_file_requests.clone(),
         ));
 
         let state = Self {
@@ -150,6 +153,7 @@ impl AppState {
             dashboard_shared_password: Arc::new(config.dashboard_shared_password),
             dashboard_allowed_origins: Arc::new(config.dashboard_allowed_origins),
             terminal_tokens: Arc::new(DashMap::new()),
+            pending_file_requests,
         };
         state
             .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())
