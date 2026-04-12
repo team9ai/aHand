@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use ahand_protocol::{
     file_position, file_read_text, file_request, file_response, FileErrorCode, FileGlob, FileList,
-    FileMkdir, FilePosition, FileReadText, FileRequest, FileStat, FileType, LineCol, StopReason,
+    FileMkdir, FilePosition, FileReadBinary, FileReadImage, FileReadText, FileRequest, FileStat,
+    FileType, ImageFormat, LineCol, StopReason,
 };
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
@@ -118,6 +119,24 @@ fn wrap_read_text(req: FileReadText) -> FileRequest {
     FileRequest {
         request_id: "t".into(),
         operation: Some(file_request::Operation::ReadText(req)),
+    }
+}
+
+fn expect_read_binary(
+    resp: ahand_protocol::FileResponse,
+) -> ahand_protocol::FileReadBinaryResult {
+    match resp.result {
+        Some(file_response::Result::ReadBinary(r)) => r,
+        other => panic!("expected read_binary result, got {other:?}"),
+    }
+}
+
+fn expect_read_image(
+    resp: ahand_protocol::FileResponse,
+) -> ahand_protocol::FileReadImageResult {
+    match resp.result {
+        Some(file_response::Result::ReadImage(r)) => r,
+        other => panic!("expected read_image result, got {other:?}"),
     }
 }
 
@@ -771,3 +790,229 @@ async fn read_text_nonexistent_file_returns_error() {
     assert_eq!(err.code, FileErrorCode::NotFound as i32);
 }
 
+// ── FileReadBinary tests ───────────────────────────────────────────────────
+
+fn binary_req(path: &Path, offset: u64, length: u64) -> FileRequest {
+    FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadBinary(FileReadBinary {
+            path: path.to_string_lossy().into_owned(),
+            byte_offset: offset,
+            byte_length: length,
+            max_bytes: None,
+            no_follow_symlink: false,
+        })),
+    }
+}
+
+#[tokio::test]
+async fn read_binary_full_file() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("bin.dat");
+    let data: Vec<u8> = (0..100u8).collect();
+    fs::write(&file, &data).unwrap();
+
+    let resp = mgr.handle(&binary_req(&file, 0, 0)).await;
+    let result = expect_read_binary(resp);
+    assert_eq!(result.content, data);
+    assert_eq!(result.bytes_read, 100);
+    assert_eq!(result.total_file_bytes, 100);
+    assert_eq!(result.remaining_bytes, 0);
+}
+
+#[tokio::test]
+async fn read_binary_range() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("range.dat");
+    let data: Vec<u8> = (0..100u8).collect();
+    fs::write(&file, &data).unwrap();
+
+    let resp = mgr.handle(&binary_req(&file, 20, 30)).await;
+    let result = expect_read_binary(resp);
+    assert_eq!(result.content, data[20..50].to_vec());
+    assert_eq!(result.byte_offset, 20);
+    assert_eq!(result.bytes_read, 30);
+    assert_eq!(result.remaining_bytes, 50);
+}
+
+#[tokio::test]
+async fn read_binary_respects_max_bytes() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("big.dat");
+    let data = vec![0u8; 10_000];
+    fs::write(&file, &data).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadBinary(FileReadBinary {
+            path: file.to_string_lossy().into_owned(),
+            byte_offset: 0,
+            byte_length: 0,
+            max_bytes: Some(1024),
+            no_follow_symlink: false,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_read_binary(resp);
+    assert_eq!(result.bytes_read, 1024);
+    assert_eq!(result.remaining_bytes, 10_000 - 1024);
+}
+
+#[tokio::test]
+async fn read_binary_past_eof_returns_empty() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("small.dat");
+    fs::write(&file, [1u8, 2, 3]).unwrap();
+
+    let resp = mgr.handle(&binary_req(&file, 100, 10)).await;
+    let result = expect_read_binary(resp);
+    assert_eq!(result.bytes_read, 0);
+    assert_eq!(result.content.len(), 0);
+    assert_eq!(result.remaining_bytes, 0);
+}
+
+// ── FileReadImage tests ────────────────────────────────────────────────────
+
+/// Write a small synthetic PNG (via the `image` crate) to disk for testing.
+fn write_test_png(path: &Path, width: u32, height: u32) {
+    use image::{ImageBuffer, Rgb};
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(width, height, |x, y| {
+            Rgb([(x & 0xFF) as u8, (y & 0xFF) as u8, 0u8])
+        });
+    img.save_with_format(path, image::ImageFormat::Png)
+        .expect("failed to write test png");
+}
+
+fn image_req(path: &Path, max_w: Option<u32>, max_h: Option<u32>) -> FileRequest {
+    FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadImage(FileReadImage {
+            path: path.to_string_lossy().into_owned(),
+            max_width: max_w,
+            max_height: max_h,
+            max_bytes: None,
+            quality: None,
+            output_format: None,
+            no_follow_symlink: false,
+        })),
+    }
+}
+
+#[tokio::test]
+async fn read_image_passthrough_returns_original_format() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("plain.png");
+    write_test_png(&file, 100, 50);
+    let original_size = fs::metadata(&file).unwrap().len();
+
+    let resp = mgr.handle(&image_req(&file, None, None)).await;
+    let result = expect_read_image(resp);
+    assert_eq!(result.width, 100);
+    assert_eq!(result.height, 50);
+    assert_eq!(result.original_bytes, original_size);
+    assert_eq!(result.format, ImageFormat::Png as i32);
+    assert!(!result.content.is_empty());
+}
+
+#[tokio::test]
+async fn read_image_resize_preserves_aspect_ratio() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("resize.png");
+    write_test_png(&file, 1000, 800);
+
+    let resp = mgr.handle(&image_req(&file, Some(500), None)).await;
+    let result = expect_read_image(resp);
+    assert_eq!(result.width, 500);
+    assert_eq!(result.height, 400);
+}
+
+#[tokio::test]
+async fn read_image_format_convert_png_to_jpeg() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("convert.png");
+    write_test_png(&file, 64, 64);
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadImage(FileReadImage {
+            path: file.to_string_lossy().into_owned(),
+            max_width: None,
+            max_height: None,
+            max_bytes: None,
+            quality: Some(80),
+            output_format: Some(ImageFormat::Jpeg as i32),
+            no_follow_symlink: false,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_read_image(resp);
+    assert_eq!(result.format, ImageFormat::Jpeg as i32);
+    // JPEG files start with 0xFF 0xD8 (SOI marker).
+    assert_eq!(result.content.first().copied(), Some(0xFF));
+    assert_eq!(result.content.get(1).copied(), Some(0xD8));
+}
+
+#[tokio::test]
+async fn read_image_max_bytes_reduces_jpeg_size() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("busy.png");
+    write_test_png(&file, 400, 400);
+
+    // First pass: no max_bytes at quality 100.
+    let req_full = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadImage(FileReadImage {
+            path: file.to_string_lossy().into_owned(),
+            max_width: None,
+            max_height: None,
+            max_bytes: None,
+            quality: Some(100),
+            output_format: Some(ImageFormat::Jpeg as i32),
+            no_follow_symlink: false,
+        })),
+    };
+    let full = expect_read_image(mgr.handle(&req_full).await);
+
+    // Second pass: force a tight max_bytes that should iteratively drop quality.
+    let budget = (full.output_bytes / 2).max(1000);
+    let req_budget = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadImage(FileReadImage {
+            path: file.to_string_lossy().into_owned(),
+            max_width: None,
+            max_height: None,
+            max_bytes: Some(budget),
+            quality: Some(100),
+            output_format: Some(ImageFormat::Jpeg as i32),
+            no_follow_symlink: false,
+        })),
+    };
+    let reduced = expect_read_image(mgr.handle(&req_budget).await);
+    assert!(
+        reduced.output_bytes < full.output_bytes,
+        "expected reduced output smaller than full: reduced={} full={}",
+        reduced.output_bytes,
+        full.output_bytes
+    );
+}
+
+#[tokio::test]
+async fn read_image_not_an_image_returns_error() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("plain.txt");
+    fs::write(&file, b"not an image").unwrap();
+
+    let resp = mgr.handle(&image_req(&file, None, None)).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+}

@@ -4,6 +4,7 @@
 //! and maps the results back to `FileResponse`. Policy is enforced per-path;
 //! the actual filesystem work lives in the submodules.
 
+pub mod binary_read;
 pub mod fs_ops;
 pub mod policy;
 pub mod text_read;
@@ -109,12 +110,16 @@ impl FileManager {
                 Ok(file_response::Result::ReadText(result))
             }
             file_request::Operation::ReadBinary(req) => {
-                let _result = self.policy.check_path(&req.path, false)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, false)?;
+                let result =
+                    binary_read::handle_read_binary(req, checked.resolved_path.as_path()).await?;
+                Ok(file_response::Result::ReadBinary(result))
             }
             file_request::Operation::ReadImage(req) => {
-                let _result = self.policy.check_path(&req.path, false)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, false)?;
+                let result =
+                    binary_read::handle_read_image(req, checked.resolved_path.as_path()).await?;
+                Ok(file_response::Result::ReadImage(result))
             }
             file_request::Operation::Write(req) => {
                 let _result = self.policy.check_path(&req.path, true)?;
