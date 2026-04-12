@@ -259,42 +259,24 @@ pub fn error_response(request_id: String, message: impl Into<String>) -> FileRes
     }
 }
 
-// ── S3 upload URL endpoint ────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct UploadUrlResponse {
-    pub url: String,
-    pub expires_at_ms: u64,
-    pub object_key: String,
-}
-
-/// Handle `POST /api/devices/{device_id}/files/upload-url`. Returns a pre-signed
-/// S3 PUT URL plus the object key the client should reuse in a follow-up
-/// FileRequest. Returns 503 if S3 is not configured on this hub.
-pub async fn get_upload_url(
-    auth: AuthContextExt,
-    State(state): State<AppState>,
-    Path(device_id): Path<String>,
-) -> ApiResult<Json<UploadUrlResponse>> {
-    auth.require_dashboard_access()?;
-
-    let Some(s3) = state.s3_client.clone() else {
-        return Err(ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "S3_DISABLED",
-            "S3 large-file transfer is not configured on this hub",
-        ));
-    };
-
-    let key = format!("file-ops/{device_id}/{}", uuid::Uuid::new_v4());
-    let presigned = s3
-        .generate_upload_url(&key)
-        .await
-        .map_err(|e| ApiError::internal(format!("failed to presign upload URL: {e}")))?;
-
-    Ok(Json(UploadUrlResponse {
-        url: presigned.url,
-        expires_at_ms: presigned.expires_at_ms,
-        object_key: presigned.object_key,
-    }))
-}
+// ── S3 large-file transfer ────────────────────────────────────────────────
+//
+// The `POST /files/upload-url` endpoint used to live here. It was removed
+// during Round 1 review because the full large-file transfer flow (hub
+// downloads from S3 before forwarding writes, hub uploads large responses
+// before returning reads) was only half-wired: the endpoint produced valid
+// presigned PUT URLs but the daemon rejected any FileRequest carrying
+// `FullWrite.s3_object_key`. Exposing a half-working API surface is worse
+// than not exposing it at all, so the route was dropped until the entire
+// path is implemented.
+//
+// The underlying plumbing is intentionally kept:
+// - `s3::S3Client` (generate_upload_url/generate_download_url/
+//   upload_bytes/download_bytes)
+// - `config::S3Config`
+// - `AppState.s3_client`
+// - proto field `FullWrite.s3_object_key`
+//
+// A follow-up PR can wire the full flow inside `file_operation` (S3 fetch
+// before forwarding writes, S3 push after large reads) without having to
+// re-establish any of the skeleton.
