@@ -121,13 +121,22 @@ pub async fn handle_list(req: &FileList, resolved: &Path) -> Result<FileListResu
 }
 
 /// Match glob pattern against files under the (optional) base path.
+///
+/// Every matched path is re-checked against `policy` before being returned —
+/// without this filter, a `**` pattern rooted inside the allowlist could still
+/// surface symlinks or follow resolution paths whose canonical target lies
+/// outside the allowlist. The dispatcher also rejects obviously hostile
+/// patterns (absolute paths, `..` components) before calling us.
 pub async fn handle_glob(
     req: &FileGlob,
     base: Option<&Path>,
+    policy: &super::policy::FilePolicyChecker,
 ) -> Result<FileGlobResult, FileError> {
     let max_results = req.max_results.unwrap_or(DEFAULT_GLOB_MAX) as usize;
 
-    // Resolve pattern relative to base_path if provided.
+    // Resolve pattern relative to base_path if provided. `Path::join` with an
+    // absolute `req.pattern` would discard the base entirely, so absolute
+    // patterns are rejected in the dispatcher before we get here.
     let full_pattern = match base {
         Some(b) => {
             let joined: PathBuf = b.join(&req.pattern);
@@ -150,6 +159,15 @@ pub async fn handle_glob(
         let Ok(path) = entry else {
             continue;
         };
+        // Re-check every matched path against policy. Paths that resolve
+        // outside the allowlist (via symlinks inside an allowed directory,
+        // for example) are silently excluded — we neither leak metadata for
+        // them nor error out, because the caller asked for a pattern match,
+        // not a specific file.
+        let path_str = path.to_string_lossy();
+        if policy.check_path(&path_str, false, false).is_err() {
+            continue;
+        }
         total_matches = total_matches.saturating_add(1);
         if entries.len() >= max_results {
             continue;

@@ -23,7 +23,7 @@
     {
       "id": 3,
       "subject": "T3: FileGlob re-checks each matched path against policy",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [2],
       "description": "Two-part fix for glob escape (review issue #1): (a) reject glob patterns containing `..` or starting with an absolute path when no `base_path` is set, (b) inside `handle_glob`, run each matched path through `policy.check_path` before returning it. Addresses review issue #1.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/file_manager/fs_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops glob\", \"acceptanceCriteria\": [\"Glob with absolute pattern /etc/** and no base is rejected\", \"Glob pattern containing .. is rejected\", \"Each matched path is re-checked against policy and excluded if denied\", \"Existing glob tests still pass\"]}\n```"
     },

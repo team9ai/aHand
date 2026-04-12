@@ -454,6 +454,71 @@ async fn glob_recursive() {
     assert!(glob.total_matches >= 2);
 }
 
+#[tokio::test]
+async fn glob_absolute_pattern_without_base_is_rejected() {
+    // Without a base_path, an absolute pattern like `/etc/**` would let
+    // glob iterate the entire filesystem. Must be rejected up front.
+    let dir = TempDir::new().unwrap();
+    let (mgr, _root) = test_manager(&dir);
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Glob(FileGlob {
+            pattern: "/etc/**".into(),
+            base_path: None,
+            max_results: None,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+}
+
+#[tokio::test]
+async fn glob_traversal_pattern_is_rejected() {
+    // `../` inside a pattern would let the matcher escape the base dir.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Glob(FileGlob {
+            pattern: "../*.rs".into(),
+            base_path: Some(root.to_string_lossy().into_owned()),
+            max_results: None,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn glob_skips_symlink_pointing_outside_allowlist() {
+    // A `**` pattern inside the allowlist still matches symlinks whose
+    // canonical target lies outside. handle_glob re-checks policy per match
+    // and silently filters those out.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    fs::write(root.join("inside.rs"), "x").unwrap();
+    // Symlink inside root pointing at a real file outside the allowlist.
+    std::os::unix::fs::symlink("/etc/hosts", root.join("escape.rs")).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Glob(FileGlob {
+            pattern: "**/*.rs".into(),
+            base_path: Some(root.to_string_lossy().into_owned()),
+            max_results: None,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let glob = expect_glob(resp);
+    // Only `inside.rs` should survive — `escape.rs` gets filtered out.
+    assert_eq!(glob.total_matches, 1);
+    assert!(glob.entries.iter().any(|e| e.name.ends_with("inside.rs")));
+    assert!(glob.entries.iter().all(|e| !e.name.ends_with("escape.rs")));
+}
+
 // ── FileMkdir tests ────────────────────────────────────────────────────────
 
 #[tokio::test]

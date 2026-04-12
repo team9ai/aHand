@@ -91,6 +91,26 @@ impl FileManager {
                 Ok(file_response::Result::List(result))
             }
             file_request::Operation::Glob(req) => {
+                // Reject absolute and traversal glob patterns early. Without
+                // this check, `/etc/**` or `../**` would let glob iterate
+                // outside the base directory entirely; the per-match re-check
+                // in handle_glob is a backstop but the pattern itself should
+                // never have been accepted.
+                if req.pattern.starts_with('/') {
+                    return Err(file_error(
+                        FileErrorCode::InvalidPath,
+                        &req.pattern,
+                        "absolute glob patterns are not allowed",
+                    ));
+                }
+                if req.pattern.split(&['/', '\\'][..]).any(|seg| seg == "..") {
+                    return Err(file_error(
+                        FileErrorCode::InvalidPath,
+                        &req.pattern,
+                        "glob patterns must not contain .. components",
+                    ));
+                }
+
                 let base_path_str = req.base_path.as_deref().unwrap_or("");
                 let base: Option<std::path::PathBuf> = if base_path_str.is_empty() {
                     None
@@ -98,7 +118,7 @@ impl FileManager {
                     let checked = self.policy.check_path(base_path_str, false, false)?;
                     Some(checked.resolved_path)
                 };
-                let result = fs_ops::handle_glob(req, base.as_deref()).await?;
+                let result = fs_ops::handle_glob(req, base.as_deref(), &self.policy).await?;
                 Ok(file_response::Result::Glob(result))
             }
             file_request::Operation::Mkdir(req) => {
