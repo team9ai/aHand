@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ahand_protocol::{
-    file_request, file_response, FileErrorCode, FileGlob, FileList, FileMkdir, FileRequest,
-    FileStat, FileType,
+    file_position, file_read_text, file_request, file_response, FileErrorCode, FileGlob, FileList,
+    FileMkdir, FilePosition, FileReadText, FileRequest, FileStat, FileType, LineCol, StopReason,
 };
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
@@ -88,6 +88,36 @@ fn expect_mkdir(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileMkdir
     match resp.result {
         Some(file_response::Result::Mkdir(r)) => r,
         other => panic!("expected mkdir result, got {other:?}"),
+    }
+}
+
+fn expect_read_text(
+    resp: ahand_protocol::FileResponse,
+) -> ahand_protocol::FileReadTextResult {
+    match resp.result {
+        Some(file_response::Result::ReadText(r)) => r,
+        other => panic!("expected read_text result, got {other:?}"),
+    }
+}
+
+fn read_text_request(path: &Path) -> FileReadText {
+    FileReadText {
+        path: path.to_string_lossy().into_owned(),
+        start: None,
+        max_lines: None,
+        max_bytes: None,
+        target_end: None,
+        max_line_width: None,
+        encoding: None,
+        line_numbers: true,
+        no_follow_symlink: false,
+    }
+}
+
+fn wrap_read_text(req: FileReadText) -> FileRequest {
+    FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadText(req)),
     }
 }
 
@@ -495,5 +525,249 @@ async fn disabled_file_manager_rejects_everything() {
     let resp = mgr.handle(&req).await;
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
+}
+
+// ── FileReadText tests ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn read_text_basic_reads_all_lines() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("simple.txt");
+    fs::write(&file, "line1\nline2\nline3\n").unwrap();
+
+    let resp = mgr.handle(&wrap_read_text(read_text_request(&file))).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 3);
+    assert_eq!(result.lines[0].content, "line1");
+    assert_eq!(result.lines[1].content, "line2");
+    assert_eq!(result.lines[2].content, "line3");
+    assert_eq!(result.stop_reason, StopReason::FileEnd as i32);
+    assert_eq!(result.total_file_bytes, 18);
+    assert_eq!(result.remaining_bytes, 0);
+    assert_eq!(result.detected_encoding, "UTF-8");
+}
+
+#[tokio::test]
+async fn read_text_respects_max_lines() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("hundred.txt");
+    let content: String = (1..=100).map(|i| format!("line{i}\n")).collect();
+    fs::write(&file, &content).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.max_lines = Some(5);
+    req.max_bytes = Some(10_000_000);
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 5);
+    assert_eq!(result.stop_reason, StopReason::MaxLines as i32);
+    assert_eq!(result.lines[4].content, "line5");
+    assert!(result.remaining_bytes > 0);
+}
+
+#[tokio::test]
+async fn read_text_respects_max_bytes() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("fiftysome.txt");
+    // 100 lines, each "x" * 50 = 51 bytes incl. newline → 5100 bytes total.
+    let mut content = String::new();
+    for _ in 0..100 {
+        content.push_str(&"x".repeat(50));
+        content.push('\n');
+    }
+    fs::write(&file, &content).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.max_lines = Some(10_000);
+    req.max_bytes = Some(120);
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.stop_reason, StopReason::MaxBytes as i32);
+    assert!(result.lines.len() <= 3); // at most 2-3 lines
+    assert!(result.lines.len() >= 1);
+}
+
+#[tokio::test]
+async fn read_text_respects_target_end_line() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("target.txt");
+    let content: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+    fs::write(&file, &content).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.target_end = Some(FilePosition {
+        position: Some(file_position::Position::Line(5)),
+    });
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.stop_reason, StopReason::TargetEnd as i32);
+    assert_eq!(result.lines.len(), 4); // lines 1..4 before target line 5
+    assert_eq!(result.lines.last().unwrap().content, "line4");
+}
+
+#[tokio::test]
+async fn read_text_start_at_line() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("startline.txt");
+    let content: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+    fs::write(&file, &content).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.start = Some(file_read_text::Start::StartLine(3));
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.first().unwrap().content, "line3");
+    assert_eq!(result.lines.first().unwrap().line_number, 3);
+    assert_eq!(result.start_pos.unwrap().line, 3);
+}
+
+#[tokio::test]
+async fn read_text_start_at_byte() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("startbyte.txt");
+    fs::write(&file, "abcdefghij").unwrap();
+
+    let mut req = read_text_request(&file);
+    req.start = Some(file_read_text::Start::StartByte(4));
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 1);
+    assert_eq!(result.lines[0].content, "efghij");
+    assert_eq!(result.start_pos.unwrap().byte_in_file, 4);
+}
+
+#[tokio::test]
+async fn read_text_start_at_line_col() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("linecol.txt");
+    fs::write(&file, "first\nsecond\nthird\n").unwrap();
+
+    let mut req = read_text_request(&file);
+    req.start = Some(file_read_text::Start::StartLineCol(LineCol {
+        line: 2,
+        col: 3,
+    }));
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.first().unwrap().content, "ond");
+    let start = result.start_pos.unwrap();
+    assert_eq!(start.line, 2);
+    assert_eq!(start.byte_in_line, 3);
+}
+
+#[tokio::test]
+async fn read_text_line_truncation_marks_flag_and_remaining() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("long.txt");
+    let line = "x".repeat(1000);
+    fs::write(&file, format!("{line}\n")).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.max_line_width = Some(100);
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 1);
+    let line = &result.lines[0];
+    assert!(line.truncated);
+    assert_eq!(line.content.len(), 100);
+    assert_eq!(line.remaining_bytes, 900);
+}
+
+#[tokio::test]
+async fn read_text_empty_file() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("empty.txt");
+    fs::write(&file, "").unwrap();
+
+    let resp = mgr.handle(&wrap_read_text(read_text_request(&file))).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 0);
+    assert_eq!(result.stop_reason, StopReason::FileEnd as i32);
+    assert_eq!(result.total_file_bytes, 0);
+}
+
+#[tokio::test]
+async fn read_text_remaining_bytes_after_limit() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("remain.txt");
+    // 10 lines of "abc\n" = 40 bytes total.
+    let content = "abc\n".repeat(10);
+    fs::write(&file, &content).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.max_lines = Some(3);
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 3);
+    // After 3 lines (12 bytes), 28 bytes remain.
+    assert_eq!(result.remaining_bytes, 28);
+    assert_eq!(result.total_file_bytes, 40);
+}
+
+#[tokio::test]
+async fn read_text_utf8_multibyte_not_split() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("utf8.txt");
+    // "你好世界" is 12 UTF-8 bytes (3 bytes per char).
+    fs::write(&file, "你好世界\n").unwrap();
+
+    let mut req = read_text_request(&file);
+    req.max_line_width = Some(7); // Would split in the middle of "世" (byte 6-8)
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    let line = &result.lines[0];
+    // Truncated content must be valid UTF-8 and not contain partial codepoints.
+    assert!(line.truncated);
+    assert!(line.content.chars().all(|c| c != '\u{FFFD}'));
+}
+
+#[tokio::test]
+async fn read_text_encoding_forced_gbk() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("gbk.txt");
+    // Encode "你好" in GBK manually.
+    let gbk_bytes: [u8; 4] = [0xC4, 0xE3, 0xBA, 0xC3];
+    fs::write(&file, gbk_bytes).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.encoding = Some("gbk".into());
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 1);
+    assert_eq!(result.lines[0].content, "你好");
+    assert!(result.detected_encoding.to_ascii_lowercase().contains("gbk"));
+}
+
+#[tokio::test]
+async fn read_text_nonexistent_file_returns_error() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let missing = root.join("missing.txt");
+
+    let resp = mgr.handle(&wrap_read_text(read_text_request(&missing))).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::NotFound as i32);
 }
 

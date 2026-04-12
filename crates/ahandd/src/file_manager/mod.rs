@@ -6,6 +6,7 @@
 
 pub mod fs_ops;
 pub mod policy;
+pub mod text_read;
 
 use ahand_protocol::{
     FileError, FileErrorCode, FileRequest, FileResponse, file_request, file_response,
@@ -102,8 +103,10 @@ impl FileManager {
                 Ok(file_response::Result::Mkdir(result))
             }
             file_request::Operation::ReadText(req) => {
-                let _result = self.policy.check_path(&req.path, false)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, false)?;
+                let result =
+                    text_read::handle_read_text(req, checked.resolved_path.as_path()).await?;
+                Ok(file_response::Result::ReadText(result))
             }
             file_request::Operation::ReadBinary(req) => {
                 let _result = self.policy.check_path(&req.path, false)?;
