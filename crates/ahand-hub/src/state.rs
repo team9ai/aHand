@@ -44,6 +44,7 @@ pub struct AppState {
     pub dashboard_allowed_origins: Arc<Vec<String>>,
     pub terminal_tokens: Arc<DashMap<String, crate::http::terminal::TerminalToken>>,
     pub pending_file_requests: Arc<crate::http::files::PendingFileRequests>,
+    pub s3_client: Option<Arc<crate::s3::S3Client>>,
 }
 
 impl AppState {
@@ -119,6 +120,11 @@ impl AppState {
             audit_store.clone(),
         ));
         let pending_file_requests = crate::http::files::new_pending_requests();
+        let s3_client = if let Some(ref s3_cfg) = config.s3 {
+            Some(Arc::new(crate::s3::S3Client::new(s3_cfg).await))
+        } else {
+            None
+        };
         let jobs = Arc::new(crate::http::jobs::JobRuntime::new(
             job_dispatcher.clone(),
             jobs_store.clone(),
@@ -154,6 +160,7 @@ impl AppState {
             dashboard_allowed_origins: Arc::new(config.dashboard_allowed_origins),
             terminal_tokens: Arc::new(DashMap::new()),
             pending_file_requests,
+            s3_client,
         };
         state
             .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())

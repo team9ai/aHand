@@ -27,6 +27,12 @@ tracing-subscriber.workspace = true
 url = "2"
 uuid.workspace = true
 
+# S3 support for large file transfer. Optional in config; skipped at runtime
+# when the `[s3]` section is not present in the hub config.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
+aws-credential-types = "1"
+
 [dev-dependencies]
 ahand-hub-store = { path = "../ahand-hub-store", features = ["test-support"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }

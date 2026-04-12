@@ -51,6 +51,7 @@ pub fn test_config() -> Config {
         audit_fallback_path: std::env::temp_dir().join("ahand-hub-test-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
         store: StoreConfig::Memory,
+        s3: None,
     }
 }
 
@@ -78,6 +79,7 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
             database_url: stack.database_url().into(),
             redis_url: stack.redis_url().into(),
         },
+        s3: None,
     }
 }
 

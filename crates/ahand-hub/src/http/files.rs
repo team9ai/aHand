@@ -258,3 +258,43 @@ pub fn error_response(request_id: String, message: impl Into<String>) -> FileRes
         })),
     }
 }
+
+// ── S3 upload URL endpoint ────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct UploadUrlResponse {
+    pub url: String,
+    pub expires_at_ms: u64,
+    pub object_key: String,
+}
+
+/// Handle `POST /api/devices/{device_id}/files/upload-url`. Returns a pre-signed
+/// S3 PUT URL plus the object key the client should reuse in a follow-up
+/// FileRequest. Returns 503 if S3 is not configured on this hub.
+pub async fn get_upload_url(
+    auth: AuthContextExt,
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> ApiResult<Json<UploadUrlResponse>> {
+    auth.require_dashboard_access()?;
+
+    let Some(s3) = state.s3_client.clone() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "S3_DISABLED",
+            "S3 large-file transfer is not configured on this hub",
+        ));
+    };
+
+    let key = format!("file-ops/{device_id}/{}", uuid::Uuid::new_v4());
+    let presigned = s3
+        .generate_upload_url(&key)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to presign upload URL: {e}")))?;
+
+    Ok(Json(UploadUrlResponse {
+        url: presigned.url,
+        expires_at_ms: presigned.expires_at_ms,
+        object_key: presigned.object_key,
+    }))
+}

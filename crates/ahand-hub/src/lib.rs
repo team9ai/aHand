@@ -5,6 +5,7 @@ pub mod config;
 pub mod events;
 pub mod http;
 pub mod output_stream;
+pub mod s3;
 pub mod state;
 pub mod ws;
 

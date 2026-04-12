@@ -31,6 +31,46 @@ pub struct Config {
     pub audit_fallback_path: PathBuf,
     pub output_retention_ms: u64,
     pub store: StoreConfig,
+    /// Optional S3 configuration for large file transfer.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+}
+
+/// S3 configuration used by the file operation transfer path.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct S3Config {
+    pub bucket: String,
+    pub region: String,
+    /// Custom S3 endpoint (e.g. for MinIO or LocalStack).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// File-size threshold above which hub uses S3 instead of inlining the
+    /// content in the FileResponse/FileRequest envelope. Defaults to 1 MB.
+    #[serde(default = "default_file_transfer_threshold_bytes")]
+    pub file_transfer_threshold_bytes: u64,
+    /// Pre-signed URL expiration, in seconds. Defaults to 1 hour.
+    #[serde(default = "default_url_expiration_secs")]
+    pub url_expiration_secs: u64,
+}
+
+fn default_file_transfer_threshold_bytes() -> u64 {
+    1_048_576
+}
+
+fn default_url_expiration_secs() -> u64 {
+    3_600
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            file_transfer_threshold_bytes: default_file_transfer_threshold_bytes(),
+            url_expiration_secs: default_url_expiration_secs(),
+        }
+    }
 }
 
 impl Config {
@@ -105,8 +145,35 @@ impl Config {
                 database_url: required_env(&getenv, "AHAND_HUB_DATABASE_URL")?,
                 redis_url: required_env(&getenv, "AHAND_HUB_REDIS_URL")?,
             },
+            s3: s3_config_from_env(&getenv)?,
         })
     }
+}
+
+fn s3_config_from_env<F>(getenv: &F) -> anyhow::Result<Option<S3Config>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(bucket) = getenv("AHAND_HUB_S3_BUCKET") else {
+        return Ok(None);
+    };
+    let region = getenv("AHAND_HUB_S3_REGION").unwrap_or_else(|| "us-east-1".into());
+    let endpoint = getenv("AHAND_HUB_S3_ENDPOINT");
+    let threshold = getenv("AHAND_HUB_S3_THRESHOLD_BYTES")
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or_else(default_file_transfer_threshold_bytes);
+    let expiration = getenv("AHAND_HUB_S3_URL_EXPIRATION_SECS")
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or_else(default_url_expiration_secs);
+    Ok(Some(S3Config {
+        bucket,
+        region,
+        endpoint,
+        file_transfer_threshold_bytes: threshold,
+        url_expiration_secs: expiration,
+    }))
 }
 
 fn default_audit_fallback_path() -> PathBuf {
