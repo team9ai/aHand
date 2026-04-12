@@ -183,6 +183,8 @@ message FileWrite {
     ByteRangeReplace byte_range_replace = 14;
   }
 
+  // NOTE: v1 only supports UTF-8. Any other value is rejected with
+  // FILE_ERROR_CODE_ENCODING. Full encoding conversion is future work.
   optional string encoding = 30;
   bool no_follow_symlink = 31;
 }
@@ -225,6 +227,8 @@ message FileEdit {
     ByteRangeReplace byte_range_replace = 12;
   }
 
+  // NOTE: v1 only supports UTF-8. Any other value is rejected with
+  // FILE_ERROR_CODE_ENCODING. Full encoding conversion is future work.
   optional string encoding = 30;
   bool no_follow_symlink = 31;
 }

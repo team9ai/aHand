@@ -528,7 +528,13 @@ export interface FileWrite {
   append?: FileAppend | undefined;
   stringReplace?: StringReplace | undefined;
   lineRangeReplace?: LineRangeReplace | undefined;
-  byteRangeReplace?: ByteRangeReplace | undefined;
+  byteRangeReplace?:
+    | ByteRangeReplace
+    | undefined;
+  /**
+   * NOTE: v1 only supports UTF-8. Any other value is rejected with
+   * FILE_ERROR_CODE_ENCODING. Full encoding conversion is future work.
+   */
   encoding?: string | undefined;
   noFollowSymlink: boolean;
 }
@@ -566,7 +572,13 @@ export interface FileEdit {
   path: string;
   stringReplace?: StringReplace | undefined;
   lineRangeReplace?: LineRangeReplace | undefined;
-  byteRangeReplace?: ByteRangeReplace | undefined;
+  byteRangeReplace?:
+    | ByteRangeReplace
+    | undefined;
+  /**
+   * NOTE: v1 only supports UTF-8. Any other value is rejected with
+   * FILE_ERROR_CODE_ENCODING. Full encoding conversion is future work.
+   */
   encoding?: string | undefined;
   noFollowSymlink: boolean;
 }

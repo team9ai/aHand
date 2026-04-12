@@ -21,6 +21,8 @@ pub async fn handle_write(
     resolved: &Path,
     max_write_bytes: u64,
 ) -> Result<FileWriteResult, FileError> {
+    ensure_encoding_supported(req.encoding.as_deref(), &req.path)?;
+
     let Some(method) = &req.method else {
         return Err(file_error(
             FileErrorCode::Unspecified,
@@ -62,6 +64,8 @@ pub async fn handle_edit(
     resolved: &Path,
     max_write_bytes: u64,
 ) -> Result<FileEditResult, FileError> {
+    ensure_encoding_supported(req.encoding.as_deref(), &req.path)?;
+
     // Require existing file for edit.
     if !tokio::fs::try_exists(resolved).await.unwrap_or(false) {
         return Err(file_error(FileErrorCode::NotFound, &req.path, "file not found"));
@@ -436,6 +440,32 @@ async fn apply_byte_range_replace(
     out.extend_from_slice(&br.new_content);
     out.extend_from_slice(&existing[end..]);
     Ok(out)
+}
+
+/// Reject non-UTF-8 encoding parameters. V1 only supports UTF-8 writes;
+/// anything else returns FILE_ERROR_CODE_ENCODING with a clear message.
+fn ensure_encoding_supported(
+    encoding: Option<&str>,
+    req_path: &str,
+) -> Result<(), FileError> {
+    match encoding {
+        None => Ok(()),
+        Some(e)
+            if e.is_empty()
+                || e.eq_ignore_ascii_case("utf-8")
+                || e.eq_ignore_ascii_case("utf8") =>
+        {
+            Ok(())
+        }
+        Some(other) => Err(file_error(
+            FileErrorCode::Encoding,
+            req_path,
+            format!(
+                "encoding '{}' is not supported for writes (v1 only supports UTF-8)",
+                other
+            ),
+        )),
+    }
 }
 
 fn enforce_size_limit(size: u64, max: u64, path: &str) -> Result<(), FileError> {
