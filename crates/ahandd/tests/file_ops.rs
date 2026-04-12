@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ahand_protocol::{
-    file_position, file_read_text, file_request, file_response, FileErrorCode, FileGlob, FileList,
-    FileMkdir, FilePosition, FileReadBinary, FileReadImage, FileReadText, FileRequest, FileStat,
-    FileType, ImageFormat, LineCol, StopReason,
+    file_edit, file_position, file_read_text, file_request, file_response, file_write, full_write,
+    ByteRangeReplace, FileAppend, FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir,
+    FilePosition, FileReadBinary, FileReadImage, FileReadText, FileRequest, FileStat, FileType,
+    FileWrite, FullWrite, ImageFormat, LineCol, LineRangeReplace, StopReason, StringReplace,
+    WriteAction,
 };
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
@@ -137,6 +139,35 @@ fn expect_read_image(
     match resp.result {
         Some(file_response::Result::ReadImage(r)) => r,
         other => panic!("expected read_image result, got {other:?}"),
+    }
+}
+
+fn expect_write(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileWriteResult {
+    match resp.result {
+        Some(file_response::Result::Write(r)) => r,
+        other => panic!("expected write result, got {other:?}"),
+    }
+}
+
+fn expect_edit(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileEditResult {
+    match resp.result {
+        Some(file_response::Result::Edit(r)) => r,
+        other => panic!("expected edit result, got {other:?}"),
+    }
+}
+
+fn write_request_full(path: &Path, content: &[u8], create_parents: bool) -> FileRequest {
+    FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: path.to_string_lossy().into_owned(),
+            create_parents,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::Content(content.to_vec())),
+            })),
+        })),
     }
 }
 
@@ -1015,4 +1046,340 @@ async fn read_image_not_an_image_returns_error() {
     let resp = mgr.handle(&image_req(&file, None, None)).await;
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+}
+
+// ── FileWrite tests ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn full_write_creates_new_file() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("new.txt");
+
+    let resp = mgr
+        .handle(&write_request_full(&file, b"hello world", false))
+        .await;
+    let result = expect_write(resp);
+    assert_eq!(result.action, WriteAction::Created as i32);
+    assert_eq!(result.bytes_written, 11);
+    assert_eq!(result.final_size, 11);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello world");
+}
+
+#[tokio::test]
+async fn full_write_create_parents_creates_intermediate_dirs() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let nested = root.join("a/b/c/file.txt");
+
+    let resp = mgr.handle(&write_request_full(&nested, b"x", true)).await;
+    let result = expect_write(resp);
+    assert_eq!(result.action, WriteAction::Created as i32);
+    assert!(nested.is_file());
+}
+
+#[tokio::test]
+async fn full_write_overwrites_existing() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("ex.txt");
+    fs::write(&file, "old").unwrap();
+
+    let resp = mgr
+        .handle(&write_request_full(&file, b"new content", false))
+        .await;
+    let result = expect_write(resp);
+    assert_eq!(result.action, WriteAction::Overwritten as i32);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "new content");
+}
+
+#[tokio::test]
+async fn file_append_appends_to_existing() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("append.txt");
+    fs::write(&file, "hello").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::Append(FileAppend {
+                content: b" world".to_vec(),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_write(resp);
+    assert_eq!(result.action, WriteAction::Appended as i32);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello world");
+}
+
+#[tokio::test]
+async fn string_replace_write_single() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("sr.txt");
+    fs::write(&file, "foo bar foo").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::StringReplace(StringReplace {
+                old_string: "bar".into(),
+                new_string: "BAZ".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_write(resp);
+    assert_eq!(result.replacements_made, Some(1));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "foo BAZ foo");
+}
+
+#[tokio::test]
+async fn string_replace_write_multiple_without_replace_all_errors() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("sr.txt");
+    fs::write(&file, "foo foo foo").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::StringReplace(StringReplace {
+                old_string: "foo".into(),
+                new_string: "BAR".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::MultipleMatches as i32);
+    // File content preserved.
+    assert_eq!(fs::read_to_string(&file).unwrap(), "foo foo foo");
+}
+
+#[tokio::test]
+async fn string_replace_write_replace_all_works() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("sr.txt");
+    fs::write(&file, "foo foo foo").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::StringReplace(StringReplace {
+                old_string: "foo".into(),
+                new_string: "BAR".into(),
+                replace_all: true,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_write(resp);
+    assert_eq!(result.replacements_made, Some(3));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "BAR BAR BAR");
+}
+
+#[tokio::test]
+async fn line_range_replace_write() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("lr.txt");
+    fs::write(&file, "one\ntwo\nthree\nfour\nfive\n").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::LineRangeReplace(LineRangeReplace {
+                start_line: 2,
+                end_line: 3,
+                new_content: "TWO_AND_THREE".into(),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_write(resp);
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        "one\nTWO_AND_THREE\nfour\nfive\n"
+    );
+}
+
+#[tokio::test]
+async fn byte_range_replace_write() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("br.bin");
+    fs::write(&file, b"0123456789").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::ByteRangeReplace(ByteRangeReplace {
+                byte_offset: 5,
+                byte_length: 3,
+                new_content: b"XYZW".to_vec(),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_write(resp);
+    assert_eq!(fs::read(&file).unwrap(), b"01234XYZW89");
+}
+
+#[tokio::test]
+async fn write_exceeds_max_bytes_returns_too_large() {
+    let dir = TempDir::new().unwrap();
+    let _ = dir.path();
+    // Use a custom manager with a tight max_write_bytes.
+    let tmp_root = dir.path().canonicalize().unwrap();
+    let root_str = tmp_root.to_string_lossy().into_owned();
+    let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec![format!("{}/**", root_str), root_str.clone()],
+        path_denylist: vec![],
+        max_read_bytes: 100_000_000,
+        max_write_bytes: 10,
+        dangerous_paths: vec![],
+    });
+    let file = tmp_root.join("too_big.bin");
+
+    let resp = mgr.handle(&write_request_full(&file, &vec![0u8; 100], false)).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+}
+
+// ── FileEdit tests ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn edit_nonexistent_file_returns_not_found() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let missing = root.join("nope.txt");
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: missing.to_string_lossy().into_owned(),
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_edit::Method::StringReplace(StringReplace {
+                old_string: "x".into(),
+                new_string: "y".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::NotFound as i32);
+}
+
+#[tokio::test]
+async fn edit_string_replace_missing_reports_match_error() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("ex.txt");
+    fs::write(&file, "hello").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: file.to_string_lossy().into_owned(),
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_edit::Method::StringReplace(StringReplace {
+                old_string: "world".into(),
+                new_string: "friends".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_edit(resp);
+    assert_eq!(result.replacements_made, Some(0));
+    assert!(result.match_error.is_some());
+    // File content unchanged.
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello");
+}
+
+#[tokio::test]
+async fn edit_string_replace_multiple_reports_match_error() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("ex.txt");
+    fs::write(&file, "foo foo foo").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: file.to_string_lossy().into_owned(),
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_edit::Method::StringReplace(StringReplace {
+                old_string: "foo".into(),
+                new_string: "bar".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_edit(resp);
+    assert!(result.match_error.unwrap().contains("multiple matches"));
+    assert_eq!(fs::read_to_string(&file).unwrap(), "foo foo foo");
+}
+
+#[tokio::test]
+async fn edit_string_replace_single_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("ex.txt");
+    fs::write(&file, "hello world").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: file.to_string_lossy().into_owned(),
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_edit::Method::StringReplace(StringReplace {
+                old_string: "world".into(),
+                new_string: "friend".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_edit(resp);
+    assert_eq!(result.replacements_made, Some(1));
+    assert!(result.match_error.is_none());
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello friend");
 }

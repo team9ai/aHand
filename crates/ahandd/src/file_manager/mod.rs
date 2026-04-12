@@ -8,6 +8,7 @@ pub mod binary_read;
 pub mod fs_ops;
 pub mod policy;
 pub mod text_read;
+pub mod write_ops;
 
 use ahand_protocol::{
     FileError, FileErrorCode, FileRequest, FileResponse, file_request, file_response,
@@ -122,12 +123,24 @@ impl FileManager {
                 Ok(file_response::Result::ReadImage(result))
             }
             file_request::Operation::Write(req) => {
-                let _result = self.policy.check_path(&req.path, true)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, true)?;
+                let result = write_ops::handle_write(
+                    req,
+                    checked.resolved_path.as_path(),
+                    self.policy.max_write_bytes(),
+                )
+                .await?;
+                Ok(file_response::Result::Write(result))
             }
             file_request::Operation::Edit(req) => {
-                let _result = self.policy.check_path(&req.path, true)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, true)?;
+                let result = write_ops::handle_edit(
+                    req,
+                    checked.resolved_path.as_path(),
+                    self.policy.max_write_bytes(),
+                )
+                .await?;
+                Ok(file_response::Result::Edit(result))
             }
             file_request::Operation::Delete(req) => {
                 let _result = self.policy.check_path(&req.path, true)?;
