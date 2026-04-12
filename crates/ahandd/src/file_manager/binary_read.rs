@@ -24,6 +24,7 @@ const DEFAULT_IMAGE_QUALITY: u8 = 85;
 pub async fn handle_read_binary(
     req: &FileReadBinary,
     resolved: &Path,
+    max_read_bytes: u64,
 ) -> Result<FileReadBinaryResult, FileError> {
     let metadata = if req.no_follow_symlink {
         tokio::fs::symlink_metadata(resolved).await
@@ -41,7 +42,9 @@ pub async fn handle_read_binary(
     }
 
     let total_file_bytes = metadata.len();
-    let max = req.max_bytes.unwrap_or(DEFAULT_BINARY_MAX);
+    // Clamp against the policy-level read budget so callers can never
+    // bypass `max_read_bytes` by requesting a larger per-call max_bytes.
+    let max = req.max_bytes.unwrap_or(DEFAULT_BINARY_MAX).min(max_read_bytes);
 
     let byte_offset = req.byte_offset;
     if byte_offset >= total_file_bytes {

@@ -43,7 +43,7 @@
     {
       "id": 6,
       "subject": "T6: Enforce max_read_bytes at the dispatch boundary",
-      "status": "pending",
+      "status": "completed",
       "description": "`FilePolicyConfig.max_read_bytes` exists but no handler consults it. Clamp the effective read cap for read_text/read_binary/read_image to `min(request_max, policy.max_read_bytes())`, and refuse to buffer the whole file for text reads when `file_size > max_read_bytes`. Addresses review issue #6.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/file_manager/text_read.rs\", \"crates/ahandd/src/file_manager/binary_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops\", \"acceptanceCriteria\": [\"max_read_bytes policy value is respected for all three read operations\", \"New test: config with max_read_bytes=1024 + 2KB file → TooLarge or truncated at 1024\", \"Existing read tests still pass\"]}\n```"
     },
     {
@@ -93,7 +93,7 @@
     {
       "id": 14,
       "subject": "T14: Reject non-UTF-8 encoding for writes + document in proto",
-      "status": "pending",
+      "status": "completed",
       "description": "`FileWrite.encoding` is currently ignored. Until full encoding support lands, explicitly reject anything other than empty/'utf-8' with a `FILE_ERROR_CODE_ENCODING` error, and update the proto comment to say 'v1 only supports UTF-8 for writes'. Addresses review issue #18.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/write_ops.rs\", \"proto/ahand/v1/file_ops.proto\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops encoding\", \"acceptanceCriteria\": [\"FileWrite with encoding='gbk' returns FILE_ERROR_CODE_ENCODING\", \"FileWrite with encoding empty or 'utf-8' works\", \"Proto comment updated\", \"New test covers the rejection path\"]}\n```"
     },
     {

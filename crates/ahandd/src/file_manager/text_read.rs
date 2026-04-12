@@ -28,6 +28,7 @@ const DEFAULT_MAX_LINE_WIDTH: u32 = 500;
 pub async fn handle_read_text(
     req: &FileReadText,
     resolved: &Path,
+    max_read_bytes: u64,
 ) -> Result<FileReadTextResult, FileError> {
     // Check file existence & get size.
     let metadata = if req.no_follow_symlink {
@@ -47,6 +48,18 @@ pub async fn handle_read_text(
 
     let total_file_bytes = metadata.len();
 
+    // Enforce the policy-level max_read_bytes budget before loading the file.
+    if total_file_bytes > max_read_bytes {
+        return Err(file_error(
+            FileErrorCode::TooLarge,
+            &req.path,
+            format!(
+                "file size {} exceeds max_read_bytes ({})",
+                total_file_bytes, max_read_bytes
+            ),
+        ));
+    }
+
     // Read the whole file (bounded by max_bytes anyway, and large binary files
     // would not be text). We use async read to stay inside tokio.
     let raw = tokio::fs::read(resolved)
@@ -65,7 +78,9 @@ pub async fn handle_read_text(
 
     // Resolve max_lines / max_bytes / target_end / max_line_width.
     let max_lines = req.max_lines.unwrap_or(DEFAULT_MAX_LINES) as usize;
-    let max_bytes = req.max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
+    // Clamp against the policy-level read budget so callers can never
+    // bypass `max_read_bytes` by requesting a larger per-call max_bytes.
+    let max_bytes = req.max_bytes.unwrap_or(DEFAULT_MAX_BYTES).min(max_read_bytes);
     let max_line_width = req.max_line_width.unwrap_or(DEFAULT_MAX_LINE_WIDTH);
     let target_end_byte = req
         .target_end

@@ -130,16 +130,24 @@ impl FileManager {
                 let checked =
                     self.policy
                         .check_path(&req.path, false, req.no_follow_symlink)?;
-                let result =
-                    text_read::handle_read_text(req, checked.resolved_path.as_path()).await?;
+                let result = text_read::handle_read_text(
+                    req,
+                    checked.resolved_path.as_path(),
+                    self.policy.max_read_bytes(),
+                )
+                .await?;
                 Ok(file_response::Result::ReadText(result))
             }
             file_request::Operation::ReadBinary(req) => {
                 let checked =
                     self.policy
                         .check_path(&req.path, false, req.no_follow_symlink)?;
-                let result =
-                    binary_read::handle_read_binary(req, checked.resolved_path.as_path()).await?;
+                let result = binary_read::handle_read_binary(
+                    req,
+                    checked.resolved_path.as_path(),
+                    self.policy.max_read_bytes(),
+                )
+                .await?;
                 Ok(file_response::Result::ReadBinary(result))
             }
             file_request::Operation::ReadImage(req) => {
