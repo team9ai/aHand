@@ -8,6 +8,8 @@
 //! GUI rendering) live in adapter modules (`crate::cli::browser_doctor`,
 //! `crate::cli::browser_init`).
 
+pub mod browser_detect;
 pub mod types;
 
+pub use browser_detect::{detect as detect_browser, detect_all as detect_all_browsers, tried_browsers};
 pub use types::*;
