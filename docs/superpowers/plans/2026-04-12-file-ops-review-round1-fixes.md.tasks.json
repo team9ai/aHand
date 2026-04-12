@@ -30,7 +30,7 @@
     {
       "id": 4,
       "subject": "T4: Plumb NeedsApproval through handle_file_request (strict-mode file-op approval)",
-      "status": "pending",
+      "status": "completed",
       "description": "`handle_file_request` currently treats `SessionDecision::NeedsApproval` the same as `Allow`. Mirror the approval flow from `handle_job_request`: when approval is required, register with `approval_mgr`, emit an `ApprovalRequest` envelope, await the response, and only then dispatch to `FileManager`. Addresses review issue #3.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo build -p ahandd\", \"acceptanceCriteria\": [\"NeedsApproval branch fires an ApprovalRequest and waits for the reply\", \"Approved requests are dispatched to FileManager\", \"Denied/timed-out requests return a FileError with PolicyDenied\", \"Build passes\"]}\n```"
     },
     {

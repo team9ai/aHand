@@ -345,7 +345,17 @@ async fn connect_with_auth(
                     .await;
             }
             Some(envelope::Payload::FileRequest(req)) => {
-                handle_file_request(device_id, caller_uid, &req, &tx, session_mgr, file_mgr).await;
+                handle_file_request(
+                    device_id,
+                    caller_uid,
+                    req,
+                    &tx,
+                    session_mgr,
+                    file_mgr,
+                    approval_mgr,
+                    approval_broadcast_tx,
+                )
+                .await;
             }
             Some(envelope::Payload::UpdateCommand(cmd)) => {
                 info!(update_id = %cmd.update_id, target = %cmd.target_version,
@@ -823,13 +833,16 @@ async fn handle_browser_request<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_file_request<T>(
     device_id: &str,
     caller_uid: &str,
-    req: &ahand_protocol::FileRequest,
+    req: ahand_protocol::FileRequest,
     tx: &T,
     session_mgr: &Arc<SessionManager>,
     file_mgr: &Arc<FileManager>,
+    approval_mgr: &Arc<ApprovalManager>,
+    approval_broadcast_tx: &broadcast::Sender<Envelope>,
 ) where
     T: crate::executor::EnvelopeSink,
 {
@@ -839,7 +852,7 @@ async fn handle_file_request<T>(
         "received file request"
     );
 
-    let reply = |resp: ahand_protocol::FileResponse| {
+    let send_file_response = |resp: ahand_protocol::FileResponse| {
         let env = Envelope {
             device_id: device_id.to_string(),
             msg_id: new_msg_id(),
@@ -851,7 +864,7 @@ async fn handle_file_request<T>(
     };
 
     if !file_mgr.is_enabled() {
-        reply(crate::file_manager::error_response(
+        send_file_response(crate::file_manager::error_response(
             req.request_id.clone(),
             ahand_protocol::FileErrorCode::PolicyDenied,
             "",
@@ -860,33 +873,125 @@ async fn handle_file_request<T>(
         return;
     }
 
-    // Session mode check — file operations always go through the same gate as other
-    // cloud-initiated tools. We synthesise a JobRequest with tool="file" so that
-    // the session manager can apply the caller's current policy.
+    // Session mode check — file operations always go through the same gate as
+    // other cloud-initiated tools. We synthesise a JobRequest with
+    // tool="file" so that the session manager can apply the caller's current
+    // policy. The synthetic job_id = request_id so approval_mgr keys on it.
+    let op_name = req
+        .operation
+        .as_ref()
+        .map(file_op_name)
+        .unwrap_or("unspecified")
+        .to_string();
     let synthetic_req = ahand_protocol::JobRequest {
         job_id: req.request_id.clone(),
         tool: "file".to_string(),
-        args: req
-            .operation
-            .as_ref()
-            .map(|op| vec![file_op_name(op).to_string()])
-            .unwrap_or_default(),
+        args: vec![op_name],
         ..Default::default()
     };
 
     match session_mgr.check(&synthetic_req, caller_uid).await {
         SessionDecision::Deny(reason) => {
             warn!(request_id = %req.request_id, reason = %reason, "file request denied by session mode");
-            reply(crate::file_manager::error_response(
+            send_file_response(crate::file_manager::error_response(
                 req.request_id.clone(),
                 ahand_protocol::FileErrorCode::PolicyDenied,
                 "",
                 &reason,
             ));
         }
-        SessionDecision::Allow | SessionDecision::NeedsApproval { .. } => {
-            let response = file_mgr.handle(req).await;
-            reply(response);
+        SessionDecision::Allow => {
+            let response = file_mgr.handle(&req).await;
+            send_file_response(response);
+        }
+        SessionDecision::NeedsApproval {
+            reason,
+            previous_refusals,
+        } => {
+            info!(
+                request_id = %req.request_id,
+                reason = %reason,
+                "file request needs approval (strict mode)"
+            );
+
+            let (approval_req, approval_rx) = approval_mgr
+                .submit(synthetic_req, caller_uid, reason, previous_refusals)
+                .await;
+
+            // Send ApprovalRequest to cloud via WS.
+            let approval_env = Envelope {
+                device_id: device_id.to_string(),
+                msg_id: new_msg_id(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::ApprovalRequest(approval_req.clone())),
+                ..Default::default()
+            };
+            let _ = tx.send(approval_env.clone());
+            let _ = approval_broadcast_tx.send(approval_env);
+
+            // Wait for the approval response (or timeout) before dispatching.
+            // Unlike handle_job_request we can't spawn this into a detached
+            // task because FileResponse delivery is synchronous from the
+            // client's point of view — we stay inside this async function
+            // for the whole approval cycle.
+            let tx_clone = (*tx).clone();
+            let file_mgr_clone = Arc::clone(file_mgr);
+            let amgr = Arc::clone(approval_mgr);
+            let did = device_id.to_string();
+            let timeout = amgr.default_timeout();
+            let request_id = req.request_id.clone();
+
+            tokio::spawn(async move {
+                let reply = |resp: ahand_protocol::FileResponse| {
+                    let env = Envelope {
+                        device_id: did.clone(),
+                        msg_id: new_msg_id(),
+                        ts_ms: now_ms(),
+                        payload: Some(envelope::Payload::FileResponse(resp)),
+                        ..Default::default()
+                    };
+                    let _ = tx_clone.send(env);
+                };
+
+                let approved = match tokio::time::timeout(timeout, approval_rx).await {
+                    Ok(Ok(resp)) if resp.approved => {
+                        info!(request_id = %request_id, "file approval granted");
+                        true
+                    }
+                    Ok(Ok(resp)) => {
+                        info!(request_id = %request_id, "file approval denied");
+                        amgr.expire(&request_id).await;
+                        let reason = if resp.reason.is_empty() {
+                            "approval denied".to_string()
+                        } else {
+                            format!("approval denied: {}", resp.reason)
+                        };
+                        reply(crate::file_manager::error_response(
+                            request_id.clone(),
+                            ahand_protocol::FileErrorCode::PolicyDenied,
+                            "",
+                            &reason,
+                        ));
+                        false
+                    }
+                    _ => {
+                        info!(request_id = %request_id, "file approval timed out");
+                        amgr.expire(&request_id).await;
+                        reply(crate::file_manager::error_response(
+                            request_id.clone(),
+                            ahand_protocol::FileErrorCode::PolicyDenied,
+                            "",
+                            "approval timed out",
+                        ));
+                        false
+                    }
+                };
+
+                if approved {
+                    let response = file_mgr_clone.handle(&req).await;
+                    reply(response);
+                }
+            });
         }
     }
 }
