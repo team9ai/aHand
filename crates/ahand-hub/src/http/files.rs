@@ -26,25 +26,48 @@ use crate::state::AppState;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
+/// Hard cap on simultaneously in-flight file requests across all devices.
+/// Picked high enough to never bite a dashboard user under normal load, low
+/// enough to stop a malicious client from leaking 30-second waiters.
+const MAX_PENDING_FILE_REQUESTS: usize = 1024;
+
+/// Error returned when `PendingFileRequests::register` cannot accept a new
+/// waiter because the table is at capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingFileRequestsAtCapacity;
 
 /// Tracks in-flight file requests so the device_gateway can resolve them when a
 /// FileResponse arrives. Keyed by `(device_id, request_id)` to prevent cross
 /// contamination between devices that happen to pick colliding request IDs.
-#[derive(Default)]
+///
+/// Admission control: `register` caps inserts at `MAX_PENDING_FILE_REQUESTS`
+/// to prevent an authenticated client from retaining arbitrarily many
+/// 30-second waiters on the hub.
 pub struct PendingFileRequests {
     pending: DashMap<(String, String), oneshot::Sender<FileResponse>>,
+    capacity: usize,
 }
 
 impl PendingFileRequests {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            pending: DashMap::new(),
+            capacity,
+        }
+    }
+
     pub fn register(
         &self,
         device_id: &str,
         request_id: &str,
-    ) -> oneshot::Receiver<FileResponse> {
+    ) -> Result<oneshot::Receiver<FileResponse>, PendingFileRequestsAtCapacity> {
+        if self.pending.len() >= self.capacity {
+            return Err(PendingFileRequestsAtCapacity);
+        }
         let (tx, rx) = oneshot::channel();
         self.pending
             .insert((device_id.to_string(), request_id.to_string()), tx);
-        rx
+        Ok(rx)
     }
 
     pub fn resolve(&self, device_id: &str, request_id: &str, response: FileResponse) {
@@ -59,6 +82,17 @@ impl PendingFileRequests {
     pub fn cancel(&self, device_id: &str, request_id: &str) {
         self.pending
             .remove(&(device_id.to_string(), request_id.to_string()));
+    }
+
+    #[cfg(test)]
+    pub fn in_flight(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+impl Default for PendingFileRequests {
+    fn default() -> Self {
+        Self::new(MAX_PENDING_FILE_REQUESTS)
     }
 }
 
@@ -101,7 +135,14 @@ pub async fn file_operation(
 
     let rx = state
         .pending_file_requests
-        .register(&device_id, &request.request_id);
+        .register(&device_id, &request.request_id)
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "FILE_REQUESTS_SATURATED",
+                "hub pending file-request table is at capacity; retry shortly",
+            )
+        })?;
 
     let request_id = request.request_id.clone();
     let envelope = ahand_protocol::Envelope {

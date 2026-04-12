@@ -86,7 +86,7 @@
     {
       "id": 13,
       "subject": "T13: Admission control on PendingFileRequests (cap inflight waiters)",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [12],
       "description": "Cap `PendingFileRequests` at a configurable max (default 1024). Once the table is full, return a 503 `TOO_MANY_REQUESTS` error from the file endpoint. Addresses review issue #12.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib\", \"acceptanceCriteria\": [\"Hard cap enforced (default 1024)\", \"New request at capacity returns 503 with a stable error code\", \"New test covers the saturation path\"]}\n```"
     },
