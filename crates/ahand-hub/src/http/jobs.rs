@@ -316,7 +316,8 @@ impl JobRuntime {
             }
             Some(ahand_protocol::envelope::Payload::FileResponse(response)) => {
                 let request_id = response.request_id.clone();
-                self.pending_file_requests.resolve(&request_id, response);
+                self.pending_file_requests
+                    .resolve(device_id, &request_id, response);
             }
             _ => {}
         }

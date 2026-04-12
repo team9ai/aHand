@@ -49,13 +49,13 @@
     {
       "id": 7,
       "subject": "T7: Text read respects target_end / max_bytes mid-line",
-      "status": "pending",
+      "status": "completed",
       "description": "Current pagination stops only at line boundaries, so `target_end` at column 5 still returns the whole line and `max_bytes=120` can return up to the next newline. Rework the loop to evaluate stop conditions per byte, truncating the current line to the exact stop point. Addresses review issue #7.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"target_end at column 5 of line N returns lines 1..N-1 plus 5 bytes of line N\", \"max_bytes=X stops at exactly X bytes consumed, not at the next newline\", \"New tests for both mid-line scenarios\", \"Existing text read tests still pass\"]}\n```"
     },
     {
       "id": 8,
       "subject": "T8: Text read reports raw on-disk byte positions (not decoded buffer offsets)",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [7],
       "description": "Compute line offsets and all reported positions (start_byte, target_end resolution, PositionInfo.byte_in_file, remaining_bytes) on the raw file bytes, then decode only the output slices. This keeps the proto's `byte_in_file` contract honest for GBK/Shift-JIS/etc. Addresses review issue #8.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"Line offsets computed on raw bytes\", \"start_pos/end_pos/byte_in_file/remaining_bytes reported in raw bytes\", \"New test: GBK file with non-UTF-8 cursor position round-trips correctly\", \"Existing UTF-8 tests still pass\"]}\n```"
     },
@@ -74,13 +74,13 @@
     {
       "id": 11,
       "subject": "T11: Honor no_follow_symlink in write/edit/chmod",
-      "status": "pending",
+      "status": "completed",
       "description": "The proto exposes `no_follow_symlink` on FileWrite, FileEdit, and FileChmod, but handlers ignore it. Use `symlink_metadata` to detect symlinks when the flag is set, and error out with a clear message before touching the filesystem. For chmod specifically, branch on the flag to avoid following symlinks when applying mode bits. Addresses review issue #14.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/write_ops.rs\", \"crates/ahandd/src/file_manager/fs_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops symlink\", \"acceptanceCriteria\": [\"Write/Edit/Chmod with no_follow_symlink=true on a symlink returns an error and does not modify the target\", \"Same operations with no_follow_symlink=false still work\", \"New tests for all three handlers\"]}\n```"
     },
     {
       "id": 12,
       "subject": "T12: Key PendingFileRequests by (device_id, request_id)",
-      "status": "pending",
+      "status": "completed",
       "description": "`PendingFileRequests` currently keys on `request_id` alone, so two devices with a colliding caller-chosen ID cross-contaminate. Change the DashMap key to `(String, String)`, update registration and resolution sites, and reject duplicate registrations instead of silently overwriting. Addresses review issue #4.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\", \"crates/ahand-hub/src/http/jobs.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib\", \"acceptanceCriteria\": [\"Map keyed by (device_id, request_id) tuple\", \"Duplicate register returns an error instead of overwriting\", \"handle_device_frame passes device_id into resolve()\", \"Existing hub lib tests still pass\"]}\n```"
     },
     {

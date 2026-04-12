@@ -28,27 +28,37 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
 /// Tracks in-flight file requests so the device_gateway can resolve them when a
-/// FileResponse arrives.
+/// FileResponse arrives. Keyed by `(device_id, request_id)` to prevent cross
+/// contamination between devices that happen to pick colliding request IDs.
 #[derive(Default)]
 pub struct PendingFileRequests {
-    pending: DashMap<String, oneshot::Sender<FileResponse>>,
+    pending: DashMap<(String, String), oneshot::Sender<FileResponse>>,
 }
 
 impl PendingFileRequests {
-    pub fn register(&self, request_id: String) -> oneshot::Receiver<FileResponse> {
+    pub fn register(
+        &self,
+        device_id: &str,
+        request_id: &str,
+    ) -> oneshot::Receiver<FileResponse> {
         let (tx, rx) = oneshot::channel();
-        self.pending.insert(request_id, tx);
+        self.pending
+            .insert((device_id.to_string(), request_id.to_string()), tx);
         rx
     }
 
-    pub fn resolve(&self, request_id: &str, response: FileResponse) {
-        if let Some((_, tx)) = self.pending.remove(request_id) {
+    pub fn resolve(&self, device_id: &str, request_id: &str, response: FileResponse) {
+        if let Some((_, tx)) = self
+            .pending
+            .remove(&(device_id.to_string(), request_id.to_string()))
+        {
             let _ = tx.send(response);
         }
     }
 
-    pub fn cancel(&self, request_id: &str) {
-        self.pending.remove(request_id);
+    pub fn cancel(&self, device_id: &str, request_id: &str) {
+        self.pending
+            .remove(&(device_id.to_string(), request_id.to_string()));
     }
 }
 
@@ -91,7 +101,7 @@ pub async fn file_operation(
 
     let rx = state
         .pending_file_requests
-        .register(request.request_id.clone());
+        .register(&device_id, &request.request_id);
 
     let request_id = request.request_id.clone();
     let envelope = ahand_protocol::Envelope {
@@ -106,7 +116,9 @@ pub async fn file_operation(
     };
 
     if let Err(err) = state.connections.send(&device_id, envelope).await {
-        state.pending_file_requests.cancel(&request_id);
+        state
+            .pending_file_requests
+            .cancel(&device_id, &request_id);
         return Err(err.into());
     }
 
@@ -114,13 +126,17 @@ pub async fn file_operation(
     let response = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
-            state.pending_file_requests.cancel(&request_id);
+            state
+                .pending_file_requests
+                .cancel(&device_id, &request_id);
             return Err(ApiError::internal(
                 "file response channel closed unexpectedly",
             ));
         }
         Err(_) => {
-            state.pending_file_requests.cancel(&request_id);
+            state
+                .pending_file_requests
+                .cancel(&device_id, &request_id);
             return Err(ApiError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "DEVICE_TIMEOUT",
