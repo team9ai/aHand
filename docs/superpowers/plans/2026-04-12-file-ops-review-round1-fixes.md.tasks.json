@@ -10,7 +10,7 @@
     {
       "id": 1,
       "subject": "T1: Replace base64 wrapper with application/x-protobuf on POST /files",
-      "status": "pending",
+      "status": "completed",
       "description": "Change the file operation endpoint to accept raw protobuf bytes and return raw protobuf bytes, instead of wrapping them in a JSON `{proto_b64: ...}` envelope. Delete the hand-rolled base64 module (also fixes review issue #27 about malformed padding). Addresses review issue #15.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\"], \"verifyCommand\": \"cargo build -p ahand-hub\", \"acceptanceCriteria\": [\"file_operation accepts axum::body::Bytes with content-type application/x-protobuf\", \"Response body is raw proto with the same content-type\", \"simple_base64 module removed entirely\", \"FileOperationRequest / FileOperationResponse structs removed\", \"cargo build -p ahand-hub succeeds\"]}\n```"
     },
     {
