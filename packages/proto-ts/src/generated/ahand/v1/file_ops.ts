@@ -190,19 +190,19 @@ export function deleteModeToJSON(object: DeleteMode): string {
 }
 
 export enum AclEntryType {
-  ACL_ENTRY_ALLOW = 0,
-  ACL_ENTRY_DENY = 1,
+  ACL_ENTRY_TYPE_ALLOW = 0,
+  ACL_ENTRY_TYPE_DENY = 1,
   UNRECOGNIZED = -1,
 }
 
 export function aclEntryTypeFromJSON(object: any): AclEntryType {
   switch (object) {
     case 0:
-    case "ACL_ENTRY_ALLOW":
-      return AclEntryType.ACL_ENTRY_ALLOW;
+    case "ACL_ENTRY_TYPE_ALLOW":
+      return AclEntryType.ACL_ENTRY_TYPE_ALLOW;
     case 1:
-    case "ACL_ENTRY_DENY":
-      return AclEntryType.ACL_ENTRY_DENY;
+    case "ACL_ENTRY_TYPE_DENY":
+      return AclEntryType.ACL_ENTRY_TYPE_DENY;
     case -1:
     case "UNRECOGNIZED":
     default:
@@ -212,10 +212,10 @@ export function aclEntryTypeFromJSON(object: any): AclEntryType {
 
 export function aclEntryTypeToJSON(object: AclEntryType): string {
   switch (object) {
-    case AclEntryType.ACL_ENTRY_ALLOW:
-      return "ACL_ENTRY_ALLOW";
-    case AclEntryType.ACL_ENTRY_DENY:
-      return "ACL_ENTRY_DENY";
+    case AclEntryType.ACL_ENTRY_TYPE_ALLOW:
+      return "ACL_ENTRY_TYPE_ALLOW";
+    case AclEntryType.ACL_ENTRY_TYPE_DENY:
+      return "ACL_ENTRY_TYPE_DENY";
     case AclEntryType.UNRECOGNIZED:
     default:
       return "UNRECOGNIZED";
@@ -268,63 +268,63 @@ export function fileTypeToJSON(object: FileType): string {
 }
 
 export enum FileErrorCode {
-  FILE_ERROR_UNSPECIFIED = 0,
-  FILE_ERROR_NOT_FOUND = 1,
-  FILE_ERROR_PERMISSION_DENIED = 2,
-  FILE_ERROR_ALREADY_EXISTS = 3,
-  FILE_ERROR_NOT_A_DIRECTORY = 4,
-  FILE_ERROR_IS_A_DIRECTORY = 5,
-  FILE_ERROR_NOT_EMPTY = 6,
-  FILE_ERROR_TOO_LARGE = 7,
-  FILE_ERROR_INVALID_PATH = 8,
-  FILE_ERROR_IO = 9,
-  FILE_ERROR_ENCODING = 10,
-  FILE_ERROR_MULTIPLE_MATCHES = 11,
-  FILE_ERROR_POLICY_DENIED = 12,
+  FILE_ERROR_CODE_UNSPECIFIED = 0,
+  FILE_ERROR_CODE_NOT_FOUND = 1,
+  FILE_ERROR_CODE_PERMISSION_DENIED = 2,
+  FILE_ERROR_CODE_ALREADY_EXISTS = 3,
+  FILE_ERROR_CODE_NOT_A_DIRECTORY = 4,
+  FILE_ERROR_CODE_IS_A_DIRECTORY = 5,
+  FILE_ERROR_CODE_NOT_EMPTY = 6,
+  FILE_ERROR_CODE_TOO_LARGE = 7,
+  FILE_ERROR_CODE_INVALID_PATH = 8,
+  FILE_ERROR_CODE_IO = 9,
+  FILE_ERROR_CODE_ENCODING = 10,
+  FILE_ERROR_CODE_MULTIPLE_MATCHES = 11,
+  FILE_ERROR_CODE_POLICY_DENIED = 12,
   UNRECOGNIZED = -1,
 }
 
 export function fileErrorCodeFromJSON(object: any): FileErrorCode {
   switch (object) {
     case 0:
-    case "FILE_ERROR_UNSPECIFIED":
-      return FileErrorCode.FILE_ERROR_UNSPECIFIED;
+    case "FILE_ERROR_CODE_UNSPECIFIED":
+      return FileErrorCode.FILE_ERROR_CODE_UNSPECIFIED;
     case 1:
-    case "FILE_ERROR_NOT_FOUND":
-      return FileErrorCode.FILE_ERROR_NOT_FOUND;
+    case "FILE_ERROR_CODE_NOT_FOUND":
+      return FileErrorCode.FILE_ERROR_CODE_NOT_FOUND;
     case 2:
-    case "FILE_ERROR_PERMISSION_DENIED":
-      return FileErrorCode.FILE_ERROR_PERMISSION_DENIED;
+    case "FILE_ERROR_CODE_PERMISSION_DENIED":
+      return FileErrorCode.FILE_ERROR_CODE_PERMISSION_DENIED;
     case 3:
-    case "FILE_ERROR_ALREADY_EXISTS":
-      return FileErrorCode.FILE_ERROR_ALREADY_EXISTS;
+    case "FILE_ERROR_CODE_ALREADY_EXISTS":
+      return FileErrorCode.FILE_ERROR_CODE_ALREADY_EXISTS;
     case 4:
-    case "FILE_ERROR_NOT_A_DIRECTORY":
-      return FileErrorCode.FILE_ERROR_NOT_A_DIRECTORY;
+    case "FILE_ERROR_CODE_NOT_A_DIRECTORY":
+      return FileErrorCode.FILE_ERROR_CODE_NOT_A_DIRECTORY;
     case 5:
-    case "FILE_ERROR_IS_A_DIRECTORY":
-      return FileErrorCode.FILE_ERROR_IS_A_DIRECTORY;
+    case "FILE_ERROR_CODE_IS_A_DIRECTORY":
+      return FileErrorCode.FILE_ERROR_CODE_IS_A_DIRECTORY;
     case 6:
-    case "FILE_ERROR_NOT_EMPTY":
-      return FileErrorCode.FILE_ERROR_NOT_EMPTY;
+    case "FILE_ERROR_CODE_NOT_EMPTY":
+      return FileErrorCode.FILE_ERROR_CODE_NOT_EMPTY;
     case 7:
-    case "FILE_ERROR_TOO_LARGE":
-      return FileErrorCode.FILE_ERROR_TOO_LARGE;
+    case "FILE_ERROR_CODE_TOO_LARGE":
+      return FileErrorCode.FILE_ERROR_CODE_TOO_LARGE;
     case 8:
-    case "FILE_ERROR_INVALID_PATH":
-      return FileErrorCode.FILE_ERROR_INVALID_PATH;
+    case "FILE_ERROR_CODE_INVALID_PATH":
+      return FileErrorCode.FILE_ERROR_CODE_INVALID_PATH;
     case 9:
-    case "FILE_ERROR_IO":
-      return FileErrorCode.FILE_ERROR_IO;
+    case "FILE_ERROR_CODE_IO":
+      return FileErrorCode.FILE_ERROR_CODE_IO;
     case 10:
-    case "FILE_ERROR_ENCODING":
-      return FileErrorCode.FILE_ERROR_ENCODING;
+    case "FILE_ERROR_CODE_ENCODING":
+      return FileErrorCode.FILE_ERROR_CODE_ENCODING;
     case 11:
-    case "FILE_ERROR_MULTIPLE_MATCHES":
-      return FileErrorCode.FILE_ERROR_MULTIPLE_MATCHES;
+    case "FILE_ERROR_CODE_MULTIPLE_MATCHES":
+      return FileErrorCode.FILE_ERROR_CODE_MULTIPLE_MATCHES;
     case 12:
-    case "FILE_ERROR_POLICY_DENIED":
-      return FileErrorCode.FILE_ERROR_POLICY_DENIED;
+    case "FILE_ERROR_CODE_POLICY_DENIED":
+      return FileErrorCode.FILE_ERROR_CODE_POLICY_DENIED;
     case -1:
     case "UNRECOGNIZED":
     default:
@@ -334,32 +334,32 @@ export function fileErrorCodeFromJSON(object: any): FileErrorCode {
 
 export function fileErrorCodeToJSON(object: FileErrorCode): string {
   switch (object) {
-    case FileErrorCode.FILE_ERROR_UNSPECIFIED:
-      return "FILE_ERROR_UNSPECIFIED";
-    case FileErrorCode.FILE_ERROR_NOT_FOUND:
-      return "FILE_ERROR_NOT_FOUND";
-    case FileErrorCode.FILE_ERROR_PERMISSION_DENIED:
-      return "FILE_ERROR_PERMISSION_DENIED";
-    case FileErrorCode.FILE_ERROR_ALREADY_EXISTS:
-      return "FILE_ERROR_ALREADY_EXISTS";
-    case FileErrorCode.FILE_ERROR_NOT_A_DIRECTORY:
-      return "FILE_ERROR_NOT_A_DIRECTORY";
-    case FileErrorCode.FILE_ERROR_IS_A_DIRECTORY:
-      return "FILE_ERROR_IS_A_DIRECTORY";
-    case FileErrorCode.FILE_ERROR_NOT_EMPTY:
-      return "FILE_ERROR_NOT_EMPTY";
-    case FileErrorCode.FILE_ERROR_TOO_LARGE:
-      return "FILE_ERROR_TOO_LARGE";
-    case FileErrorCode.FILE_ERROR_INVALID_PATH:
-      return "FILE_ERROR_INVALID_PATH";
-    case FileErrorCode.FILE_ERROR_IO:
-      return "FILE_ERROR_IO";
-    case FileErrorCode.FILE_ERROR_ENCODING:
-      return "FILE_ERROR_ENCODING";
-    case FileErrorCode.FILE_ERROR_MULTIPLE_MATCHES:
-      return "FILE_ERROR_MULTIPLE_MATCHES";
-    case FileErrorCode.FILE_ERROR_POLICY_DENIED:
-      return "FILE_ERROR_POLICY_DENIED";
+    case FileErrorCode.FILE_ERROR_CODE_UNSPECIFIED:
+      return "FILE_ERROR_CODE_UNSPECIFIED";
+    case FileErrorCode.FILE_ERROR_CODE_NOT_FOUND:
+      return "FILE_ERROR_CODE_NOT_FOUND";
+    case FileErrorCode.FILE_ERROR_CODE_PERMISSION_DENIED:
+      return "FILE_ERROR_CODE_PERMISSION_DENIED";
+    case FileErrorCode.FILE_ERROR_CODE_ALREADY_EXISTS:
+      return "FILE_ERROR_CODE_ALREADY_EXISTS";
+    case FileErrorCode.FILE_ERROR_CODE_NOT_A_DIRECTORY:
+      return "FILE_ERROR_CODE_NOT_A_DIRECTORY";
+    case FileErrorCode.FILE_ERROR_CODE_IS_A_DIRECTORY:
+      return "FILE_ERROR_CODE_IS_A_DIRECTORY";
+    case FileErrorCode.FILE_ERROR_CODE_NOT_EMPTY:
+      return "FILE_ERROR_CODE_NOT_EMPTY";
+    case FileErrorCode.FILE_ERROR_CODE_TOO_LARGE:
+      return "FILE_ERROR_CODE_TOO_LARGE";
+    case FileErrorCode.FILE_ERROR_CODE_INVALID_PATH:
+      return "FILE_ERROR_CODE_INVALID_PATH";
+    case FileErrorCode.FILE_ERROR_CODE_IO:
+      return "FILE_ERROR_CODE_IO";
+    case FileErrorCode.FILE_ERROR_CODE_ENCODING:
+      return "FILE_ERROR_CODE_ENCODING";
+    case FileErrorCode.FILE_ERROR_CODE_MULTIPLE_MATCHES:
+      return "FILE_ERROR_CODE_MULTIPLE_MATCHES";
+    case FileErrorCode.FILE_ERROR_CODE_POLICY_DENIED:
+      return "FILE_ERROR_CODE_POLICY_DENIED";
     case FileErrorCode.UNRECOGNIZED:
     default:
       return "UNRECOGNIZED";

@@ -15,6 +15,7 @@ use crate::browser::BrowserManager;
 use crate::config::Config;
 use crate::device_identity::DeviceIdentity;
 use crate::executor::{self, EnvelopeSink as _};
+use crate::file_manager::FileManager;
 use crate::outbox::{Outbox, prepare_outbound};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
@@ -65,6 +66,7 @@ pub async fn run(
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
+    file_mgr: Arc<FileManager>,
 ) -> anyhow::Result<()> {
     let hub_config = config.hub_config();
     let identity_path = hub_config
@@ -95,6 +97,7 @@ pub async fn run(
             &approval_mgr,
             &approval_broadcast_tx,
             &browser_mgr,
+            &file_mgr,
         )
         .await
         {
@@ -127,6 +130,7 @@ async fn connect(
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
+    file_mgr: &Arc<FileManager>,
 ) -> anyhow::Result<()> {
     let auth_modes = hello_auth_modes(bearer_token.as_deref());
     let mut last_handshake_error = None;
@@ -144,6 +148,7 @@ async fn connect(
             approval_mgr,
             approval_broadcast_tx,
             browser_mgr,
+            file_mgr,
         )
         .await
         {
@@ -172,6 +177,7 @@ async fn connect_with_auth(
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
+    file_mgr: &Arc<FileManager>,
 ) -> Result<(), ConnectError> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(url)
         .await
@@ -336,6 +342,9 @@ async fn connect_with_auth(
             Some(envelope::Payload::BrowserRequest(req)) => {
                 handle_browser_request(device_id, caller_uid, &req, &tx, session_mgr, browser_mgr)
                     .await;
+            }
+            Some(envelope::Payload::FileRequest(req)) => {
+                handle_file_request(device_id, caller_uid, &req, &tx, session_mgr, file_mgr).await;
             }
             Some(envelope::Payload::UpdateCommand(cmd)) => {
                 info!(update_id = %cmd.update_id, target = %cmd.target_version,
@@ -806,6 +815,94 @@ async fn handle_browser_request<T>(
             };
             let _ = tx.send(resp_env);
         }
+    }
+}
+
+async fn handle_file_request<T>(
+    device_id: &str,
+    caller_uid: &str,
+    req: &ahand_protocol::FileRequest,
+    tx: &T,
+    session_mgr: &Arc<SessionManager>,
+    file_mgr: &Arc<FileManager>,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    info!(
+        request_id = %req.request_id,
+        operation = ?req.operation.as_ref().map(file_op_name),
+        "received file request"
+    );
+
+    let reply = |resp: ahand_protocol::FileResponse| {
+        let env = Envelope {
+            device_id: device_id.to_string(),
+            msg_id: new_msg_id(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::FileResponse(resp)),
+            ..Default::default()
+        };
+        let _ = tx.send(env);
+    };
+
+    if !file_mgr.is_enabled() {
+        reply(crate::file_manager::error_response(
+            req.request_id.clone(),
+            ahand_protocol::FileErrorCode::PolicyDenied,
+            "",
+            "file operations are not enabled on this daemon",
+        ));
+        return;
+    }
+
+    // Session mode check — file operations always go through the same gate as other
+    // cloud-initiated tools. We synthesise a JobRequest with tool="file" so that
+    // the session manager can apply the caller's current policy.
+    let synthetic_req = ahand_protocol::JobRequest {
+        job_id: req.request_id.clone(),
+        tool: "file".to_string(),
+        args: req
+            .operation
+            .as_ref()
+            .map(|op| vec![file_op_name(op).to_string()])
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+
+    match session_mgr.check(&synthetic_req, caller_uid).await {
+        SessionDecision::Deny(reason) => {
+            warn!(request_id = %req.request_id, reason = %reason, "file request denied by session mode");
+            reply(crate::file_manager::error_response(
+                req.request_id.clone(),
+                ahand_protocol::FileErrorCode::PolicyDenied,
+                "",
+                &reason,
+            ));
+        }
+        SessionDecision::Allow | SessionDecision::NeedsApproval { .. } => {
+            let response = file_mgr.handle(req).await;
+            reply(response);
+        }
+    }
+}
+
+fn file_op_name(op: &ahand_protocol::file_request::Operation) -> &'static str {
+    use ahand_protocol::file_request::Operation;
+    match op {
+        Operation::ReadText(_) => "read_text",
+        Operation::ReadBinary(_) => "read_binary",
+        Operation::ReadImage(_) => "read_image",
+        Operation::Write(_) => "write",
+        Operation::Edit(_) => "edit",
+        Operation::Delete(_) => "delete",
+        Operation::Chmod(_) => "chmod",
+        Operation::Stat(_) => "stat",
+        Operation::List(_) => "list",
+        Operation::Glob(_) => "glob",
+        Operation::Mkdir(_) => "mkdir",
+        Operation::Copy(_) => "copy",
+        Operation::Move(_) => "move",
+        Operation::CreateSymlink(_) => "create_symlink",
     }
 }
 

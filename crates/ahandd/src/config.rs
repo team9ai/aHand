@@ -71,6 +71,59 @@ pub struct Config {
     /// Hub authentication configuration for authenticated Hello handshakes.
     #[serde(default)]
     pub hub: Option<HubConfig>,
+
+    /// File operation policy configuration.
+    #[serde(default)]
+    pub file_policy: Option<FilePolicyConfig>,
+}
+
+/// File operation policy configuration.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct FilePolicyConfig {
+    /// Enable file operations (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Allowed path patterns (glob syntax). Empty = deny all.
+    #[serde(default)]
+    pub path_allowlist: Vec<String>,
+
+    /// Denied path patterns (checked before allowlist).
+    #[serde(default)]
+    pub path_denylist: Vec<String>,
+
+    /// Maximum bytes for a single read operation.
+    #[serde(default = "default_max_read_bytes")]
+    pub max_read_bytes: u64,
+
+    /// Maximum bytes for a single write operation.
+    #[serde(default = "default_max_write_bytes")]
+    pub max_write_bytes: u64,
+
+    /// Paths that require STRICT approval regardless of session mode.
+    #[serde(default)]
+    pub dangerous_paths: Vec<String>,
+}
+
+fn default_max_read_bytes() -> u64 {
+    104_857_600 // 100MB
+}
+
+fn default_max_write_bytes() -> u64 {
+    104_857_600 // 100MB
+}
+
+impl Default for FilePolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path_allowlist: Vec::new(),
+            path_denylist: Vec::new(),
+            max_read_bytes: default_max_read_bytes(),
+            max_write_bytes: default_max_write_bytes(),
+            dangerous_paths: Vec::new(),
+        }
+    }
 }
 
 /// Hub authentication configuration.
