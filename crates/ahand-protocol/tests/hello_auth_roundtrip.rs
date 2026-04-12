@@ -115,6 +115,7 @@ fn hello_accepted_roundtrip() {
         payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(
             HelloAccepted {
                 auth_method: "ed25519".into(),
+                update_suggestion: None,
             },
         )),
         ..Default::default()
