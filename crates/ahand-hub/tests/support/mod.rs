@@ -19,8 +19,8 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use ahand_protocol::{
-    BootstrapAuth, CancelJob, Ed25519Auth, Envelope, Hello, HelloAccepted, HelloChallenge,
-    JobEvent, JobFinished, JobRequest, envelope, hello, job_event,
+    BootstrapAuth, CancelJob, Ed25519Auth, Envelope, FileRequest, FileResponse, Hello,
+    HelloAccepted, HelloChallenge, JobEvent, JobFinished, JobRequest, envelope, hello, job_event,
 };
 
 pub fn service_request(uri: &str) -> Request<Body> {
@@ -124,6 +124,10 @@ pub struct TestServer {
 impl TestServer {
     pub fn http_base_url(&self) -> &str {
         &self.base_http_url
+    }
+
+    pub fn state_ref(&self) -> &AppState {
+        &self.state
     }
 
     pub fn ws_url(&self, path: &str) -> String {
@@ -353,6 +357,40 @@ impl TestDevice {
                 exit_code,
                 error: error.into(),
             })),
+            ..Default::default()
+        };
+
+        self.socket
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                envelope.encode_to_vec().into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    pub async fn recv_file_request(&mut self) -> FileRequest {
+        while let Some(message) = self.socket.next().await {
+            let message = message.unwrap();
+            match message {
+                tokio_tungstenite::tungstenite::Message::Binary(data) => {
+                    let envelope = Envelope::decode(data.as_ref()).unwrap();
+                    if let Some(envelope::Payload::FileRequest(req)) = envelope.payload {
+                        return req;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        panic!("device socket closed before a file request arrived");
+    }
+
+    pub async fn send_file_response(&mut self, response: FileResponse) {
+        let envelope = Envelope {
+            device_id: self.device_id.clone(),
+            msg_id: format!("file-resp-{}", response.request_id),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::FileResponse(response)),
             ..Default::default()
         };
 

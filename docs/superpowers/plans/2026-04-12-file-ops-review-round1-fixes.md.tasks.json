@@ -111,7 +111,7 @@
     {
       "id": 17,
       "subject": "T17: Tests for crates/ahand-hub/src/http/files.rs (axum handler)",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [1, 12, 13],
       "description": "Add axum-level tests for the (post-T1) protobuf file operation handler: happy path via fake ConnectionRegistry + pending-request resolver, device offline → 409, timeout → 504, malformed protobuf body → 400, admission cap → 503. Addresses review issue #16.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/tests/http_files.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --test http_files\", \"acceptanceCriteria\": [\"Happy path test: request forwarded to fake device, response round-trips\", \"Device offline test\", \"Timeout test (with short timeout override)\", \"Malformed protobuf body test\", \"Admission cap test (from T13)\"]}\n```"
     },

@@ -215,6 +215,83 @@ pub fn error_response(request_id: String, message: impl Into<String>) -> FileRes
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ahand_protocol::{file_response, FileErrorCode as ProtoFileErrorCode};
+
+    fn ok_response(request_id: &str) -> FileResponse {
+        FileResponse {
+            request_id: request_id.to_string(),
+            result: Some(file_response::Result::Error(FileError {
+                code: ProtoFileErrorCode::Unspecified as i32,
+                message: "stub".into(),
+                path: String::new(),
+            })),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_file_requests_cross_device_collision_does_not_resolve_other_waiter() {
+        // T12 regression: two devices share the same caller-chosen
+        // request_id. Resolving (device_b, "req-1") must NOT deliver to
+        // the (device_a, "req-1") waiter.
+        let table = PendingFileRequests::default();
+        let rx_a = table.register("device-a", "req-1").unwrap();
+        let _rx_b = table.register("device-b", "req-1").unwrap();
+
+        table.resolve("device-b", "req-1", ok_response("req-1"));
+
+        // device-a waiter still pending.
+        let poll = tokio::time::timeout(std::time::Duration::from_millis(25), rx_a).await;
+        assert!(
+            poll.is_err(),
+            "device-a waiter should NOT have been resolved by device-b's response"
+        );
+        assert_eq!(table.in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_file_requests_resolves_correct_device() {
+        let table = PendingFileRequests::default();
+        let rx_a = table.register("device-a", "req-1").unwrap();
+        let _rx_b = table.register("device-b", "req-1").unwrap();
+
+        table.resolve("device-a", "req-1", ok_response("req-1"));
+
+        let resp = tokio::time::timeout(std::time::Duration::from_millis(100), rx_a)
+            .await
+            .expect("device-a waiter must resolve")
+            .expect("oneshot must deliver");
+        assert_eq!(resp.request_id, "req-1");
+    }
+
+    #[tokio::test]
+    async fn pending_file_requests_admission_control_rejects_over_capacity() {
+        // T13 regression: register returns AtCapacity once the table is
+        // full. We use a tiny capacity=2 so the test doesn't need 1024
+        // waiters.
+        let table = PendingFileRequests::new(2);
+        let _rx1 = table.register("device-1", "r1").unwrap();
+        let _rx2 = table.register("device-1", "r2").unwrap();
+        let third = table.register("device-1", "r3");
+        assert_eq!(third.err(), Some(PendingFileRequestsAtCapacity));
+    }
+
+    #[tokio::test]
+    async fn pending_file_requests_admission_control_accepts_after_cancel() {
+        let table = PendingFileRequests::new(2);
+        let _rx1 = table.register("device-1", "r1").unwrap();
+        let _rx2 = table.register("device-1", "r2").unwrap();
+        table.cancel("device-1", "r1");
+        // After cancelling one, there's room again.
+        let _rx3 = table
+            .register("device-1", "r3")
+            .expect("room available after cancel");
+        assert_eq!(table.in_flight(), 2);
+    }
+}
+
 // ── S3 large-file transfer ────────────────────────────────────────────────
 //
 // The `POST /files/upload-url` endpoint used to live here. It was removed
