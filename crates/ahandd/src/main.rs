@@ -2,6 +2,7 @@ mod ahand_client;
 mod approval;
 mod browser;
 mod browser_init;
+mod browser_setup;
 mod config;
 mod device_identity;
 mod executor;
