@@ -2,6 +2,7 @@ mod ahand_client;
 mod approval;
 mod browser;
 mod browser_setup;
+mod cli;
 mod config;
 mod device_identity;
 mod executor;
@@ -98,6 +99,8 @@ enum Cmd {
         #[arg(long)]
         step: Option<String>,
     },
+    /// Diagnose browser automation setup and report missing components
+    BrowserDoctor,
 }
 
 #[tokio::main]
@@ -110,19 +113,10 @@ async fn main() -> anyhow::Result<()> {
     if let Some(cmd) = &args.command {
         match cmd {
             Cmd::BrowserInit { force, step } => {
-                let progress = |event: browser_setup::ProgressEvent| {
-                    println!("  [{}] {}", event.step, event.message);
-                };
-                return match step {
-                    Some(s) => {
-                        browser_setup::run_step(s, *force, progress).await?;
-                        Ok(())
-                    }
-                    None => {
-                        browser_setup::run_all(*force, progress).await?;
-                        Ok(())
-                    }
-                };
+                return cli::browser_init::run(*force, step.clone()).await;
+            }
+            Cmd::BrowserDoctor => {
+                return cli::browser_doctor::run().await;
             }
         }
     }
