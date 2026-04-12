@@ -6,6 +6,7 @@
 
 use std::fs::Metadata;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -218,11 +219,17 @@ pub async fn handle_mkdir(
             .map_err(|e| io_to_file_error(e, resolved))?;
     }
 
+    #[cfg(unix)]
     if let Some(mode) = req.mode {
         let perms = std::fs::Permissions::from_mode(mode);
         tokio::fs::set_permissions(resolved, perms)
             .await
             .map_err(|e| io_to_file_error(e, resolved))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-Unix platforms, `mode` is advisory and silently ignored.
+        let _ = req.mode;
     }
 
     Ok(FileMkdirResult {
@@ -534,11 +541,23 @@ pub async fn handle_chmod(
                     "unix permission mode is required",
                 ));
             };
-            let items = set_unix_mode(resolved, mode, req.recursive).await?;
-            Ok(FileChmodResult {
-                path: resolved.to_string_lossy().into_owned(),
-                items_modified: items,
-            })
+            #[cfg(unix)]
+            {
+                let items = set_unix_mode(resolved, mode, req.recursive).await?;
+                Ok(FileChmodResult {
+                    path: resolved.to_string_lossy().into_owned(),
+                    items_modified: items,
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (mode, req.recursive);
+                Err(file_error(
+                    FileErrorCode::Unspecified,
+                    &req.path,
+                    "Unix mode chmod not supported on this platform",
+                ))
+            }
         }
         file_chmod::Permission::Windows(_acl) => {
             #[cfg(not(windows))]
@@ -563,6 +582,7 @@ pub async fn handle_chmod(
     }
 }
 
+#[cfg(unix)]
 async fn set_unix_mode(path: &Path, mode: u32, recursive: bool) -> Result<u32, FileError> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<u32, FileError> {
@@ -574,6 +594,7 @@ async fn set_unix_mode(path: &Path, mode: u32, recursive: bool) -> Result<u32, F
     .map_err(|e| file_error(FileErrorCode::Io, "", format!("chmod join error: {e}")))?
 }
 
+#[cfg(unix)]
 fn set_unix_mode_sync(
     path: &Path,
     mode: u32,
@@ -621,10 +642,22 @@ pub fn system_time_to_ms(time: Option<std::time::SystemTime>) -> u64 {
 }
 
 pub fn unix_permission_from_metadata(metadata: &Metadata) -> UnixPermission {
-    UnixPermission {
-        mode: Some(metadata.permissions().mode()),
-        owner: None,
-        group: None,
+    #[cfg(unix)]
+    {
+        UnixPermission {
+            mode: Some(metadata.permissions().mode()),
+            owner: None,
+            group: None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        UnixPermission {
+            mode: None,
+            owner: None,
+            group: None,
+        }
     }
 }
 

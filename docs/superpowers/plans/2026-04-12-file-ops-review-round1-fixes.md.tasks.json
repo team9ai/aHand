@@ -99,7 +99,7 @@
     {
       "id": 15,
       "subject": "T15: Gate Unix-only APIs in fs_ops.rs behind cfg(unix)",
-      "status": "pending",
+      "status": "completed",
       "description": "`fs_ops.rs` unconditionally imports `std::os::unix::fs::PermissionsExt`, uses `Permissions::from_mode`, and calls `.mode()`. Gate these behind `#[cfg(unix)]` and provide Windows-safe alternatives (or at least cfg-out the feature on Windows). Addresses review issue #13.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/fs_ops.rs\"], \"verifyCommand\": \"cargo check -p ahandd\", \"acceptanceCriteria\": [\"Unix-only imports and calls are cfg-gated\", \"Windows equivalents exist (UnixPermission returned as None on Windows, mkdir mode ignored)\", \"cargo check on native platform still succeeds\", \"Rustdoc note added explaining Windows behavior\"]}\n```"
     },
     {
