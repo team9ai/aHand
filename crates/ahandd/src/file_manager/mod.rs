@@ -321,6 +321,33 @@ pub fn file_error(code: FileErrorCode, path: &str, message: impl Into<String>) -
     }
 }
 
+/// When `no_follow_symlink` is set, refuse to operate on the final component
+/// if it is a symlink. This is the defense layer after policy has already
+/// done its parent-canonicalization — we want to make sure the handler
+/// itself never calls a follow-by-default syscall like `tokio::fs::write`
+/// on a symlink target.
+pub(super) async fn reject_if_final_component_is_symlink(
+    resolved: &std::path::Path,
+    req_path: &str,
+    no_follow_symlink: bool,
+) -> Result<(), FileError> {
+    if !no_follow_symlink {
+        return Ok(());
+    }
+    // symlink_metadata never follows. If the file doesn't exist at all, we
+    // let the downstream handler produce its own NotFound error.
+    if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await {
+        if metadata.file_type().is_symlink() {
+            return Err(file_error(
+                FileErrorCode::InvalidPath,
+                req_path,
+                "no_follow_symlink is set but the final component is a symlink",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn unimplemented_error(path: &str) -> FileError {
     file_error(
         FileErrorCode::Unspecified,

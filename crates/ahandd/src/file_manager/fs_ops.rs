@@ -543,6 +543,9 @@ pub async fn handle_chmod(
         ));
     };
 
+    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink)
+        .await?;
+
     match permission {
         file_chmod::Permission::Unix(unix) => {
             if unix.owner.is_some() || unix.group.is_some() {

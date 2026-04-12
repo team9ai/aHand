@@ -22,6 +22,8 @@ pub async fn handle_write(
     max_write_bytes: u64,
 ) -> Result<FileWriteResult, FileError> {
     ensure_encoding_supported(req.encoding.as_deref(), &req.path)?;
+    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink)
+        .await?;
 
     let Some(method) = &req.method else {
         return Err(file_error(
@@ -65,6 +67,8 @@ pub async fn handle_edit(
     max_write_bytes: u64,
 ) -> Result<FileEditResult, FileError> {
     ensure_encoding_supported(req.encoding.as_deref(), &req.path)?;
+    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink)
+        .await?;
 
     // Require existing file for edit.
     if !tokio::fs::try_exists(resolved).await.unwrap_or(false) {
