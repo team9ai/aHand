@@ -98,12 +98,70 @@ Full remote control of the device's desktop environment.
 | Agent | Structured actions (click coordinates, type text, read screen via OCR/screenshot) |
 | Human | Live VNC/RDP-style interactive session |
 
-**Current status:**
-- [ ] TODO: Screen capture protocol
-- [ ] TODO: Input event forwarding
-- [ ] TODO: Dashboard remote desktop viewer
+Detailed research and phased plan: [2026-04-12-remote-desktop-research.md](superpowers/specs/2026-04-12-remote-desktop-research.md) — compares screenshot polling / noVNC / RustDesk-style (libvpx + WebCodecs) approaches, locks in a multi-phase path from macOS JPEG prototype to production VP9 + WebCodecs.
 
-Detailed research and phased plan: [2026-04-12-remote-desktop-research.md](superpowers/specs/2026-04-12-remote-desktop-research.md) — compares screenshot polling / noVNC / RustDesk-style (libvpx + WebCodecs) approaches, proposes a two-phase prototype → production path.
+**Phase 1 — macOS view-only prototype (current target)**
+- [ ] Protocol: `DesktopCaptureConfig` + `DesktopFrame` messages, `JobRequest.desktop_capture` field, `PolicyState.allow_desktop_capture` field
+- [ ] Daemon: `desktop.rs` module with `xcap` capture + `image` JPEG encoding
+- [ ] Daemon: policy integration (default deny, explicit opt-in via config)
+- [ ] Daemon: macOS Screen Recording permission failure handling + docs
+- [ ] Hub: `DesktopFrameBus` (live-only broadcast, no history, no persistence)
+- [ ] Hub: `/api/desktop/token` endpoint, `/ws/desktop` gateway
+- [ ] Hub: `/api/jobs` rejects concurrent same-device desktop sessions (409)
+- [ ] Hub: jobs table `desktop_capture_config` JSONB column + migration
+- [ ] Hub: audit records `frame_count` + `total_bytes`
+- [ ] Dashboard: `device-desktop.tsx` + canvas + debug panel + stream hook
+- [ ] Dashboard: Desktop tab in `device-tabs.tsx`
+- [ ] Dashboard: 10-minute memory leak check (ImageBitmap cleanup verified)
+
+**Phase 1.5 — macOS input forwarding**
+- [ ] Protocol: `DesktopInputEvent` message (MouseMove / MouseButton / MouseScroll / KeyDown / KeyUp)
+- [ ] Protocol: coordinates use normalized [0,1] domain so resolution changes mid-session don't break mapping
+- [ ] Daemon: `enigo` crate integration for macOS input injection
+- [ ] Daemon: `register_desktop` with input channel (mirror of `register_interactive`)
+- [ ] Hub: `/ws/desktop` accepts inbound binary/text frames from dashboard → `DesktopInputEvent` envelopes
+- [ ] Dashboard: canvas mouse + keyboard event capture + normalization
+- [ ] Dashboard: basic keyboard support (ASCII + modifiers); IME/layout deferred to Phase 3
+
+**Phase 1.9 — macOS multi-monitor picker**
+- [ ] Protocol: `DesktopDisplayInfo` request/response messages
+- [ ] Daemon: enumerate displays via `xcap`
+- [ ] Dashboard: display picker UI above canvas; populate from daemon
+- [ ] Dashboard: switching displays restarts the session with new `display_index`
+
+**Phase 2 — Production encoding + Linux X11 + Windows**
+- [ ] Protocol: `DesktopCaptureConfig.codec` field, `DesktopCodecNegotiate` message, `DesktopKeyframeRequest` message
+- [ ] Daemon: libvpx VP9 encoder (realtime/CBR mode, `rc_dropframe_thresh=25`) — reference [RustDesk `libs/scrap/src/common/vpxcodec.rs`](https://github.com/rustdesk/rustdesk/blob/master/libs/scrap/src/common/vpxcodec.rs)
+- [ ] Daemon: Linux X11 capture backend via `xcap` (or RustDesk-style XCB SHM if performance demands it)
+- [ ] Daemon: Windows capture backend via `xcap` (or DXGI Desktop Duplication for performance)
+- [ ] Dashboard: WebCodecs `VideoDecoder` integration replaces the JPEG + `createImageBitmap` path
+- [ ] Dashboard: automatic WS reconnection with backoff (terminate + rejoin on drop)
+- [ ] Hub: codec-aware routing (VP9 bytes are still opaque envelope payload, but size assertions / rate limits differ)
+- [ ] Acceptance: 30 fps at < 5 Mbps on typical LAN, sub-100ms glass-to-glass latency
+
+**Phase 2W — Generic window-scoped capture (non-browser apps)**
+- [ ] Protocol: `DesktopCaptureConfig.target` oneof (display vs window), `WindowRef` message
+- [ ] Daemon: window enumeration API — macOS `CGWindowListCopyWindowInfo`, X11 composite extension, Windows `EnumWindows`
+- [ ] Daemon: per-window capture — macOS `CGWindowListCreateImage`, X11 `XCompositeNameWindowPixmap`, Windows `PrintWindow`/`BitBlt`
+- [ ] Daemon: input forwarding scoped to target window (bring-to-front + window-relative coordinate mapping; macOS may require Accessibility API)
+- [ ] Dashboard: window picker UI listing available windows from daemon
+- [ ] Docs: clear guidance — for browsers, use the Browser tab (CDP live view from Section 2 of this roadmap); for other apps, use window capture
+
+**Phase 2.5 — Linux Wayland + multi-observer**
+- [ ] Daemon: Wayland capture via `xdg-desktop-portal` ScreenCast + PipeWire (with-display path)
+- [ ] Daemon: Wayland headless path via `uinput` helper process (separate privileged process)
+- [ ] Daemon: Wayland input injection via portal RemoteDesktop or uinput
+- [ ] Hub: `DesktopFrameBus` upgraded to support multiple concurrent subscribers per session (one capture, many viewers)
+- [ ] Dashboard: show current viewer count in debug panel
+
+**Phase 3 — Quality & hardening**
+- [ ] Daemon: adaptive QoS — fps / bitrate / keyframe interval feedback loop based on `DesktopSessionStats` (reference [RustDesk `src/server/video_qos.rs`](https://github.com/rustdesk/rustdesk/blob/master/src/server/video_qos.rs))
+- [ ] Daemon: hardware encoding (NVENC / VAAPI / AMF on Linux/Windows; VideoToolbox on macOS) via ffmpeg or `rustdesk-org/hwcodec`
+- [ ] Daemon: clipboard sync (new protocol message family, piggybacks on desktop session)
+- [ ] Daemon: file drag-and-drop (integrates with File Operations work from roadmap Section 3)
+- [ ] Daemon: keyboard layout mapping + IME support (reference RustDesk `libs/enigo/src/macos/macos_impl.rs` for TIS layout-aware translation)
+- [ ] Hub: session recording to persistent storage (opt-in, audited)
+- [ ] Dashboard: clipboard UI, file drag-drop, recording playback
 
 ### 5. Local MCP Execution
 
