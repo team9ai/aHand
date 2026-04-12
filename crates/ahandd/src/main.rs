@@ -1,7 +1,6 @@
 mod ahand_client;
 mod approval;
 mod browser;
-mod browser_init;
 mod browser_setup;
 mod config;
 mod device_identity;
@@ -95,6 +94,9 @@ enum Cmd {
         /// Force reinstall (clean existing installation first)
         #[arg(long)]
         force: bool,
+        /// Run only a single step: node or playwright
+        #[arg(long)]
+        step: Option<String>,
     },
 }
 
@@ -107,8 +109,20 @@ async fn main() -> anyhow::Result<()> {
     // Handle subcommands that don't need daemon setup.
     if let Some(cmd) = &args.command {
         match cmd {
-            Cmd::BrowserInit { force } => {
-                return browser_init::run(*force).await;
+            Cmd::BrowserInit { force, step } => {
+                let progress = |event: browser_setup::ProgressEvent| {
+                    println!("  [{}] {}", event.step, event.message);
+                };
+                return match step {
+                    Some(s) => {
+                        browser_setup::run_step(s, *force, progress).await?;
+                        Ok(())
+                    }
+                    None => {
+                        browser_setup::run_all(*force, progress).await?;
+                        Ok(())
+                    }
+                };
             }
         }
     }
