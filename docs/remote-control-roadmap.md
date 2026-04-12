@@ -62,6 +62,14 @@ Remote control of a browser instance on the device via Playwright.
     - Check newer `@playwright/cli` versions for server/daemon mode with exposed CDP
   - **Once CDP is reachable:** new hub WS endpoint `/ws/devices/{id}/cdp` transparently proxies CDP frames between dashboard and daemon. Dashboard uses `Page.startScreencast` for live frames and `Input.dispatchMouseEvent` / `Input.dispatchKeyEvent` for interaction. Canvas-based renderer in the Browser tab.
 - [ ] TODO: Human takeover handoff protocol (agent pauses, human operates, agent resumes)
+- [ ] TODO: Reduce browser install footprint (currently ~250–450 MB: Node.js v24 + `@playwright/cli` + Chromium).
+  - **Short-term (incremental):**
+    - Detect system Node.js ≥18 and reuse it; only download the bundled Node when the system lacks one. Expected install drops to ~100 MB on dev machines.
+    - Lazy install: trigger `browser-init` automatically on first browser command instead of requiring a manual subcommand. Users who never use browser features pay zero cost.
+  - **Long-term (rewrite, coupled with live browser view above):**
+    - Evaluate switching from `playwright-cli` to a Rust-native CDP client (`chromiumoxide` or similar). Drops Node.js entirely; only Chrome binary remains. Also unblocks the CDP proxy feature for live browser view, so this rewrite is the likely path to both goals.
+    - **Main loss to solve:** Playwright's accessibility snapshot with `@eN` element refs (agent-friendly). Need a selector cache in the daemon: when `snapshot` runs, assign IDs to elements and store their CSS selectors; look up the stored selector on subsequent `click`/`fill` references.
+    - Prototype chromiumoxide against current feature set before committing to the rewrite.
 
 ### 3. File Operations
 
