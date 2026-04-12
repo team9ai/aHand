@@ -79,12 +79,14 @@ impl FileManager {
     ) -> Result<file_response::Result, FileError> {
         match op {
             file_request::Operation::Stat(req) => {
-                let checked = self.policy.check_path(&req.path, false)?;
+                let checked =
+                    self.policy
+                        .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = fs_ops::handle_stat(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Stat(result))
             }
             file_request::Operation::List(req) => {
-                let checked = self.policy.check_path(&req.path, false)?;
+                let checked = self.policy.check_path(&req.path, false, false)?;
                 let result = fs_ops::handle_list(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::List(result))
             }
@@ -93,31 +95,37 @@ impl FileManager {
                 let base: Option<std::path::PathBuf> = if base_path_str.is_empty() {
                     None
                 } else {
-                    let checked = self.policy.check_path(base_path_str, false)?;
+                    let checked = self.policy.check_path(base_path_str, false, false)?;
                     Some(checked.resolved_path)
                 };
                 let result = fs_ops::handle_glob(req, base.as_deref()).await?;
                 Ok(file_response::Result::Glob(result))
             }
             file_request::Operation::Mkdir(req) => {
-                let checked = self.policy.check_path(&req.path, true)?;
+                let checked = self.policy.check_path(&req.path, true, false)?;
                 let result = fs_ops::handle_mkdir(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Mkdir(result))
             }
             file_request::Operation::ReadText(req) => {
-                let checked = self.policy.check_path(&req.path, false)?;
+                let checked =
+                    self.policy
+                        .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result =
                     text_read::handle_read_text(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::ReadText(result))
             }
             file_request::Operation::ReadBinary(req) => {
-                let checked = self.policy.check_path(&req.path, false)?;
+                let checked =
+                    self.policy
+                        .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result =
                     binary_read::handle_read_binary(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::ReadBinary(result))
             }
             file_request::Operation::ReadImage(req) => {
-                let checked = self.policy.check_path(&req.path, false)?;
+                let checked =
+                    self.policy
+                        .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = binary_read::handle_read_image(
                     req,
                     checked.resolved_path.as_path(),
@@ -127,7 +135,9 @@ impl FileManager {
                 Ok(file_response::Result::ReadImage(result))
             }
             file_request::Operation::Write(req) => {
-                let checked = self.policy.check_path(&req.path, true)?;
+                let checked =
+                    self.policy
+                        .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = write_ops::handle_write(
                     req,
                     checked.resolved_path.as_path(),
@@ -137,7 +147,9 @@ impl FileManager {
                 Ok(file_response::Result::Write(result))
             }
             file_request::Operation::Edit(req) => {
-                let checked = self.policy.check_path(&req.path, true)?;
+                let checked =
+                    self.policy
+                        .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = write_ops::handle_edit(
                     req,
                     checked.resolved_path.as_path(),
@@ -147,18 +159,22 @@ impl FileManager {
                 Ok(file_response::Result::Edit(result))
             }
             file_request::Operation::Delete(req) => {
-                let checked = self.policy.check_path(&req.path, true)?;
+                let checked =
+                    self.policy
+                        .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = fs_ops::handle_delete(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Delete(result))
             }
             file_request::Operation::Chmod(req) => {
-                let checked = self.policy.check_path(&req.path, true)?;
+                let checked =
+                    self.policy
+                        .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = fs_ops::handle_chmod(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Chmod(result))
             }
             file_request::Operation::Copy(req) => {
-                let source = self.policy.check_path(&req.source, false)?;
-                let dest = self.policy.check_path(&req.destination, true)?;
+                let source = self.policy.check_path(&req.source, false, false)?;
+                let dest = self.policy.check_path(&req.destination, true, false)?;
                 let result = fs_ops::handle_copy(
                     req,
                     source.resolved_path.as_path(),
@@ -168,8 +184,8 @@ impl FileManager {
                 Ok(file_response::Result::Copy(result))
             }
             file_request::Operation::Move(req) => {
-                let source = self.policy.check_path(&req.source, true)?;
-                let dest = self.policy.check_path(&req.destination, true)?;
+                let source = self.policy.check_path(&req.source, true, false)?;
+                let dest = self.policy.check_path(&req.destination, true, false)?;
                 let result = fs_ops::handle_move(
                     req,
                     source.resolved_path.as_path(),
@@ -179,7 +195,10 @@ impl FileManager {
                 Ok(file_response::Result::MoveResult(result))
             }
             file_request::Operation::CreateSymlink(req) => {
-                let checked = self.policy.check_path(&req.link_path, true)?;
+                // Symlinks are created (not followed); the destination at
+                // link_path must not be resolved through any pre-existing
+                // symlink sitting there, so we use no_follow_symlink=true.
+                let checked = self.policy.check_path(&req.link_path, true, true)?;
                 let result =
                     fs_ops::handle_create_symlink(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::CreateSymlink(result))

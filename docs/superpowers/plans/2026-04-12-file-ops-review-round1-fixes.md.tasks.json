@@ -16,7 +16,7 @@
     {
       "id": 2,
       "subject": "T2: Policy canonicalizes paths (resolve symlinks before allowlist check)",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [],
       "description": "`FilePolicyChecker::check_path` currently only does lexical normalization. Switch to canonicalizing existing paths (via `std::fs::canonicalize`) and, for paths that don't exist yet (Write/Mkdir/Copy/Move destinations), canonicalizing the deepest existing parent and re-joining the tail. Re-check the resolved path against allowlist and denylist. Addresses review issue #2.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/policy.rs\", \"crates/ahandd/src/file_manager/mod.rs\"], \"verifyCommand\": \"cargo test -p ahandd --lib file_manager::policy\", \"acceptanceCriteria\": [\"Existing paths are canonicalized before matching allowlist/denylist\", \"Non-existing paths canonicalize their deepest existing parent\", \"New test: symlink inside allowlist pointing at /etc/passwd is rejected\", \"Existing policy tests still pass\"]}\n```"
     },
