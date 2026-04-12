@@ -33,6 +33,7 @@ async fn build_hello_envelope_includes_ed25519_auth() {
         &identity,
         42,
         true,
+        false,
         &[1, 2, 3, 4],
         None,
     );
@@ -59,6 +60,7 @@ async fn build_hello_envelope_includes_bootstrap_auth() {
         "device-2",
         &identity,
         7,
+        false,
         false,
         &[9, 8, 7, 6],
         Some("bootstrap-token".into()),
@@ -100,6 +102,7 @@ async fn build_hello_envelope_advances_signed_at_ms_on_fast_reconnects() {
         &identity,
         0,
         false,
+        false,
         &[1, 2, 3, 4],
         None,
     );
@@ -107,6 +110,7 @@ async fn build_hello_envelope_advances_signed_at_ms_on_fast_reconnects() {
         "device-1",
         &identity,
         0,
+        false,
         false,
         &[5, 6, 7, 8],
         None,

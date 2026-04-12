@@ -195,6 +195,7 @@ async fn connect_with_auth(
         identity,
         last_ack,
         browser_mgr.is_enabled(),
+        file_mgr.is_enabled(),
         &challenge.nonce,
         match auth_mode {
             HelloAuthMode::Ed25519 => None,
@@ -400,6 +401,7 @@ pub fn build_hello_envelope(
     identity: &DeviceIdentity,
     last_ack: u64,
     browser_enabled: bool,
+    file_enabled: bool,
     challenge_nonce: &[u8],
     bearer_token: Option<String>,
 ) -> Envelope {
@@ -407,6 +409,9 @@ pub fn build_hello_envelope(
     let mut capabilities = vec!["exec".to_string()];
     if browser_enabled {
         capabilities.push("browser".to_string());
+    }
+    if file_enabled {
+        capabilities.push("file".to_string());
     }
 
     let mut hello = Hello {
