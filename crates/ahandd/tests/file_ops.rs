@@ -1773,3 +1773,390 @@ async fn chmod_chown_not_supported_returns_permission_denied() {
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::PermissionDenied as i32);
 }
+
+// ── T18: additional write/edit/fs edge tests ─────────────────────────────
+
+#[tokio::test]
+async fn file_write_string_replace_not_found_returns_error() {
+    // Round 1 #23: FileWrite (not FileEdit) path wasn't covered for the
+    // "old_string not found" case. FileWrite errors, FileEdit uses
+    // match_error instead.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("nf.txt");
+    fs::write(&file, "hello world").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::StringReplace(StringReplace {
+                old_string: "missing".into(),
+                new_string: "x".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::NotFound as i32);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "hello world");
+}
+
+#[tokio::test]
+async fn line_range_replace_start_line_past_eof_errors() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("short.txt");
+    fs::write(&file, "a\nb\nc\n").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::LineRangeReplace(LineRangeReplace {
+                start_line: 99,
+                end_line: 100,
+                new_content: "x".into(),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let _err = expect_error(resp);
+}
+
+#[tokio::test]
+async fn line_range_replace_end_line_clamped_past_total() {
+    // end_line > total_lines should clamp to the last line rather than
+    // erroring.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("three.txt");
+    fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::LineRangeReplace(LineRangeReplace {
+                start_line: 2,
+                end_line: 99,
+                new_content: "REST".into(),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_write(resp);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "alpha\nREST\n");
+}
+
+#[tokio::test]
+async fn byte_range_replace_at_eof_inserts() {
+    // Pure insert at EOF: byte_offset == file.len(), byte_length == 0.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("b.bin");
+    fs::write(&file, b"hello").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::ByteRangeReplace(ByteRangeReplace {
+                byte_offset: 5,
+                byte_length: 0,
+                new_content: b" world".to_vec(),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_write(resp);
+    assert_eq!(fs::read(&file).unwrap(), b"hello world");
+}
+
+#[tokio::test]
+async fn byte_range_replace_pure_insert_mid_file() {
+    // byte_length == 0 in the middle of the file is a pure insertion.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("b.bin");
+    fs::write(&file, b"hello world").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::ByteRangeReplace(ByteRangeReplace {
+                byte_offset: 5,
+                byte_length: 0,
+                new_content: b",".to_vec(),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_write(resp);
+    assert_eq!(fs::read(&file).unwrap(), b"hello, world");
+}
+
+#[tokio::test]
+async fn byte_range_replace_u64_overflow_returns_error() {
+    // T9 regression: byte_offset + byte_length overflowing u64 must not
+    // panic. The handler should return an InvalidPath error.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("b.bin");
+    fs::write(&file, b"hi").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::ByteRangeReplace(ByteRangeReplace {
+                byte_offset: 5,
+                byte_length: u64::MAX,
+                new_content: Vec::new(),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+}
+
+#[tokio::test]
+async fn file_write_encoding_non_utf8_rejected() {
+    // T14 regression: FileWrite.encoding other than utf-8 returns
+    // FILE_ERROR_CODE_ENCODING without touching the filesystem.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("enc.txt");
+    fs::write(&file, "original").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: Some("gbk".to_string()),
+            no_follow_symlink: false,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::Content(b"new".to_vec())),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::Encoding as i32);
+    // File unchanged.
+    assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+}
+
+#[tokio::test]
+async fn file_edit_encoding_non_utf8_rejected() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("enc.txt");
+    fs::write(&file, "foo").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: file.to_string_lossy().into_owned(),
+            encoding: Some("shift_jis".to_string()),
+            no_follow_symlink: false,
+            method: Some(file_edit::Method::StringReplace(StringReplace {
+                old_string: "foo".into(),
+                new_string: "bar".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::Encoding as i32);
+    assert_eq!(fs::read_to_string(&file).unwrap(), "foo");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_refuses_symlink_when_no_follow_set() {
+    // T11 regression: no_follow_symlink=true on a symlink must error
+    // without touching the target.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "original").unwrap();
+    let link = root.join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: link.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: true,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::Content(b"hijacked".to_vec())),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+    // Target must be untouched.
+    assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn edit_refuses_symlink_when_no_follow_set() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "foo").unwrap();
+    let link = root.join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: link.to_string_lossy().into_owned(),
+            encoding: None,
+            no_follow_symlink: true,
+            method: Some(file_edit::Method::StringReplace(StringReplace {
+                old_string: "foo".into(),
+                new_string: "bar".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+    assert_eq!(fs::read_to_string(&target).unwrap(), "foo");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_refuses_symlink_when_no_follow_set() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "x").unwrap();
+    // Capture the original target mode.
+    let original_mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+    let link = root.join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: link.to_string_lossy().into_owned(),
+            recursive: false,
+            no_follow_symlink: true,
+            permission: Some(file_chmod::Permission::Unix(UnixPermission {
+                mode: Some(0o700),
+                owner: None,
+                group: None,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+    // Target mode must be unchanged.
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        original_mode
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn delete_symlink_no_follow_removes_link_not_target() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "x").unwrap();
+    let link = root.join("link.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Delete(FileDelete {
+            path: link.to_string_lossy().into_owned(),
+            recursive: false,
+            mode: DeleteMode::Permanent as i32,
+            no_follow_symlink: true,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_delete(resp);
+    // Symlink gone, target survived.
+    assert!(!link.exists());
+    assert!(target.exists());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "x");
+}
+
+#[tokio::test]
+async fn copy_recursive_overwrite_merges_into_existing_destination() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let src = root.join("src");
+    let dst = root.join("dst");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("fresh.txt"), "new").unwrap();
+    fs::write(dst.join("fresh.txt"), "old").unwrap();
+    fs::write(dst.join("untouched.txt"), "keep").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Copy(FileCopy {
+            source: src.to_string_lossy().into_owned(),
+            destination: dst.to_string_lossy().into_owned(),
+            recursive: true,
+            overwrite: true,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_copy(resp);
+    assert_eq!(fs::read_to_string(dst.join("fresh.txt")).unwrap(), "new");
+    assert_eq!(fs::read_to_string(dst.join("untouched.txt")).unwrap(), "keep");
+}
+
+#[tokio::test]
+async fn file_request_with_no_operation_returns_unspecified_error() {
+    // T20 regression: the operation-less request path in FileManager::handle
+    // should produce FILE_ERROR_CODE_UNSPECIFIED rather than silently
+    // dispatching to a default handler.
+    let dir = TempDir::new().unwrap();
+    let (mgr, _root) = test_manager(&dir);
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: None,
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+}

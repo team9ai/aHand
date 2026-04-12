@@ -118,7 +118,7 @@
     {
       "id": 18,
       "subject": "T18: Daemon test coverage batch — write/edit/fs edge cases",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [9, 11],
       "description": "Fill coverage gaps called out by Reviewer C: FileWrite StringReplace NotFound, line-range OOB (start_line > total, end_line > total, no trailing newline), byte-range EOF insert (byte_offset == file.len(), byte_length == 0 mid-file), recursive copy overwrite, symlink delete follow/no-follow, chmod no_follow_symlink, TRASH delete round-trip (guarded with #[ignore] or a real tempdir cleanup). Addresses review issues #23, #28, parts of #14 and #10.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops\", \"acceptanceCriteria\": [\"Every bullet above has at least one test\", \"Total test count in file_ops.rs increases by 8+ tests\", \"All new tests pass\"]}\n```"
     },
