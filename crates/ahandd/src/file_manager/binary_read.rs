@@ -102,6 +102,7 @@ pub async fn handle_read_binary(
 pub async fn handle_read_image(
     req: &FileReadImage,
     resolved: &Path,
+    max_read_bytes: u64,
 ) -> Result<FileReadImageResult, FileError> {
     let metadata = if req.no_follow_symlink {
         tokio::fs::symlink_metadata(resolved).await
@@ -131,7 +132,71 @@ pub async fn handle_read_image(
     let max_height = req.max_height;
     let max_bytes = req.max_bytes;
 
+    // Raw passthrough: no resize, no recompress, no reformat requested.
+    // Return the original file bytes byte-for-byte and only read the header
+    // for dimensions. This avoids the decode→encode round trip entirely.
+    let is_passthrough = max_width.is_none()
+        && max_height.is_none()
+        && max_bytes.is_none()
+        && requested_quality.is_none()
+        && matches!(requested_format, ImageFormat::Original);
+
+    let req_path = req.path.clone();
     let processed = tokio::task::spawn_blocking(move || -> Result<FileReadImageResult, FileError> {
+        // Peek the format and dimensions without decoding pixels, so we can
+        // reject decompression bombs before allocating the full pixel buffer.
+        let header_reader = ImageReader::new(Cursor::new(&raw))
+            .with_guessed_format()
+            .map_err(|e| {
+                file_error(
+                    FileErrorCode::Unspecified,
+                    "",
+                    format!("failed to read image: {e}"),
+                )
+            })?;
+        let source_format = header_reader.format();
+        let (header_width, header_height) = header_reader.into_dimensions().map_err(|e| {
+            file_error(
+                FileErrorCode::Unspecified,
+                "",
+                format!("failed to read image dimensions: {e}"),
+            )
+        })?;
+
+        // Decompression bomb guard: reject images whose decoded RGBA pixel
+        // buffer would exceed the policy's read budget.
+        let decoded_bytes = (header_width as u64)
+            .saturating_mul(header_height as u64)
+            .saturating_mul(4);
+        if decoded_bytes > max_read_bytes {
+            return Err(file_error(
+                FileErrorCode::TooLarge,
+                &req_path,
+                format!(
+                    "image dimensions {}x{} would exceed max_read_bytes when decoded",
+                    header_width, header_height
+                ),
+            ));
+        }
+
+        if is_passthrough {
+            let format_proto = source_format
+                .map(output_format_to_proto)
+                .unwrap_or(ImageFormat::Original);
+            let size = raw.len() as u64;
+            return Ok(FileReadImageResult {
+                content: raw,
+                format: format_proto as i32,
+                width: header_width,
+                height: header_height,
+                original_bytes,
+                output_bytes: size,
+                download_url: None,
+                download_url_expires_ms: None,
+            });
+        }
+
+        // Non-passthrough: fully decode and go through the resize/encode pipeline.
         let reader = ImageReader::new(Cursor::new(&raw))
             .with_guessed_format()
             .map_err(|e| {
@@ -141,7 +206,6 @@ pub async fn handle_read_image(
                     format!("failed to read image: {e}"),
                 )
             })?;
-        let source_format = reader.format();
         let img = reader.decode().map_err(|e| {
             file_error(
                 FileErrorCode::Unspecified,

@@ -118,8 +118,12 @@ impl FileManager {
             }
             file_request::Operation::ReadImage(req) => {
                 let checked = self.policy.check_path(&req.path, false)?;
-                let result =
-                    binary_read::handle_read_image(req, checked.resolved_path.as_path()).await?;
+                let result = binary_read::handle_read_image(
+                    req,
+                    checked.resolved_path.as_path(),
+                    self.policy.max_read_bytes(),
+                )
+                .await?;
                 Ok(file_response::Result::ReadImage(result))
             }
             file_request::Operation::Write(req) => {

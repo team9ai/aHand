@@ -68,7 +68,7 @@
     {
       "id": 10,
       "subject": "T10: Image read adds decompression bomb guard and raw-passthrough mode",
-      "status": "pending",
+      "status": "completed",
       "description": "Two fixes in one place (review issues #9 and #21): (a) before `reader.decode()`, call `image::image_dimensions` (which doesn't decode pixels) to check `width * height * 4 <= max_read_bytes` and reject bombs; (b) when request has no `max_width`/`max_height`/`max_bytes`/`quality`, and `output_format` is Original, return the raw file bytes unchanged (true passthrough).\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/binary_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_image\", \"acceptanceCriteria\": [\"Images whose declared dimensions exceed max_read_bytes are rejected pre-decode\", \"Passthrough returns raw file bytes byte-for-byte\", \"New test: passthrough equality with original file bytes\", \"Existing image tests still pass\"]}\n```"
     },
     {
