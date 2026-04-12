@@ -409,15 +409,28 @@ async fn apply_byte_range_replace(
     let existing = tokio::fs::read(resolved)
         .await
         .map_err(|e| io_to_file_error(e, resolved))?;
-    let start = br.byte_offset as usize;
-    let end = (br.byte_offset + br.byte_length) as usize;
-    if start > existing.len() || end > existing.len() {
+
+    // Detect u64 overflow from the caller first.
+    let Some(end_u64) = br.byte_offset.checked_add(br.byte_length) else {
+        return Err(file_error(
+            FileErrorCode::InvalidPath,
+            req_path,
+            "byte range overflow (byte_offset + byte_length > u64::MAX)",
+        ));
+    };
+
+    // Validate against file size (still in u64, before casting to usize).
+    let file_len = existing.len() as u64;
+    if br.byte_offset > file_len || end_u64 > file_len {
         return Err(file_error(
             FileErrorCode::Unspecified,
             req_path,
             "byte range out of bounds",
         ));
     }
+
+    let start = br.byte_offset as usize;
+    let end = end_u64 as usize;
     let mut out = Vec::with_capacity(existing.len() - (end - start) + br.new_content.len());
     out.extend_from_slice(&existing[..start]);
     out.extend_from_slice(&br.new_content);

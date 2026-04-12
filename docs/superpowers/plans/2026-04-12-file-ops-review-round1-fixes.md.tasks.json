@@ -62,7 +62,7 @@
     {
       "id": 9,
       "subject": "T9: ByteRangeReplace uses checked_add and rejects overflow",
-      "status": "pending",
+      "status": "completed",
       "description": "`(br.byte_offset + br.byte_length) as usize` is unchecked u64 addition and can wrap, crashing the handler task. Switch to `checked_add`, validate `end <= file.len()`, and return an `InvalidPath` or `TooLarge` error on overflow. Addresses review issue #10.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/write_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops byte_range\", \"acceptanceCriteria\": [\"byte_length = u64::MAX returns an error instead of panicking\", \"byte_offset + byte_length > file_size returns a clear error\", \"New regression test with u64::MAX byte_length\", \"Existing byte-range tests still pass\"]}\n```"
     },
     {
@@ -105,7 +105,7 @@
     {
       "id": 16,
       "subject": "T16: Advertise file capability in daemon Hello when enabled",
-      "status": "pending",
+      "status": "completed",
       "description": "When `file_mgr.is_enabled()`, push `\"file\"` into the capabilities vector in `build_hello_envelope`. Mirrors the existing `browser` capability handling. Addresses review issue #19.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test hub_handshake\", \"acceptanceCriteria\": [\"Capabilities vector contains 'file' when file_mgr is enabled\", \"Capabilities vector does not contain 'file' when disabled\", \"Existing hub_handshake tests still pass\"]}\n```"
     },
     {
