@@ -1,20 +1,16 @@
 "use client";
 
 import { useState } from "react";
-import { JobRecord } from "@/lib/api";
+import { DeviceJobsPanel } from "./device-jobs-panel";
 import { DeviceTerminal } from "./device-terminal";
 import { DeviceBrowser } from "./device-browser";
 
-type Job = JobRecord;
-
 export function DeviceTabs({
   deviceId,
-  jobs,
   online,
   capabilities,
 }: {
   deviceId: string;
-  jobs: Job[];
   online: boolean;
   capabilities: string[];
 }) {
@@ -52,28 +48,7 @@ export function DeviceTabs({
 
       {tab === "jobs" && (
         <div className="device-tab-content">
-          {jobs.length === 0 ? (
-            <p className="empty-state">No jobs found for this device.</p>
-          ) : (
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Job ID</th>
-                  <th>Tool</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {jobs.map((job) => (
-                  <tr key={job.id}>
-                    <td className="table-subtle">{job.id}</td>
-                    <td>{job.tool}</td>
-                    <td>{job.status}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
+          <DeviceJobsPanel deviceId={deviceId} />
         </div>
       )}
 
