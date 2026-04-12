@@ -40,6 +40,28 @@ impl FileManager {
         &self.policy
     }
 
+    /// Pre-check a FileRequest's paths against policy *before* dispatching.
+    ///
+    /// Used by the request handler to decide whether the request should go
+    /// through the approval flow (because the policy marks at least one of
+    /// its paths as `dangerous_paths`) or proceed directly.
+    ///
+    /// - `Ok(true)`  — the request touches a dangerous path and must go
+    ///   through approval regardless of session mode.
+    /// - `Ok(false)` — no dangerous paths; normal session-mode flow applies.
+    /// - `Err(FileError)` — one of the paths is flat-out denied by policy;
+    ///   the caller should return this error immediately.
+    pub fn check_request_approval(&self, req: &FileRequest) -> Result<bool, FileError> {
+        let mut needs_approval = false;
+        for (path, is_write, no_follow) in collect_request_paths(req) {
+            let result = self.policy.check_path(&path, is_write, no_follow)?;
+            if result.needs_approval {
+                needs_approval = true;
+            }
+        }
+        Ok(needs_approval)
+    }
+
     /// Dispatch a `FileRequest` to the appropriate submodule handler.
     pub async fn handle(&self, req: &FileRequest) -> FileResponse {
         let request_id = req.request_id.clone();
@@ -232,6 +254,45 @@ impl FileManager {
                 Ok(file_response::Result::CreateSymlink(result))
             }
         }
+    }
+}
+
+/// Walk a FileRequest and return every path it touches, alongside the
+/// `is_write` and `no_follow_symlink` flags that dispatch would use.
+/// Shared between `check_request_approval` (pre-flight) and the dispatch
+/// arms in `FileManager::dispatch` — when adding a new operation, keep
+/// both call sites in sync.
+fn collect_request_paths(req: &FileRequest) -> Vec<(String, bool, bool)> {
+    use file_request::Operation;
+    let Some(op) = &req.operation else {
+        return Vec::new();
+    };
+    match op {
+        Operation::Stat(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
+        Operation::List(r) => vec![(r.path.clone(), false, false)],
+        Operation::Glob(r) => r
+            .base_path
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|b| vec![(b.to_string(), false, false)])
+            .unwrap_or_default(),
+        Operation::Mkdir(r) => vec![(r.path.clone(), true, false)],
+        Operation::ReadText(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
+        Operation::ReadBinary(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
+        Operation::ReadImage(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
+        Operation::Write(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
+        Operation::Edit(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
+        Operation::Delete(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
+        Operation::Chmod(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
+        Operation::Copy(r) => vec![
+            (r.source.clone(), false, false),
+            (r.destination.clone(), true, false),
+        ],
+        Operation::Move(r) => vec![
+            (r.source.clone(), true, false),
+            (r.destination.clone(), true, false),
+        ],
+        Operation::CreateSymlink(r) => vec![(r.link_path.clone(), true, true)],
     }
 }
 

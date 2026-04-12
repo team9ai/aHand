@@ -36,7 +36,7 @@
     {
       "id": 5,
       "subject": "T5: Wire dangerous_paths.needs_approval into the approval path",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [4],
       "description": "`PolicyResult.needs_approval` is computed but ignored. Have `FileManager::dispatch` return the `needs_approval` flag alongside the handler result, and have `handle_file_request` force the approval flow when either the session decision OR the policy result says approval is required. Addresses review issue #5.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo test -p ahandd --lib\", \"acceptanceCriteria\": [\"Requests touching a path in dangerous_paths always require approval, regardless of session mode\", \"New test: AutoAccept session + dangerous path → approval requested\", \"Existing tests still pass\"]}\n```"
     },

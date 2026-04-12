@@ -873,6 +873,24 @@ async fn handle_file_request<T>(
         return;
     }
 
+    // Pre-flight policy check — runs the same allowlist/denylist checks that
+    // dispatch would, but also surfaces `dangerous_paths` hits as
+    // "needs_approval". If any path is outright denied, short-circuit with
+    // the FileError. Otherwise we carry `policy_needs_approval` forward so
+    // the session-mode branch below can escalate to approval even when the
+    // session itself would Allow.
+    let policy_needs_approval = match file_mgr.check_request_approval(&req) {
+        Ok(flag) => flag,
+        Err(err) => {
+            warn!(request_id = %req.request_id, code = err.code, "file request denied by policy pre-check");
+            send_file_response(ahand_protocol::FileResponse {
+                request_id: req.request_id.clone(),
+                result: Some(ahand_protocol::file_response::Result::Error(err)),
+            });
+            return;
+        }
+    };
+
     // Session mode check — file operations always go through the same gate as
     // other cloud-initiated tools. We synthesise a JobRequest with
     // tool="file" so that the session manager can apply the caller's current
@@ -890,7 +908,9 @@ async fn handle_file_request<T>(
         ..Default::default()
     };
 
-    match session_mgr.check(&synthetic_req, caller_uid).await {
+    let session_decision = session_mgr.check(&synthetic_req, caller_uid).await;
+
+    let (approval_reason, previous_refusals) = match session_decision {
         SessionDecision::Deny(reason) => {
             warn!(request_id = %req.request_id, reason = %reason, "file request denied by session mode");
             send_file_response(crate::file_manager::error_response(
@@ -899,10 +919,25 @@ async fn handle_file_request<T>(
                 "",
                 &reason,
             ));
+            return;
         }
-        SessionDecision::Allow => {
+        SessionDecision::Allow if !policy_needs_approval => {
+            // Fast path — no dangerous paths involved, session would allow.
             let response = file_mgr.handle(&req).await;
             send_file_response(response);
+            return;
+        }
+        SessionDecision::Allow => {
+            // Session would Allow, but the path is listed in
+            // `dangerous_paths`. Force the approval flow regardless.
+            info!(
+                request_id = %req.request_id,
+                "file request touches dangerous_paths — forcing approval flow"
+            );
+            (
+                "path is listed in dangerous_paths".to_string(),
+                Vec::new(),
+            )
         }
         SessionDecision::NeedsApproval {
             reason,
@@ -913,87 +948,86 @@ async fn handle_file_request<T>(
                 reason = %reason,
                 "file request needs approval (strict mode)"
             );
+            (reason, previous_refusals)
+        }
+    };
 
-            let (approval_req, approval_rx) = approval_mgr
-                .submit(synthetic_req, caller_uid, reason, previous_refusals)
-                .await;
+    // Both the Allow+dangerous and NeedsApproval branches fall through here.
+    let (approval_req, approval_rx) = approval_mgr
+        .submit(synthetic_req, caller_uid, approval_reason, previous_refusals)
+        .await;
 
-            // Send ApprovalRequest to cloud via WS.
-            let approval_env = Envelope {
-                device_id: device_id.to_string(),
+    // Send ApprovalRequest to cloud via WS and broadcast to IPC clients.
+    let approval_env = Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::ApprovalRequest(approval_req.clone())),
+        ..Default::default()
+    };
+    let _ = tx.send(approval_env.clone());
+    let _ = approval_broadcast_tx.send(approval_env);
+
+    // Wait for the approval response (or timeout) in a detached task so the
+    // dispatch loop keeps draining inbound frames while approval is pending.
+    let tx_clone = (*tx).clone();
+    let file_mgr_clone = Arc::clone(file_mgr);
+    let amgr = Arc::clone(approval_mgr);
+    let did = device_id.to_string();
+    let timeout = amgr.default_timeout();
+    let request_id = req.request_id.clone();
+
+    tokio::spawn(async move {
+        let reply = |resp: ahand_protocol::FileResponse| {
+            let env = Envelope {
+                device_id: did.clone(),
                 msg_id: new_msg_id(),
                 ts_ms: now_ms(),
-                payload: Some(envelope::Payload::ApprovalRequest(approval_req.clone())),
+                payload: Some(envelope::Payload::FileResponse(resp)),
                 ..Default::default()
             };
-            let _ = tx.send(approval_env.clone());
-            let _ = approval_broadcast_tx.send(approval_env);
+            let _ = tx_clone.send(env);
+        };
 
-            // Wait for the approval response (or timeout) before dispatching.
-            // Unlike handle_job_request we can't spawn this into a detached
-            // task because FileResponse delivery is synchronous from the
-            // client's point of view — we stay inside this async function
-            // for the whole approval cycle.
-            let tx_clone = (*tx).clone();
-            let file_mgr_clone = Arc::clone(file_mgr);
-            let amgr = Arc::clone(approval_mgr);
-            let did = device_id.to_string();
-            let timeout = amgr.default_timeout();
-            let request_id = req.request_id.clone();
-
-            tokio::spawn(async move {
-                let reply = |resp: ahand_protocol::FileResponse| {
-                    let env = Envelope {
-                        device_id: did.clone(),
-                        msg_id: new_msg_id(),
-                        ts_ms: now_ms(),
-                        payload: Some(envelope::Payload::FileResponse(resp)),
-                        ..Default::default()
-                    };
-                    let _ = tx_clone.send(env);
+        let approved = match tokio::time::timeout(timeout, approval_rx).await {
+            Ok(Ok(resp)) if resp.approved => {
+                info!(request_id = %request_id, "file approval granted");
+                true
+            }
+            Ok(Ok(resp)) => {
+                info!(request_id = %request_id, "file approval denied");
+                amgr.expire(&request_id).await;
+                let reason = if resp.reason.is_empty() {
+                    "approval denied".to_string()
+                } else {
+                    format!("approval denied: {}", resp.reason)
                 };
+                reply(crate::file_manager::error_response(
+                    request_id.clone(),
+                    ahand_protocol::FileErrorCode::PolicyDenied,
+                    "",
+                    &reason,
+                ));
+                false
+            }
+            _ => {
+                info!(request_id = %request_id, "file approval timed out");
+                amgr.expire(&request_id).await;
+                reply(crate::file_manager::error_response(
+                    request_id.clone(),
+                    ahand_protocol::FileErrorCode::PolicyDenied,
+                    "",
+                    "approval timed out",
+                ));
+                false
+            }
+        };
 
-                let approved = match tokio::time::timeout(timeout, approval_rx).await {
-                    Ok(Ok(resp)) if resp.approved => {
-                        info!(request_id = %request_id, "file approval granted");
-                        true
-                    }
-                    Ok(Ok(resp)) => {
-                        info!(request_id = %request_id, "file approval denied");
-                        amgr.expire(&request_id).await;
-                        let reason = if resp.reason.is_empty() {
-                            "approval denied".to_string()
-                        } else {
-                            format!("approval denied: {}", resp.reason)
-                        };
-                        reply(crate::file_manager::error_response(
-                            request_id.clone(),
-                            ahand_protocol::FileErrorCode::PolicyDenied,
-                            "",
-                            &reason,
-                        ));
-                        false
-                    }
-                    _ => {
-                        info!(request_id = %request_id, "file approval timed out");
-                        amgr.expire(&request_id).await;
-                        reply(crate::file_manager::error_response(
-                            request_id.clone(),
-                            ahand_protocol::FileErrorCode::PolicyDenied,
-                            "",
-                            "approval timed out",
-                        ));
-                        false
-                    }
-                };
-
-                if approved {
-                    let response = file_mgr_clone.handle(&req).await;
-                    reply(response);
-                }
-            });
+        if approved {
+            let response = file_mgr_clone.handle(&req).await;
+            reply(response);
         }
-    }
+    });
 }
 
 fn file_op_name(op: &ahand_protocol::file_request::Operation) -> &'static str {
