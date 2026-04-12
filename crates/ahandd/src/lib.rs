@@ -1,6 +1,7 @@
 pub mod ahand_client;
 mod approval;
 mod browser;
+pub mod browser_setup;
 pub mod config;
 pub mod device_identity;
 pub mod executor;
