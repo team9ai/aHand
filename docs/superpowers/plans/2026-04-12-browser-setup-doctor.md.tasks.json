@@ -1,0 +1,54 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-12-browser-setup-doctor.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Create browser_setup/types.rs with structured types",
+      "status": "pending",
+      "description": "**Goal:** Define all public types (CheckStatus, CheckReport, ProgressEvent, etc.) with Serialize derives for both CLI and Tauri use.\n\n**Files:**\n- Create: crates/ahandd/src/browser_setup/types.rs\n- Create: crates/ahandd/src/browser_setup/mod.rs\n- Modify: crates/ahandd/src/main.rs\n\n**Verify:** cargo test -p ahandd browser_setup::types\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/browser_setup/types.rs\", \"crates/ahandd/src/browser_setup/mod.rs\", \"crates/ahandd/src/main.rs\"], \"verifyCommand\": \"cargo test -p ahandd browser_setup::types\", \"acceptanceCriteria\": [\"All 9 types from spec exist with Serialize derives\", \"Enums use serde tag/rename_all attributes\", \"Unit tests verify JSON shape\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Implement browser_setup/browser_detect.rs",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Extract browser detection with Edge support and Windows paths, exposed as detect()/detect_all().\n\n**Files:**\n- Create: crates/ahandd/src/browser_setup/browser_detect.rs\n- Modify: crates/ahandd/src/browser_setup/mod.rs\n\n**Verify:** cargo test -p ahandd browser_setup::browser_detect\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/browser_setup/browser_detect.rs\", \"crates/ahandd/src/browser_setup/mod.rs\"], \"verifyCommand\": \"cargo test -p ahandd browser_setup::browser_detect\", \"acceptanceCriteria\": [\"detect respects config override\", \"detect_all returns multiple\", \"Chrome priority over Edge\", \"Windows paths included\", \"Platform-specific tests\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Implement browser_setup/node.rs with inspect and ensure",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Move Node.js download/install logic from browser_init.rs into browser_setup/node.rs, with inspect() returning CheckReport and ensure() using progress callback.\n\n**Files:**\n- Create: crates/ahandd/src/browser_setup/node.rs\n- Modify: crates/ahandd/src/browser_setup/mod.rs\n\n**Verify:** cargo test -p ahandd browser_setup::node\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/browser_setup/node.rs\", \"crates/ahandd/src/browser_setup/mod.rs\"], \"verifyCommand\": \"cargo test -p ahandd browser_setup::node\", \"acceptanceCriteria\": [\"inspect returns Ok/Missing/Outdated\", \"ensure downloads and installs\", \"No println! calls\", \"Callback receives Phase events\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Implement playwright.rs and orchestration API",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "**Goal:** Add playwright.rs, top-level run_all/run_step/inspect_all orchestration, delete old browser_init.rs.\n\n**Files:**\n- Create: crates/ahandd/src/browser_setup/playwright.rs\n- Modify: crates/ahandd/src/browser_setup/mod.rs\n- Delete: crates/ahandd/src/browser_init.rs\n- Modify: crates/ahandd/src/main.rs\n\n**Verify:** cargo test -p ahandd browser_setup; cargo check -p ahandd\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/browser_setup/playwright.rs\", \"crates/ahandd/src/browser_setup/mod.rs\", \"crates/ahandd/src/browser_init.rs\", \"crates/ahandd/src/main.rs\"], \"verifyCommand\": \"cargo test -p ahandd browser_setup\", \"acceptanceCriteria\": [\"playwright::inspect/ensure work\", \"run_all executes steps in order\", \"run_step rejects unknown names\", \"run_step errors on playwright without node\", \"browser_init.rs deleted\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Replace browser.rs::resolve_executable_path with shared helper",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Delete duplicated browser detection in browser.rs, call browser_setup::detect_browser instead.\n\n**Files:**\n- Modify: crates/ahandd/src/browser.rs\n\n**Verify:** cargo test -p ahandd; cargo check -p ahandd\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/browser.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"resolve_executable_path is one line call\", \"Config override still works\", \"No regressions\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: CLI adapters for browser-doctor and browser-init",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "**Goal:** Create cli/ module with terminal formatters and wire both subcommands through it. Add BrowserDoctor command.\n\n**Files:**\n- Create: crates/ahandd/src/cli/mod.rs\n- Create: crates/ahandd/src/cli/browser_doctor.rs\n- Create: crates/ahandd/src/cli/browser_init.rs\n- Modify: crates/ahandd/src/main.rs\n\n**Verify:** cargo check -p ahandd + manual smoke tests\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/cli/mod.rs\", \"crates/ahandd/src/cli/browser_doctor.rs\", \"crates/ahandd/src/cli/browser_init.rs\", \"crates/ahandd/src/main.rs\"], \"verifyCommand\": \"cargo check -p ahandd\", \"acceptanceCriteria\": [\"browser-doctor exits 0 or 1\", \"browser-init prints progress\", \"--step node works\", \"--step playwright errors without node\", \"--force --step reinstalls single component\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: Integration test for browser-doctor exit code",
+      "status": "pending",
+      "blockedBy": [6],
+      "description": "**Goal:** Lightweight smoke test verifying browser-doctor exits 0 or 1 cleanly.\n\n**Files:**\n- Create: crates/ahandd/tests/browser_doctor.rs\n\n**Verify:** cargo test -p ahandd --test browser_doctor\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/browser_doctor.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test browser_doctor\", \"acceptanceCriteria\": [\"Test spawns subprocess\", \"Verifies exit code is 0 or 1\", \"Test is environment-independent\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-12T00:00:00Z"
+}
