@@ -2160,3 +2160,267 @@ async fn file_request_with_no_operation_returns_unspecified_error() {
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::Unspecified as i32);
 }
+
+// ── T19: text/image edge-case tests ──────────────────────────────────────
+
+#[tokio::test]
+async fn read_text_reports_total_lines_and_full_position_info() {
+    // 5 short lines — confirm total_lines populated and PositionInfo fields
+    // are populated (line, byte_in_file, byte_in_line).
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("lines.txt");
+    fs::write(&file, "alpha\nbeta\ngamma\ndelta\nepsilon\n").unwrap();
+
+    let resp = mgr.handle(&wrap_read_text(read_text_request(&file))).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.total_lines, 5);
+    let start = result.start_pos.as_ref().unwrap();
+    assert_eq!(start.line, 1);
+    assert_eq!(start.byte_in_file, 0);
+    assert_eq!(start.byte_in_line, 0);
+    let end = result.end_pos.as_ref().unwrap();
+    assert_eq!(end.line, 5);
+    // File is 32 bytes total ("alpha\n"=6 + "beta\n"=5 + "gamma\n"=6 +
+    // "delta\n"=6 + "epsilon\n"=8 = 31 bytes).
+    assert_eq!(result.total_file_bytes, 31);
+    assert_eq!(end.byte_in_file, 31);
+}
+
+#[tokio::test]
+async fn read_text_start_line_col_reports_full_position_info() {
+    // Starting at line 2 col 3 of "first\nsecond\nthird\n" should yield
+    // byte_in_file = 6 (start of line 2) + 3 = 9, byte_in_line = 3.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("linecol.txt");
+    fs::write(&file, "first\nsecond\nthird\n").unwrap();
+
+    let mut req = read_text_request(&file);
+    req.start = Some(file_read_text::Start::StartLineCol(LineCol {
+        line: 2,
+        col: 3,
+    }));
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    let start = result.start_pos.unwrap();
+    assert_eq!(start.line, 2);
+    assert_eq!(start.byte_in_file, 9);
+    assert_eq!(start.byte_in_line, 3);
+}
+
+#[tokio::test]
+async fn read_text_gbk_autodetect_without_forced_encoding() {
+    // T8 regression: when chardetng identifies the file as GBK and we did
+    // NOT pass an explicit encoding, the handler still decodes correctly
+    // and reports an encoding name (not UTF-8).
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("gbk-auto.txt");
+    // "你好,世界" in GBK (with CJK punctuation to give chardetng enough
+    // signal to lock in on GBK).
+    let gbk: Vec<u8> = vec![
+        0xC4, 0xE3, 0xBA, 0xC3, 0xA3, 0xAC, 0xCA, 0xC0, 0xBD, 0xE7,
+    ];
+    fs::write(&file, &gbk).unwrap();
+
+    let req = read_text_request(&file);
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 1);
+    // Content should be the decoded CJK string.
+    assert!(result.lines[0].content.contains("你好"));
+    // Detected encoding must NOT be UTF-8.
+    assert_ne!(result.detected_encoding.to_ascii_uppercase(), "UTF-8");
+    // On-disk byte positions reported in raw bytes, not decoded.
+    assert_eq!(result.total_file_bytes, gbk.len() as u64);
+}
+
+#[tokio::test]
+async fn read_text_byte_positions_match_raw_on_disk_bytes_for_gbk() {
+    // T8 regression: for GBK, PositionInfo.byte_in_file must be raw
+    // on-disk bytes (not decoded UTF-8 offset). Start at raw byte 4
+    // ("中间" after the first two characters) and confirm we get bytes
+    // 4..end.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("gbk-cursor.txt");
+    // 2 GBK CJK chars = 4 bytes "你好", 2 more = 4 bytes "世界", total 8.
+    let gbk: Vec<u8> = vec![0xC4, 0xE3, 0xBA, 0xC3, 0xCA, 0xC0, 0xBD, 0xE7];
+    fs::write(&file, &gbk).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.encoding = Some("gbk".into());
+    req.start = Some(file_read_text::Start::StartByte(4));
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    let start = result.start_pos.unwrap();
+    // start_byte = 4 (raw), not 6 (decoded UTF-8 offset of "世").
+    assert_eq!(start.byte_in_file, 4);
+    let end = result.end_pos.unwrap();
+    // end_byte = 8 (raw file length), not 12 (decoded UTF-8 length).
+    assert_eq!(end.byte_in_file, 8);
+}
+
+#[tokio::test]
+async fn read_image_passthrough_is_byte_for_byte_identical() {
+    // T10 regression: passthrough mode must return the original file bytes
+    // without decode/encode.
+    use image::{ImageBuffer, Rgb};
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("pass.png");
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(32, 32, |x, y| Rgb([(x * 7) as u8, (y * 11) as u8, 13u8]));
+    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+
+    let original = fs::read(&file).unwrap();
+
+    let resp = mgr.handle(&image_req(&file, None, None)).await;
+    let result = expect_read_image(resp);
+    assert_eq!(result.content, original, "passthrough must be byte-identical");
+    assert_eq!(result.width, 32);
+    assert_eq!(result.height, 32);
+    assert_eq!(result.original_bytes, original.len() as u64);
+    assert_eq!(result.output_bytes, original.len() as u64);
+}
+
+#[tokio::test]
+async fn read_image_max_height_only_preserves_aspect_ratio() {
+    use image::{ImageBuffer, Rgb};
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("tall.png");
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(800, 1000, |_, _| Rgb([0, 0, 0]));
+    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+
+    // max_height=500, no max_width → height scaled to 500, width scaled
+    // proportionally to 400.
+    let resp = mgr.handle(&image_req(&file, None, Some(500))).await;
+    let result = expect_read_image(resp);
+    assert_eq!(result.height, 500);
+    assert_eq!(result.width, 400);
+}
+
+#[tokio::test]
+async fn read_image_both_axis_resize_preserves_aspect_ratio() {
+    use image::{ImageBuffer, Rgb};
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("box.png");
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(1000, 500, |_, _| Rgb([128, 128, 128]));
+    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+
+    // Both axes set — smaller axis wins. max_width=500 → height=250.
+    let resp = mgr
+        .handle(&image_req(&file, Some(500), Some(400)))
+        .await;
+    let result = expect_read_image(resp);
+    assert!(result.width <= 500);
+    assert!(result.height <= 400);
+    // Aspect ratio 1000:500 = 2:1. Expected 500x250.
+    assert_eq!(result.width, 500);
+    assert_eq!(result.height, 250);
+}
+
+#[tokio::test]
+async fn read_image_jpeg_source_can_be_read() {
+    // T19 gap: only PNG sources were exercised. Write a JPEG and read it.
+    use image::{ImageBuffer, Rgb};
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("src.jpg");
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(64, 48, |x, _| Rgb([x as u8 * 4, 100, 200]));
+    img.save_with_format(&file, image::ImageFormat::Jpeg)
+        .unwrap();
+
+    // Passthrough: the returned content should be exactly the JPEG bytes.
+    let original = fs::read(&file).unwrap();
+    let resp = mgr.handle(&image_req(&file, None, None)).await;
+    let result = expect_read_image(resp);
+    assert_eq!(result.content, original);
+    assert_eq!(result.width, 64);
+    assert_eq!(result.height, 48);
+    // Format should be JPEG (not PNG).
+    assert_eq!(result.format, ImageFormat::Jpeg as i32);
+}
+
+#[tokio::test]
+async fn read_image_quality_clamp_accepts_out_of_range_values() {
+    // Quality values outside [1, 100] must be clamped rather than rejected.
+    use image::{ImageBuffer, Rgb};
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("clamp.png");
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(64, 64, |_, _| Rgb([50, 100, 150]));
+    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+
+    // quality = 0 (below minimum) → still produces valid JPEG output.
+    let req_zero = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadImage(FileReadImage {
+            path: file.to_string_lossy().into_owned(),
+            max_width: None,
+            max_height: None,
+            max_bytes: None,
+            quality: Some(0),
+            output_format: Some(ImageFormat::Jpeg as i32),
+            no_follow_symlink: false,
+        })),
+    };
+    let result_zero = expect_read_image(mgr.handle(&req_zero).await);
+    assert_eq!(result_zero.format, ImageFormat::Jpeg as i32);
+    assert!(!result_zero.content.is_empty());
+
+    // quality = 200 (above maximum) → still produces valid JPEG output.
+    let req_high = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadImage(FileReadImage {
+            path: file.to_string_lossy().into_owned(),
+            max_width: None,
+            max_height: None,
+            max_bytes: None,
+            quality: Some(200),
+            output_format: Some(ImageFormat::Jpeg as i32),
+            no_follow_symlink: false,
+        })),
+    };
+    let result_high = expect_read_image(mgr.handle(&req_high).await);
+    assert_eq!(result_high.format, ImageFormat::Jpeg as i32);
+    assert!(!result_high.content.is_empty());
+}
+
+#[tokio::test]
+async fn read_image_bomb_guard_rejects_oversized_dimensions() {
+    // T10 regression: a PNG whose declared dimensions x 4 exceeds
+    // max_read_bytes must be rejected BEFORE decoding. We simulate this
+    // by setting max_read_bytes tight enough that the guard trips.
+    use image::{ImageBuffer, Rgb};
+    let dir = TempDir::new().unwrap();
+    let tmp_root = dir.path().canonicalize().unwrap();
+    let root_str = tmp_root.to_string_lossy().into_owned();
+    // Tight budget: 1 MB read cap, but 1024x1024 RGBA = 4 MB decoded.
+    let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec![format!("{}/**", root_str), root_str.clone()],
+        path_denylist: vec![],
+        max_read_bytes: 1_000_000,
+        max_write_bytes: 100_000_000,
+        dangerous_paths: vec![],
+    });
+    let file = tmp_root.join("big.png");
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+        ImageBuffer::from_fn(1024, 1024, |_, _| Rgb([0, 0, 0]));
+    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+
+    // The on-disk PNG is well under 1 MB (it compresses), so file-level
+    // max_read_bytes wouldn't catch it. The dimension guard in
+    // handle_read_image should.
+    let resp = mgr.handle(&image_req(&file, None, None)).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+}

@@ -559,7 +559,9 @@ async fn test_read_text_max_bytes() {
 #[tokio::test]
 async fn test_read_text_target_end() {
     // File: 10 lines
-    // target_end = line 5 → 5 lines, TARGET_END
+    // target_end = line 5 → 4 lines returned (lines 1..4), TARGET_END
+    // Note: target_end is EXCLUSIVE — we read up to but not including the
+    // target line. The line-5 byte offset is where the read stops.
 }
 
 #[tokio::test]

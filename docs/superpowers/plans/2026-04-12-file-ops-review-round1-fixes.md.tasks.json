@@ -125,14 +125,14 @@
     {
       "id": 19,
       "subject": "T19: Daemon test coverage batch — text/image edges",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [8, 10],
       "description": "Fill coverage for the fixes in T8 and T10: text non-UTF-8 auto-detect (GBK without forcing the encoding parameter), total_lines field assertion, full PositionInfo (byte_in_file and byte_in_line) assertion after a mid-line start; image max-height-only resize, both-axis resize, non-PNG source (JPEG or WebP), quality clamp to 1..=100. Addresses review issues #24, #4, #6, #7.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops\", \"acceptanceCriteria\": [\"Text auto-detect test uses a GBK file without the encoding parameter and succeeds\", \"total_lines and full PositionInfo are asserted\", \"Image tests cover max-height, both-axis, non-PNG source, and quality=0/quality=101 clamping\", \"All new tests pass\"]}\n```"
     },
     {
       "id": 20,
       "subject": "T20: Tiny holes — operation=None test, target_end semantics alignment",
-      "status": "pending",
+      "status": "completed",
       "description": "Add a regression test for `FileRequest { operation: None }` expecting FILE_ERROR_CODE_UNSPECIFIED, and align the plan's target_end=5 sample (currently says '5 lines returned') with the exclusive semantics the test asserts (4 lines returned). Update the plan text, not the test. Addresses review issues #26, #29.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/file_ops.rs\", \"docs/superpowers/plans/2026-04-12-device-file-operations.md\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops\", \"acceptanceCriteria\": [\"New test for operation=None → Unspecified error\", \"Plan text reads '4 lines' for target_end=5 (exclusive semantics)\", \"Tests pass\"]}\n```"
     },
     {
