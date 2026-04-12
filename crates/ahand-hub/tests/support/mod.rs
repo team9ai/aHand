@@ -19,8 +19,8 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use ahand_protocol::{
-    BootstrapAuth, CancelJob, Ed25519Auth, Envelope, Hello, HelloAccepted, HelloChallenge,
-    JobEvent, JobFinished, JobRequest, envelope, hello, job_event,
+    BootstrapAuth, BrowserRequest, BrowserResponse, CancelJob, Ed25519Auth, Envelope, Hello,
+    HelloAccepted, HelloChallenge, JobEvent, JobFinished, JobRequest, envelope, hello, job_event,
 };
 
 pub fn service_request(uri: &str) -> Request<Body> {
@@ -98,6 +98,32 @@ pub async fn test_state() -> AppState {
             hostname: "seeded-device".into(),
             os: "linux".into(),
             capabilities: vec!["exec".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+        })
+        .await
+        .unwrap();
+    state.devices.mark_offline("device-1").await.unwrap();
+    state
+}
+
+pub async fn test_state_with_browser_device() -> AppState {
+    let state = AppState::from_config(test_config())
+        .await
+        .expect("test state should build");
+    state
+        .devices
+        .insert(NewDevice {
+            id: "device-1".into(),
+            public_key: Some(
+                SigningKey::from_bytes(&[7u8; 32])
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec(),
+            ),
+            hostname: "seeded-device".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into(), "browser".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
         })
@@ -213,6 +239,26 @@ impl TestServer {
 
         let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
         socket
+    }
+
+    pub async fn attach_browser_device(&self, device_id: &str) -> TestDevice {
+        let (mut socket, _) = tokio_tungstenite::connect_async(self.ws_url("/ws"))
+            .await
+            .unwrap();
+        let challenge = read_hello_challenge(&mut socket).await;
+        let hello = signed_hello_with_browser(device_id, &challenge.nonce);
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                hello.encode_to_vec().into(),
+            ))
+            .await
+            .unwrap();
+        let _ = read_hello_accepted(&mut socket).await;
+
+        TestDevice {
+            device_id: device_id.into(),
+            socket,
+        }
     }
 
     pub async fn attach_bootstrap_device(&self, device_id: &str, token: &str) -> TestDevice {
@@ -354,6 +400,38 @@ impl TestDevice {
             ..Default::default()
         };
 
+        self.socket
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                envelope.encode_to_vec().into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    pub async fn recv_browser_request(&mut self) -> BrowserRequest {
+        while let Some(message) = self.socket.next().await {
+            let message = message.unwrap();
+            match message {
+                tokio_tungstenite::tungstenite::Message::Binary(data) => {
+                    let envelope = Envelope::decode(data.as_ref()).unwrap();
+                    if let Some(envelope::Payload::BrowserRequest(req)) = envelope.payload {
+                        return req;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("device socket closed before a browser request arrived");
+    }
+
+    pub async fn send_browser_response(&mut self, response: BrowserResponse) {
+        let envelope = Envelope {
+            device_id: self.device_id.clone(),
+            msg_id: format!("browser-resp-{}", response.request_id),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::BrowserResponse(response)),
+            ..Default::default()
+        };
         self.socket
             .send(tokio_tungstenite::tungstenite::Message::Binary(
                 envelope.encode_to_vec().into(),
@@ -506,6 +584,41 @@ pub fn signed_hello_with_key_at(
     Envelope {
         device_id: device_id.into(),
         msg_id: "hello-1".into(),
+        ts_ms: signed_at_ms,
+        payload: Some(envelope::Payload::Hello(hello)),
+        ..Default::default()
+    }
+}
+
+pub fn signed_hello_with_browser(device_id: &str, challenge_nonce: &[u8]) -> Envelope {
+    let signed_at_ms = next_test_signed_at_ms();
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let mut hello = Hello {
+        version: "0.1.2".into(),
+        hostname: "devbox".into(),
+        os: "linux".into(),
+        capabilities: vec!["exec".into(), "browser".into()],
+        last_ack: 0,
+        auth: None,
+    };
+    let signature = signing_key
+        .sign(&ahand_protocol::build_hello_auth_payload(
+            device_id,
+            &hello,
+            signed_at_ms,
+            challenge_nonce,
+        ))
+        .to_bytes()
+        .to_vec();
+    hello.auth = Some(hello::Auth::Ed25519(Ed25519Auth {
+        public_key: signing_key.verifying_key().to_bytes().to_vec(),
+        signature,
+        signed_at_ms,
+    }));
+
+    Envelope {
+        device_id: device_id.into(),
+        msg_id: "hello-browser-1".into(),
         ts_ms: signed_at_ms,
         payload: Some(envelope::Payload::Hello(hello)),
         ..Default::default()

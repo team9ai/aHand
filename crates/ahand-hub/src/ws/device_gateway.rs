@@ -401,6 +401,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(
                         ahand_protocol::HelloAccepted {
                             auth_method: verified.auth_method.into(),
+                            update_suggestion: None,
                         },
                     )),
                     ..Default::default()
@@ -539,7 +540,22 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             match message {
                 WsMessage::Binary(frame) => {
                     *last_inbound_at.lock().await = tokio::time::Instant::now();
-                    state.jobs.handle_device_frame(&device_id, &frame).await?;
+                    let envelope = ahand_protocol::Envelope::decode(frame.as_ref())?;
+                    if state.connections.has_seen_inbound(&device_id, envelope.seq) {
+                        state.connections.observe_ack(&device_id, envelope.ack)?;
+                    } else if let Some(ahand_protocol::envelope::Payload::BrowserResponse(ref browser_resp)) = envelope.payload {
+                        if let Some((_, sender)) = state.browser_pending.remove(&browser_resp.request_id) {
+                            let _ = sender.send(browser_resp.clone());
+                        } else {
+                            tracing::warn!(
+                                request_id = %browser_resp.request_id,
+                                "received BrowserResponse with no pending request"
+                            );
+                        }
+                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                    } else {
+                        state.jobs.handle_device_frame(&device_id, &frame).await?;
+                    }
                 }
                 WsMessage::Ping(payload) => {
                     *last_inbound_at.lock().await = tokio::time::Instant::now();
@@ -650,6 +666,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()
@@ -671,6 +688,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()
@@ -724,6 +742,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()

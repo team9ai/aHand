@@ -8,6 +8,7 @@ use crate::state::AppState;
 pub mod api_error;
 pub mod audit;
 pub mod auth;
+pub mod browser;
 pub mod devices;
 pub mod jobs;
 pub mod system;
@@ -39,6 +40,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/jobs/{job_id}/output", get(jobs::stream_output))
         .route("/api/audit-logs", get(audit::list_audit_logs))
         .route("/api/terminal/token", post(terminal::create_token))
+        .route("/api/browser", post(browser::browser_command))
         .route("/ws", get(crate::ws::device_gateway::handle_device_socket))
         .route("/ws/terminal", get(terminal::handle_terminal_ws))
         .route(

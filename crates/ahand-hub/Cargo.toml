@@ -11,6 +11,7 @@ ahand-protocol = { path = "../ahand-protocol" }
 anyhow.workspace = true
 async-trait.workspace = true
 async-stream = "0.3"
+base64 = "0.22"
 axum.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
@@ -29,6 +30,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 ahand-hub-store = { path = "../ahand-hub-store", features = ["test-support"] }
+base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = "0.3"
 prost.workspace = true

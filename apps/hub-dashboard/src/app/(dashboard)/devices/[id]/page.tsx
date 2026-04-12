@@ -70,7 +70,7 @@ export default async function DeviceDetailPage({ params }: DeviceDetailPageProps
         </article>
       </div>
 
-      <DeviceTabs deviceId={device.id} jobs={jobs} online={device.online} />
+      <DeviceTabs deviceId={device.id} jobs={jobs} online={device.online} capabilities={device.capabilities} />
     </section>
   );
 }
