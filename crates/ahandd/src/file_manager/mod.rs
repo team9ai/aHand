@@ -4,6 +4,7 @@
 //! and maps the results back to `FileResponse`. Policy is enforced per-path;
 //! the actual filesystem work lives in the submodules.
 
+pub mod fs_ops;
 pub mod policy;
 
 use ahand_protocol::{
@@ -74,23 +75,31 @@ impl FileManager {
         op: &file_request::Operation,
     ) -> Result<file_response::Result, FileError> {
         match op {
-            // Operations added in subsequent tasks return unspecified for now.
             file_request::Operation::Stat(req) => {
-                let _result = self.policy.check_path(&req.path, false)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, false)?;
+                let result = fs_ops::handle_stat(req, checked.resolved_path.as_path()).await?;
+                Ok(file_response::Result::Stat(result))
             }
             file_request::Operation::List(req) => {
-                let _result = self.policy.check_path(&req.path, false)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, false)?;
+                let result = fs_ops::handle_list(req, checked.resolved_path.as_path()).await?;
+                Ok(file_response::Result::List(result))
             }
             file_request::Operation::Glob(req) => {
-                let base = req.base_path.as_deref().unwrap_or("");
-                let _result = self.policy.check_path(base, false)?;
-                Err(unimplemented_error(base))
+                let base_path_str = req.base_path.as_deref().unwrap_or("");
+                let base: Option<std::path::PathBuf> = if base_path_str.is_empty() {
+                    None
+                } else {
+                    let checked = self.policy.check_path(base_path_str, false)?;
+                    Some(checked.resolved_path)
+                };
+                let result = fs_ops::handle_glob(req, base.as_deref()).await?;
+                Ok(file_response::Result::Glob(result))
             }
             file_request::Operation::Mkdir(req) => {
-                let _result = self.policy.check_path(&req.path, true)?;
-                Err(unimplemented_error(&req.path))
+                let checked = self.policy.check_path(&req.path, true)?;
+                let result = fs_ops::handle_mkdir(req, checked.resolved_path.as_path()).await?;
+                Ok(file_response::Result::Mkdir(result))
             }
             file_request::Operation::ReadText(req) => {
                 let _result = self.policy.check_path(&req.path, false)?;
