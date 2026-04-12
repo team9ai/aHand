@@ -1,7 +1,8 @@
 mod ahand_client;
 mod approval;
 mod browser;
-mod browser_init;
+mod browser_setup;
+mod cli;
 mod config;
 mod device_identity;
 mod executor;
@@ -94,7 +95,12 @@ enum Cmd {
         /// Force reinstall (clean existing installation first)
         #[arg(long)]
         force: bool,
+        /// Run only a single step: node or playwright
+        #[arg(long)]
+        step: Option<String>,
     },
+    /// Diagnose browser automation setup and report missing components
+    BrowserDoctor,
 }
 
 #[tokio::main]
@@ -106,8 +112,11 @@ async fn main() -> anyhow::Result<()> {
     // Handle subcommands that don't need daemon setup.
     if let Some(cmd) = &args.command {
         match cmd {
-            Cmd::BrowserInit { force } => {
-                return browser_init::run(*force).await;
+            Cmd::BrowserInit { force, step } => {
+                return cli::browser_init::run(*force, step.clone()).await;
+            }
+            Cmd::BrowserDoctor => {
+                return cli::browser_doctor::run().await;
             }
         }
     }
