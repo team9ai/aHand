@@ -4,6 +4,8 @@
 //! `file_manager::mod` is responsible for running policy checks *before* invoking
 //! these handlers.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::Metadata;
 use std::io;
 #[cfg(unix)]
@@ -21,6 +23,13 @@ use super::file_error;
 
 const DEFAULT_LIST_MAX: u32 = 1000;
 const DEFAULT_GLOB_MAX: u32 = 1000;
+
+/// Safety margin on top of `offset + max_results` retained in the list heap.
+/// Small extra room so near-tie mtimes don't break pagination boundaries.
+const LIST_HEAP_SAFETY_MARGIN: usize = 64;
+/// Absolute ceiling on retained entries. Prevents a pathological
+/// `max_results = u32::MAX` request from pre-allocating all of memory.
+const LIST_HEAP_RETAIN_CAP: usize = 100_000;
 
 /// Stat a file/directory/symlink and return its metadata.
 pub async fn handle_stat(req: &FileStat, resolved: &Path) -> Result<FileStatResult, FileError> {
@@ -56,6 +65,17 @@ pub async fn handle_stat(req: &FileStat, resolved: &Path) -> Result<FileStatResu
 }
 
 /// List entries in a directory, sorted by mtime desc with pagination.
+///
+/// Security / DoS properties:
+/// - Entry metadata is fetched via `symlink_metadata` so a symlink inside
+///   `resolved` never leaks its target's type, size, or mtime into the listing.
+///   The listing reports the symlink itself (type = Symlink) plus the target
+///   path string via `read_link`.
+/// - Entries are streamed into a bounded min-heap keyed by mtime. Only
+///   `offset + max_results + margin` entries are retained in memory, so a
+///   pathologically large directory cannot blow the heap. `total_count`
+///   still reflects every non-hidden entry scanned so pagination metadata
+///   (`has_more`) stays correct.
 pub async fn handle_list(req: &FileList, resolved: &Path) -> Result<FileListResult, FileError> {
     let metadata = tokio::fs::metadata(resolved)
         .await
@@ -68,10 +88,38 @@ pub async fn handle_list(req: &FileList, resolved: &Path) -> Result<FileListResu
         ));
     }
 
+    let max_results = req.max_results.unwrap_or(DEFAULT_LIST_MAX) as usize;
+    let offset = req.offset.unwrap_or(0) as usize;
+    // We need to retain offset+max_results entries to serve this page, plus a
+    // small safety margin so near-tie mtimes at the boundary don't drop a
+    // valid entry. Capped at LIST_HEAP_RETAIN_CAP regardless of request.
+    let retain = offset
+        .saturating_add(max_results)
+        .saturating_add(LIST_HEAP_SAFETY_MARGIN)
+        .min(LIST_HEAP_RETAIN_CAP);
+    // Pre-allocating the heap to `retain` is fine in the common case, but we
+    // still cap initial capacity so a huge `max_results` doesn't allocate
+    // eagerly before we've even seen one entry.
+    let initial_capacity = retain.min(1024);
+
+    // Min-heap (via `Reverse`) keyed by (mtime, name). The smallest mtime sits
+    // at the top; when the heap is full we peek the top and only push newer
+    // entries (evicting the oldest). The `name` tiebreaker keeps eviction
+    // deterministic when mtimes collide.
+    //
+    // `FileEntry` is a protobuf type and does not implement `Ord`, so the
+    // payload is stored in a parallel `Vec` and the heap only carries the
+    // comparable key plus an index into that vec. When the heap evicts an
+    // entry we "tombstone" its slot (`None`) rather than paying to compact
+    // the vec, then filter out tombstones when draining at the end.
+    let mut heap: BinaryHeap<Reverse<(u64, String, usize)>> =
+        BinaryHeap::with_capacity(initial_capacity);
+    let mut payload: Vec<Option<FileEntry>> = Vec::with_capacity(initial_capacity);
+    let mut total_count: u32 = 0;
+
     let mut read_dir = tokio::fs::read_dir(resolved)
         .await
         .map_err(|e| io_to_file_error(e, resolved))?;
-    let mut entries: Vec<FileEntry> = Vec::new();
     while let Some(entry) = read_dir
         .next_entry()
         .await
@@ -81,7 +129,11 @@ pub async fn handle_list(req: &FileList, resolved: &Path) -> Result<FileListResu
         if !req.include_hidden && name.starts_with('.') {
             continue;
         }
-        let Ok(metadata) = entry.metadata().await else {
+        // symlink_metadata never follows the entry's symlink, so a symlink
+        // pointing at /etc/passwd reports the link itself, not the target.
+        // tokio's `DirEntry` doesn't expose symlink_metadata directly, so we
+        // call it on the full path.
+        let Ok(metadata) = tokio::fs::symlink_metadata(entry.path()).await else {
             continue;
         };
         let symlink_target = if metadata.file_type().is_symlink() {
@@ -92,26 +144,58 @@ pub async fn handle_list(req: &FileList, resolved: &Path) -> Result<FileListResu
         } else {
             None
         };
-        entries.push(FileEntry {
-            name,
+
+        // Count every non-hidden entry we successfully stat'd, even if it
+        // later gets evicted from the heap. This keeps `has_more`/`total_count`
+        // accurate for pagination.
+        total_count = total_count.saturating_add(1);
+
+        let mtime = system_time_to_ms(metadata.modified().ok());
+        let file_entry = FileEntry {
+            name: name.clone(),
             file_type: map_file_type(&metadata) as i32,
             size: metadata.len(),
-            modified_ms: system_time_to_ms(metadata.modified().ok()),
+            modified_ms: mtime,
             symlink_target,
-        });
+        };
+
+        if heap.len() < retain {
+            let idx = payload.len();
+            payload.push(Some(file_entry));
+            heap.push(Reverse((mtime, name, idx)));
+        } else if let Some(Reverse((top_mtime, top_name, _))) = heap.peek() {
+            // Evict the oldest if this entry is newer. Ties are broken by
+            // name so eviction is deterministic.
+            if (mtime, &name) > (*top_mtime, top_name) {
+                if let Some(Reverse((_, _, evict_idx))) = heap.pop() {
+                    payload[evict_idx] = None;
+                }
+                let idx = payload.len();
+                payload.push(Some(file_entry));
+                heap.push(Reverse((mtime, name, idx)));
+            }
+        }
     }
 
-    // Sort by mtime desc (most recent first).
-    entries.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    // Drain the heap and sort by mtime desc (tiebreaker: name asc) for a
+    // stable, user-facing order. Evicted slots are tombstoned `None`; we
+    // walk the payload vec in index order (which is heap insertion order)
+    // and filter those out before sorting.
+    let mut sorted: Vec<FileEntry> = payload.into_iter().flatten().collect();
+    sorted.sort_by(|a, b| {
+        b.modified_ms
+            .cmp(&a.modified_ms)
+            .then_with(|| a.name.cmp(&b.name))
+    });
 
-    let total = entries.len() as u32;
-    let offset = req.offset.unwrap_or(0) as usize;
-    let max_results = req.max_results.unwrap_or(DEFAULT_LIST_MAX) as usize;
-
-    let end = offset.saturating_add(max_results).min(entries.len());
-    let start = offset.min(entries.len());
-    let paged: Vec<FileEntry> = entries[start..end].to_vec();
-    let has_more = end < entries.len();
+    let total = total_count;
+    // Pagination. Note: `sorted` only holds up to `retain` entries, so `offset`
+    // beyond that clamps to the end of the retained window. `has_more` is
+    // computed against the full scanned count so callers know more pages exist.
+    let start = offset.min(sorted.len());
+    let end = offset.saturating_add(max_results).min(sorted.len());
+    let paged: Vec<FileEntry> = sorted[start..end].to_vec();
+    let has_more = offset.saturating_add(max_results) < total as usize;
 
     Ok(FileListResult {
         entries: paged,
