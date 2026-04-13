@@ -16,7 +16,7 @@
     {
       "id": 2,
       "subject": "R2: FileCreateSymlink validates target path against policy",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 C4: handle_create_symlink only checks link_path; the target string is never validated, so a caller can create an allowed symlink that points at /etc/passwd. Add target validation in the dispatch arm and update collect_request_paths to include the target for approval preflight too.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops create_symlink\", \"acceptanceCriteria\": [\"CreateSymlink dispatch checks both link_path and target\", \"collect_request_paths emits both\", \"new test: symlink with denied target is rejected\"]}\n```"
     },
     {
@@ -28,7 +28,7 @@
     {
       "id": 4,
       "subject": "R4: FileGlob escalates to approval when matched paths hit dangerous_paths",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 C7: handle_glob filters denied paths but never reports needs_approval back to the caller. A glob rooted in an allowed directory can return files in dangerous_paths without forcing approval. Two-part fix:\n\n1. handle_glob collects per-match needs_approval flags and surfaces an aggregated hint via FileGlobResult or a side channel.\n2. check_request_approval/handle_file_request expand glob preflight: list matches up to a reasonable cap, check each one for needs_approval, and escalate if any is true.\n\nGo with the simpler version: dispatch pre-walks glob matches via fs_ops::glob_match_paths, and check_request_approval returns true if any match is dangerous.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/file_manager/fs_ops.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops glob\", \"acceptanceCriteria\": [\"check_request_approval expands glob and checks each match\", \"new test: glob over a dir containing a dangerous path triggers approval\", \"existing glob tests still pass\"]}\n```"
     },
     {
@@ -58,13 +58,13 @@
     {
       "id": 9,
       "subject": "R9: Recursive PERMANENT delete escalates to STRICT approval",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 spec rule (design.md:635): 'DELETE_MODE_PERMANENT + recursive in TRUST mode escalates to STRICT (requires confirmation)'. Currently never enforced. Add an op-level escalation in check_request_approval (or in handle_file_request directly) for FileDelete{mode=PERMANENT, recursive=true}.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/ahand_client.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"FileDelete with mode=PERMANENT and recursive=true escalates to approval regardless of session mode (except for INACTIVE which still rejects)\", \"new test pins this behavior\"]}\n```"
     },
     {
       "id": 10,
       "subject": "R10: Nonexistent-path symlink TOCTOU mitigation",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 S1 / Reviewer A#1: canonicalize_or_parent rebuilds an absolute path from the deepest existing ancestor + suffix; later handlers call follow-by-default ops on that path. A local attacker can swap a component for a symlink between policy approval and execution.\n\nFull fix (openat2 + RESOLVE_NO_SYMLINKS) is heavy. A simpler mitigation: after canonicalizing, the dispatch layer resolves the parent directory once and makes downstream handlers operate relative to that fd. Even simpler: post-write, call canonicalize() on the actual created path and check it against policy a SECOND time; if it escaped, delete the file and return PolicyDenied.\n\nGo with the simpler 'verify after' pattern for this round, plus document the residual risk.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/file_manager/policy.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"After write/mkdir/copy/move on a not-previously-existing path, policy is re-checked on the actual created path\", \"If the post-create path escapes the allowlist, the file is removed and PolicyDenied is returned\", \"Doc note: full TOCTOU fix requires openat2 (deferred to a follow-up)\"]}\n```"
     },
     {

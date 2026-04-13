@@ -10,8 +10,10 @@ pub mod policy;
 pub mod text_read;
 pub mod write_ops;
 
+use std::path::Path;
+
 use ahand_protocol::{
-    FileError, FileErrorCode, FileRequest, FileResponse, file_request, file_response,
+    DeleteMode, FileError, FileErrorCode, FileRequest, FileResponse, file_request, file_response,
 };
 
 use crate::config::FilePolicyConfig;
@@ -43,15 +45,36 @@ impl FileManager {
     /// Pre-check a FileRequest's paths against policy *before* dispatching.
     ///
     /// Used by the request handler to decide whether the request should go
-    /// through the approval flow (because the policy marks at least one of
-    /// its paths as `dangerous_paths`) or proceed directly.
+    /// through the approval flow. A request is escalated to approval when
+    /// ANY of the following are true:
     ///
-    /// - `Ok(true)`  — the request touches a dangerous path and must go
-    ///   through approval regardless of session mode.
-    /// - `Ok(false)` — no dangerous paths; normal session-mode flow applies.
+    /// - The policy marks at least one of the request's paths as dangerous
+    ///   (`dangerous_paths` glob match).
+    /// - For `FileGlob`, at least one matched path is dangerous (R4 —
+    ///   without this, a glob over an allowed directory could silently
+    ///   surface files in `dangerous_paths`).
+    /// - The request is `FileDelete` with `mode = DELETE_MODE_PERMANENT`
+    ///   and `recursive = true` (R9 + spec rule: recursive permanent delete
+    ///   always forces approval regardless of session mode).
+    ///
+    /// Returns:
+    /// - `Ok(true)` — the request must go through the approval flow.
+    /// - `Ok(false)` — normal session-mode flow applies.
     /// - `Err(FileError)` — one of the paths is flat-out denied by policy;
     ///   the caller should return this error immediately.
-    pub fn check_request_approval(&self, req: &FileRequest) -> Result<bool, FileError> {
+    pub async fn check_request_approval(&self, req: &FileRequest) -> Result<bool, FileError> {
+        // R9: recursive PERMANENT delete forces approval even if none of the
+        // paths themselves are marked dangerous. The spec says this must
+        // escalate regardless of session mode (design.md:635).
+        if let Some(file_request::Operation::Delete(d)) = &req.operation {
+            if d.mode == DeleteMode::Permanent as i32 && d.recursive {
+                return Ok(true);
+            }
+        }
+
+        // Walk the request's declared paths (R2 + existing behavior). The
+        // collect_request_paths helper already includes both link_path AND
+        // target for CreateSymlink (see R2).
         let mut needs_approval = false;
         for (path, is_write, no_follow) in collect_request_paths(req) {
             let result = self.policy.check_path(&path, is_write, no_follow)?;
@@ -59,7 +82,21 @@ impl FileManager {
                 needs_approval = true;
             }
         }
-        Ok(needs_approval)
+        if needs_approval {
+            return Ok(true);
+        }
+
+        // R4: for Glob requests, also expand the pattern and check each
+        // matched path. A glob rooted in an allowed directory can still
+        // surface files in `dangerous_paths`, so we must pre-walk matches
+        // here. Capped to avoid pathological patterns.
+        if let Some(file_request::Operation::Glob(g)) = &req.operation {
+            if glob_has_dangerous_match(&self.policy, g)? {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
     }
 
     /// Dispatch a `FileRequest` to the appropriate submodule handler.
@@ -146,6 +183,10 @@ impl FileManager {
             file_request::Operation::Mkdir(req) => {
                 let checked = self.policy.check_path(&req.path, true, false)?;
                 let result = fs_ops::handle_mkdir(req, checked.resolved_path.as_path()).await?;
+                // R10: verify the just-created directory's canonical path
+                // is still inside the allowlist (TOCTOU mitigation for
+                // nonexistent-path symlink swaps).
+                verify_post_create(&self.policy, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Mkdir(result))
             }
             file_request::Operation::ReadText(req) => {
@@ -194,6 +235,8 @@ impl FileManager {
                     self.policy.max_write_bytes(),
                 )
                 .await?;
+                // R10: post-create verification for new files.
+                verify_post_create(&self.policy, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Write(result))
             }
             file_request::Operation::Edit(req) => {
@@ -231,6 +274,8 @@ impl FileManager {
                     dest.resolved_path.as_path(),
                 )
                 .await?;
+                // R10: verify the copy destination is still inside policy.
+                verify_post_create(&self.policy, dest.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Copy(result))
             }
             file_request::Operation::Move(req) => {
@@ -242,6 +287,8 @@ impl FileManager {
                     dest.resolved_path.as_path(),
                 )
                 .await?;
+                // R10: verify the move destination is still inside policy.
+                verify_post_create(&self.policy, dest.resolved_path.as_path()).await?;
                 Ok(file_response::Result::MoveResult(result))
             }
             file_request::Operation::CreateSymlink(req) => {
@@ -249,8 +296,33 @@ impl FileManager {
                 // link_path must not be resolved through any pre-existing
                 // symlink sitting there, so we use no_follow_symlink=true.
                 let checked = self.policy.check_path(&req.link_path, true, true)?;
+                // R2: also validate the target path against policy. An
+                // absolute target is checked outright; a relative target is
+                // resolved against the link's parent before checking. This
+                // prevents creating an allowed symlink that points at
+                // /etc/passwd and later using it as an allowlist bypass
+                // surface through read operations that hit the canonical
+                // target.
+                let target_path = if Path::new(&req.target).is_absolute() {
+                    std::path::PathBuf::from(&req.target)
+                } else {
+                    // Resolve relative target against the link's PARENT
+                    // directory (that's what the OS does when resolving
+                    // a relative symlink at read time).
+                    let parent = checked
+                        .resolved_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("/"));
+                    parent.join(&req.target)
+                };
+                self.policy
+                    .check_path(&target_path.to_string_lossy(), false, true)?;
+
                 let result =
                     fs_ops::handle_create_symlink(req, checked.resolved_path.as_path()).await?;
+                // R10: post-create verification — after the symlink exists,
+                // re-check the link's own canonical path to catch any race.
+                verify_post_create(&self.policy, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::CreateSymlink(result))
             }
         }
@@ -292,7 +364,105 @@ fn collect_request_paths(req: &FileRequest) -> Vec<(String, bool, bool)> {
             (r.source.clone(), true, false),
             (r.destination.clone(), true, false),
         ],
-        Operation::CreateSymlink(r) => vec![(r.link_path.clone(), true, true)],
+        Operation::CreateSymlink(r) => {
+            // R2: check BOTH the symlink's own location (link_path) and the
+            // target string. The target is validated with no_follow=true +
+            // is_write=false — it's a read-only reference stored inside the
+            // symlink, not a path we operate on directly. If the target is
+            // absolute and outside the allowlist, we refuse at creation
+            // time so the symlink can't be used as an allowlist-bypass
+            // vector later.
+            let mut paths = vec![(r.link_path.clone(), true, true)];
+            if !r.target.is_empty() && Path::new(&r.target).is_absolute() {
+                paths.push((r.target.clone(), false, true));
+            }
+            paths
+        }
+    }
+}
+
+/// R4 helper: walk glob matches and return `true` as soon as any match is
+/// flagged as dangerous by policy. Capped to avoid blocking on a
+/// pathological pattern like `/**/*` that could enumerate millions of
+/// files.
+fn glob_has_dangerous_match(
+    policy: &FilePolicyChecker,
+    req: &ahand_protocol::FileGlob,
+) -> Result<bool, FileError> {
+    const GLOB_APPROVAL_SCAN_CAP: usize = 10_000;
+
+    // Reject patterns that would have been rejected by dispatch anyway.
+    if req.pattern.starts_with('/') {
+        return Ok(false);
+    }
+    if req.pattern.split(&['/', '\\'][..]).any(|seg| seg == "..") {
+        return Ok(false);
+    }
+
+    // Resolve the pattern against the (policy-canonicalized) base_path.
+    let base = match req.base_path.as_deref() {
+        Some(b) if !b.is_empty() => {
+            // The caller's check_request_approval already ran
+            // policy.check_path on the base_path, so we can trust it.
+            match policy.check_path(b, false, false) {
+                Ok(r) => Some(r.resolved_path),
+                Err(_) => return Ok(false),
+            }
+        }
+        _ => None,
+    };
+    let full_pattern = match base {
+        Some(b) => b.join(&req.pattern).to_string_lossy().into_owned(),
+        None => req.pattern.clone(),
+    };
+
+    let glob_iter = match glob::glob(&full_pattern) {
+        Ok(g) => g,
+        Err(_) => return Ok(false),
+    };
+
+    for entry in glob_iter.take(GLOB_APPROVAL_SCAN_CAP) {
+        let Ok(path) = entry else {
+            continue;
+        };
+        let path_str = path.to_string_lossy();
+        match policy.check_path(&path_str, false, false) {
+            Ok(result) if result.needs_approval => return Ok(true),
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// R10: post-create verification to mitigate the nonexistent-path symlink
+/// TOCTOU race. The canonicalize_or_parent helper in policy rebuilds a
+/// non-existing path from its deepest existing ancestor, so an attacker
+/// who swaps a component for a symlink between the policy check and the
+/// operation can redirect the write/mkdir target. Re-canonicalizing AFTER
+/// the operation catches most such swaps; anything escaping the allowlist
+/// is cleaned up (best-effort) and reported as PolicyDenied.
+///
+/// Full TOCTOU protection requires fd-based syscalls (openat2 +
+/// RESOLVE_NO_SYMLINKS on Linux, O_NOFOLLOW elsewhere) — that refactor is
+/// deferred to a follow-up PR.
+async fn verify_post_create(policy: &FilePolicyChecker, resolved: &Path) -> Result<(), FileError> {
+    let path_str = resolved.to_string_lossy();
+    match policy.check_path(&path_str, false, false) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            // Best-effort cleanup: try file removal first, then directory.
+            // If the created resource can't be removed, leave it in place
+            // and still return the error so the caller knows the op was
+            // rejected.
+            if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await {
+                if metadata.is_dir() {
+                    let _ = tokio::fs::remove_dir(resolved).await;
+                } else {
+                    let _ = tokio::fs::remove_file(resolved).await;
+                }
+            }
+            Err(err)
+        }
     }
 }
 

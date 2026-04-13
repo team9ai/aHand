@@ -879,7 +879,7 @@ async fn handle_file_request<T>(
     // the FileError. Otherwise we carry `policy_needs_approval` forward so
     // the session-mode branch below can escalate to approval even when the
     // session itself would Allow.
-    let policy_needs_approval = match file_mgr.check_request_approval(&req) {
+    let policy_needs_approval = match file_mgr.check_request_approval(&req).await {
         Ok(flag) => flag,
         Err(err) => {
             warn!(request_id = %req.request_id, code = err.code, "file request denied by policy pre-check");
