@@ -122,6 +122,21 @@ pub async fn handle_read_image(
         ));
     }
 
+    // Enforce the policy-level max_read_bytes budget before loading the file.
+    // This catches both the normal pipeline and passthrough mode — a huge file
+    // must never be slurped into memory regardless of what the caller requests.
+    let file_size = metadata.len();
+    if file_size > max_read_bytes {
+        return Err(file_error(
+            FileErrorCode::TooLarge,
+            &req.path,
+            format!(
+                "file size {} exceeds max_read_bytes ({})",
+                file_size, max_read_bytes
+            ),
+        ));
+    }
+
     let raw = tokio::fs::read(resolved)
         .await
         .map_err(|e| io_to_file_error(e, resolved))?;
@@ -301,6 +316,19 @@ fn encode_image(
     // met by resizing, which we don't do here. Return a single encode pass.
     if !format_supports_quality(format) {
         let bytes = encode_single(img, format, quality)?;
+        if let Some(budget) = max_bytes {
+            if bytes.len() as u64 > budget {
+                return Err(file_error(
+                    FileErrorCode::TooLarge,
+                    "",
+                    format!(
+                        "encoded image {} bytes exceeds requested max_bytes {} (lossless format has no quality knob)",
+                        bytes.len(),
+                        budget
+                    ),
+                ));
+            }
+        }
         return Ok(EncodedImage {
             size: bytes.len() as u64,
             bytes,
@@ -314,6 +342,20 @@ fn encode_image(
         while last.len() as u64 > budget && q > 10 {
             q = q.saturating_sub(10);
             last = encode_single(img, format, q)?;
+        }
+        // If we still exceed the budget after hitting the quality floor, the
+        // caller's max_bytes is unreachable — fail loudly instead of silently
+        // handing back oversize output.
+        if last.len() as u64 > budget {
+            return Err(file_error(
+                FileErrorCode::TooLarge,
+                "",
+                format!(
+                    "encoded image {} bytes exceeds requested max_bytes {} even at minimum quality",
+                    last.len(),
+                    budget
+                ),
+            ));
         }
     }
     let size = last.len() as u64;
