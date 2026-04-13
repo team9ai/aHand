@@ -177,16 +177,16 @@ pub async fn handle_read_text(
             }
         }
 
-        // Decode the display slice from the file's native encoding into UTF-8.
-        let decoded_line = decode_slice(&raw, effective_start, display_end_raw, encoding);
-
         // Apply per-line truncation (max_line_width, measured in raw bytes).
-        // `raw_display_len` is what the caller sees as "this line's content";
-        // remaining_bytes counts raw bytes dropped by truncation, never
-        // including the trailing newline.
-        let raw_display_len = display_end_raw - effective_start;
+        // `truncate_line` cuts the raw slice first, then decodes, so
+        // `remaining_bytes` is always counted in raw on-disk bytes — a must
+        // for non-UTF-8 encodings (GBK, Shift-JIS, etc.) where the decoded
+        // UTF-8 byte length differs from the raw byte length. The trailing
+        // newline, if any, is already excluded by `display_end_raw`, so
+        // `remaining_bytes` never includes it.
+        let raw_line = &raw[effective_start..display_end_raw];
         let (content, truncated, remaining_bytes) =
-            truncate_line(&decoded_line, raw_display_len, max_line_width);
+            truncate_line(raw_line, encoding, max_line_width);
 
         lines.push(TextLine {
             content,
@@ -278,23 +278,6 @@ fn resolve_encoding(
     Ok(detector.guess(None, true))
 }
 
-/// Decode a `[start, end)` slice of `raw` from the file's encoding into a
-/// UTF-8 `String`. `encoding_rs::Encoding::decode_without_bom_handling` is
-/// the right tool here because we've already consumed any BOM in
-/// `resolve_encoding` (the BOM is at raw[0..3], which the line iterator
-/// silently reads as part of line 0 — that's consistent with how the
-/// previous implementation behaved and is what the existing tests expect).
-fn decode_slice(
-    raw: &[u8],
-    start: usize,
-    end: usize,
-    encoding: &'static encoding_rs::Encoding,
-) -> String {
-    let slice = &raw[start..end];
-    let (decoded, _, _had_errors) = encoding.decode(slice);
-    decoded.into_owned()
-}
-
 /// Compute the byte offset of each line start in the RAW buffer.
 ///
 /// Line 0 starts at byte 0. Line N+1 starts at the byte immediately after a
@@ -372,40 +355,39 @@ fn line_index_for_byte(offsets: &[usize], byte: usize) -> usize {
     }
 }
 
-/// Truncate a decoded line to `max_line_width` raw bytes. Returns
-/// `(content, truncated, remaining_bytes)` where `remaining_bytes` is in
-/// raw on-disk bytes.
+/// Truncate a raw line slice to `max_line_width` raw on-disk bytes, then
+/// decode it via `encoding`. Returns `(content, truncated, remaining_bytes)`
+/// where `remaining_bytes` is in **raw** on-disk bytes (not UTF-8 bytes).
 ///
-/// `raw_slice_len` is the length of the underlying raw slice; we use it to
-/// decide truncation because `max_line_width` is historically specified in
-/// bytes. When the decoded string's byte count differs from `raw_slice_len`
-/// (non-UTF-8 input), we still compare against `raw_slice_len` for the
-/// truncation decision and report `raw_slice_len - raw_cut` as the
-/// remaining-bytes count.
-fn truncate_line(decoded: &str, raw_slice_len: usize, max_width: u32) -> (String, bool, u32) {
-    if max_width == 0 || raw_slice_len <= max_width as usize {
-        return (decoded.to_string(), false, 0);
+/// This must operate on the raw slice before decoding so the remaining-byte
+/// accounting stays consistent for non-UTF-8 encodings (GBK, Shift-JIS, …)
+/// where the decoded UTF-8 length differs from the raw length. For UTF-8 we
+/// back the cut up to a char boundary so multi-byte code points are never
+/// split. For non-UTF-8 encodings we cut at the raw byte boundary directly;
+/// in the worst case the encoder's `decode` call replaces a dangling trail
+/// byte with U+FFFD, which is acceptable — doing better would require
+/// per-encoding state tracking that `encoding_rs` doesn't expose here.
+fn truncate_line(
+    raw_line: &[u8],
+    encoding: &'static encoding_rs::Encoding,
+    max_width: u32,
+) -> (String, bool, u32) {
+    if max_width == 0 || raw_line.len() <= max_width as usize {
+        let (decoded, _, _) = encoding.decode(raw_line);
+        return (decoded.into_owned(), false, 0);
     }
-    // Cut the decoded string to max_width bytes, respecting char boundaries.
-    let cut = safe_utf8_prefix(decoded.as_bytes(), max_width as usize);
-    let content = std::str::from_utf8(cut)
-        .unwrap_or("")
-        .to_string();
-    let remaining = (raw_slice_len - cut.len()) as u32;
-    (content, true, remaining)
-}
-
-/// Truncate a UTF-8 byte slice at `max_bytes`, backing up to a char boundary
-/// so we never split a multi-byte code point.
-fn safe_utf8_prefix(bytes: &[u8], max_bytes: usize) -> &[u8] {
-    if bytes.len() <= max_bytes {
-        return bytes;
+    let mut cut = max_width as usize;
+    if encoding == encoding_rs::UTF_8 {
+        // Back up to a UTF-8 char boundary so we never split a multi-byte
+        // code point. The continuation-byte test `(b & 0xC0) == 0x80`
+        // identifies 10xxxxxx bytes.
+        while cut > 0 && (raw_line[cut] & 0xC0) == 0x80 {
+            cut -= 1;
+        }
     }
-    let mut end = max_bytes;
-    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
-        end -= 1;
-    }
-    &bytes[..end]
+    let (decoded, _, _) = encoding.decode(&raw_line[..cut]);
+    let remaining = (raw_line.len() - cut) as u32;
+    (decoded.into_owned(), true, remaining)
 }
 
 use ahand_protocol::file_read_text as file_read_text_mod;
