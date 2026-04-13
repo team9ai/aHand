@@ -139,30 +139,32 @@ fn expires_at_ms(expiration: Duration) -> u64 {
     now + expiration.as_millis() as u64
 }
 
+/// Test-only constructor that builds an `S3Client` from an already-configured
+/// `aws_sdk_s3::Client`. This lets tests inject explicit credentials via the
+/// SDK config builder instead of mutating process-wide environment variables,
+/// which is unsound under cargo's parallel test runner.
+#[cfg(test)]
+impl S3Client {
+    pub(crate) fn for_test(
+        client: aws_sdk_s3::Client,
+        bucket: &str,
+        threshold: u64,
+        expiration_secs: u64,
+    ) -> Self {
+        Self {
+            client,
+            bucket: bucket.into(),
+            expiration: Duration::from_secs(expiration_secs),
+            threshold,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::S3Config;
-
-    /// Set synthetic AWS credentials for the test process so the aws-sdk-s3
-    /// presigner has something to sign with. The presigner itself is a pure
-    /// local computation (HMAC-SHA256 of a canonical request), so the values
-    /// only need to exist — they do not need to be real.
-    ///
-    /// `std::env::set_var` is `unsafe` on Rust 2024 edition because setting
-    /// env vars from multiple threads is not guaranteed to be sound on every
-    /// platform. Inside a single-threaded test setup this is fine.
-    fn ensure_fake_aws_creds() {
-        unsafe {
-            std::env::set_var("AWS_ACCESS_KEY_ID", "test");
-            std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
-            // Some SDK code paths look for a session token even when unused.
-            std::env::remove_var("AWS_SESSION_TOKEN");
-            // Prevent the default credential provider chain from trying to
-            // hit IMDS / SSO / profile files on the dev machine.
-            std::env::set_var("AWS_EC2_METADATA_DISABLED", "true");
-        }
-    }
+    use aws_credential_types::Credentials;
 
     fn fake_endpoint_config() -> S3Config {
         S3Config {
@@ -172,6 +174,34 @@ mod tests {
             file_transfer_threshold_bytes: 1_048_576,
             url_expiration_secs: 3_600,
         }
+    }
+
+    /// Build an `aws_sdk_s3::Client` wired with explicit synthetic credentials
+    /// and the given endpoint. The presigner is a pure local HMAC-SHA256
+    /// computation, so the credentials only need to exist — they do not need
+    /// to be real. Crucially, this path never touches process env, so tests
+    /// are safe to run in parallel.
+    fn sdk_client_with_explicit_creds(endpoint: &str, region: &str) -> aws_sdk_s3::Client {
+        let creds = Credentials::new("test", "test", None, None, "ahand-hub-s3-tests");
+        let s3_config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(BehaviorVersion::latest())
+            .credentials_provider(creds)
+            .region(Region::new(region.to_string()))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .build();
+        aws_sdk_s3::Client::from_conf(s3_config)
+    }
+
+    fn build_test_s3_client(config: &S3Config) -> S3Client {
+        let endpoint = config.endpoint.as_ref().expect("test config has endpoint");
+        let aws_client = sdk_client_with_explicit_creds(endpoint, &config.region);
+        S3Client::for_test(
+            aws_client,
+            &config.bucket,
+            config.file_transfer_threshold_bytes,
+            config.url_expiration_secs,
+        )
     }
 
     #[test]
@@ -186,18 +216,16 @@ mod tests {
 
     #[tokio::test]
     async fn s3_client_constructs_with_fake_endpoint() {
-        ensure_fake_aws_creds();
         let config = fake_endpoint_config();
-        let client = S3Client::new(&config).await;
+        let client = build_test_s3_client(&config);
         assert_eq!(client.bucket(), "test-bucket");
         assert_eq!(client.threshold(), 1_048_576);
     }
 
     #[tokio::test]
     async fn s3_client_generate_upload_url_returns_populated_url() {
-        ensure_fake_aws_creds();
         let config = fake_endpoint_config();
-        let client = S3Client::new(&config).await;
+        let client = build_test_s3_client(&config);
 
         let key = "file-ops/device-1/obj-key";
         let result = client.generate_upload_url(key).await;
@@ -228,9 +256,8 @@ mod tests {
 
     #[tokio::test]
     async fn s3_client_generate_download_url_returns_populated_url() {
-        ensure_fake_aws_creds();
         let config = fake_endpoint_config();
-        let client = S3Client::new(&config).await;
+        let client = build_test_s3_client(&config);
 
         let key = "file-ops/device-1/obj-key";
         let result = client.generate_download_url(key).await;

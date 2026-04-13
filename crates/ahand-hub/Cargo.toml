@@ -31,10 +31,12 @@ uuid.workspace = true
 # when the `[s3]` section is not present in the hub config.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
 aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
-aws-credential-types = "1"
 
 [dev-dependencies]
 ahand-hub-store = { path = "../ahand-hub-store", features = ["test-support"] }
+# Used by the `s3` test module to build an `aws_sdk_s3::Client` with explicit
+# synthetic credentials, avoiding unsafe process-wide env var mutation.
+aws-credential-types = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = "0.3"
 prost.workspace = true
