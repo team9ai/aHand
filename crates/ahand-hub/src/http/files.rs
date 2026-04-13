@@ -8,6 +8,7 @@
 //! content type.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -15,6 +16,7 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use prost::Message;
 use tokio::sync::oneshot;
 
@@ -31,21 +33,33 @@ const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 /// enough to stop a malicious client from leaking 30-second waiters.
 const MAX_PENDING_FILE_REQUESTS: usize = 1024;
 
-/// Error returned when `PendingFileRequests::register` cannot accept a new
-/// waiter because the table is at capacity.
+/// Error returned by `PendingFileRequests::register`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PendingFileRequestsAtCapacity;
+pub enum PendingFileRequestsError {
+    /// The pending-request table is at its configured capacity.
+    AtCapacity,
+    /// A waiter for the same `(device_id, request_id)` is already pending.
+    /// The caller should pick a different request id (or wait for the
+    /// existing one to complete).
+    Duplicate,
+}
 
 /// Tracks in-flight file requests so the device_gateway can resolve them when a
 /// FileResponse arrives. Keyed by `(device_id, request_id)` to prevent cross
 /// contamination between devices that happen to pick colliding request IDs.
 ///
-/// Admission control: `register` caps inserts at `MAX_PENDING_FILE_REQUESTS`
-/// to prevent an authenticated client from retaining arbitrarily many
-/// 30-second waiters on the hub.
+/// Concurrency: admission control is enforced via an `AtomicUsize` counter
+/// that is incremented BEFORE inserting and decremented on resolve / cancel.
+/// This makes the cap atomic in the face of concurrent registers — a naive
+/// `len() >= capacity` check followed by `insert()` could let multiple
+/// callers race past the cap. Duplicate keys are rejected via
+/// `DashMap::entry`, so retries that reuse a still-pending request_id get an
+/// explicit `Duplicate` error instead of silently clobbering the previous
+/// waiter.
 pub struct PendingFileRequests {
     pending: DashMap<(String, String), oneshot::Sender<FileResponse>>,
     capacity: usize,
+    in_flight: AtomicUsize,
 }
 
 impl PendingFileRequests {
@@ -53,6 +67,7 @@ impl PendingFileRequests {
         Self {
             pending: DashMap::new(),
             capacity,
+            in_flight: AtomicUsize::new(0),
         }
     }
 
@@ -60,14 +75,31 @@ impl PendingFileRequests {
         &self,
         device_id: &str,
         request_id: &str,
-    ) -> Result<oneshot::Receiver<FileResponse>, PendingFileRequestsAtCapacity> {
-        if self.pending.len() >= self.capacity {
-            return Err(PendingFileRequestsAtCapacity);
+    ) -> Result<oneshot::Receiver<FileResponse>, PendingFileRequestsError> {
+        // 1. Atomically reserve a slot. If we exceed capacity we hand the
+        //    reservation back. This makes the cap race-free under concurrent
+        //    callers.
+        let new_count = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        if new_count > self.capacity {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return Err(PendingFileRequestsError::AtCapacity);
         }
-        let (tx, rx) = oneshot::channel();
-        self.pending
-            .insert((device_id.to_string(), request_id.to_string()), tx);
-        Ok(rx)
+
+        // 2. Try to take the (device_id, request_id) slot. Reject duplicates
+        //    explicitly — silently overwriting would orphan the prior waiter
+        //    in the closed-channel error path.
+        let key = (device_id.to_string(), request_id.to_string());
+        match self.pending.entry(key) {
+            Entry::Occupied(_) => {
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Err(PendingFileRequestsError::Duplicate)
+            }
+            Entry::Vacant(slot) => {
+                let (tx, rx) = oneshot::channel();
+                slot.insert(tx);
+                Ok(rx)
+            }
+        }
     }
 
     pub fn resolve(&self, device_id: &str, request_id: &str, response: FileResponse) {
@@ -75,18 +107,24 @@ impl PendingFileRequests {
             .pending
             .remove(&(device_id.to_string(), request_id.to_string()))
         {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             let _ = tx.send(response);
         }
     }
 
     pub fn cancel(&self, device_id: &str, request_id: &str) {
-        self.pending
-            .remove(&(device_id.to_string(), request_id.to_string()));
+        if self
+            .pending
+            .remove(&(device_id.to_string(), request_id.to_string()))
+            .is_some()
+        {
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     #[cfg(test)]
     pub fn in_flight(&self) -> usize {
-        self.pending.len()
+        self.in_flight.load(Ordering::SeqCst)
     }
 }
 
@@ -136,12 +174,20 @@ pub async fn file_operation(
     let rx = state
         .pending_file_requests
         .register(&device_id, &request.request_id)
-        .map_err(|_| {
-            ApiError::new(
+        .map_err(|err| match err {
+            PendingFileRequestsError::AtCapacity => ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "FILE_REQUESTS_SATURATED",
                 "hub pending file-request table is at capacity; retry shortly",
-            )
+            ),
+            PendingFileRequestsError::Duplicate => ApiError::new(
+                StatusCode::CONFLICT,
+                "FILE_REQUEST_DUPLICATE",
+                format!(
+                    "request_id {} is already in flight for device {}",
+                    request.request_id, device_id
+                ),
+            ),
         })?;
 
     let request_id = request.request_id.clone();
@@ -275,7 +321,53 @@ mod tests {
         let _rx1 = table.register("device-1", "r1").unwrap();
         let _rx2 = table.register("device-1", "r2").unwrap();
         let third = table.register("device-1", "r3");
-        assert_eq!(third.err(), Some(PendingFileRequestsAtCapacity));
+        assert_eq!(third.err(), Some(PendingFileRequestsError::AtCapacity));
+    }
+
+    #[tokio::test]
+    async fn pending_file_requests_rejects_duplicate_keys_explicitly() {
+        // R1 regression: registering the same (device_id, request_id) twice
+        // must NOT silently overwrite the prior waiter. The second register
+        // returns Duplicate so the caller can pick a fresh id (or wait for
+        // the existing one to complete).
+        let table = PendingFileRequests::default();
+        let _rx1 = table.register("device-a", "req-1").unwrap();
+        let second = table.register("device-a", "req-1");
+        assert_eq!(second.err(), Some(PendingFileRequestsError::Duplicate));
+        // The first waiter is still alive — `in_flight` reflects only one slot.
+        assert_eq!(table.in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_file_requests_capacity_is_atomic_under_concurrent_registers() {
+        // R1 regression: capacity must not be over-subscribed under
+        // concurrent admission. Spawn 32 tasks that each try to grab a slot
+        // in a 4-slot table; exactly 4 must succeed, 28 must fail with
+        // AtCapacity, and `in_flight` lands at 4 after the dust settles.
+        let table = std::sync::Arc::new(PendingFileRequests::new(4));
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let t = table.clone();
+            handles.push(tokio::spawn(async move {
+                t.register("device-1", &format!("r{i}"))
+            }));
+        }
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        let mut keepalives = Vec::new();
+        for h in handles {
+            match h.await.unwrap() {
+                Ok(rx) => {
+                    accepted += 1;
+                    keepalives.push(rx);
+                }
+                Err(PendingFileRequestsError::AtCapacity) => rejected += 1,
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 4, "exactly 4 registrations should be accepted");
+        assert_eq!(rejected, 28, "the rest should be AtCapacity");
+        assert_eq!(table.in_flight(), 4);
     }
 
     #[tokio::test]
