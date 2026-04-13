@@ -408,6 +408,62 @@ async fn list_not_a_directory_returns_error() {
     assert_eq!(err.code, FileErrorCode::NotADirectory as i32);
 }
 
+/// Regression for R5: a symlink inside the listed directory must surface as
+/// `FileType::Symlink` with a `symlink_target`, and must NOT leak the target
+/// file's size/type/mtime. Previously `handle_list` called
+/// `entry.metadata()` which follows symlinks, so a symlink pointing at
+/// `/etc/hosts` would report `/etc/hosts`'s metadata to the caller.
+#[cfg(unix)]
+#[tokio::test]
+async fn list_does_not_follow_symlink_into_target_metadata() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    // Create a real file with a known size inside the sandbox.
+    let target = root.join("real.txt");
+    fs::write(&target, "1234567890").unwrap();
+    // Create a symlink in the same directory pointing OUTSIDE the sandbox.
+    // /etc/hosts is a stable system file on macOS/Linux.
+    let link = root.join("link-out");
+    std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::List(FileList {
+            path: root.to_string_lossy().into_owned(),
+            max_results: None,
+            offset: None,
+            include_hidden: false,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let list = expect_list(resp);
+    let link_entry = list
+        .entries
+        .iter()
+        .find(|e| e.name == "link-out")
+        .expect("link-out must appear in listing");
+    // The link must be reported as Symlink type, not File or Directory.
+    assert_eq!(
+        link_entry.file_type,
+        FileType::Symlink as i32,
+        "symlink must not be resolved to its target's file type"
+    );
+    // The target string must be populated so callers can see what it points at.
+    assert_eq!(
+        link_entry.symlink_target.as_deref(),
+        Some("/etc/hosts"),
+        "symlink_target should reflect the literal link target"
+    );
+    // And the real file must still be listed correctly alongside it.
+    let real_entry = list
+        .entries
+        .iter()
+        .find(|e| e.name == "real.txt")
+        .expect("real.txt must appear in listing");
+    assert_eq!(real_entry.file_type, FileType::File as i32);
+    assert_eq!(real_entry.size, 10);
+}
+
 // ── FileGlob tests ─────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -842,6 +898,34 @@ async fn read_text_line_truncation_marks_flag_and_remaining() {
 }
 
 #[tokio::test]
+async fn read_text_truncates_gbk_in_raw_bytes_not_decoded_bytes() {
+    // R0 regression: `truncate_line` must cut the raw on-disk slice at
+    // `max_line_width` raw bytes, not the decoded UTF-8 length. For GBK
+    // "你好世界" = 8 raw bytes (4 CJK chars × 2 bytes each) but 12 UTF-8
+    // bytes after decoding — the old impl mixed these up and returned
+    // wrong content + wrong remaining_bytes. With max_line_width=4 we
+    // should keep the first 4 raw bytes (= 2 GBK chars = "你好") and
+    // report remaining_bytes=4.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("gbk-trunc.txt");
+    let gbk: Vec<u8> = vec![0xC4, 0xE3, 0xBA, 0xC3, 0xCA, 0xC0, 0xBD, 0xE7];
+    fs::write(&file, &gbk).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.encoding = Some("gbk".into());
+    req.max_line_width = Some(4);
+
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 1);
+    let line = &result.lines[0];
+    assert!(line.truncated);
+    assert_eq!(line.content, "你好");
+    assert_eq!(line.remaining_bytes, 4);
+}
+
+#[tokio::test]
 async fn read_text_empty_file() {
     let dir = TempDir::new().unwrap();
     let (mgr, root) = test_manager(&dir);
@@ -1149,6 +1233,72 @@ async fn read_image_not_an_image_returns_error() {
     let resp = mgr.handle(&image_req(&file, None, None)).await;
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+}
+
+#[tokio::test]
+async fn read_image_input_size_exceeds_max_read_bytes_is_rejected() {
+    // Use a tight policy budget and a real image whose on-disk size is
+    // larger than the budget. We force the budget below the encoded PNG
+    // size so the file-size check trips before the dimension guard.
+    use image::{ImageBuffer, Rgb};
+    let dir = TempDir::new().unwrap();
+    let tmp_root = dir.path().canonicalize().unwrap();
+    let root_str = tmp_root.to_string_lossy().into_owned();
+    let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec![format!("{}/**", root_str), root_str.clone()],
+        path_denylist: vec![],
+        max_read_bytes: 200,
+        max_write_bytes: 100_000_000,
+        dangerous_paths: vec![],
+    });
+    let file = tmp_root.join("big.png");
+    // 64x64 random-noise PNG won't compress to under 200 bytes. Use
+    // wrapping arithmetic so we don't overflow u8 in debug builds.
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(64, 64, |x, y| {
+        Rgb([
+            ((x ^ y) as u8).wrapping_mul(7),
+            (x.wrapping_mul(y) & 0xFF) as u8,
+            ((x.wrapping_add(y)) as u8) ^ 0xAA,
+        ])
+    });
+    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+
+    let resp = mgr.handle(&image_req(&file, None, None)).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+}
+
+#[tokio::test]
+async fn read_image_max_bytes_unreachable_returns_too_large() {
+    // Generate a JPEG that cannot be compressed below ~1 KB even at the
+    // quality floor, then ask for max_bytes=100. The handler must return
+    // TooLarge instead of best-effort output.
+    use image::{ImageBuffer, Rgb};
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("noise.png");
+    // High-entropy image so JPEG can't compress it down.
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(256, 256, |x, y| {
+        Rgb([(x as u8).wrapping_mul(17) ^ y as u8, (x as u8).wrapping_add(y as u8), 0])
+    });
+    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadImage(FileReadImage {
+            path: file.to_string_lossy().into_owned(),
+            max_width: None,
+            max_height: None,
+            max_bytes: Some(100),
+            quality: Some(100),
+            output_format: Some(ImageFormat::Jpeg as i32),
+            no_follow_symlink: false,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
 }
 
 // ── FileWrite tests ────────────────────────────────────────────────────────

@@ -1,0 +1,138 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-12-file-ops-review-round2-fixes.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "R0: text_read truncate_line uses raw bytes (not decoded UTF-8)",
+      "status": "completed",
+      "description": "Round 2 C1: truncate_line() trims decoded.as_bytes() then subtracts cut.len() from raw_slice_len. For non-UTF-8 input (GBK, Shift-JIS) the decoded UTF-8 length differs from raw, so content stops too early and remaining_bytes is wrong. Fix: truncate the raw slice first, then decode only the retained prefix. Add a regression test with GBK input + max_line_width.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"truncate_line truncates raw bytes before decoding\", \"GBK file with max_line_width=4 returns 4 raw bytes worth of decoded content\", \"remaining_bytes is in raw on-disk bytes\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "R1: PendingFileRequests rejects duplicate keys + atomic admission",
+      "status": "completed",
+      "description": "Round 2 C2 + C3: register() does len() check then separate insert() (race), and unconditional insert() silently overwrites duplicate (device_id, request_id) keys. Use DashMap entry API to detect duplicates (return an explicit DuplicateKey error mapped to 409), and serialize admission control via a single critical section that checks-and-inserts atomically.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib http::files\", \"acceptanceCriteria\": [\"register() returns an error variant for duplicate (device_id, request_id)\", \"register() returns AtCapacity atomically (no over-subscription)\", \"file_operation handler maps duplicate error to 409\", \"new test: same-device duplicate request_id rejected\", \"new test: concurrent registers stop exactly at capacity\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "R2: FileCreateSymlink validates target path against policy",
+      "status": "pending",
+      "description": "Round 2 C4: handle_create_symlink only checks link_path; the target string is never validated, so a caller can create an allowed symlink that points at /etc/passwd. Add target validation in the dispatch arm and update collect_request_paths to include the target for approval preflight too.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops create_symlink\", \"acceptanceCriteria\": [\"CreateSymlink dispatch checks both link_path and target\", \"collect_request_paths emits both\", \"new test: symlink with denied target is rejected\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "R3: Image read enforces max_read_bytes on input + passthrough",
+      "status": "completed",
+      "description": "Round 2 C5 + C6: handle_read_image reads the entire file into memory before any size check. A 500MB file with tiny dimensions (header-only payload) blows the read budget. Passthrough mode also returns whole file unchanged regardless of max_read_bytes. Fix: check metadata.len() against max_read_bytes BEFORE tokio::fs::read, in the same async-context check binary_read already does for binary.\n\nAlso: when encode_image cannot meet max_bytes even at the lossy quality floor, return TooLarge instead of returning the floor's output.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/binary_read.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_image\", \"acceptanceCriteria\": [\"handle_read_image checks metadata.len() against max_read_bytes before reading\", \"Passthrough mode rejects oversize files with TooLarge\", \"encode_image returns TooLarge if lossy floor still exceeds max_bytes\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "R4: FileGlob escalates to approval when matched paths hit dangerous_paths",
+      "status": "pending",
+      "description": "Round 2 C7: handle_glob filters denied paths but never reports needs_approval back to the caller. A glob rooted in an allowed directory can return files in dangerous_paths without forcing approval. Two-part fix:\n\n1. handle_glob collects per-match needs_approval flags and surfaces an aggregated hint via FileGlobResult or a side channel.\n2. check_request_approval/handle_file_request expand glob preflight: list matches up to a reasonable cap, check each one for needs_approval, and escalate if any is true.\n\nGo with the simpler version: dispatch pre-walks glob matches via fs_ops::glob_match_paths, and check_request_approval returns true if any match is dangerous.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/file_manager/fs_ops.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops glob\", \"acceptanceCriteria\": [\"check_request_approval expands glob and checks each match\", \"new test: glob over a dir containing a dangerous path triggers approval\", \"existing glob tests still pass\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "R5: FileList uses symlink_metadata so target metadata never leaks",
+      "status": "completed",
+      "description": "Round 2 C8: handle_list calls entry.metadata() which follows symlinks. A symlink in an allowed dir pointing at /etc/passwd surfaces target type/size/mtime in the listing. Switch to entry.metadata() vs symlink_metadata depending on what we want to expose. The right semantics: never follow during listing — surface symlink type + read_link target, that's it.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/fs_ops.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops list\", \"acceptanceCriteria\": [\"handle_list uses symlink_metadata for each entry\", \"new test: symlink in listed dir is reported as Symlink type with target string, NOT as the target's type\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "R6: File approvals scoped separately from job approvals",
+      "status": "pending",
+      "description": "Round 2 C9: ApprovalManager keys pending entries on job_id. handle_file_request reuses request_id as a synthetic job_id, so a file request can evict a real job's pending approval. Fix by either (a) prefixing file approval keys with 'file:' inside the manager call sites, or (b) splitting ApprovalManager into two namespaces. Go with (a) — minimal change, no API breakage.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo build -p ahandd && cargo test -p ahandd\", \"acceptanceCriteria\": [\"file approval submit uses prefixed key (e.g. 'file:<request_id>')\", \"approval response routing handles the prefix on resolve\", \"new test: parallel file + job request with identical IDs do not evict each other\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "R7: Empty encoding string treated as auto-detect (not UTF-8)",
+      "status": "pending",
+      "description": "Round 2 I1: design spec says empty encoding means auto-detect, but resolve_encoding() returns UTF_8 for empty strings. Treat Some('') the same as None.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"empty string encoding triggers auto-detect path\", \"new test: GBK file with encoding='' is decoded correctly\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "R8: ApprovalRequest payload carries the file paths it touches",
+      "status": "pending",
+      "description": "Round 2 I2: the synthetic JobRequest only sets tool='file' and args=[op_name], so the user-facing approval prompt never sees what file is being touched. Populate args from collect_request_paths so the approval payload includes the actual paths.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo build -p ahandd\", \"acceptanceCriteria\": [\"synthetic JobRequest.args = [op_name, path1, path2, ...]\", \"approval payload visible to dashboard contains the path\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "R9: Recursive PERMANENT delete escalates to STRICT approval",
+      "status": "pending",
+      "description": "Round 2 spec rule (design.md:635): 'DELETE_MODE_PERMANENT + recursive in TRUST mode escalates to STRICT (requires confirmation)'. Currently never enforced. Add an op-level escalation in check_request_approval (or in handle_file_request directly) for FileDelete{mode=PERMANENT, recursive=true}.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/ahand_client.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"FileDelete with mode=PERMANENT and recursive=true escalates to approval regardless of session mode (except for INACTIVE which still rejects)\", \"new test pins this behavior\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "R10: Nonexistent-path symlink TOCTOU mitigation",
+      "status": "pending",
+      "description": "Round 2 S1 / Reviewer A#1: canonicalize_or_parent rebuilds an absolute path from the deepest existing ancestor + suffix; later handlers call follow-by-default ops on that path. A local attacker can swap a component for a symlink between policy approval and execution.\n\nFull fix (openat2 + RESOLVE_NO_SYMLINKS) is heavy. A simpler mitigation: after canonicalizing, the dispatch layer resolves the parent directory once and makes downstream handlers operate relative to that fd. Even simpler: post-write, call canonicalize() on the actual created path and check it against policy a SECOND time; if it escaped, delete the file and return PolicyDenied.\n\nGo with the simpler 'verify after' pattern for this round, plus document the residual risk.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/file_manager/policy.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"After write/mkdir/copy/move on a not-previously-existing path, policy is re-checked on the actual created path\", \"If the post-create path escapes the allowlist, the file is removed and PolicyDenied is returned\", \"Doc note: full TOCTOU fix requires openat2 (deferred to a follow-up)\"]}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "R11: Config loader expands `~` in policy patterns",
+      "status": "pending",
+      "description": "Round 2 S4: spec uses `~/.ssh/**` etc in dangerous_paths examples. FilePolicyChecker stores patterns verbatim and never expands `~`. Fix at config load time by expanding `~` and `~/` to dirs::home_dir() before constructing FilePolicyChecker.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/config.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"FilePolicyConfig load() expands `~/...` patterns to absolute home-relative paths\", \"new unit test: ~/.ssh/** becomes /home/user/.ssh/** (or platform equivalent)\"]}\n```"
+    },
+    {
+      "id": 12,
+      "subject": "R12: LineCol.col clamped to current line length",
+      "status": "pending",
+      "description": "Round 2 S7: resolve_start_raw / resolve_position_raw add `col` to the line's starting byte and clamp only against EOF. If col exceeds the line's length, the position spills into later lines, violating the proto's 'byte offset within line' semantics. Clamp against the line's end (excluding newline) instead.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"LineCol with col>line_length is clamped to the line's last printable byte\", \"new test: line_col=(line=2, col=999) on a short line resolves to end of line 2\"]}\n```"
+    },
+    {
+      "id": 13,
+      "subject": "R13: FileList streams entries with bounded heap (DoS guard)",
+      "status": "completed",
+      "description": "Round 2 S9: handle_list reads ALL directory entries into a Vec, sorts them, then slices. A directory with 10M entries blows memory regardless of max_read_bytes. Switch to a bounded keep-top-K-by-mtime approach with a small heap, capping memory at offset+max_results entries.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/fs_ops.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops list\", \"acceptanceCriteria\": [\"handle_list uses a bounded BinaryHeap keyed by mtime\", \"existing list pagination tests still pass\", \"behavior on small dirs is unchanged\"]}\n```"
+    },
+    {
+      "id": 14,
+      "subject": "R14: TRASH delete returns trash_path when supported",
+      "status": "pending",
+      "description": "Round 2 S10: handle_delete calls trash::delete and discards the result. The trash crate does NOT directly expose the per-item destination path, but trash::os_limited::list() can be used after the delete, OR we can use trash::TrashItem APIs on platforms that expose them. Best-effort: for platforms that surface a trash dir (macOS, Linux), report the OS-level trash directory plus the original basename. On Windows, leave as None.\n\nIf the API truly doesn't expose enough info, document why trash_path stays None and add a clear comment.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/fs_ops.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops delete\", \"acceptanceCriteria\": [\"handle_delete attempts to populate trash_path on supported platforms\", \"comment explains any remaining None case\", \"new test (or #[ignore] noting why) for the populated path\"]}\n```"
+    },
+    {
+      "id": 15,
+      "subject": "R15: file_operation enforces application/x-protobuf content-type",
+      "status": "pending",
+      "description": "Round 2 S11 / Path A #6: handler claims content-type application/x-protobuf but does not actually verify it. Add a check: if Content-Type header is present and is not application/x-protobuf (or */* or missing), return 415 Unsupported Media Type.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\", \"crates/ahand-hub/tests/http_files.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --test http_files\", \"acceptanceCriteria\": [\"file_operation rejects requests with Content-Type: application/json with 415\", \"requests without Content-Type still work (lenient default)\", \"requests with Content-Type: application/x-protobuf still work\"]}\n```"
+    },
+    {
+      "id": 16,
+      "subject": "R16: text read max_bytes=0 returns empty lines (no empty TextLine)",
+      "status": "pending",
+      "description": "Round 2 S12: when max_bytes=0, the loop emits one empty TextLine and STOP_REASON_MAX_BYTES instead of zero lines. Bail out at the start of the loop body if budget_remaining=0 AND we're about to emit a line that wouldn't have any consumable bytes.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"max_bytes=0 returns 0 lines, STOP_REASON_MAX_BYTES\", \"existing read_text tests pass\"]}\n```"
+    },
+    {
+      "id": 17,
+      "subject": "R17: Move PendingFileRequests out of http module into state.rs",
+      "status": "pending",
+      "description": "Round 2 S15: PendingFileRequests is defined in crates/ahand-hub/src/http/files.rs but referenced by JobRuntime in the WS frame handler. That's a layering violation. Move the type into a transport-neutral module (state.rs is the natural home, or a new pending.rs module).\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\", \"crates/ahand-hub/src/state.rs\", \"crates/ahand-hub/src/lib.rs\", \"crates/ahand-hub/src/http/jobs.rs\"], \"verifyCommand\": \"cargo build -p ahand-hub && cargo test -p ahand-hub\", \"acceptanceCriteria\": [\"PendingFileRequests + PendingFileRequestsAtCapacity defined outside http/\", \"http/files.rs imports it via `use crate::pending_file_requests::*` or similar\", \"all existing tests pass\"]}\n```"
+    },
+    {
+      "id": 18,
+      "subject": "R18: Drop unused aws-credential-types dependency",
+      "status": "completed",
+      "description": "Round 2 S16: ahand-hub Cargo.toml lists aws-credential-types but no source file imports it. Remove.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/Cargo.toml\"], \"verifyCommand\": \"cargo build -p ahand-hub\", \"acceptanceCriteria\": [\"aws-credential-types removed from Cargo.toml\", \"build still succeeds\"]}\n```"
+    },
+    {
+      "id": 19,
+      "subject": "R19: s3.rs tests serialize env-var setup with a Mutex",
+      "status": "completed",
+      "description": "Round 2 I7: s3 tests use `unsafe { std::env::set_var }` without serialization. Cargo's test harness runs tests in parallel by default, and env mutation across threads is unsound. Wrap the env-set helper in a `Mutex` (or `Once`) so the env mutation only runs from a serialized critical section. Better: use `aws-sdk-s3`'s explicit credentials provider so we don't touch env vars at all.\n\nGo with the explicit credentials provider approach.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/s3.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib s3\", \"acceptanceCriteria\": [\"s3 tests do not call std::env::set_var\", \"aws-sdk-s3 builder uses Credentials::new() directly\", \"tests still pass\"]}\n```"
+    },
+    {
+      "id": 20,
+      "subject": "R20: handle_file_request approval task exits on connection close",
+      "status": "pending",
+      "description": "Round 2 I8 / Path A #5: the approval-await task is `tokio::spawn`-ed and only exits on approval response or timeout. If the device websocket disconnects, the task lingers until the 24h default approval timeout. Plumb a watch::Receiver<bool> close signal from connect_with_auth into handle_file_request so the spawned task can `tokio::select!` on either.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo build -p ahandd\", \"acceptanceCriteria\": [\"approval-await task aborts cleanly when the parent connection closes\", \"approval_mgr.expire is called on connection close\", \"existing tests still pass\"]}\n```"
+    },
+    {
+      "id": 21,
+      "subject": "R21: Tests for dangerous_paths / strict approval and Hello file capability",
+      "status": "pending",
+      "description": "Round 2 I4 + I5 + B#23 + B#24: the approval-sensitive code paths and the Hello capability advertisement are uncovered by tests. Add:\n- handle_file_request test for dangerous_paths in TRUST mode → approval requested\n- handle_file_request test for strict mode → approval requested\n- hub_handshake test for build_hello_envelope(file_enabled=true) → 'file' in capabilities\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/file_ops.rs\", \"crates/ahandd/tests/hub_handshake.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"dangerous_paths + TRUST → approval test passes\", \"strict mode + file op → approval test passes\", \"build_hello_envelope(file_enabled=true) test passes\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-13T00:00:00Z"
+}
