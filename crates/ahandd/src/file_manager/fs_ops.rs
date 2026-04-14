@@ -365,11 +365,25 @@ pub async fn handle_delete(
                     format!("failed to move to trash: {e}"),
                 )
             })?;
+            // The `trash` crate (5.2.x) does not expose the post-delete
+            // destination: on macOS the `resultingItemURL` out-param from
+            // `NSFileManager::trashItemAtURL` is discarded, the Finder
+            // AppleScript path returns nothing, and the `os_limited` module
+            // (which can `list()` trash contents on freedesktop/Windows) is
+            // not compiled on macOS. So we fall back to a best-effort guess
+            // of the home trash location. This is a hint only — the trash
+            // system may rename the item to resolve name collisions, and on
+            // non-home volumes the real location is a per-volume
+            // `/Volumes/.../.Trashes/<uid>/` directory we don't try to
+            // detect. On unsupported platforms (Windows, other Unixes) we
+            // return `None` so callers can detect "unknown" rather than
+            // relying on a fabricated path.
+            let trash_path = guess_trash_path(resolved);
             Ok(FileDeleteResult {
                 path: path_str,
                 mode: DeleteMode::Trash as i32,
                 items_deleted: 1,
-                trash_path: None, // OS-specific — not always discoverable
+                trash_path,
             })
         }
         DeleteMode::Permanent => {
@@ -424,6 +438,99 @@ pub async fn handle_delete(
                 })
             }
         }
+    }
+}
+
+/// Best-effort guess of where the home trash places an item after a
+/// `trash::delete` call.
+///
+/// The `trash` crate (5.2.x) does not return the destination path on any
+/// platform — see the comment in [`handle_delete`]'s TRASH branch for
+/// details. This helper reproduces the Freedesktop/macOS "home trash"
+/// location so the `FileDeleteResult.trash_path` field can carry a
+/// human-useful hint instead of always being `None`.
+///
+/// **This is a hint, not a guarantee.** Concretely:
+/// - The trash system may rename the item when another file with the same
+///   basename already exists (e.g. macOS appends " 2", freedesktop appends
+///   numeric suffixes to the `.trashinfo` file).
+/// - On macOS, items deleted from non-boot volumes are placed in a
+///   per-volume `/Volumes/<vol>/.Trashes/<uid>/` directory rather than
+///   `~/.Trash`. We do not try to detect this.
+/// - On Linux, items on a separate mount point land in that mount's
+///   `.Trash-<uid>/files/` directory, not the home trash.
+///
+/// Returns `None` on platforms where no stable user-visible path exists
+/// (currently Windows and any Unix other than macOS / freedesktop-compatible
+/// Linux) or when the required environment variables (`HOME`,
+/// `XDG_DATA_HOME`) are unset.
+pub fn guess_trash_path(original: &Path) -> Option<String> {
+    let basename = original.file_name()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        // Follows the default `DeleteMethod::Finder` path: moves into the
+        // user's home trash at `~/.Trash`.
+        let home = std::env::var_os("HOME")?;
+        if home.is_empty() {
+            return None;
+        }
+        let mut p = PathBuf::from(home);
+        p.push(".Trash");
+        p.push(basename);
+        return Some(p.to_string_lossy().into_owned());
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    {
+        // Freedesktop Trash spec 1.0: the "home trash" is
+        // `$XDG_DATA_HOME/Trash` (default `$HOME/.local/share/Trash`), and
+        // deleted payloads live under its `files/` subdirectory.
+        let trash_root = if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+            if data_home.is_empty() {
+                None
+            } else {
+                let mut p = PathBuf::from(data_home);
+                p.push("Trash");
+                Some(p)
+            }
+        } else {
+            None
+        };
+        let trash_root = trash_root.or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            if home.is_empty() {
+                return None;
+            }
+            let mut p = PathBuf::from(home);
+            p.push(".local/share/Trash");
+            Some(p)
+        })?;
+        let mut p = trash_root;
+        p.push("files");
+        p.push(basename);
+        return Some(p.to_string_lossy().into_owned());
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            unix,
+            not(target_os = "macos"),
+            not(target_os = "ios"),
+            not(target_os = "android")
+        )
+    )))]
+    {
+        // Windows Recycle Bin does not expose a stable user-visible path;
+        // other platforms have no standard home trash location.
+        let _ = basename;
+        None
     }
 }
 
