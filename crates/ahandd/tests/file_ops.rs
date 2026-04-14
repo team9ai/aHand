@@ -1698,6 +1698,99 @@ async fn delete_non_recursive_on_non_empty_dir_returns_not_empty() {
     assert!(sub.exists());
 }
 
+// ── Trash path guess (Option B fallback) ──────────────────────────────────
+
+/// `guess_trash_path` must produce a user-visible hint ending in the
+/// original basename on platforms where the trash crate actually has a
+/// home trash concept (macOS + freedesktop Linux). This test exercises the
+/// Option B fallback path that `handle_delete`'s TRASH branch now uses,
+/// without actually touching the real system trash.
+#[cfg(any(
+    target_os = "macos",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
+#[test]
+fn guess_trash_path_returns_basename_under_home_trash() {
+    use ahandd::file_manager::fs_ops::guess_trash_path;
+
+    let original = PathBuf::from("/tmp/some/where/trash-me.txt");
+    let guess = guess_trash_path(&original).expect("home trash guess should be available");
+    assert!(
+        guess.ends_with("trash-me.txt"),
+        "guessed path {guess:?} should end with the original basename",
+    );
+
+    #[cfg(target_os = "macos")]
+    assert!(
+        guess.contains("/.Trash/"),
+        "on macOS the guess should live under ~/.Trash, got {guess:?}",
+    );
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    assert!(
+        guess.contains("/Trash/files/"),
+        "on freedesktop Linux the guess should live under Trash/files, got {guess:?}",
+    );
+}
+
+/// A path with no basename (e.g. `/`) can't produce a meaningful trash
+/// hint. The helper must return `None` in that case rather than panic or
+/// produce a garbage path.
+#[test]
+fn guess_trash_path_returns_none_for_rootless_path() {
+    use ahandd::file_manager::fs_ops::guess_trash_path;
+
+    // `Path::file_name` returns `None` for `/` and for empty paths.
+    assert!(guess_trash_path(Path::new("/")).is_none());
+    assert!(guess_trash_path(Path::new("")).is_none());
+}
+
+/// End-to-end check that the TRASH delete mode actually populates
+/// `trash_path` via the Option B fallback. This test moves a real file
+/// into the user's system trash, so it's gated behind `#[ignore]` — run
+/// manually with `cargo test -p ahandd --test file_ops -- --ignored
+/// delete_trash_populates_trash_path`.
+///
+/// Uses the multi-thread tokio flavor because `handle_delete` calls
+/// `tokio::task::block_in_place` for the blocking trash move, which
+/// panics on the default current-thread runtime.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "touches the real system trash; run manually"]
+async fn delete_trash_populates_trash_path() {
+    // Guarded by #[ignore] because it actually moves a file to the
+    // user's system trash. Run manually with `cargo test -- --ignored`.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("trash-me.txt");
+    fs::write(&file, "goodbye").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Delete(FileDelete {
+            path: file.to_string_lossy().into_owned(),
+            recursive: false,
+            mode: DeleteMode::Trash as i32,
+            no_follow_symlink: false,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let result = expect_delete(resp);
+    assert_eq!(result.mode, DeleteMode::Trash as i32);
+    assert!(result.trash_path.is_some(), "trash_path should be populated");
+    assert!(!file.exists(), "original file should be gone");
+}
+
 // ── FileCopy tests ─────────────────────────────────────────────────────────
 
 fn copy_req(src: &Path, dst: &Path, recursive: bool, overwrite: bool) -> FileRequest {
@@ -2410,6 +2503,69 @@ async fn read_text_byte_positions_match_raw_on_disk_bytes_for_gbk() {
     let end = result.end_pos.unwrap();
     // end_byte = 8 (raw file length), not 12 (decoded UTF-8 length).
     assert_eq!(end.byte_in_file, 8);
+}
+
+#[tokio::test]
+async fn read_text_empty_encoding_triggers_auto_detect() {
+    // R7 regression: an empty `encoding` string means "auto-detect", NOT
+    // "force UTF-8". A short CJK blob in GBK should round-trip through the
+    // auto-detect path (BOM / chardetng), not be mis-decoded as UTF-8.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("auto.txt");
+    // "你好,世界" in GBK — same bytes as the gbk-autodetect test above, enough
+    // signal for chardetng to lock onto GBK rather than falling back to UTF-8.
+    let gbk: Vec<u8> = vec![
+        0xC4, 0xE3, 0xBA, 0xC3, 0xA3, 0xAC, 0xCA, 0xC0, 0xBD, 0xE7,
+    ];
+    fs::write(&file, &gbk).unwrap();
+
+    let mut req = read_text_request(&file);
+    req.encoding = Some(String::new()); // explicit empty → auto-detect
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    // Auto-detect should pick a non-UTF-8 encoding (GBK/GB18030) and decode
+    // the bytes correctly.
+    assert_ne!(result.detected_encoding.to_ascii_uppercase(), "UTF-8");
+    assert_eq!(result.lines.len(), 1);
+    assert!(result.lines[0].content.contains("你好"));
+}
+
+#[tokio::test]
+async fn read_text_line_col_with_col_past_eol_clamps_to_line_end() {
+    // R12 regression: an oversized `col` on a short line must clamp to the
+    // current line's end (start of next line), not spill into the next line.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("clamp.txt");
+    fs::write(&file, "hi\nlong line here\n").unwrap();
+
+    let mut req = read_text_request(&file);
+    req.start = Some(file_read_text::Start::StartLineCol(LineCol {
+        line: 1,
+        col: 999, // way past "hi"
+    }));
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    // start_pos must remain on line 1, not spill into line 2.
+    assert_eq!(result.start_pos.unwrap().line, 1);
+}
+
+#[tokio::test]
+async fn read_text_max_bytes_zero_returns_no_lines() {
+    // R16 regression: max_bytes=0 must return zero lines with
+    // stop_reason=MaxBytes (previously it emitted a single empty TextLine).
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("zero.txt");
+    fs::write(&file, "line1\nline2\n").unwrap();
+
+    let mut req = read_text_request(&file);
+    req.max_bytes = Some(0);
+    let resp = mgr.handle(&wrap_read_text(req)).await;
+    let result = expect_read_text(resp);
+    assert_eq!(result.lines.len(), 0);
+    assert_eq!(result.stop_reason, StopReason::MaxBytes as i32);
 }
 
 #[tokio::test]

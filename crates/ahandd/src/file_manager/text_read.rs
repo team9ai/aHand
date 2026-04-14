@@ -117,6 +117,12 @@ pub async fn handle_read_text(
     let mut end_line_idx = start_line_idx;
 
     for idx in start_line_idx..line_offsets.len() {
+        // max_bytes budget check comes first so `max_bytes=0` returns zero
+        // lines with stop_reason=MaxBytes (rather than an empty TextLine).
+        if max_bytes == 0 || bytes_accumulated >= max_bytes {
+            stop_reason = StopReason::MaxBytes;
+            break;
+        }
         if lines.len() >= max_lines {
             stop_reason = StopReason::MaxLines;
             break;
@@ -166,11 +172,16 @@ pub async fn handle_read_text(
         // displayed content but keep it counted in the consumed range so
         // `end_byte` / `bytes_accumulated` correctly advance past it.
         let mut display_end_raw = consume_end_raw;
-        if !cut_short {
-            if raw.get(display_end_raw.saturating_sub(1)) == Some(&b'\n') {
+        // Only strip a trailing newline when there's at least one byte in
+        // the consumed range. Guarding on `display_end_raw > effective_start`
+        // avoids an underflow/reversed slice when the effective start has
+        // been clamped forward (e.g. a LineCol.col that landed exactly on
+        // the start-of-next-line boundary).
+        if !cut_short && display_end_raw > effective_start {
+            if raw.get(display_end_raw - 1) == Some(&b'\n') {
                 display_end_raw -= 1;
                 if display_end_raw > effective_start
-                    && raw.get(display_end_raw.saturating_sub(1)) == Some(&b'\r')
+                    && raw.get(display_end_raw - 1) == Some(&b'\r')
                 {
                     display_end_raw -= 1;
                 }
@@ -253,19 +264,19 @@ fn resolve_encoding(
     encoding_hint: Option<&str>,
 ) -> Result<&'static encoding_rs::Encoding, FileError> {
     if let Some(name) = encoding_hint {
-        if name.is_empty()
-            || name.eq_ignore_ascii_case("utf-8")
-            || name.eq_ignore_ascii_case("utf8")
-        {
-            return Ok(encoding_rs::UTF_8);
+        if !name.is_empty() {
+            if name.eq_ignore_ascii_case("utf-8") || name.eq_ignore_ascii_case("utf8") {
+                return Ok(encoding_rs::UTF_8);
+            }
+            return encoding_rs::Encoding::for_label(name.as_bytes()).ok_or_else(|| {
+                file_error(
+                    FileErrorCode::Encoding,
+                    "",
+                    format!("unknown encoding: {name}"),
+                )
+            });
         }
-        return encoding_rs::Encoding::for_label(name.as_bytes()).ok_or_else(|| {
-            file_error(
-                FileErrorCode::Encoding,
-                "",
-                format!("unknown encoding: {name}"),
-            )
-        });
+        // Empty string → fall through to auto-detect path below.
     }
 
     // Auto-detect. UTF-8 validation fast path.
@@ -321,7 +332,12 @@ fn resolve_start_raw(
         file_read_text_mod::Start::StartLineCol(lc) => {
             let line_idx = (lc.line.saturating_sub(1) as usize).min(offsets.len());
             let line_start = offsets.get(line_idx).copied().unwrap_or(raw_len);
-            let byte = (line_start + lc.col as usize).min(raw_len);
+            // Clamp `col` against the end of the current line (the start of
+            // the next line, or `raw_len` for the last line) so an oversized
+            // `col` never spills into the next line. Worst case lands on the
+            // newline character, a valid "end of line" position.
+            let next_start = offsets.get(line_idx + 1).copied().unwrap_or(raw_len);
+            let byte = (line_start + lc.col as usize).min(next_start);
             Ok((byte, line_idx))
         }
     }
@@ -342,7 +358,10 @@ fn resolve_position_raw(
         Some(file_position::Position::LineCol(lc)) => {
             let line_idx = (lc.line.saturating_sub(1) as usize).min(offsets.len());
             let line_start = offsets.get(line_idx).copied().unwrap_or(raw_len);
-            Ok((line_start + lc.col as usize).min(raw_len))
+            // Clamp `col` against the end of the current line so oversized
+            // `col` values never spill into the next line.
+            let next_start = offsets.get(line_idx + 1).copied().unwrap_or(raw_len);
+            Ok((line_start + lc.col as usize).min(next_start))
         }
         None => Ok(raw_len),
     }
