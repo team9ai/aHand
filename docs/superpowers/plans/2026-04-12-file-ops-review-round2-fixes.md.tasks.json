@@ -40,19 +40,19 @@
     {
       "id": 6,
       "subject": "R6: File approvals scoped separately from job approvals",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 C9: ApprovalManager keys pending entries on job_id. handle_file_request reuses request_id as a synthetic job_id, so a file request can evict a real job's pending approval. Fix by either (a) prefixing file approval keys with 'file:' inside the manager call sites, or (b) splitting ApprovalManager into two namespaces. Go with (a) — minimal change, no API breakage.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo build -p ahandd && cargo test -p ahandd\", \"acceptanceCriteria\": [\"file approval submit uses prefixed key (e.g. 'file:<request_id>')\", \"approval response routing handles the prefix on resolve\", \"new test: parallel file + job request with identical IDs do not evict each other\"]}\n```"
     },
     {
       "id": 7,
       "subject": "R7: Empty encoding string treated as auto-detect (not UTF-8)",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 I1: design spec says empty encoding means auto-detect, but resolve_encoding() returns UTF_8 for empty strings. Treat Some('') the same as None.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"empty string encoding triggers auto-detect path\", \"new test: GBK file with encoding='' is decoded correctly\"]}\n```"
     },
     {
       "id": 8,
       "subject": "R8: ApprovalRequest payload carries the file paths it touches",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 I2: the synthetic JobRequest only sets tool='file' and args=[op_name], so the user-facing approval prompt never sees what file is being touched. Populate args from collect_request_paths so the approval payload includes the actual paths.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo build -p ahandd\", \"acceptanceCriteria\": [\"synthetic JobRequest.args = [op_name, path1, path2, ...]\", \"approval payload visible to dashboard contains the path\"]}\n```"
     },
     {
@@ -70,13 +70,13 @@
     {
       "id": 11,
       "subject": "R11: Config loader expands `~` in policy patterns",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 S4: spec uses `~/.ssh/**` etc in dangerous_paths examples. FilePolicyChecker stores patterns verbatim and never expands `~`. Fix at config load time by expanding `~` and `~/` to dirs::home_dir() before constructing FilePolicyChecker.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/config.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"FilePolicyConfig load() expands `~/...` patterns to absolute home-relative paths\", \"new unit test: ~/.ssh/** becomes /home/user/.ssh/** (or platform equivalent)\"]}\n```"
     },
     {
       "id": 12,
       "subject": "R12: LineCol.col clamped to current line length",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 S7: resolve_start_raw / resolve_position_raw add `col` to the line's starting byte and clamp only against EOF. If col exceeds the line's length, the position spills into later lines, violating the proto's 'byte offset within line' semantics. Clamp against the line's end (excluding newline) instead.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"LineCol with col>line_length is clamped to the line's last printable byte\", \"new test: line_col=(line=2, col=999) on a short line resolves to end of line 2\"]}\n```"
     },
     {
@@ -88,19 +88,19 @@
     {
       "id": 14,
       "subject": "R14: TRASH delete returns trash_path when supported",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 S10: handle_delete calls trash::delete and discards the result. The trash crate does NOT directly expose the per-item destination path, but trash::os_limited::list() can be used after the delete, OR we can use trash::TrashItem APIs on platforms that expose them. Best-effort: for platforms that surface a trash dir (macOS, Linux), report the OS-level trash directory plus the original basename. On Windows, leave as None.\n\nIf the API truly doesn't expose enough info, document why trash_path stays None and add a clear comment.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/fs_ops.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops delete\", \"acceptanceCriteria\": [\"handle_delete attempts to populate trash_path on supported platforms\", \"comment explains any remaining None case\", \"new test (or #[ignore] noting why) for the populated path\"]}\n```"
     },
     {
       "id": 15,
       "subject": "R15: file_operation enforces application/x-protobuf content-type",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 S11 / Path A #6: handler claims content-type application/x-protobuf but does not actually verify it. Add a check: if Content-Type header is present and is not application/x-protobuf (or */* or missing), return 415 Unsupported Media Type.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\", \"crates/ahand-hub/tests/http_files.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --test http_files\", \"acceptanceCriteria\": [\"file_operation rejects requests with Content-Type: application/json with 415\", \"requests without Content-Type still work (lenient default)\", \"requests with Content-Type: application/x-protobuf still work\"]}\n```"
     },
     {
       "id": 16,
       "subject": "R16: text read max_bytes=0 returns empty lines (no empty TextLine)",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 S12: when max_bytes=0, the loop emits one empty TextLine and STOP_REASON_MAX_BYTES instead of zero lines. Bail out at the start of the loop body if budget_remaining=0 AND we're about to emit a line that wouldn't have any consumable bytes.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\", \"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"max_bytes=0 returns 0 lines, STOP_REASON_MAX_BYTES\", \"existing read_text tests pass\"]}\n```"
     },
     {
@@ -124,7 +124,7 @@
     {
       "id": 20,
       "subject": "R20: handle_file_request approval task exits on connection close",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 I8 / Path A #5: the approval-await task is `tokio::spawn`-ed and only exits on approval response or timeout. If the device websocket disconnects, the task lingers until the 24h default approval timeout. Plumb a watch::Receiver<bool> close signal from connect_with_auth into handle_file_request so the spawned task can `tokio::select!` on either.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo build -p ahandd\", \"acceptanceCriteria\": [\"approval-await task aborts cleanly when the parent connection closes\", \"approval_mgr.expire is called on connection close\", \"existing tests still pass\"]}\n```"
     },
     {
