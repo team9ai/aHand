@@ -42,6 +42,17 @@ impl FileManager {
         &self.policy
     }
 
+    /// Return the list of paths a FileRequest touches, for display in
+    /// approval prompts (R8). Mirrors `collect_request_paths` but drops
+    /// the is_write / no_follow_symlink flags so the caller can use the
+    /// result directly as `ApprovalRequest.args`.
+    pub fn request_paths(&self, req: &FileRequest) -> Vec<String> {
+        collect_request_paths(req)
+            .into_iter()
+            .map(|(p, _, _)| p)
+            .collect()
+    }
+
     /// Pre-check a FileRequest's paths against policy *before* dispatching.
     ///
     /// Used by the request handler to decide whether the request should go
