@@ -257,10 +257,57 @@ fn default_server_url() -> String {
     "ws://localhost:3000/ws".to_string()
 }
 
+/// Expand a leading `~` in a path pattern to the user's home directory.
+///
+/// Supports `~/...` (Unix) and `~\...` (Windows) prefixes, as well as a bare
+/// `~`. If [`dirs::home_dir`] returns `None`, the original pattern is returned
+/// unchanged and a warning is logged — we avoid panicking so daemon startup is
+/// never blocked by tilde expansion failures.
+fn expand_tilde(pattern: &str) -> String {
+    if let Some(rest) = pattern
+        .strip_prefix("~/")
+        .or_else(|| pattern.strip_prefix("~\\"))
+    {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
+        }
+        tracing::warn!(
+            pattern = %pattern,
+            "cannot expand tilde: dirs::home_dir() returned None; leaving pattern as-is"
+        );
+    } else if pattern == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.to_string_lossy().into_owned();
+        }
+        tracing::warn!(
+            "cannot expand tilde: dirs::home_dir() returned None; leaving `~` as-is"
+        );
+    }
+    pattern.to_string()
+}
+
+/// Apply [`expand_tilde`] to every entry in a mutable string list in place.
+fn expand_tildes_in_place(list: &mut Vec<String>) {
+    for item in list.iter_mut() {
+        *item = expand_tilde(item);
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+
+        // Expand `~` in file-policy path patterns so FilePolicyChecker never
+        // sees a tilde — glob_match compares patterns literally against
+        // canonicalized absolute paths, so `~/.ssh/**` would otherwise never
+        // match `/home/user/.ssh/...`.
+        if let Some(ref mut fp) = config.file_policy {
+            expand_tildes_in_place(&mut fp.path_allowlist);
+            expand_tildes_in_place(&mut fp.path_denylist);
+            expand_tildes_in_place(&mut fp.dangerous_paths);
+        }
+
         Ok(config)
     }
 
@@ -335,4 +382,32 @@ fn uuid_v4() -> String {
         .unwrap()
         .as_nanos();
     format!("{:032x}", ts)
+}
+
+#[cfg(test)]
+mod tilde_tests {
+    use super::*;
+
+    #[test]
+    fn expand_tilde_for_home_rooted_patterns() {
+        let home = dirs::home_dir().expect("home dir required for this test");
+        assert_eq!(
+            expand_tilde("~/.ssh/**"),
+            format!("{}/.ssh/**", home.display())
+        );
+        assert_eq!(expand_tilde("~"), home.to_string_lossy().to_string());
+    }
+
+    #[test]
+    fn expand_tilde_leaves_absolute_and_other_paths_alone() {
+        assert_eq!(expand_tilde("/etc/passwd"), "/etc/passwd");
+        assert_eq!(expand_tilde("./relative"), "./relative");
+        assert_eq!(expand_tilde("no_tilde_here"), "no_tilde_here");
+    }
+
+    #[test]
+    fn expand_tilde_does_not_touch_middle_tildes() {
+        // Tildes inside a path (not at the start) stay literal.
+        assert_eq!(expand_tilde("/tmp/~backup"), "/tmp/~backup");
+    }
 }
