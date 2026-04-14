@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -156,9 +156,31 @@ pub async fn file_operation(
     auth: AuthContextExt,
     State(state): State<AppState>,
     Path(device_id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<Response> {
     auth.require_dashboard_access()?;
+
+    // Enforce content-type: missing / empty is allowed for backwards
+    // compatibility with older clients and test helpers, but any explicit
+    // content-type other than `application/x-protobuf` is rejected with
+    // 415 so schema confusion (e.g. a client sending JSON by mistake) is
+    // surfaced loudly instead of silently decoding random bytes.
+    if let Some(ct) = headers.get(header::CONTENT_TYPE) {
+        let ct_str = ct.to_str().unwrap_or("");
+        // Strip any `; charset=...` / parameter suffix.
+        let base = ct_str.split(';').next().unwrap_or("").trim();
+        if !base.is_empty() && base != PROTOBUF_CONTENT_TYPE {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "UNSUPPORTED_MEDIA_TYPE",
+                format!(
+                    "expected content-type {}, got {}",
+                    PROTOBUF_CONTENT_TYPE, ct_str
+                ),
+            ));
+        }
+    }
 
     if body.is_empty() {
         return Err(ApiError::validation("request body is empty"));

@@ -169,6 +169,29 @@ async fn file_operation_empty_body_returns_400() {
 }
 
 #[tokio::test]
+async fn file_operation_rejects_non_protobuf_content_type() {
+    // R15 regression: the handler documents that the request body must be
+    // `application/x-protobuf`. A client that sends a valid protobuf body
+    // but mislabels it (e.g. `application/json`) should get a loud 415
+    // instead of a silent decode, so schema confusion surfaces during
+    // integration rather than deep inside the device runtime.
+    let server = spawn_test_server().await;
+    let token = dashboard_token(&server).await;
+    let url = format!("{}/api/devices/device-2/files", server.http_base_url());
+    let body = encoded_read_text("/tmp/fake.txt", "req-wrong-ct");
+    let response = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 415);
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn file_operation_malformed_proto_returns_400() {
     let server = spawn_test_server().await;
     let token = dashboard_token(&server).await;
