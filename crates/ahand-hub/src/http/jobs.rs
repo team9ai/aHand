@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use crate::auth::AuthContextExt;
 use crate::events::EventBus;
 use crate::http::api_error::{ApiError, ApiResult};
-use crate::http::files::PendingFileRequests;
+use crate::pending_file_requests::PendingFileRequests;
 use crate::state::AppState;
 use crate::ws::device_gateway::ConnectionRegistry;
 

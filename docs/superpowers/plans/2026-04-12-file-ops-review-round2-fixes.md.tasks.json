@@ -106,7 +106,7 @@
     {
       "id": 17,
       "subject": "R17: Move PendingFileRequests out of http module into state.rs",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 S15: PendingFileRequests is defined in crates/ahand-hub/src/http/files.rs but referenced by JobRuntime in the WS frame handler. That's a layering violation. Move the type into a transport-neutral module (state.rs is the natural home, or a new pending.rs module).\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\", \"crates/ahand-hub/src/state.rs\", \"crates/ahand-hub/src/lib.rs\", \"crates/ahand-hub/src/http/jobs.rs\"], \"verifyCommand\": \"cargo build -p ahand-hub && cargo test -p ahand-hub\", \"acceptanceCriteria\": [\"PendingFileRequests + PendingFileRequestsAtCapacity defined outside http/\", \"http/files.rs imports it via `use crate::pending_file_requests::*` or similar\", \"all existing tests pass\"]}\n```"
     },
     {

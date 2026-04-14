@@ -43,7 +43,7 @@ pub struct AppState {
     pub dashboard_shared_password: Arc<String>,
     pub dashboard_allowed_origins: Arc<Vec<String>>,
     pub terminal_tokens: Arc<DashMap<String, crate::http::terminal::TerminalToken>>,
-    pub pending_file_requests: Arc<crate::http::files::PendingFileRequests>,
+    pub pending_file_requests: Arc<crate::pending_file_requests::PendingFileRequests>,
     pub s3_client: Option<Arc<crate::s3::S3Client>>,
 }
 
@@ -119,7 +119,7 @@ impl AppState {
             jobs_store.clone(),
             audit_store.clone(),
         ));
-        let pending_file_requests = crate::http::files::new_pending_requests();
+        let pending_file_requests = crate::pending_file_requests::new_pending_requests();
         let s3_client = if let Some(ref s3_cfg) = config.s3 {
             Some(Arc::new(crate::s3::S3Client::new(s3_cfg).await))
         } else {
