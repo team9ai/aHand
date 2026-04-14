@@ -2730,3 +2730,176 @@ async fn read_image_bomb_guard_rejects_oversized_dimensions() {
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::TooLarge as i32);
 }
+
+// ── R21: approval / dangerous_paths / recursive-delete tests ─────────────
+
+/// Build a FileManager whose policy allowlist scopes to the temp dir AND
+/// marks specific subpaths as `dangerous_paths`. Mirrors `test_manager`
+/// but with the dangerous-paths slot populated.
+fn manager_with_dangerous(tmp: &TempDir, dangerous: &[&str]) -> (FileManager, std::path::PathBuf) {
+    let root = tmp
+        .path()
+        .canonicalize()
+        .expect("tempdir canonicalization should succeed");
+    let root_str = root.to_string_lossy().into_owned();
+    let pattern = format!("{}/**", root_str.trim_end_matches('/'));
+    let dangerous_abs: Vec<String> = dangerous
+        .iter()
+        .map(|d| format!("{}/{}", root_str.trim_end_matches('/'), d))
+        .collect();
+    let mgr = FileManager::new(&FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec![pattern, root_str],
+        path_denylist: vec![],
+        max_read_bytes: 100_000_000,
+        max_write_bytes: 100_000_000,
+        dangerous_paths: dangerous_abs,
+    });
+    (mgr, root)
+}
+
+#[tokio::test]
+async fn check_request_approval_returns_true_for_dangerous_path_read() {
+    // R21: a request that reads a dangerous-paths file must be flagged
+    // for approval, regardless of session mode.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = manager_with_dangerous(&dir, &["secret.txt"]);
+    let secret = root.join("secret.txt");
+    fs::write(&secret, "shhh").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadText(FileReadText {
+            path: secret.to_string_lossy().into_owned(),
+            start: None,
+            max_lines: None,
+            max_bytes: None,
+            target_end: None,
+            max_line_width: None,
+            encoding: None,
+            line_numbers: true,
+            no_follow_symlink: false,
+        })),
+    };
+    let needs_approval = mgr
+        .check_request_approval(&req)
+        .await
+        .expect("dangerous path must not be denied");
+    assert!(needs_approval, "dangerous_paths read must require approval");
+}
+
+#[tokio::test]
+async fn check_request_approval_returns_false_for_normal_path() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = manager_with_dangerous(&dir, &["secret.txt"]);
+    let normal = root.join("ordinary.txt");
+    fs::write(&normal, "x").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Stat(FileStat {
+            path: normal.to_string_lossy().into_owned(),
+            no_follow_symlink: false,
+        })),
+    };
+    let needs_approval = mgr.check_request_approval(&req).await.unwrap();
+    assert!(
+        !needs_approval,
+        "non-dangerous path must NOT trigger approval"
+    );
+}
+
+#[tokio::test]
+async fn check_request_approval_returns_true_for_recursive_permanent_delete() {
+    // R9 + R21: spec rule design.md:635 — recursive PERMANENT delete
+    // always escalates to STRICT approval regardless of which path is
+    // involved. The check must fire even on a path NOT in dangerous_paths.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("victim_dir");
+    fs::create_dir(&target).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Delete(FileDelete {
+            path: target.to_string_lossy().into_owned(),
+            recursive: true,
+            mode: DeleteMode::Permanent as i32,
+            no_follow_symlink: false,
+        })),
+    };
+    let needs_approval = mgr.check_request_approval(&req).await.unwrap();
+    assert!(
+        needs_approval,
+        "recursive PERMANENT delete must require approval"
+    );
+}
+
+#[tokio::test]
+async fn check_request_approval_returns_false_for_non_recursive_permanent_delete() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("single.txt");
+    fs::write(&target, "x").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Delete(FileDelete {
+            path: target.to_string_lossy().into_owned(),
+            recursive: false,
+            mode: DeleteMode::Permanent as i32,
+            no_follow_symlink: false,
+        })),
+    };
+    let needs_approval = mgr.check_request_approval(&req).await.unwrap();
+    assert!(
+        !needs_approval,
+        "non-recursive permanent delete should NOT require approval by itself"
+    );
+}
+
+#[tokio::test]
+async fn check_request_approval_returns_true_for_dangerous_path_trash_delete() {
+    // recursive=true + TRASH mode is NOT auto-escalated (only PERMANENT
+    // is), but a dangerous path IS escalated independently.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = manager_with_dangerous(&dir, &[".sensitive"]);
+    let target = root.join(".sensitive");
+    fs::create_dir(&target).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Delete(FileDelete {
+            path: target.to_string_lossy().into_owned(),
+            recursive: true,
+            mode: DeleteMode::Trash as i32,
+            no_follow_symlink: false,
+        })),
+    };
+    let needs_approval = mgr.check_request_approval(&req).await.unwrap();
+    assert!(
+        needs_approval,
+        "TRASH delete on a dangerous path must still require approval"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn check_request_approval_denies_symlink_target_outside_allowlist() {
+    // R2 regression: FileCreateSymlink with a target pointing outside the
+    // allowlist is rejected at the policy preflight (PolicyDenied), not
+    // silently allowed.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let link = root.join("escape");
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: "/etc/passwd".into(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let err = mgr.check_request_approval(&req).await.unwrap_err();
+    assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
+}

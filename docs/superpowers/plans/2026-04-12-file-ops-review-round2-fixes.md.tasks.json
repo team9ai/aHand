@@ -130,7 +130,7 @@
     {
       "id": 21,
       "subject": "R21: Tests for dangerous_paths / strict approval and Hello file capability",
-      "status": "pending",
+      "status": "completed",
       "description": "Round 2 I4 + I5 + B#23 + B#24: the approval-sensitive code paths and the Hello capability advertisement are uncovered by tests. Add:\n- handle_file_request test for dangerous_paths in TRUST mode → approval requested\n- handle_file_request test for strict mode → approval requested\n- hub_handshake test for build_hello_envelope(file_enabled=true) → 'file' in capabilities\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/file_ops.rs\", \"crates/ahandd/tests/hub_handshake.rs\"], \"verifyCommand\": \"cargo test -p ahandd\", \"acceptanceCriteria\": [\"dangerous_paths + TRUST → approval test passes\", \"strict mode + file op → approval test passes\", \"build_hello_envelope(file_enabled=true) test passes\"]}\n```"
     }
   ],

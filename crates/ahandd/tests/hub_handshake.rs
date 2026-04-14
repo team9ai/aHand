@@ -26,6 +26,62 @@ private_key_path = "/tmp/ahand/id_ed25519"
 }
 
 #[tokio::test]
+async fn build_hello_envelope_includes_file_capability_when_enabled() {
+    // R21: Hello.capabilities must contain "file" when file_enabled=true,
+    // mirroring the existing browser capability handling. Without this
+    // test the positive path was completely uncovered.
+    let identity = DeviceIdentity::generate_for_tests();
+    let hello = ahandd::ahand_client::build_hello_envelope(
+        "device-cap",
+        &identity,
+        0,
+        false, // browser disabled
+        true,  // file enabled
+        &[0xCA, 0xFE],
+        None,
+    );
+
+    let payload = match hello.payload.unwrap() {
+        ahand_protocol::envelope::Payload::Hello(hello) => hello,
+        other => panic!("unexpected payload: {other:?}"),
+    };
+
+    assert!(
+        payload.capabilities.iter().any(|c| c == "file"),
+        "capabilities must contain 'file' when file_enabled=true: {:?}",
+        payload.capabilities
+    );
+    assert!(
+        !payload.capabilities.iter().any(|c| c == "browser"),
+        "capabilities must NOT contain 'browser' when browser_enabled=false"
+    );
+}
+
+#[tokio::test]
+async fn build_hello_envelope_excludes_file_capability_when_disabled() {
+    let identity = DeviceIdentity::generate_for_tests();
+    let hello = ahandd::ahand_client::build_hello_envelope(
+        "device-no-file",
+        &identity,
+        0,
+        false,
+        false,
+        &[0xBE, 0xEF],
+        None,
+    );
+
+    let payload = match hello.payload.unwrap() {
+        ahand_protocol::envelope::Payload::Hello(hello) => hello,
+        other => panic!("unexpected payload: {other:?}"),
+    };
+    assert!(
+        !payload.capabilities.iter().any(|c| c == "file"),
+        "capabilities must NOT contain 'file' when file_enabled=false: {:?}",
+        payload.capabilities
+    );
+}
+
+#[tokio::test]
 async fn build_hello_envelope_includes_ed25519_auth() {
     let identity = DeviceIdentity::generate_for_tests();
     let hello = ahandd::ahand_client::build_hello_envelope(
