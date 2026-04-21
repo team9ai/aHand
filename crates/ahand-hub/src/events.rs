@@ -98,6 +98,24 @@ impl EventBus {
         Ok(())
     }
 
+    /// Emit a `device.revoked` event. The admin API calls this after
+    /// deleting a pre-registered device; Task 1.5's webhook sender will
+    /// consume it. The detail carries `externalUserId` when available so
+    /// consumers can attribute the revocation to the owning tenant.
+    pub async fn emit_device_revoked(
+        &self,
+        device_id: &str,
+        external_user_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let detail = match external_user_id {
+            Some(user) => serde_json::json!({ "externalUserId": user }),
+            None => serde_json::json!({}),
+        };
+        self.record_and_publish("device.revoked", "device", device_id, "service", detail)
+            .await?;
+        Ok(())
+    }
+
     pub async fn emit_device_offline(&self, device_id: &str) -> anyhow::Result<()> {
         self.record_and_publish(
             "device.offline",

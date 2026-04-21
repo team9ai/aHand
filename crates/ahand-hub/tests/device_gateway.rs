@@ -61,6 +61,7 @@ async fn idle_device_connection_times_out_and_marks_presence_offline() {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
@@ -117,6 +118,7 @@ async fn daemon_heartbeats_keep_connection_online_past_staleness_timeout() {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();

@@ -985,6 +985,7 @@ mod tests {
                 capabilities: vec!["exec".into()],
                 version: Some("0.1.2".into()),
                 auth_method: "ed25519".into(),
+                external_user_id: None,
             })
             .await
             .unwrap();

@@ -143,6 +143,25 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Forcibly close an active device WS. Returns true if there was an
+    /// active connection to close, false otherwise. Idempotent: calling
+    /// it on a device with no WS is a no-op. The main loop in
+    /// `run_device_socket` picks up the `close_tx` signal, unregisters,
+    /// and runs the normal teardown path.
+    pub async fn kick_device(&self, device_id: &str) -> bool {
+        let active = {
+            let Some(entry) = self.senders.get(device_id) else {
+                return false;
+            };
+            entry.active.clone()
+        };
+        let Some(active) = active else {
+            return false;
+        };
+        let _ = active.close_tx.send(true);
+        true
+    }
+
     pub(crate) fn is_current(&self, device_id: &str, connection_id: uuid::Uuid) -> bool {
         self.senders
             .get(device_id)

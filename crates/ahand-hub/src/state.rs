@@ -7,7 +7,7 @@ use ahand_hub_core::device::{Device, NewDevice};
 use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::device_manager::DeviceManager;
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
-use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
+use ahand_hub_core::traits::{AuditStore, DeviceAdminStore, DeviceStore, JobStore};
 use ahand_hub_core::{HubError, Result};
 use ahand_hub_store::audit_store::PgAuditStore;
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
@@ -221,6 +221,7 @@ impl AppState {
                 capabilities: Vec::new(),
                 version: None,
                 auth_method: "bootstrap".into(),
+                external_user_id: None,
             })
             .await?;
         self.devices.mark_offline(device_id).await?;
@@ -362,6 +363,10 @@ impl MemoryDeviceStore {
                 capabilities: hello.capabilities.clone(),
                 version: Some(hello.version.clone()),
                 auth_method: verified.auth_method.into(),
+                // Hello-flow upserts never overwrite an admin-set
+                // external_user_id; the upsert uses COALESCE so
+                // passing None preserves whatever was pre-registered.
+                external_user_id: None,
             })
             .await?;
         let device = persistent.get(device_id).await?.unwrap_or(Device {
@@ -415,6 +420,7 @@ impl DeviceStore for MemoryDeviceStore {
                     version: device.version,
                     auth_method: device.auth_method,
                     online: false,
+                    external_user_id: device.external_user_id,
                 };
                 entry.insert(StoredDevice {
                     device: device.clone(),
@@ -454,6 +460,105 @@ impl DeviceStore for MemoryDeviceStore {
         }
         self.devices.remove(device_id);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl DeviceAdminStore for MemoryDeviceStore {
+    async fn pre_register(
+        &self,
+        device_id: &str,
+        public_key: &[u8],
+        external_user_id: &str,
+    ) -> Result<Device> {
+        if let Some(persistent) = &self.persistent {
+            let device = persistent
+                .pre_register(device_id, public_key, external_user_id)
+                .await?;
+            self.devices.insert(
+                device.id.clone(),
+                StoredDevice {
+                    device: device.clone(),
+                    last_signed_at_ms: 0,
+                },
+            );
+            return Ok(device);
+        }
+
+        // Memory-backed: mirror the PgDeviceStore semantics exactly so
+        // tests that exercise the admin API against an in-memory hub
+        // behave identically to production.
+        match self.devices.entry(device_id.into()) {
+            Entry::Occupied(mut entry) => {
+                let existing_user_id = entry.get().device.external_user_id.clone();
+                if let Some(existing_user) = existing_user_id.as_ref() {
+                    if existing_user != external_user_id {
+                        return Err(HubError::DeviceOwnedByDifferentUser {
+                            device_id: device_id.into(),
+                            existing_external_user_id: existing_user.clone(),
+                        });
+                    }
+                }
+                // Update the row: overwrite public_key + external_user_id.
+                let stored = entry.get_mut();
+                stored.device.public_key = Some(public_key.to_vec());
+                stored.device.external_user_id = Some(external_user_id.into());
+                Ok(stored.device.clone())
+            }
+            Entry::Vacant(entry) => {
+                let device = Device {
+                    id: device_id.into(),
+                    public_key: Some(public_key.to_vec()),
+                    hostname: "pending-device".into(),
+                    os: "unknown".into(),
+                    capabilities: Vec::new(),
+                    version: None,
+                    auth_method: "preregistered".into(),
+                    online: false,
+                    external_user_id: Some(external_user_id.into()),
+                };
+                entry.insert(StoredDevice {
+                    device: device.clone(),
+                    last_signed_at_ms: 0,
+                });
+                Ok(device)
+            }
+        }
+    }
+
+    async fn find_by_id(&self, device_id: &str) -> Result<Option<Device>> {
+        self.get(device_id).await
+    }
+
+    async fn delete_device(&self, device_id: &str) -> Result<bool> {
+        if let Some(persistent) = &self.persistent {
+            let removed = persistent.delete_device(device_id).await?;
+            self.devices.remove(device_id);
+            return Ok(removed);
+        }
+        Ok(self.devices.remove(device_id).is_some())
+    }
+
+    async fn list_by_external_user(&self, external_user_id: &str) -> Result<Vec<Device>> {
+        if let Some(persistent) = &self.persistent {
+            return persistent.list_by_external_user(external_user_id).await;
+        }
+        let mut devices = self
+            .devices
+            .iter()
+            .filter(|entry| {
+                entry
+                    .value()
+                    .device
+                    .external_user_id
+                    .as_deref()
+                    .map(|user| user == external_user_id)
+                    .unwrap_or(false)
+            })
+            .map(|entry| entry.value().device.clone())
+            .collect::<Vec<_>>();
+        devices.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(devices)
     }
 }
 

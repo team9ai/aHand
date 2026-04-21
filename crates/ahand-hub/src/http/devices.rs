@@ -74,6 +74,7 @@ pub async fn create_device(
             capabilities: body.capabilities,
             version: body.version,
             auth_method: "bootstrap".into(),
+            external_user_id: None,
         })
         .await
         .map_err(ApiError::from)?;

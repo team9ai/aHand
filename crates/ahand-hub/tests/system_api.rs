@@ -313,6 +313,7 @@ async fn device_token_can_read_only_its_own_device_record() {
             capabilities: vec!["exec".into(), "browser".into()],
             version: Some("0.1.2".into()),
             auth_method: "bootstrap".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
@@ -349,6 +350,7 @@ async fn delete_device_requires_admin_and_removes_device() {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "bootstrap".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
@@ -389,6 +391,7 @@ async fn create_device_rejects_duplicate_device_ids() {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
@@ -428,6 +431,7 @@ async fn direct_memory_insert_starts_device_offline_until_presence_is_marked() {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();

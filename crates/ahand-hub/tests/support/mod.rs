@@ -102,6 +102,7 @@ pub async fn test_state() -> AppState {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
@@ -128,6 +129,7 @@ pub async fn test_state_with_browser_device() -> AppState {
             capabilities: vec!["exec".into(), "browser".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
