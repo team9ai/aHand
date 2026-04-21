@@ -55,6 +55,40 @@ impl crate::executor::EnvelopeSink for BufferedEnvelopeSender {
     }
 }
 
+/// Coarse outcome of a single `connect()` attempt, used by library callers
+/// that want to observe handshake success/failure without scraping logs.
+#[derive(Debug, Clone)]
+pub enum ConnectOutcome {
+    /// The Hello handshake was accepted.
+    HandshakeAccepted,
+    /// Every configured auth mode was rejected by the hub.
+    HandshakeRejected(String),
+    /// Transport-level failure (dial, TLS, malformed frame, …).
+    Session(String),
+    /// The session completed cleanly (remote closed, etc.).
+    Disconnected,
+}
+
+/// Sink for [`ConnectOutcome`] events. `run_with_reporter` calls this for
+/// every handshake attempt so callers can drive state machines off it.
+pub trait ClientReporter: Send + Sync + 'static {
+    fn report(&self, outcome: ConnectOutcome);
+}
+
+impl<F> ClientReporter for F
+where
+    F: Fn(ConnectOutcome) + Send + Sync + 'static,
+{
+    fn report(&self, outcome: ConnectOutcome) {
+        (self)(outcome)
+    }
+}
+
+struct NoopReporter;
+impl ClientReporter for NoopReporter {
+    fn report(&self, _outcome: ConnectOutcome) {}
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -65,6 +99,36 @@ pub async fn run(
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
+) -> anyhow::Result<()> {
+    run_with_reporter(
+        config,
+        device_id,
+        registry,
+        store,
+        session_mgr,
+        approval_mgr,
+        approval_broadcast_tx,
+        browser_mgr,
+        Arc::new(NoopReporter),
+    )
+    .await
+}
+
+/// Variant of [`run`] that pushes every handshake outcome into `reporter`.
+///
+/// Library callers (e.g. `public_api::spawn`) use this to drive a status
+/// channel without modifying the reconnect loop.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_reporter(
+    config: Config,
+    device_id: String,
+    registry: Arc<JobRegistry>,
+    store: Option<Arc<RunStore>>,
+    session_mgr: Arc<SessionManager>,
+    approval_mgr: Arc<ApprovalManager>,
+    approval_broadcast_tx: broadcast::Sender<Envelope>,
+    browser_mgr: Arc<BrowserManager>,
+    reporter: Arc<dyn ClientReporter>,
 ) -> anyhow::Result<()> {
     let hub_config = config.hub_config();
     let identity_path = hub_config
@@ -83,7 +147,7 @@ pub async fn run(
     loop {
         info!(url = %config.server_url, "connecting to cloud");
 
-        match connect(
+        let attempt = connect_reporting(
             &config.server_url,
             &device_id,
             &identity,
@@ -95,11 +159,14 @@ pub async fn run(
             &approval_mgr,
             &approval_broadcast_tx,
             &browser_mgr,
+            reporter.as_ref(),
         )
-        .await
-        {
+        .await;
+
+        match attempt {
             Ok(()) => {
                 info!("disconnected from cloud");
+                reporter.report(ConnectOutcome::Disconnected);
                 backoff = 1;
             }
             Err(e) => {
@@ -115,7 +182,7 @@ pub async fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn connect(
+async fn connect_reporting(
     url: &str,
     device_id: &str,
     identity: &DeviceIdentity,
@@ -127,12 +194,13 @@ async fn connect(
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
+    reporter: &dyn ClientReporter,
 ) -> anyhow::Result<()> {
     let auth_modes = hello_auth_modes(bearer_token.as_deref());
     let mut last_handshake_error = None;
 
     for auth_mode in auth_modes {
-        match connect_with_auth(
+        let outcome = connect_with_auth(
             url,
             device_id,
             identity,
@@ -144,19 +212,25 @@ async fn connect(
             approval_mgr,
             approval_broadcast_tx,
             browser_mgr,
+            reporter,
         )
-        .await
-        {
+        .await;
+        match outcome {
             Ok(()) => return Ok(()),
             Err(ConnectError::HandshakeRejected(err)) => {
                 warn!(?auth_mode, error = %err, "hello auth rejected");
                 last_handshake_error = Some(err);
             }
-            Err(ConnectError::Session(err)) => return Err(err),
+            Err(ConnectError::Session(err)) => {
+                reporter.report(ConnectOutcome::Session(err.to_string()));
+                return Err(err);
+            }
         }
     }
 
-    Err(last_handshake_error.unwrap_or_else(|| anyhow::anyhow!("device hello rejected")))
+    let err = last_handshake_error.unwrap_or_else(|| anyhow::anyhow!("device hello rejected"));
+    reporter.report(ConnectOutcome::HandshakeRejected(err.to_string()));
+    Err(err)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -172,6 +246,7 @@ async fn connect_with_auth(
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
+    reporter: &dyn ClientReporter,
 ) -> Result<(), ConnectError> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(url)
         .await
@@ -205,6 +280,7 @@ async fn connect_with_auth(
         .map_err(ConnectError::Session)?;
     let accepted = recv_hello_accepted(&mut stream).await?;
     info!(auth_method = %accepted.auth_method, "hello accepted");
+    reporter.report(ConnectOutcome::HandshakeAccepted);
 
     // Replay unacked messages from previous connection.
     let unacked = outbox
