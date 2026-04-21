@@ -298,7 +298,11 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     let mut bootstrap_reservation: Option<crate::bootstrap::BootstrapReservation> = None;
     let mut send_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
+    // Staleness monitor: closes the WS if no inbound frame (including the
+    // daemon's Heartbeat envelopes) has arrived within
+    // `device_staleness_timeout_ms`. Replaces the old hub-initiated ping
+    // timer — direction is now daemon → hub.
+    let mut staleness_monitor_task: Option<tokio::task::JoinHandle<()>> = None;
     let (local_close_tx, local_close_rx) = watch::channel(false);
 
     let run_result: anyhow::Result<()> = async {
@@ -487,31 +491,32 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             }
         }));
 
-        if state.device_heartbeat_interval_ms > 0 && state.device_heartbeat_timeout_ms > 0 {
-            let heartbeat_interval = state.device_heartbeat_interval_ms;
-            let heartbeat_timeout = std::time::Duration::from_millis(state.device_heartbeat_timeout_ms);
-            let mut heartbeat_close_rx = close_rx.clone();
-            let mut heartbeat_local_close_rx = local_close_rx.clone();
-            let heartbeat_last_inbound_at = last_inbound_at.clone();
-            let heartbeat_control_tx = control_tx.clone();
-            let heartbeat_local_close_tx = local_close_tx.clone();
-            heartbeat_task = Some(tokio::spawn(async move {
+        if state.device_staleness_probe_interval_ms > 0 && state.device_staleness_timeout_ms > 0 {
+            let probe_interval = state.device_staleness_probe_interval_ms;
+            let staleness_timeout =
+                std::time::Duration::from_millis(state.device_staleness_timeout_ms);
+            let mut staleness_close_rx = close_rx.clone();
+            let mut staleness_local_close_rx = local_close_rx.clone();
+            let staleness_last_inbound_at = last_inbound_at.clone();
+            let staleness_local_close_tx = local_close_tx.clone();
+            staleness_monitor_task = Some(tokio::spawn(async move {
+                // Periodically check how long it has been since the last
+                // inbound frame. When the daemon's heartbeats stop arriving
+                // (because the process or network died without closing the
+                // WS cleanly), we trip the local close signal so the main
+                // loop exits and the connection is reaped.
+                //
+                // No outbound probes are sent — direction is now daemon →
+                // hub only.
                 loop {
                     tokio::select! {
                         biased;
-                        _ = heartbeat_close_rx.changed() => break,
-                        _ = heartbeat_local_close_rx.changed() => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(heartbeat_interval)) => {
-                            let elapsed = heartbeat_last_inbound_at.lock().await.elapsed();
-                            if elapsed >= heartbeat_timeout {
-                                let _ = heartbeat_local_close_tx.send(true);
-                                break;
-                            }
-                            if heartbeat_control_tx
-                                .send(WsMessage::Ping(Vec::new().into()))
-                                .is_err()
-                            {
-                                let _ = heartbeat_local_close_tx.send(true);
+                        _ = staleness_close_rx.changed() => break,
+                        _ = staleness_local_close_rx.changed() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(probe_interval)) => {
+                            let elapsed = staleness_last_inbound_at.lock().await.elapsed();
+                            if elapsed >= staleness_timeout {
+                                let _ = staleness_local_close_tx.send(true);
                                 break;
                             }
                         }
@@ -543,6 +548,30 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     let envelope = ahand_protocol::Envelope::decode(frame.as_ref())?;
                     if state.connections.has_seen_inbound(&device_id, envelope.seq) {
                         state.connections.observe_ack(&device_id, envelope.ack)?;
+                    } else if let Some(ahand_protocol::envelope::Payload::Heartbeat(ref hb)) =
+                        envelope.payload
+                    {
+                        // Heartbeat is observed (for ack bookkeeping and
+                        // staleness refresh above) and then fanned out so
+                        // downstream webhook senders / dashboards can mirror
+                        // device presence without polling.
+                        state
+                            .connections
+                            .observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                        let ttl = state
+                            .device_expected_heartbeat_secs
+                            .saturating_mul(3);
+                        if let Err(err) = state
+                            .events
+                            .emit_device_heartbeat(&device_id, hb.sent_at_ms, ttl)
+                            .await
+                        {
+                            tracing::warn!(
+                                device_id = %device_id,
+                                error = %err,
+                                "failed to emit device.heartbeat event",
+                            );
+                        }
                     } else if let Some(ahand_protocol::envelope::Payload::BrowserResponse(ref browser_resp)) = envelope.payload {
                         if let Some((_, sender)) = state.browser_pending.remove(&browser_resp.request_id) {
                             let _ = sender.send(browser_resp.clone());
@@ -582,7 +611,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     if let Some(task) = presence_task.take() {
         task.abort();
     }
-    if let Some(task) = heartbeat_task.take() {
+    if let Some(task) = staleness_monitor_task.take() {
         task.abort();
     }
     if let Some(reservation) = bootstrap_reservation.take() {

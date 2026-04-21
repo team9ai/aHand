@@ -102,3 +102,49 @@ async fn load_or_create_identity_is_idempotent() {
     let b = load_or_create_identity(tmp.path()).unwrap();
     assert_eq!(a.public_key_bytes(), b.public_key_bytes());
 }
+
+/// With a 500ms heartbeat interval, the daemon must push at least two
+/// Heartbeat envelopes within ~1.5s (i.e. after the first-tick skip the
+/// sender should fire at ~0.5s, ~1.0s, ~1.5s). Each heartbeat carries a
+/// non-empty `daemon_version` so downstream consumers can correlate
+/// reported daemon versions with the webhook stream.
+#[tokio::test]
+async fn daemon_sends_heartbeat_on_interval() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
+        .heartbeat_interval(Duration::from_millis(500))
+        .device_id("dev-heartbeat-test")
+        .build();
+
+    let handle = spawn(config).await.expect("spawn ok");
+
+    // Wait until we see the daemon Online so we know handshake completed,
+    // so the 1.5s observation window starts counting from post-Hello.
+    let mut status = handle.subscribe_status();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(*status.borrow(), DaemonStatus::Online { .. }) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("daemon did not come Online within 5s");
+
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+
+    let beats = mock.captured_heartbeats();
+    assert!(
+        beats.len() >= 2,
+        "expected >=2 heartbeats in ~1.5s, got {}",
+        beats.len()
+    );
+    assert!(
+        beats.iter().all(|hb| !hb.daemon_version.is_empty()),
+        "every heartbeat must carry a non-empty daemon_version",
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}

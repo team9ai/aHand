@@ -13,10 +13,11 @@
 
 #![allow(dead_code)]
 
-use ahand_protocol::{Envelope, HelloAccepted, HelloChallenge, envelope};
+use ahand_protocol::{Envelope, Heartbeat, HelloAccepted, HelloChallenge, envelope};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -28,6 +29,7 @@ use tokio_tungstenite::tungstenite::{
 /// Handle returned by `start_*` helpers. Drop stops the listener task.
 pub struct Mock {
     pub port: u16,
+    heartbeats: Arc<Mutex<Vec<Heartbeat>>>,
     _shutdown: oneshot::Sender<()>,
     _task: JoinHandle<()>,
 }
@@ -39,6 +41,13 @@ impl Mock {
 
     pub fn valid_jwt(&self) -> String {
         "test-bootstrap-token".to_string()
+    }
+
+    /// Snapshot of every `Heartbeat` envelope observed from any connected
+    /// daemon since the mock started. Cheap to clone; intended for
+    /// integration-test assertions, not for high-volume production use.
+    pub fn captured_heartbeats(&self) -> Vec<Heartbeat> {
+        self.heartbeats.lock().unwrap().clone()
     }
 }
 
@@ -62,7 +71,9 @@ async fn start(behavior: Behavior) -> Mock {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("local_addr").port();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let heartbeats: Arc<Mutex<Vec<Heartbeat>>> = Arc::new(Mutex::new(Vec::new()));
 
+    let heartbeats_for_task = heartbeats.clone();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -72,7 +83,7 @@ async fn start(behavior: Behavior) -> Mock {
                         Ok(pair) => pair,
                         Err(_) => break,
                     };
-                    tokio::spawn(handle_conn(stream, behavior));
+                    tokio::spawn(handle_conn(stream, behavior, heartbeats_for_task.clone()));
                 }
             }
         }
@@ -80,12 +91,17 @@ async fn start(behavior: Behavior) -> Mock {
 
     Mock {
         port,
+        heartbeats,
         _shutdown: shutdown_tx,
         _task: task,
     }
 }
 
-async fn handle_conn(stream: tokio::net::TcpStream, behavior: Behavior) {
+async fn handle_conn(
+    stream: tokio::net::TcpStream,
+    behavior: Behavior,
+    heartbeats: Arc<Mutex<Vec<Heartbeat>>>,
+) {
     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
@@ -134,10 +150,19 @@ async fn handle_conn(stream: tokio::net::TcpStream, behavior: Behavior) {
             let _ = sink
                 .send(WsMessage::Binary(accepted.encode_to_vec()))
                 .await;
-            // Keep the connection open until the client closes it.
+            // Keep the connection open until the client closes it, and
+            // record every `Heartbeat` envelope observed on the way.
             while let Some(m) = src.next().await {
-                if m.is_err() {
-                    break;
+                let frame = match m {
+                    Ok(WsMessage::Binary(bytes)) => bytes,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                };
+                let Ok(envelope) = Envelope::decode(frame.as_ref()) else {
+                    continue;
+                };
+                if let Some(envelope::Payload::Heartbeat(hb)) = envelope.payload {
+                    heartbeats.lock().unwrap().push(hb);
                 }
             }
         }

@@ -37,8 +37,16 @@ pub struct AppState {
     pub device_bootstrap_token: Arc<String>,
     pub device_bootstrap_device_id: Arc<String>,
     pub device_hello_max_age_ms: u64,
-    pub device_heartbeat_interval_ms: u64,
-    pub device_heartbeat_timeout_ms: u64,
+    /// Cadence for the staleness-monitor probe loop. See
+    /// [`crate::config::Config::device_staleness_probe_interval_ms`].
+    pub device_staleness_probe_interval_ms: u64,
+    /// Timeout after which an idle device WS is closed. See
+    /// [`crate::config::Config::device_staleness_timeout_ms`].
+    pub device_staleness_timeout_ms: u64,
+    /// Expected daemon heartbeat cadence in seconds. Advertised to
+    /// downstream webhook consumers via `presenceTtlSeconds` hints
+    /// (`secs × 3`).
+    pub device_expected_heartbeat_secs: u64,
     pub device_presence_refresh_ms: u64,
     pub service_token: Arc<String>,
     pub dashboard_shared_password: Arc<String>,
@@ -147,8 +155,9 @@ impl AppState {
             device_bootstrap_token: Arc::new(config.device_bootstrap_token),
             device_bootstrap_device_id: Arc::new(config.device_bootstrap_device_id),
             device_hello_max_age_ms: config.device_hello_max_age_ms,
-            device_heartbeat_interval_ms: config.device_heartbeat_interval_ms,
-            device_heartbeat_timeout_ms: config.device_heartbeat_timeout_ms,
+            device_staleness_probe_interval_ms: config.device_staleness_probe_interval_ms,
+            device_staleness_timeout_ms: config.device_staleness_timeout_ms,
+            device_expected_heartbeat_secs: config.device_expected_heartbeat_secs,
             device_presence_refresh_ms: config.device_presence_refresh_ms,
             service_token: Arc::new(config.service_token),
             dashboard_shared_password: Arc::new(config.dashboard_shared_password),

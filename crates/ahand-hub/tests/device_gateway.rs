@@ -41,8 +41,8 @@ async fn device_ws_accepts_signed_hello_and_registers_presence() {
 #[tokio::test]
 async fn idle_device_connection_times_out_and_marks_presence_offline() {
     let mut config = test_config();
-    config.device_heartbeat_interval_ms = 20;
-    config.device_heartbeat_timeout_ms = 60;
+    config.device_staleness_probe_interval_ms = 20;
+    config.device_staleness_timeout_ms = 60;
     let state = ahand_hub::state::AppState::from_config(config)
         .await
         .expect("test state should build");
@@ -95,10 +95,10 @@ async fn idle_device_connection_times_out_and_marks_presence_offline() {
 }
 
 #[tokio::test]
-async fn pong_responses_keep_idle_device_connection_online() {
+async fn daemon_heartbeats_keep_connection_online_past_staleness_timeout() {
     let mut config = test_config();
-    config.device_heartbeat_interval_ms = 20;
-    config.device_heartbeat_timeout_ms = 60;
+    config.device_staleness_probe_interval_ms = 20;
+    config.device_staleness_timeout_ms = 60;
     let state = ahand_hub::state::AppState::from_config(config)
         .await
         .expect("test state should build");
@@ -136,30 +136,46 @@ async fn pong_responses_keep_idle_device_connection_online() {
         .unwrap();
     let _ = read_hello_accepted(&mut socket).await;
 
-    let ping_count = Arc::new(AtomicUsize::new(0));
-    let reader_ping_count = ping_count.clone();
+    // Subscribe to the event bus BEFORE sending heartbeats so the
+    // broadcast channel is live when the first one is forwarded.
+    let mut events = server.events().subscribe();
+
+    let heartbeat_count = Arc::new(AtomicUsize::new(0));
+    let forwarder_count = heartbeat_count.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let reader = tokio::spawn(async move {
+    let forwarder = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     let _ = socket.close(None).await;
                     break;
                 }
-                message = socket.next() => {
-                    let Some(Ok(message)) = message else {
-                        break;
+                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                    let envelope = ahand_protocol::Envelope {
+                        device_id: "device-1".into(),
+                        msg_id: format!(
+                            "heartbeat-{}",
+                            forwarder_count.load(Ordering::Relaxed)
+                        ),
+                        ts_ms: now_ms(),
+                        payload: Some(ahand_protocol::envelope::Payload::Heartbeat(
+                            ahand_protocol::Heartbeat {
+                                sent_at_ms: now_ms(),
+                                daemon_version: "0.1.2".into(),
+                            },
+                        )),
+                        ..Default::default()
                     };
-                    match message {
-                        tokio_tungstenite::tungstenite::Message::Ping(_) => {
-                            reader_ping_count.fetch_add(1, Ordering::Relaxed);
-                        }
-                        tokio_tungstenite::tungstenite::Message::Binary(_) => {}
-                        tokio_tungstenite::tungstenite::Message::Close(frame) => {
-                            panic!("unexpected close frame: {frame:?}");
-                        }
-                        _ => {}
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Binary(
+                            envelope.encode_to_vec().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
                     }
+                    forwarder_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -176,12 +192,36 @@ async fn pong_responses_keep_idle_device_connection_online() {
         .unwrap();
     assert_eq!(device["online"], true);
     assert!(
-        ping_count.load(Ordering::Relaxed) > 0,
-        "expected heartbeat ping frames"
+        heartbeat_count.load(Ordering::Relaxed) > 0,
+        "expected daemon-sent heartbeats"
     );
 
+    // At least one heartbeat should have been forwarded via the event bus.
+    let mut forwarded = 0;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(40), events.recv()).await {
+            Ok(Ok(event)) if event.event == "device.heartbeat" => {
+                forwarded += 1;
+                if forwarded >= 1 {
+                    break;
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(forwarded >= 1, "expected at least one forwarded device.heartbeat event");
+
     let _ = shutdown_tx.send(true);
-    reader.await.unwrap();
+    forwarder.await.unwrap();
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 #[tokio::test]

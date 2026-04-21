@@ -110,6 +110,32 @@ impl EventBus {
         Ok(())
     }
 
+    /// Emit a `device.heartbeat` event carrying the daemon-provided
+    /// `sent_at_ms` plus a `presenceTtlSeconds` hint (three times the
+    /// hub's expected heartbeat interval) for downstream webhook
+    /// consumers that want TTL-based presence. This does NOT update the
+    /// audit log — heartbeats are high-frequency and would balloon it —
+    /// it only fans out to live subscribers and the Redis fanout (if any).
+    pub async fn emit_device_heartbeat(
+        &self,
+        device_id: &str,
+        sent_at_ms: u64,
+        presence_ttl_seconds: u64,
+    ) -> anyhow::Result<()> {
+        self.publish(DashboardEvent {
+            event: "device.heartbeat".into(),
+            resource_type: "device".into(),
+            resource_id: device_id.into(),
+            actor: "device".into(),
+            detail: serde_json::json!({
+                "sentAtMs": sent_at_ms,
+                "presenceTtlSeconds": presence_ttl_seconds,
+            }),
+            timestamp: Utc::now(),
+        })
+        .await
+    }
+
     pub async fn emit_job_status(&self, job: &Job, actor: &str) -> anyhow::Result<()> {
         let Some(action) = job_status_action(job) else {
             return Ok(());
@@ -304,6 +330,27 @@ mod tests {
             self.calls.fetch_add(1, Ordering::Relaxed);
             anyhow::bail!("fanout unavailable");
         }
+    }
+
+    #[tokio::test]
+    async fn emit_device_heartbeat_publishes_event_with_ttl_and_sent_at() {
+        let bus = EventBus::new(Arc::new(NoopAuditStore));
+        let mut rx = bus.subscribe();
+
+        bus.emit_device_heartbeat("device-1", 1_745_318_400_000, 180)
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("subscriber should receive heartbeat event")
+            .expect("event bus should stay open");
+        assert_eq!(event.event, "device.heartbeat");
+        assert_eq!(event.resource_type, "device");
+        assert_eq!(event.resource_id, "device-1");
+        assert_eq!(event.actor, "device");
+        assert_eq!(event.detail["sentAtMs"], 1_745_318_400_000_u64);
+        assert_eq!(event.detail["presenceTtlSeconds"], 180_u64);
     }
 
     #[tokio::test]

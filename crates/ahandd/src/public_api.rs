@@ -375,6 +375,16 @@ fn build_inner_config(cfg: &DaemonConfig, identity_path: &Path) -> Config {
                 Some(cfg.device_jwt.clone())
             },
             private_key_path: Some(identity_path.to_string_lossy().into_owned()),
+            // Expose the interval at both granularities so TOML-driven
+            // setups (_secs) and programmatic sub-second tests (_ms) both
+            // work. `heartbeat_interval_ms` takes precedence in
+            // `run_with_reporter`.
+            heartbeat_interval_secs: Some(cfg.heartbeat_interval.as_secs().max(1)),
+            heartbeat_interval_ms: Some(
+                u64::try_from(cfg.heartbeat_interval.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1),
+            ),
         }),
     }
 }

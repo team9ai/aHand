@@ -40,8 +40,9 @@ pub fn test_config() -> Config {
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,
-        device_heartbeat_interval_ms: 30_000,
-        device_heartbeat_timeout_ms: 90_000,
+        device_staleness_probe_interval_ms: 30_000,
+        device_staleness_timeout_ms: 180_000,
+        device_expected_heartbeat_secs: 60,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
         job_timeout_grace_ms: 50,
@@ -63,8 +64,9 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,
-        device_heartbeat_interval_ms: 30_000,
-        device_heartbeat_timeout_ms: 90_000,
+        device_staleness_probe_interval_ms: 30_000,
+        device_staleness_timeout_ms: 180_000,
+        device_expected_heartbeat_secs: 60,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
         job_timeout_grace_ms: 50,
@@ -148,6 +150,14 @@ pub struct TestServer {
 impl TestServer {
     pub fn http_base_url(&self) -> &str {
         &self.base_http_url
+    }
+
+    pub fn events(&self) -> std::sync::Arc<ahand_hub::events::EventBus> {
+        self.state.events.clone()
+    }
+
+    pub fn state(&self) -> &AppState {
+        &self.state
     }
 
     pub fn ws_url(&self, path: &str) -> String {
