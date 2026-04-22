@@ -420,6 +420,29 @@ describe("CloudClient.spawn", () => {
     const err = await client.spawn({ deviceId: "d", tool: "t", signal: ctrl.signal }).catch((e) => e);
     expect((err as CloudClientError).code).toBe("abort");
   });
+
+  it("edge: spurious blank-line chunk between events does not swallow subsequent event", async () => {
+    // Simulate a proxy injecting extra blank lines before the finished event
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(encoder.encode(sseEvent("stdout", { chunk: "hi" })));
+        // Extra blank lines (not a proper SSE event boundary)
+        c.enqueue(encoder.encode("\n\n\n\n"));
+        c.enqueue(encoder.encode(sseEvent("finished", { exitCode: 0, durationMs: 1 })));
+        c.close();
+      },
+    });
+    const { fn } = mockFetch([
+      () => jsonResponse({ job_id: "j" }, 201),
+      () => new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const chunks: string[] = [];
+    const result = await client.spawn({ deviceId: "d", tool: "t", onStdout: (c) => chunks.push(c) });
+    expect(chunks).toEqual(["hi"]);
+    expect(result.exitCode).toBe(0);
+  });
 });
 
 describe("CloudClient.cancel", () => {

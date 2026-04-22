@@ -212,12 +212,16 @@ function isSseComment(raw: string): boolean {
   // An SSE comment block is one or more lines all starting with `:`.
   // We only need to detect the common keepalive case: a single line
   // beginning with `:` and no `data:` / `event:` lines.
+  // A rawEvent consisting entirely of empty lines is NOT a comment —
+  // it must have at least one non-empty line starting with `:`.
   const normalized = raw.replace(/\r\n/g, "\n");
+  let sawNonEmpty = false;
   for (const line of normalized.split("\n")) {
     if (line === "") continue;
+    sawNonEmpty = true;
     if (!line.startsWith(":")) return false;
   }
-  return true;
+  return sawNonEmpty;
 }
 
 export class CloudClient {
