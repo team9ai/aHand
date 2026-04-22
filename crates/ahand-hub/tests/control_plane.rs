@@ -1572,6 +1572,110 @@ async fn create_job_allows_device_in_allowlist() {
     server.shutdown().await;
 }
 
+// ── R3-3: allowlist enforcement on stream_job and cancel_job ─────────────────
+
+#[tokio::test]
+async fn stream_job_rejects_device_not_in_allowlist() {
+    // Mint a full-scope token to create the job on "dev-stream-al", then
+    // attempt to stream it with a restricted token whose device_ids=["other"]
+    // → 403.
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "dev-stream-al", "user-stream-al").await;
+    let full_token = mint_cp_jwt(&server, "user-stream-al");
+
+    // Create the job with the full-scope token.
+    let resp = post_create_job(
+        &server,
+        &full_token,
+        serde_json::json!({
+            "device_id": "dev-stream-al",
+            "tool": "sleep",
+            "args": ["30"],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = recv_job_request(&mut device).await;
+
+    // Attempt to stream with a restricted token scoped to a different device.
+    let restricted_token = mint_cp_jwt_with_options(
+        "user-stream-al",
+        "jobs:execute",
+        Some(vec!["other".to_string()]),
+    );
+    let stream_resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{}/stream",
+            server.http_base_url(),
+            job_id
+        ))
+        .bearer_auth(&restricted_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stream_resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = stream_resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
+
+    drop(device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancel_job_rejects_device_not_in_allowlist() {
+    // Mint a full-scope token to create the job on "dev-cancel-al", then
+    // attempt to cancel it with a restricted token whose device_ids=["other"]
+    // → 403.
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "dev-cancel-al", "user-cancel-al").await;
+    let full_token = mint_cp_jwt(&server, "user-cancel-al");
+
+    // Create the job with the full-scope token.
+    let resp = post_create_job(
+        &server,
+        &full_token,
+        serde_json::json!({
+            "device_id": "dev-cancel-al",
+            "tool": "sleep",
+            "args": ["30"],
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = recv_job_request(&mut device).await;
+
+    // Attempt to cancel with a restricted token scoped to a different device.
+    let restricted_token = mint_cp_jwt_with_options(
+        "user-cancel-al",
+        "jobs:execute",
+        Some(vec!["other".to_string()]),
+    );
+    let cancel_resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/control/jobs/{}/cancel",
+            server.http_base_url(),
+            job_id
+        ))
+        .bearer_auth(&restricted_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel_resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = cancel_resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
+
+    drop(device);
+    server.shutdown().await;
+}
+
 // ── R2-5: scope claim validation ──────────────────────────────────────────────
 
 #[tokio::test]

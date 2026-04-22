@@ -192,10 +192,104 @@ impl DeviceAdminStore for PgDeviceStore {
         public_key: &[u8],
         external_user_id: &str,
     ) -> Result<(Device, DateTime<Utc>)> {
-        // Wrap the SELECT + INSERT in a single transaction with FOR UPDATE
-        // to prevent concurrent calls from racing on ownership checks
-        // (TOCTOU fix). The FOR UPDATE lock serializes concurrent claims
-        // for the same device_id at the DB level.
+        // Retry loop: if two callers race on the very first insert, the
+        // FOR UPDATE in pre_register_once locks nothing (no row to lock),
+        // both proceed to INSERT ... ON CONFLICT DO UPDATE, and one wins.
+        // The loser receives a Postgres unique constraint violation which
+        // we detect here and retry once — the second attempt finds the row
+        // already inserted and succeeds via the ON CONFLICT DO UPDATE path.
+        for attempt in 0..2u8 {
+            match self
+                .pre_register_once(device_id, public_key, external_user_id)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(HubError::Internal(msg))
+                    if msg.contains("duplicate key") || msg.contains("unique") =>
+                {
+                    if attempt == 0 {
+                        // Race on first insert — retry once; second attempt
+                        // sees the existing row and succeeds via ON CONFLICT.
+                        continue;
+                    }
+                    return Err(HubError::Internal(msg));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
+
+    async fn find_by_id(&self, device_id: &str) -> Result<Option<Device>> {
+        self.get(device_id).await
+    }
+
+    async fn delete_device(&self, device_id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM devices WHERE id = $1")
+            .bind(device_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+        let removed = result.rows_affected() > 0;
+        if removed {
+            self.mark_offline(device_id).await?;
+        }
+        Ok(removed)
+    }
+
+    async fn list_by_external_user(&self, external_user_id: &str) -> Result<Vec<Device>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, public_key, hostname, os, capabilities, version, auth_method, external_user_id
+            FROM devices
+            WHERE external_user_id = $1
+            ORDER BY id
+            "#,
+        )
+        .bind(external_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        let mut rows_with_ids = Vec::with_capacity(rows.len());
+        let mut device_ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            let device_id = row
+                .try_get::<String, _>("id")
+                .map_err(|err| HubError::Internal(err.to_string()))?;
+            device_ids.push(device_id.clone());
+            rows_with_ids.push((row, device_id));
+        }
+        let online_states = self.online_states(&device_ids).await?;
+        rows_with_ids
+            .into_iter()
+            .map(|(row, device_id)| {
+                map_device(row, online_states.get(&device_id).copied().unwrap_or(false))
+            })
+            .collect()
+    }
+}
+
+impl PgDeviceStore {
+    /// Inner body of `pre_register`, called by the retry wrapper in
+    /// [`DeviceAdminStore::pre_register`].
+    ///
+    /// Wraps the SELECT + INSERT in a single transaction with FOR UPDATE
+    /// to prevent concurrent calls from racing on ownership checks
+    /// (TOCTOU fix). The FOR UPDATE lock serializes concurrent claims
+    /// for the same device_id at the DB level.
+    ///
+    /// When two callers race on the very first insert (no existing row),
+    /// FOR UPDATE locks nothing — both proceed to the INSERT, one wins
+    /// with ON CONFLICT DO UPDATE, and the other gets a unique constraint
+    /// violation. The outer `pre_register` detects that error and retries
+    /// once; the retry finds the now-existing row and succeeds normally.
+    async fn pre_register_once(
+        &self,
+        device_id: &str,
+        public_key: &[u8],
+        external_user_id: &str,
+    ) -> Result<(Device, DateTime<Utc>)> {
         let mut tx = self
             .pool
             .begin()
@@ -270,57 +364,6 @@ impl DeviceAdminStore for PgDeviceStore {
         Ok((device, registered_at))
     }
 
-    async fn find_by_id(&self, device_id: &str) -> Result<Option<Device>> {
-        self.get(device_id).await
-    }
-
-    async fn delete_device(&self, device_id: &str) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM devices WHERE id = $1")
-            .bind(device_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|err| HubError::Internal(err.to_string()))?;
-        let removed = result.rows_affected() > 0;
-        if removed {
-            self.mark_offline(device_id).await?;
-        }
-        Ok(removed)
-    }
-
-    async fn list_by_external_user(&self, external_user_id: &str) -> Result<Vec<Device>> {
-        let rows = sqlx::query(
-            r#"
-            SELECT id, public_key, hostname, os, capabilities, version, auth_method, external_user_id
-            FROM devices
-            WHERE external_user_id = $1
-            ORDER BY id
-            "#,
-        )
-        .bind(external_user_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|err| HubError::Internal(err.to_string()))?;
-
-        let mut rows_with_ids = Vec::with_capacity(rows.len());
-        let mut device_ids = Vec::with_capacity(rows.len());
-        for row in rows {
-            let device_id = row
-                .try_get::<String, _>("id")
-                .map_err(|err| HubError::Internal(err.to_string()))?;
-            device_ids.push(device_id.clone());
-            rows_with_ids.push((row, device_id));
-        }
-        let online_states = self.online_states(&device_ids).await?;
-        rows_with_ids
-            .into_iter()
-            .map(|(row, device_id)| {
-                map_device(row, online_states.get(&device_id).copied().unwrap_or(false))
-            })
-            .collect()
-    }
-}
-
-impl PgDeviceStore {
     async fn online_state(&self, device_id: &str) -> Result<bool> {
         match &self.presence {
             Some(presence) => presence.is_online(device_id).await,

@@ -552,6 +552,9 @@ impl DeviceAdminStore for MemoryDeviceStore {
         // Memory-backed: mirror the PgDeviceStore semantics exactly so
         // tests that exercise the admin API against an in-memory hub
         // behave identically to production.
+        //
+        // DashMap::entry() serializes concurrent first-inserts for the same key,
+        // preventing the unique-constraint race that the Pg path must retry around.
         match self.devices.entry(device_id.into()) {
             Entry::Occupied(mut entry) => {
                 let existing_user_id = entry.get().device.external_user_id.clone();

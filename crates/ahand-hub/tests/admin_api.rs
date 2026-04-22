@@ -14,9 +14,11 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ahand_hub_core::auth::{verify_control_plane_jwt, verify_device_jwt};
+use ahand_hub_core::traits::DeviceAdminStore;
 use ahand_hub::events::DashboardEvent;
 use base64::Engine;
 use futures_util::SinkExt;
@@ -664,6 +666,73 @@ async fn pre_register_idempotent_returns_stable_created_at() {
         !second_ts.is_empty(),
         "second created_at should be a non-empty timestamp"
     );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn pre_register_concurrent_first_insert_is_idempotent() {
+    // Spawn N concurrent tasks all calling pre_register for the same new
+    // device_id at the same time. All must succeed (no errors), and the
+    // returned device must be consistent: same device_id and same
+    // external_user_id across all results.
+    //
+    // The MemoryDeviceStore uses DashMap::entry() which serializes concurrent
+    // first-inserts for the same key, so this test validates that the
+    // in-memory store handles the race correctly (the Pg path adds an explicit
+    // retry loop for the equivalent unique-constraint race).
+    let server = spawn_admin_server().await;
+    let devices = Arc::clone(&server.state().devices);
+
+    const N: usize = 10;
+    let pk_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encode_key(&[42u8; 32]))
+        .unwrap();
+
+    let mut handles = Vec::with_capacity(N);
+    for _ in 0..N {
+        let devices = Arc::clone(&devices);
+        let pk = pk_bytes.clone();
+        handles.push(tokio::spawn(async move {
+            devices
+                .pre_register("concurrent-dev-1", &pk, "user-concurrent")
+                .await
+        }));
+    }
+
+    let mut results = Vec::with_capacity(N);
+    for handle in handles {
+        let result = handle.await.expect("task panicked");
+        results.push(result);
+    }
+
+    // All calls must have succeeded.
+    for (i, result) in results.iter().enumerate() {
+        assert!(
+            result.is_ok(),
+            "task {i} failed: {:?}",
+            result.as_ref().unwrap_err()
+        );
+    }
+
+    // The returned device must be consistent across all callers.
+    let (first_device, _) = results[0].as_ref().unwrap();
+    for (i, result) in results.iter().enumerate() {
+        let (device, _) = result.as_ref().unwrap();
+        assert_eq!(
+            device.id, first_device.id,
+            "task {i} returned different device_id"
+        );
+        assert_eq!(
+            device.external_user_id, first_device.external_user_id,
+            "task {i} returned different external_user_id"
+        );
+        assert_eq!(device.id, "concurrent-dev-1");
+        assert_eq!(
+            device.external_user_id.as_deref(),
+            Some("user-concurrent")
+        );
+    }
 
     server.shutdown().await;
 }
