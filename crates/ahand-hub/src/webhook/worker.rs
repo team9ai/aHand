@@ -255,7 +255,18 @@ async fn dlq_and_delete(
                 path = %dlq_path.display(),
                 "webhook worker: DLQ write failed; leaving row in webhook_deliveries for manual recovery",
             );
-            // Do not delete — at-least-once semantics preserved.
+            // Apply a back-off so we don't spin on a disk-full condition
+            let backoff = chrono::Utc::now() + chrono::Duration::minutes(5);
+            if let Err(store_err) = store
+                .mark_failed(&delivery.event_id, backoff, delivery.attempts, "dlq_write_failed")
+                .await
+            {
+                tracing::error!(
+                    event_id = %delivery.event_id,
+                    error = %store_err,
+                    "failed to update next_retry_at after DLQ write failure"
+                );
+            }
         }
     }
 }

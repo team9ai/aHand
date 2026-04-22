@@ -538,6 +538,78 @@ fn backoff_schedule_exposed_for_callers() {
     assert_eq!(backoff_secs(8), 256);
 }
 
+/// When `append_dlq` fails (e.g. the directory doesn't exist and can't be
+/// created), the worker must apply a 5-minute back-off so it doesn't spin
+/// tightly attempting the same failing DLQ write on every tick.
+#[tokio::test]
+async fn dlq_write_failure_applies_backoff_not_spin() {
+    // /dev/null is not a directory, so create_dir_all inside append_dlq
+    // will fail with ENOTDIR — a reliable way to simulate a broken DLQ path.
+    let bad_dlq = PathBuf::from("/dev/null/subdir/webhook_dlq.jsonl");
+
+    // Point the webhook at an address that will immediately refuse connections.
+    // Port 1 is reserved and always fails on all platforms.
+    let unreachable_url = "http://127.0.0.1:1/webhook";
+
+    // max_retries=1 means the very first (and only) failed send triggers
+    // the DLQ path: next_attempts(1) >= max_retries(1).
+    let (webhook, worker, store) =
+        make_webhook_and_worker(unreachable_url, 1, 2, bad_dlq.clone());
+    let worker_task = tokio::spawn(worker.run());
+
+    webhook.enqueue_offline("device-dlq-fail", None).await.unwrap();
+
+    // Wait for the row to stay in the store AND have last_error="dlq_write_failed",
+    // meaning the back-off mark_failed was applied.
+    let deadline = Duration::from_secs(10);
+    let end = tokio::time::Instant::now() + deadline;
+    let row = loop {
+        let leased = store
+            .lease_due(
+                chrono::Utc::now() + chrono::Duration::seconds(7200),
+                10,
+            )
+            .await
+            .unwrap();
+        // Release each row so we don't interfere with the worker.
+        for r in &leased {
+            let _ = store
+                .mark_failed(&r.event_id, r.next_retry_at, r.attempts, r.last_error.as_deref().unwrap_or(""))
+                .await;
+        }
+        if let Some(r) = leased
+            .iter()
+            .find(|r| r.last_error.as_deref() == Some("dlq_write_failed"))
+            .cloned()
+        {
+            break r;
+        }
+        if tokio::time::Instant::now() >= end {
+            panic!(
+                "row never got dlq_write_failed back-off within {deadline:?}; store len={}",
+                store.len().await.unwrap()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // The back-off must push next_retry_at into the future (not in the past).
+    let delta = (row.next_retry_at - chrono::Utc::now()).num_seconds();
+    assert!(
+        delta > 0,
+        "expected next_retry_at to be in the future after DLQ write failure, got {}s",
+        delta
+    );
+    // Back-off is 5 minutes; allow a small tolerance for slow CI.
+    assert!(
+        delta <= 305,
+        "back-off should be ~5 minutes, got {}s (too large?)",
+        delta
+    );
+
+    worker_task.abort();
+}
+
 async fn wait_for_store_len(
     store: &Arc<dyn WebhookDeliveryStore>,
     want: usize,

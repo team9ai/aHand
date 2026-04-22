@@ -335,32 +335,33 @@ pub fn load_or_create_identity(dir: &Path) -> anyhow::Result<DeviceIdentity> {
     DeviceIdentity::load_or_create(&dir.join(IDENTITY_FILE_NAME))
 }
 
-/// Translate an `anyhow::Error` from the inner client into a coarse [`ErrorKind`].
+/// Classify an anyhow error into a broad [`ErrorKind`] for status reporting.
+/// Operates on the stringified error message; this is a best-effort
+/// classification. Structured error types from ahand_client will supersede
+/// this in a future refactor.
 fn classify_error(e: &anyhow::Error) -> ErrorKind {
     let s = e.to_string().to_lowercase();
-    // Check auth-specific markers first — some transports surface a 401
-    // through "http error 401" which also contains "http", so order matters.
-    if s.contains("401")
-        || s.contains("unauthorized")
-        || s.contains("jwt")
-        || s.contains("auth-rejected")
-        || s.contains("hello auth rejected")
-        || s.contains("device hello rejected")
+    // NOTE: This matches on error message substrings, which is brittle.
+    // Prefer structured errors from ahand_client when those become available.
+    // Auth errors: hub explicitly mentions 401/unauthorized/jwt rejection.
+    if s.contains("401") || s.contains("unauthorized") || s.contains("invalid jwt")
+        || s.contains("jwt expired") || s.contains("auth rejected")
     {
-        ErrorKind::Auth
-    } else if s.contains("connect")
-        || s.contains("timeout")
-        || s.contains("timed out")
-        || s.contains("network")
-        || s.contains("dns")
-        || s.contains("tls")
-        || s.contains("refused")
-        || s.contains("reset")
-    {
-        ErrorKind::Network
-    } else {
-        ErrorKind::Other
+        return ErrorKind::Auth;
     }
+    // Network errors: transport failures from tungstenite/tokio-tungstenite.
+    // Use specific patterns to avoid false-positives from application messages.
+    if s.contains("connection refused")
+        || s.contains("connection reset")
+        || s.contains("dns error")
+        || s.contains("timed out")
+        || s.contains("broken pipe")
+        || s.contains("host not found")
+        || s.contains("no route to host")
+    {
+        return ErrorKind::Network;
+    }
+    ErrorKind::Other
 }
 
 /// Build an inner `config::Config` suitable for `ahand_client::run`.
@@ -494,7 +495,7 @@ mod tests {
             ErrorKind::Network
         );
         assert_eq!(
-            classify_error(&anyhow::anyhow!("dns lookup failed")),
+            classify_error(&anyhow::anyhow!("dns error: failed to resolve")),
             ErrorKind::Network
         );
         assert_eq!(
@@ -509,6 +510,35 @@ mod tests {
             classify_error(&anyhow::anyhow!("some unrelated failure")),
             ErrorKind::Other
         );
+    }
+
+    #[test]
+    fn classify_error_auth_patterns() {
+        let e = anyhow::anyhow!("hub returned 401 unauthorized");
+        assert_eq!(classify_error(&e), ErrorKind::Auth);
+        let e2 = anyhow::anyhow!("invalid jwt in header");
+        assert_eq!(classify_error(&e2), ErrorKind::Auth);
+    }
+
+    #[test]
+    fn classify_error_network_patterns() {
+        let e = anyhow::anyhow!("connection refused (os error 111)");
+        assert_eq!(classify_error(&e), ErrorKind::Network);
+        let e2 = anyhow::anyhow!("timed out waiting for server");
+        assert_eq!(classify_error(&e2), ErrorKind::Network);
+    }
+
+    #[test]
+    fn classify_error_no_false_positives() {
+        // "connect" in an application message must not match Network
+        let e = anyhow::anyhow!("Postgres connection pool exhausted");
+        assert_eq!(classify_error(&e), ErrorKind::Other);
+        // "timeout" in an approval message must not match Network
+        let e2 = anyhow::anyhow!("approval timeout expired");
+        assert_eq!(classify_error(&e2), ErrorKind::Other);
+        // "network" alone must not match
+        let e3 = anyhow::anyhow!("network policy denied the request");
+        assert_eq!(classify_error(&e3), ErrorKind::Other);
     }
 
     #[test]
