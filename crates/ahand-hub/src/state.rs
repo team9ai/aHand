@@ -189,7 +189,7 @@ impl AppState {
                     dlq_path: crate::webhook::worker::dlq_path_from_audit_fallback(
                         &config.audit_fallback_path,
                     ),
-                    request_timeout: crate::webhook::WebhookConfig::DEFAULT_TIMEOUT,
+                    request_timeout: Duration::from_millis(config.webhook_timeout_ms),
                 };
                 let (webhook, handle) =
                     crate::webhook::Webhook::new(webhook_delivery_store, webhook_config);

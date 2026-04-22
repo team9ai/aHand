@@ -654,19 +654,22 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                         }
                         // Heartbeats are also posted to the external webhook
                         // gateway so team9's presence tracker can stay
-                        // synced. The lookup is cheap (in-memory cache on
-                        // memory-mode / indexed row on Pg) and the enqueue
-                        // path is a no-op when webhook isn't configured.
+                        // synced. Use the `online_external_user_id` cached
+                        // at Hello-accept time instead of re-fetching the
+                        // device row on every heartbeat — at fleet scale
+                        // (~1000 devices @ 60s cadence) a per-heartbeat
+                        // SELECT is ~17 Pg QPS of pure attribution
+                        // lookups. The owner of a device effectively never
+                        // changes mid-session, and if an admin revokes a
+                        // device via DELETE /api/admin/devices/{id} the
+                        // WS is torn down via `kick_device`, so staleness
+                        // is bounded to the handshake-to-close window.
                         if state.webhook.is_enabled() {
-                            let hb_external_user_id = match state.devices.get(&device_id).await {
-                                Ok(Some(device)) => device.external_user_id,
-                                _ => None,
-                            };
                             if let Err(err) = state
                                 .webhook
                                 .enqueue_heartbeat(
                                     &device_id,
-                                    hb_external_user_id.as_deref(),
+                                    online_external_user_id.as_deref(),
                                     hb.sent_at_ms,
                                     ttl,
                                 )
