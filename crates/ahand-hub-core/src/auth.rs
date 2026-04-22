@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 
 use crate::{HubError, Result};
@@ -37,6 +37,7 @@ pub enum TokenType {
 /// the resource id).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceJwtClaims {
+    pub iss: String,
     pub sub: String,
     pub external_user_id: String,
     pub exp: i64,
@@ -49,6 +50,7 @@ pub struct DeviceJwtClaims {
 /// jobs on behalf of the user.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ControlPlaneJwtClaims {
+    pub iss: String,
     pub sub: String,
     pub external_user_id: String,
     pub scope: String,
@@ -158,6 +160,7 @@ pub fn mint_device_jwt(
     let now = Utc::now();
     let expires_at = now + ChronoDuration::from_std(ttl).expect("ttl clamped to a sane range");
     let claims = DeviceJwtClaims {
+        iss: "ahand-hub".into(),
         sub: device_id.into(),
         external_user_id: external_user_id.into(),
         exp: expires_at.timestamp(),
@@ -188,6 +191,7 @@ pub fn mint_control_plane_jwt(
     let now = Utc::now();
     let expires_at = now + ChronoDuration::from_std(ttl).expect("ttl clamped to a sane range");
     let claims = ControlPlaneJwtClaims {
+        iss: "ahand-hub".into(),
         sub: external_user_id.into(),
         external_user_id: external_user_id.into(),
         scope: scope.into(),
@@ -206,8 +210,9 @@ pub fn mint_control_plane_jwt(
 }
 
 pub fn verify_device_jwt(secret: &[u8], token: &str) -> Result<DeviceJwtClaims> {
-    let mut validation = Validation::default();
-    validation.set_required_spec_claims(&["exp"]);
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_issuer(&["ahand-hub"]);
+    validation.set_required_spec_claims(&["exp", "iss"]);
     let claims = decode::<DeviceJwtClaims>(token, &DecodingKey::from_secret(secret), &validation)
         .map(|data| data.claims)
         .map_err(|err| HubError::InvalidToken(err.to_string()))?;
@@ -218,8 +223,9 @@ pub fn verify_device_jwt(secret: &[u8], token: &str) -> Result<DeviceJwtClaims> 
 }
 
 pub fn verify_control_plane_jwt(secret: &[u8], token: &str) -> Result<ControlPlaneJwtClaims> {
-    let mut validation = Validation::default();
-    validation.set_required_spec_claims(&["exp"]);
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.set_issuer(&["ahand-hub"]);
+    validation.set_required_spec_claims(&["exp", "iss"]);
     let claims =
         decode::<ControlPlaneJwtClaims>(token, &DecodingKey::from_secret(secret), &validation)
             .map(|data| data.claims)
@@ -274,6 +280,7 @@ mod tests {
         assert_eq!(claims.sub, "device-1");
         assert_eq!(claims.external_user_id, "user-9");
         assert_eq!(claims.token_type, TokenType::Device);
+        assert_eq!(claims.iss, "ahand-hub");
         // iat within the last second, exp ~24h out
         assert!((claims.iat - now.timestamp()).abs() <= 2);
         let default_secs = DEVICE_JWT_DEFAULT_TTL.as_secs() as i64;
@@ -363,6 +370,7 @@ mod tests {
         let now = Utc::now();
         let exp = (now - ChronoDuration::seconds(300)).timestamp();
         let claims = super::DeviceJwtClaims {
+            iss: "ahand-hub".into(),
             sub: "device-1".into(),
             external_user_id: "user-9".into(),
             exp,
@@ -371,6 +379,62 @@ mod tests {
         };
         let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET)).unwrap();
         let err = verify_device_jwt(SECRET, &token).unwrap_err();
+        assert!(matches!(err, HubError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn verify_device_jwt_rejects_missing_iss() {
+        // Hand-craft a claims struct without an `iss` field by using a
+        // separate local struct that omits it.
+        use chrono::Utc;
+        use jsonwebtoken::{EncodingKey, Header, encode};
+        #[derive(serde::Serialize)]
+        struct NoIssDeviceClaims {
+            sub: String,
+            external_user_id: String,
+            exp: i64,
+            iat: i64,
+            token_type: TokenType,
+        }
+        let now = Utc::now();
+        let claims = NoIssDeviceClaims {
+            sub: "device-1".into(),
+            external_user_id: "user-9".into(),
+            exp: (now + chrono::Duration::seconds(3600)).timestamp(),
+            iat: now.timestamp(),
+            token_type: TokenType::Device,
+        };
+        let token =
+            encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET)).unwrap();
+        let err = verify_device_jwt(SECRET, &token).unwrap_err();
+        assert!(matches!(err, HubError::InvalidToken(_)));
+    }
+
+    #[test]
+    fn verify_control_plane_jwt_rejects_missing_iss() {
+        use chrono::Utc;
+        use jsonwebtoken::{EncodingKey, Header, encode};
+        #[derive(serde::Serialize)]
+        struct NoIssCpClaims {
+            sub: String,
+            external_user_id: String,
+            scope: String,
+            exp: i64,
+            iat: i64,
+            token_type: TokenType,
+        }
+        let now = Utc::now();
+        let claims = NoIssCpClaims {
+            sub: "user-9".into(),
+            external_user_id: "user-9".into(),
+            scope: "jobs:execute".into(),
+            exp: (now + chrono::Duration::seconds(3600)).timestamp(),
+            iat: now.timestamp(),
+            token_type: TokenType::ControlPlane,
+        };
+        let token =
+            encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET)).unwrap();
+        let err = verify_control_plane_jwt(SECRET, &token).unwrap_err();
         assert!(matches!(err, HubError::InvalidToken(_)));
     }
 

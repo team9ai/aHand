@@ -51,8 +51,17 @@ pub struct DaemonConfig {
     /// WebSocket. The hub forwards each heartbeat as a `device.heartbeat`
     /// event for TTL-based presence tracking. Defaults to 60 s.
     pub heartbeat_interval: Duration,
-    /// Optional explicit device ID. If `None`, one is derived deterministically
-    /// from the hostname + identity dir so tests and re-launches stay stable.
+    /// Override for the device ID. If `None` (the default), the device ID
+    /// is derived as `SHA256(pubkey)` hex from the loaded identity, which
+    /// is the canonical derivation per the ahand spec.
+    ///
+    /// **Warning:** If you supply a value here it MUST equal
+    /// `DeviceIdentity::device_id()` for the identity loaded from
+    /// `identity_dir`. Supplying a mismatched ID causes the hub to reject
+    /// the Hello handshake with a 401 at runtime.
+    ///
+    /// This field exists only for tests that need to fix the device ID;
+    /// production callers should always leave it as `None`.
     pub device_id: Option<String>,
     /// Maximum number of concurrent jobs accepted by the executor. Defaults to 8.
     pub max_concurrent_jobs: usize,
@@ -241,6 +250,15 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         .device_id
         .clone()
         .unwrap_or_else(|| identity.device_id());
+
+    // Catch misconfigured callers early in debug builds.
+    debug_assert!(
+        config.device_id.is_none()
+            || config.device_id.as_deref() == Some(identity.device_id().as_str()),
+        "DaemonConfig::device_id ({:?}) must equal SHA256(pubkey) = {:?}",
+        config.device_id,
+        identity.device_id()
+    );
 
     let (status_tx, status_rx) = watch::channel(DaemonStatus::Connecting);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();

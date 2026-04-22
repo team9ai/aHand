@@ -20,11 +20,11 @@ async fn spawn_connects_and_reports_online() {
     let tmp = TempDir::new().unwrap();
     let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
         .heartbeat_interval(Duration::from_secs(1))
-        .device_id("dev-online-test")
         .build();
 
     let handle = spawn(config).await.expect("spawn ok");
-    assert_eq!(handle.device_id(), "dev-online-test");
+    // device_id is SHA256(pubkey) — just assert it is non-empty.
+    assert!(!handle.device_id().is_empty());
 
     let mut status = handle.subscribe_status();
     let online = tokio::time::timeout(Duration::from_secs(5), async {
@@ -46,9 +46,7 @@ async fn spawn_connects_and_reports_online() {
 async fn spawn_surfaces_auth_error() {
     let mock = mock_hub::start_rejecting_401().await;
     let tmp = TempDir::new().unwrap();
-    let config = DaemonConfig::builder(mock.ws_url(), "bad-jwt", tmp.path())
-        .device_id("dev-auth-test")
-        .build();
+    let config = DaemonConfig::builder(mock.ws_url(), "bad-jwt", tmp.path()).build();
     let handle = spawn(config)
         .await
         .expect("spawn returns handle even if auth later fails");
@@ -114,7 +112,6 @@ async fn daemon_sends_heartbeat_on_interval() {
     let tmp = TempDir::new().unwrap();
     let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
         .heartbeat_interval(Duration::from_millis(500))
-        .device_id("dev-heartbeat-test")
         .build();
 
     let handle = spawn(config).await.expect("spawn ok");
