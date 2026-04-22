@@ -28,12 +28,7 @@ use crate::device_identity::DeviceIdentity;
 use crate::registry::JobRegistry;
 use crate::session::SessionManager;
 
-/// Default identity filename inside the identity directory.
-///
-/// Must match [`crate::device_identity::default_identity_path`] so that
-/// library callers and the CLI agree on where the Ed25519 private key
-/// lives when only a directory is specified.
-const IDENTITY_FILE_NAME: &str = "hub-device-identity.json";
+use crate::device_identity::IDENTITY_FILE as IDENTITY_FILE_NAME;
 
 /// Configuration for a library-embedded `ahandd` instance.
 #[derive(Clone, Debug)]
@@ -52,8 +47,9 @@ pub struct DaemonConfig {
     pub session_mode: SessionMode,
     /// Whether browser capabilities should be advertised to the hub.
     pub browser_enabled: bool,
-    /// Heartbeat interval (currently unused by the client but accepted so
-    /// callers can configure it in anticipation of explicit heartbeats).
+    /// How often the daemon sends a `Heartbeat` envelope over its hub
+    /// WebSocket. The hub forwards each heartbeat as a `device.heartbeat`
+    /// event for TTL-based presence tracking. Defaults to 60 s.
     pub heartbeat_interval: Duration,
     /// Optional explicit device ID. If `None`, one is derived deterministically
     /// from the hostname + identity dir so tests and re-launches stay stable.
@@ -240,11 +236,11 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     // Load identity up-front so bad paths surface synchronously to the caller
     // rather than getting buried inside the spawned task.
     let identity_path = config.identity_dir.join(IDENTITY_FILE_NAME);
-    let _identity = DeviceIdentity::load_or_create(&identity_path)?;
+    let identity = DeviceIdentity::load_or_create(&identity_path)?;
     let device_id = config
         .device_id
         .clone()
-        .unwrap_or_else(|| default_device_id(&config.identity_dir));
+        .unwrap_or_else(|| identity.device_id());
 
     let (status_tx, status_rx) = watch::channel(DaemonStatus::Connecting);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -401,6 +397,10 @@ fn session_mode_str(mode: SessionMode) -> &'static str {
 /// Derive a stable fallback device ID from the identity directory path so
 /// repeat launches with the same dir reuse the same ID. Callers that need a
 /// specific ID should set `DaemonConfig::device_id` directly.
+///
+/// Note: kept for tests only. Production code uses [`DeviceIdentity::device_id`]
+/// (SHA256 of pubkey) via `spawn()`.
+#[cfg(test)]
 fn default_device_id(identity_dir: &Path) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
