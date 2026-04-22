@@ -237,6 +237,9 @@ async fn stream_job(
     Extension(claims): Extension<ControlPlaneJwtClaims>,
     Path(job_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ControlError> {
+    if claims.scope != "jobs:execute" {
+        return Err(ControlError::Forbidden);
+    }
     let channels = state
         .control_jobs
         .get(&job_id)
@@ -351,6 +354,9 @@ async fn cancel_job(
     Extension(claims): Extension<ControlPlaneJwtClaims>,
     Path(job_id): Path<String>,
 ) -> Result<StatusCode, ControlError> {
+    if claims.scope != "jobs:execute" {
+        return Err(ControlError::Forbidden);
+    }
     let channels = state
         .control_jobs
         .get(&job_id)

@@ -1695,3 +1695,68 @@ async fn create_job_rejects_wrong_scope() {
     assert_eq!(body["error"]["code"], "FORBIDDEN");
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn stream_job_rejects_wrong_scope() {
+    // A token with scope "jobs:read" must be rejected on GET /stream too.
+    let server = spawn_server_with_state(test_state().await).await;
+    let _device = attach_owned_device(&server, "dev-stream-scope", "user-stream-scope").await;
+    let full_token = mint_cp_jwt(&server, "user-stream-scope");
+    let restricted_token = mint_cp_jwt_with_options("user-stream-scope", "jobs:read", None);
+
+    // Create a job with the full-scope token.
+    let create_resp = post_create_job(
+        &server,
+        &full_token,
+        serde_json::json!({ "device_id": "dev-stream-scope", "tool": "echo" }),
+    )
+    .await;
+    let create_body: serde_json::Value = create_resp.json().await.unwrap();
+    let job_id = create_body["job_id"].as_str().unwrap().to_string();
+
+    // Attempt to stream it with the read-only token → 403.
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/stream",
+            server.http_base_url()
+        ))
+        .bearer_auth(&restricted_token)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancel_job_rejects_wrong_scope() {
+    // A token with scope "jobs:read" must be rejected on POST /cancel too.
+    let server = spawn_server_with_state(test_state().await).await;
+    let _device = attach_owned_device(&server, "dev-cancel-scope", "user-cancel-scope").await;
+    let full_token = mint_cp_jwt(&server, "user-cancel-scope");
+    let restricted_token = mint_cp_jwt_with_options("user-cancel-scope", "jobs:read", None);
+
+    // Create a job with the full-scope token.
+    let create_resp = post_create_job(
+        &server,
+        &full_token,
+        serde_json::json!({ "device_id": "dev-cancel-scope", "tool": "echo" }),
+    )
+    .await;
+    let create_body: serde_json::Value = create_resp.json().await.unwrap();
+    let job_id = create_body["job_id"].as_str().unwrap().to_string();
+
+    // Attempt to cancel it with the read-only token → 403.
+    let resp = reqwest::Client::new()
+        .post(format!(
+            "{}/api/control/jobs/{job_id}/cancel",
+            server.http_base_url()
+        ))
+        .bearer_auth(&restricted_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    server.shutdown().await;
+}

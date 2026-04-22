@@ -205,7 +205,7 @@ impl DeviceAdminStore for PgDeviceStore {
             {
                 Ok(result) => return Ok(result),
                 Err(HubError::Internal(msg))
-                    if msg.contains("duplicate key") || msg.contains("unique") =>
+                    if msg.contains("duplicate key") =>
                 {
                     if attempt == 0 {
                         // Race on first insert — retry once; second attempt

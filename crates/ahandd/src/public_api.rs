@@ -358,6 +358,10 @@ fn classify_error(e: &anyhow::Error) -> ErrorKind {
         || s.contains("broken pipe")
         || s.contains("host not found")
         || s.contains("no route to host")
+        // TLS negotiation failures from rustls / native-tls:
+        || s.contains("tls handshake")
+        || s.contains("tls error")
+        || s.contains("certificate")
     {
         return ErrorKind::Network;
     }
@@ -539,6 +543,17 @@ mod tests {
         // "network" alone must not match
         let e3 = anyhow::anyhow!("network policy denied the request");
         assert_eq!(classify_error(&e3), ErrorKind::Other);
+    }
+
+    #[test]
+    fn classify_error_tls_patterns() {
+        // TLS negotiation failures should be Network, not Other.
+        let e = anyhow::anyhow!("tls handshake failed: unexpected eof");
+        assert_eq!(classify_error(&e), ErrorKind::Network);
+        let e2 = anyhow::anyhow!("tls error: invalid server certificate");
+        assert_eq!(classify_error(&e2), ErrorKind::Network);
+        let e3 = anyhow::anyhow!("certificate verify failed");
+        assert_eq!(classify_error(&e3), ErrorKind::Network);
     }
 
     #[test]
