@@ -7,6 +7,8 @@ on:
       - "crates/ahand-hub-core/**"
       - "crates/ahand-hub-store/**"
       - "crates/ahand-protocol/**"
+      - "proto/**"
+      - "Cargo.lock"
       - "deploy/hub/Dockerfile"
       - ".github/workflows/deploy-hub.yml"
 
@@ -55,4 +57,6 @@ jobs:
       - name: Deploy
         env:
           GIT_SHA: ${{ github.sha }}
-        run: unset AWS_PROFILE && ./deploy/hub/deploy.sh "$ENV"
+        run: |
+          # unset AWS_PROFILE so AWS CLI uses OIDC-injected session token
+          unset AWS_PROFILE && ./deploy/hub/deploy.sh "$ENV"

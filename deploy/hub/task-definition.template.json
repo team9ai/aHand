@@ -84,7 +84,7 @@
       "healthCheck": {
         "command": [
           "CMD-SHELL",
-          "wget -qO- http://localhost:1515/api/health || exit 1"
+          "curl -fsS http://localhost:1515/api/health || exit 1"
         ],
         "interval": 30,
         "timeout": 5,

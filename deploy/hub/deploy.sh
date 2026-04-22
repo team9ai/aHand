@@ -23,6 +23,10 @@ fi
 
 ECR_IMAGE="${ECR_REGISTRY}/${ECR_REPO}:${ENV}"
 SSM_PREFIX="arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter/ahand-hub/${ENV}"
+
+# Ensure log group exists (idempotent — safe to run even if Terraform hasn't provisioned it yet)
+aws logs create-log-group --region "$AWS_REGION" \
+  --log-group-name /ecs/ahand-hub 2>/dev/null || true
 EXECUTION_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/ahand-hub-${ENV}-execution"
 TASK_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/ahand-hub-${ENV}-task"
 

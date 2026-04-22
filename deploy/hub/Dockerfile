@@ -25,7 +25,7 @@ RUN apt-get update \
 
 COPY --from=hub-build /repo/target/release/ahand-hub /usr/local/bin/ahand-hub
 
-EXPOSE 8080
+EXPOSE 1515
 ENTRYPOINT ["/usr/local/bin/ahand-hub"]
 
 FROM node:${NODE_VERSION} AS dashboard-build
