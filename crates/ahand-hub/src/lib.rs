@@ -7,6 +7,7 @@ pub mod events;
 pub mod http;
 pub mod output_stream;
 pub mod state;
+pub mod webhook;
 pub mod ws;
 
 use axum::Router;

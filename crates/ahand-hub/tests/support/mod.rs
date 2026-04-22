@@ -51,6 +51,10 @@ pub fn test_config() -> Config {
         audit_retention_days: 90,
         audit_fallback_path: std::env::temp_dir().join("ahand-hub-test-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
+        webhook_url: None,
+        webhook_secret: None,
+        webhook_max_retries: 8,
+        webhook_max_concurrency: 50,
         store: StoreConfig::Memory,
     }
 }
@@ -76,6 +80,10 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
         audit_fallback_path: std::env::temp_dir()
             .join("ahand-hub-persistent-test-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
+        webhook_url: None,
+        webhook_secret: None,
+        webhook_max_retries: 8,
+        webhook_max_concurrency: 50,
         store: StoreConfig::Persistent {
             database_url: stack.database_url().into(),
             redis_url: stack.redis_url().into(),

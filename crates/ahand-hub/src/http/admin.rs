@@ -245,9 +245,10 @@ async fn delete_device(
     if !removed {
         return Err(AdminError::NotFound);
     }
-    // Best-effort: kick any live WS, then emit the revocation event.
-    // Failure to kick isn't a client-visible error — the row is already
-    // gone. Task 1.5 will wire this to a webhook sender.
+    // Best-effort: kick any live WS, emit the dashboard event, and
+    // enqueue the outbound webhook. The row is already gone so none
+    // of these failures are client-visible; we log at warn level
+    // and return 204 either way.
     let _ = state.connections.kick_device(&device_id).await;
     if let Err(err) = state
         .events
@@ -255,6 +256,17 @@ async fn delete_device(
         .await
     {
         tracing::warn!(device_id = %device_id, error = %err, "failed to emit device.revoked event");
+    }
+    if let Err(err) = state
+        .webhook
+        .enqueue_revoked(&device_id, existing_user.as_deref())
+        .await
+    {
+        tracing::warn!(
+            device_id = %device_id,
+            error = %err,
+            "failed to enqueue device.revoked webhook",
+        );
     }
     Ok(StatusCode::NO_CONTENT)
 }

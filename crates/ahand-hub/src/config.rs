@@ -40,6 +40,25 @@ pub struct Config {
     pub audit_retention_days: u64,
     pub audit_fallback_path: PathBuf,
     pub output_retention_ms: u64,
+    /// Outbound webhook target. When `None`, webhook dispatch is a
+    /// no-op: enqueue helpers return immediately and no worker runs.
+    /// This matches the plan's "hub runs fine without a configured
+    /// gateway" contract for memory-mode and for deployments that
+    /// haven't finished integrating team9 yet.
+    pub webhook_url: Option<String>,
+    /// Shared HMAC-SHA256 secret. Required when `webhook_url` is
+    /// Some; `from_env` rejects configurations that set one without
+    /// the other.
+    pub webhook_secret: Option<String>,
+    /// Max retry attempts before a delivery is moved to the DLQ.
+    /// Exponential backoff caps at 256s, so the worst-case age of a
+    /// row in the queue is `sum(2^i for i in 1..=webhook_max_retries)`
+    /// bounded by `webhook_max_retries * 256s`.
+    pub webhook_max_retries: u32,
+    /// Cap on concurrent in-flight HTTP requests. 1000 qps bursts
+    /// from the plan's edge test must not spawn 1000 tasks —
+    /// `Semaphore(webhook_max_concurrency)` clamps it.
+    pub webhook_max_concurrency: usize,
     pub store: StoreConfig,
 }
 
@@ -52,7 +71,7 @@ impl Config {
     where
         F: Fn(&str) -> Option<String>,
     {
-        Ok(Self {
+        let config = Self {
             bind_addr: getenv("AHAND_HUB_BIND_ADDR").unwrap_or_else(|| "127.0.0.1:8080".into()),
             service_token: required_env(&getenv, "AHAND_HUB_SERVICE_TOKEN")?,
             dashboard_shared_password: required_env(&getenv, "AHAND_HUB_DASHBOARD_PASSWORD")?,
@@ -119,11 +138,28 @@ impl Config {
                 .map(|value| value.parse())
                 .transpose()?
                 .unwrap_or(60 * 60 * 1000),
+            webhook_url: getenv("AHAND_HUB_WEBHOOK_URL").filter(|v| !v.trim().is_empty()),
+            webhook_secret: getenv("AHAND_HUB_WEBHOOK_SECRET")
+                .filter(|v| !v.trim().is_empty()),
+            webhook_max_retries: getenv("AHAND_HUB_WEBHOOK_MAX_RETRIES")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(8),
+            webhook_max_concurrency: getenv("AHAND_HUB_WEBHOOK_MAX_CONCURRENCY")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(50),
             store: StoreConfig::Persistent {
                 database_url: required_env(&getenv, "AHAND_HUB_DATABASE_URL")?,
                 redis_url: required_env(&getenv, "AHAND_HUB_REDIS_URL")?,
             },
-        })
+        };
+        if config.webhook_url.is_some() && config.webhook_secret.is_none() {
+            return Err(anyhow::anyhow!(
+                "AHAND_HUB_WEBHOOK_SECRET must be set when AHAND_HUB_WEBHOOK_URL is configured"
+            ));
+        }
+        Ok(config)
     }
 }
 
@@ -211,6 +247,10 @@ mod tests {
         assert_eq!(config.device_disconnect_grace_ms, 10 * 60 * 1_000);
         assert_eq!(config.jwt_secret, "jwt-prod-secret");
         assert_eq!(config.audit_retention_days, 90);
+        assert!(config.webhook_url.is_none());
+        assert!(config.webhook_secret.is_none());
+        assert_eq!(config.webhook_max_retries, 8);
+        assert_eq!(config.webhook_max_concurrency, 50);
         assert_eq!(config.audit_fallback_path, default_audit_fallback_path());
         match config.store {
             StoreConfig::Persistent {
@@ -385,5 +425,87 @@ mod tests {
             config.audit_fallback_path,
             PathBuf::from("/var/lib/ahand-hub/audit-fallback.jsonl")
         );
+    }
+
+    fn base_required_env() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "AHAND_HUB_SERVICE_TOKEN".to_string(),
+                "service-prod-token".to_string(),
+            ),
+            (
+                "AHAND_HUB_DASHBOARD_PASSWORD".to_string(),
+                "shared-dashboard-password".to_string(),
+            ),
+            (
+                "AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN".to_string(),
+                "bootstrap-prod-token".to_string(),
+            ),
+            (
+                "AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID".to_string(),
+                "device-prod-1".to_string(),
+            ),
+            (
+                "AHAND_HUB_JWT_SECRET".to_string(),
+                "jwt-prod-secret".to_string(),
+            ),
+            (
+                "AHAND_HUB_DATABASE_URL".to_string(),
+                "postgres://prod".to_string(),
+            ),
+            (
+                "AHAND_HUB_REDIS_URL".to_string(),
+                "redis://prod".to_string(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn from_env_with_parses_webhook_tuning() {
+        let mut env = base_required_env();
+        env.insert(
+            "AHAND_HUB_WEBHOOK_URL".to_string(),
+            "https://gateway.example/webhook".to_string(),
+        );
+        env.insert(
+            "AHAND_HUB_WEBHOOK_SECRET".to_string(),
+            "webhook-secret-value".to_string(),
+        );
+        env.insert("AHAND_HUB_WEBHOOK_MAX_RETRIES".to_string(), "3".to_string());
+        env.insert(
+            "AHAND_HUB_WEBHOOK_MAX_CONCURRENCY".to_string(),
+            "12".to_string(),
+        );
+
+        let config = Config::from_env_with(|key| env.get(key).cloned()).unwrap();
+        assert_eq!(
+            config.webhook_url.as_deref(),
+            Some("https://gateway.example/webhook")
+        );
+        assert_eq!(config.webhook_secret.as_deref(), Some("webhook-secret-value"));
+        assert_eq!(config.webhook_max_retries, 3);
+        assert_eq!(config.webhook_max_concurrency, 12);
+    }
+
+    #[test]
+    fn from_env_with_rejects_webhook_url_without_secret() {
+        let mut env = base_required_env();
+        env.insert(
+            "AHAND_HUB_WEBHOOK_URL".to_string(),
+            "https://gateway.example/webhook".to_string(),
+        );
+        let err = Config::from_env_with(|key| env.get(key).cloned()).unwrap_err();
+        assert!(
+            err.to_string().contains("AHAND_HUB_WEBHOOK_SECRET"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn from_env_with_treats_blank_webhook_url_as_unset() {
+        let mut env = base_required_env();
+        env.insert("AHAND_HUB_WEBHOOK_URL".to_string(), "   ".to_string());
+        let config = Config::from_env_with(|key| env.get(key).cloned()).unwrap();
+        assert!(config.webhook_url.is_none());
     }
 }

@@ -6,6 +6,7 @@ use prost::Message;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 use ahand_hub_core::HubError;
+use ahand_hub_core::traits::DeviceStore;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -433,6 +434,25 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     }),
                 )
                 .await;
+            // Best-effort webhook — the admin pre-register path sets
+            // `external_user_id` before the daemon hellos, so we
+            // look it up here. A failure to enqueue only surfaces as
+            // a log warning; the handshake is already committed.
+            let external_user_id = match state.devices.get(&envelope.device_id).await {
+                Ok(Some(device)) => device.external_user_id,
+                _ => None,
+            };
+            if let Err(err) = state
+                .webhook
+                .enqueue_registered(&envelope.device_id, external_user_id.as_deref())
+                .await
+            {
+                tracing::warn!(
+                    device_id = %envelope.device_id,
+                    error = %err,
+                    "failed to enqueue device.registered webhook",
+                );
+            }
         }
         sender
             .send(WsMessage::Binary(
@@ -467,6 +487,25 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         state.jobs.handle_device_connected(&device_id).await?;
         if let Err(err) = state.events.emit_device_online(&device_id, &hostname).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.online audit");
+        }
+        // The external_user_id on the device row may have been set by an
+        // earlier admin pre-register or during this hello's accept path.
+        // Either way, fetch it fresh so webhooks always carry the most
+        // recent attribution.
+        let online_external_user_id = match state.devices.get(&device_id).await {
+            Ok(Some(device)) => device.external_user_id,
+            _ => None,
+        };
+        if let Err(err) = state
+            .webhook
+            .enqueue_online(&device_id, online_external_user_id.as_deref())
+            .await
+        {
+            tracing::warn!(
+                device_id = %device_id,
+                error = %err,
+                "failed to enqueue device.online webhook",
+            );
         }
 
         if state.device_presence_refresh_ms > 0 {
@@ -613,6 +652,33 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                                 "failed to emit device.heartbeat event",
                             );
                         }
+                        // Heartbeats are also posted to the external webhook
+                        // gateway so team9's presence tracker can stay
+                        // synced. The lookup is cheap (in-memory cache on
+                        // memory-mode / indexed row on Pg) and the enqueue
+                        // path is a no-op when webhook isn't configured.
+                        if state.webhook.is_enabled() {
+                            let hb_external_user_id = match state.devices.get(&device_id).await {
+                                Ok(Some(device)) => device.external_user_id,
+                                _ => None,
+                            };
+                            if let Err(err) = state
+                                .webhook
+                                .enqueue_heartbeat(
+                                    &device_id,
+                                    hb_external_user_id.as_deref(),
+                                    hb.sent_at_ms,
+                                    ttl,
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    device_id = %device_id,
+                                    error = %err,
+                                    "failed to enqueue device.heartbeat webhook",
+                                );
+                            }
+                        }
                     } else if let Some(ahand_protocol::envelope::Payload::BrowserResponse(ref browser_resp)) = envelope.payload {
                         if let Some((_, sender)) = state.browser_pending.remove(&browser_resp.request_id) {
                             let _ = sender.send(browser_resp.clone());
@@ -679,10 +745,25 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             .unregister(&device_id, connection_id)
             .await?
     {
+        let offline_external_user_id = match state.devices.get(&device_id).await {
+            Ok(Some(device)) => device.external_user_id,
+            _ => None,
+        };
         state.devices.mark_offline(&device_id).await?;
         state.jobs.handle_device_disconnected(&device_id).await?;
         if let Err(err) = state.events.emit_device_offline(&device_id).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.offline audit");
+        }
+        if let Err(err) = state
+            .webhook
+            .enqueue_offline(&device_id, offline_external_user_id.as_deref())
+            .await
+        {
+            tracing::warn!(
+                device_id = %device_id,
+                error = %err,
+                "failed to enqueue device.offline webhook",
+            );
         }
     }
 

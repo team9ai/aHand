@@ -16,6 +16,9 @@ use ahand_hub_store::event_fanout::RedisEventFanout;
 use ahand_hub_store::job_output_store::RedisJobOutputStore;
 use ahand_hub_store::job_store::PgJobStore;
 use ahand_hub_store::presence_store::RedisPresenceStore;
+use ahand_hub_store::webhook_delivery_store::{
+    MemoryWebhookDeliveryStore, PgWebhookDeliveryStore, WebhookDeliveryStore,
+};
 use async_trait::async_trait;
 use dashmap::{DashMap, mapref::entry::Entry};
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
@@ -73,6 +76,11 @@ pub struct AppState {
     pub dashboard_shared_password: Arc<String>,
     pub dashboard_allowed_origins: Arc<Vec<String>>,
     pub terminal_tokens: Arc<DashMap<String, crate::http::terminal::TerminalToken>>,
+    /// Outbound webhook dispatcher. Always present; when
+    /// `config.webhook_url` is `None`, this is a no-op (`Webhook::disabled()`)
+    /// so call sites can always invoke `state.webhook.enqueue_*` without
+    /// branching.
+    pub webhook: Arc<crate::webhook::Webhook>,
 }
 
 impl AppState {
@@ -89,6 +97,7 @@ impl AppState {
             persistent_output,
             persistent_fanout,
             bootstrap_tokens,
+            webhook_delivery_store,
         ) = match &config.store {
             crate::config::StoreConfig::Memory => (
                 Arc::new(MemoryDeviceStore::default()),
@@ -97,6 +106,8 @@ impl AppState {
                 None,
                 None,
                 crate::bootstrap::BootstrapCredentials::memory(),
+                Arc::new(MemoryWebhookDeliveryStore::new())
+                    as Arc<dyn WebhookDeliveryStore>,
             ),
             crate::config::StoreConfig::Persistent {
                 database_url,
@@ -114,13 +125,15 @@ impl AppState {
                         PgDeviceStore::with_presence(pool.clone(), presence),
                     )),
                     Arc::new(PgJobStore::new(pool.clone())) as Arc<dyn JobStore>,
-                    Arc::new(PgAuditStore::new(pool)) as Arc<dyn AuditStore>,
+                    Arc::new(PgAuditStore::new(pool.clone())) as Arc<dyn AuditStore>,
                     Some(RedisJobOutputStore::new(redis_url, finished_retention).await?),
                     Some(RedisEventFanout::new(redis_url).await?),
                     crate::bootstrap::BootstrapCredentials::redis(RedisBootstrapStore::new(
                         bootstrap_redis,
                         bootstrap_reservation_ttl,
                     )),
+                    Arc::new(PgWebhookDeliveryStore::new(pool))
+                        as Arc<dyn WebhookDeliveryStore>,
                 )
             }
         };
@@ -161,6 +174,30 @@ impl AppState {
         let control_jobs = Arc::new(crate::control_jobs::ControlJobTracker::new());
         let control_rate_limiter = Arc::new(default_control_plane_rate_limiter());
 
+        // Webhook dispatcher — always present. When the URL/secret are
+        // unconfigured we build a no-op so downstream call sites don't
+        // have to branch on Option. When configured we spin up the
+        // background worker that drains the delivery store.
+        let webhook = match (&config.webhook_url, &config.webhook_secret) {
+            (Some(url), Some(secret)) if !url.is_empty() && !secret.is_empty() => {
+                let webhook_config = crate::webhook::WebhookConfig {
+                    url: url.clone(),
+                    secret: secret.clone(),
+                    max_retries: config.webhook_max_retries,
+                    max_concurrency: config.webhook_max_concurrency,
+                    dlq_path: crate::webhook::worker::dlq_path_from_audit_fallback(
+                        &config.audit_fallback_path,
+                    ),
+                    request_timeout: crate::webhook::WebhookConfig::DEFAULT_TIMEOUT,
+                };
+                let (webhook, handle) =
+                    crate::webhook::Webhook::new(webhook_delivery_store, webhook_config);
+                tokio::spawn(handle.run());
+                webhook
+            }
+            _ => crate::webhook::Webhook::disabled(),
+        };
+
         let state = Self {
             auth: Arc::new(AuthService::new(&config.jwt_secret)),
             device_manager,
@@ -188,6 +225,7 @@ impl AppState {
             dashboard_shared_password: Arc::new(config.dashboard_shared_password),
             dashboard_allowed_origins: Arc::new(config.dashboard_allowed_origins),
             terminal_tokens: Arc::new(DashMap::new()),
+            webhook,
         };
         state
             .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())
