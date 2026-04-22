@@ -218,6 +218,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn correlation_key_is_collision_free_across_separator_injection() {
+        // Before the fix, "a:b" + "c" and "a" + "b:c" both produced "a:b:c"
+        let key1 = correlation_key("a:b", "c");
+        let key2 = correlation_key("a", "b:c");
+        assert_ne!(key1, key2, "user_ids containing ':' must not collide");
+
+        // Longer case from the original bug report
+        let key3 = correlation_key("user:alice", "job-1");
+        let key4 = correlation_key("user", "alice:job-1");
+        assert_ne!(key3, key4);
+
+        // Identical inputs must produce identical keys
+        let key5 = correlation_key("user-1", "corr-42");
+        let key6 = correlation_key("user-1", "corr-42");
+        assert_eq!(key5, key6);
+
+        // Different users with same correlation_id must not collide
+        let key7 = correlation_key("alice", "job");
+        let key8 = correlation_key("bob", "job");
+        assert_ne!(key7, key8);
+    }
+
+    #[test]
     fn register_then_get_returns_channel() {
         let t = ControlJobTracker::new();
         t.register(

@@ -81,7 +81,6 @@ impl DeviceIdentity {
 
     /// Returns the Ed25519 public key encoded as standard base64.
     pub fn public_key_b64(&self) -> String {
-        use base64::{Engine, engine::general_purpose::STANDARD};
         STANDARD.encode(self.public_key_bytes())
     }
 

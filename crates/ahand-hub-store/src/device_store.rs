@@ -228,7 +228,10 @@ impl DeviceAdminStore for PgDeviceStore {
         // Upsert: insert new row or update public_key + external_user_id.
         // registered_at is set on first INSERT via DEFAULT now() and is
         // never overwritten on conflict — it is the stable creation timestamp.
-        let registered_at: DateTime<Utc> = sqlx::query_scalar(
+        // RETURNING all device fields so we can construct the Device directly
+        // without a second SELECT after commit (avoids a spurious 500 if the
+        // replica is briefly unavailable after a successful write).
+        let row = sqlx::query(
             r#"
             INSERT INTO devices (
                 id, public_key, hostname, os, capabilities, version, auth_method, external_user_id
@@ -237,7 +240,7 @@ impl DeviceAdminStore for PgDeviceStore {
             ON CONFLICT (id) DO UPDATE
             SET public_key = EXCLUDED.public_key,
                 external_user_id = EXCLUDED.external_user_id
-            RETURNING registered_at
+            RETURNING id, public_key, hostname, os, capabilities, version, auth_method, external_user_id, registered_at
             "#,
         )
         .bind(device_id)
@@ -252,16 +255,17 @@ impl DeviceAdminStore for PgDeviceStore {
         .await
         .map_err(|err| HubError::Internal(err.to_string()))?;
 
+        let registered_at: DateTime<Utc> = row
+            .try_get("registered_at")
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        // Construct Device directly from the RETURNING data — no second query.
+        // A freshly pre-registered device is never online at this point.
+        let device = map_device(row, false)?;
+
         tx.commit()
             .await
             .map_err(|err| HubError::Internal(err.to_string()))?;
-
-        let device = self
-            .get(device_id)
-            .await?
-            .ok_or_else(|| {
-                HubError::Internal(format!("preregistered device missing: {device_id}"))
-            })?;
 
         Ok((device, registered_at))
     }
