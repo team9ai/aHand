@@ -69,17 +69,19 @@ pub struct WebhookConfig {
     pub max_retries: u32,
     pub max_concurrency: usize,
     pub dlq_path: std::path::PathBuf,
-    /// Per-request HTTP timeout for the POST. 10s matches the
-    /// default gateway budget and caps the worst-case duration the
-    /// worker can spend on a single row.
+    /// Per-request HTTP timeout for the POST. Spec § 2.2.4 mandates
+    /// 5000ms; `AppState::from_config` feeds this value from
+    /// `AHAND_HUB_WEBHOOK_TIMEOUT_MS`.
     pub request_timeout: Duration,
 }
 
 impl WebhookConfig {
-    /// Default HTTP timeout for POSTs. Extracted so tests can
-    /// construct `WebhookConfig` with the same default without
-    /// importing `Duration` at the call site.
-    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Default HTTP timeout for POSTs. Matches spec § 2.2.4
+    /// (`AHAND_HUB_WEBHOOK_TIMEOUT_MS=5000`) and the deployed
+    /// `task-definition.json` default. Tests that don't care about the
+    /// exact value can use this constant without pulling `Duration`
+    /// into the call site.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(5_000);
 }
 
 /// The outbound webhook handle. Cheap to `clone` (internally
@@ -272,10 +274,10 @@ impl Webhook {
         Ok(())
     }
 
-    /// Expose the store for integration tests that want to assert on
-    /// the remaining rows after a worker tick. Production callers
-    /// should not need this.
-    #[cfg(test)]
+    /// Expose the store for integration tests and operational tooling
+    /// that want to assert on the rows remaining after a worker tick.
+    /// Production callers should treat this as opaque — the store is
+    /// an implementation detail of the dispatcher.
     pub fn store(&self) -> Option<Arc<dyn WebhookDeliveryStore>> {
         self.inner.as_ref().map(|inner| inner.store.clone())
     }

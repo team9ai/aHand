@@ -230,15 +230,31 @@ impl WebhookDeliveryStore for PgWebhookDeliveryStore {
 /// In-memory [`WebhookDeliveryStore`] for memory-mode hubs and tests.
 /// Keeps an in-process `leased` flag per row so concurrent
 /// `lease_due` calls don't hand out the same delivery twice.
-#[derive(Default)]
+///
+/// Leases expire after `lease_expiry` (default 5 minutes, matching the
+/// Pg impl's `next_retry_at = now + INTERVAL '5 minutes'` update). A
+/// row whose lease has expired is returned by the next `lease_due`
+/// call — this is how we recover from a crashed worker that claimed a
+/// row but never got the chance to `delete` or `mark_failed` it.
 pub struct MemoryWebhookDeliveryStore {
     rows: DashMap<String, MemoryRow>,
+    lease_expiry: chrono::Duration,
 }
 
 #[derive(Clone)]
 struct MemoryRow {
     delivery: WebhookDelivery,
     leased: bool,
+    leased_at: Option<DateTime<Utc>>,
+}
+
+impl Default for MemoryWebhookDeliveryStore {
+    fn default() -> Self {
+        Self {
+            rows: DashMap::new(),
+            lease_expiry: chrono::Duration::minutes(5),
+        }
+    }
 }
 
 impl MemoryWebhookDeliveryStore {
@@ -248,6 +264,16 @@ impl MemoryWebhookDeliveryStore {
 
     pub fn arc() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Build a store with a custom lease expiration window. Tests use
+    /// this to simulate a crashed worker without waiting the
+    /// production default of 5 minutes of wall clock.
+    pub fn with_lease_expiry(lease_expiry: chrono::Duration) -> Self {
+        Self {
+            rows: DashMap::new(),
+            lease_expiry,
+        }
     }
 }
 
@@ -259,6 +285,7 @@ impl WebhookDeliveryStore for MemoryWebhookDeliveryStore {
             MemoryRow {
                 delivery,
                 leased: false,
+                leased_at: None,
             },
         );
         Ok(())
@@ -273,12 +300,31 @@ impl WebhookDeliveryStore for MemoryWebhookDeliveryStore {
         // candidates first, sort by `next_retry_at`, then flip the
         // lease flag. Sorting makes the retry order deterministic
         // (oldest due first) which matches the Pg query above.
+        //
+        // A row with `leased = true` is normally invisible to
+        // `lease_due`, but if its `leased_at` is older than
+        // `lease_expiry` (default 5 minutes) we treat the lease as
+        // stale and hand it out again. This is the memory equivalent
+        // of the Pg impl's `next_retry_at = now + 5 minutes` update:
+        // a worker that crashed mid-POST without writing
+        // `mark_failed`/`delete` leaves the row in the store, and
+        // without an expiration check the row would wedge forever.
+        let expiry = self.lease_expiry;
         let mut candidates: Vec<WebhookDelivery> = self
             .rows
             .iter()
             .filter(|entry| {
                 let row = entry.value();
-                !row.leased && row.delivery.next_retry_at <= now
+                if row.delivery.next_retry_at > now {
+                    return false;
+                }
+                if !row.leased {
+                    return true;
+                }
+                // Leased — only visible once the lease is stale.
+                row.leased_at
+                    .map(|claimed_at| now - claimed_at > expiry)
+                    .unwrap_or(true)
             })
             .map(|entry| entry.value().delivery.clone())
             .collect();
@@ -287,10 +333,27 @@ impl WebhookDeliveryStore for MemoryWebhookDeliveryStore {
 
         let mut claimed = Vec::with_capacity(candidates.len());
         for delivery in candidates {
-            if let Some(mut entry) = self.rows.get_mut(&delivery.event_id)
-                && !entry.leased
-            {
+            if let Some(mut entry) = self.rows.get_mut(&delivery.event_id) {
+                // Re-check the claim predicate under the shard guard in
+                // case another `lease_due` caller raced us between the
+                // scan above and the flip below.
+                let stale_lease = entry
+                    .leased_at
+                    .map(|claimed_at| now - claimed_at > expiry)
+                    .unwrap_or(true);
+                if entry.leased && !stale_lease {
+                    continue;
+                }
                 entry.leased = true;
+                entry.leased_at = Some(now);
+                // The lease hides the row from `lease_due` via the
+                // `leased`/`leased_at` pair — unlike the Pg impl we do
+                // NOT need to mutate `next_retry_at` to keep the row
+                // invisible, because `lease_due` filters on the
+                // in-memory flags directly. Preserving the original
+                // `next_retry_at` here matches what callers expect:
+                // the returned delivery's schedule reflects the real
+                // retry time, not the bookkeeping lease window.
                 claimed.push(entry.delivery.clone());
             }
         }
@@ -314,15 +377,30 @@ impl WebhookDeliveryStore for MemoryWebhookDeliveryStore {
             entry.delivery.next_retry_at = next_retry_at;
             entry.delivery.last_error = Some(last_error.to_string());
             entry.leased = false;
+            entry.leased_at = None;
         }
         Ok(())
     }
 
     async fn earliest_next_retry(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
+        // Stale leases are candidates for re-delivery, so include them
+        // when computing the earliest wake-up time. Without this the
+        // worker would sleep past the point at which a crashed-worker
+        // row becomes due again.
+        let now = Utc::now();
+        let expiry = self.lease_expiry;
         Ok(self
             .rows
             .iter()
-            .filter(|entry| !entry.value().leased)
+            .filter(|entry| {
+                let row = entry.value();
+                if !row.leased {
+                    return true;
+                }
+                row.leased_at
+                    .map(|claimed_at| now - claimed_at > expiry)
+                    .unwrap_or(true)
+            })
             .map(|entry| entry.value().delivery.next_retry_at)
             .min())
     }
@@ -447,5 +525,61 @@ mod tests {
         let store = MemoryWebhookDeliveryStore::arc();
         store.enqueue(sample_delivery("a", -1)).await.unwrap();
         assert_eq!(store.len().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn memory_lease_expires_after_crashed_worker() {
+        // Simulate a worker that leases a row and then crashes before
+        // calling `delete` or `mark_failed`. The row must become
+        // available again once the lease expires. Tests override the
+        // expiration window so we don't have to wait 5 wall-clock
+        // minutes; production uses the default.
+        let store = MemoryWebhookDeliveryStore::with_lease_expiry(
+            chrono::Duration::milliseconds(50),
+        );
+        store.enqueue(sample_delivery("a", -1)).await.unwrap();
+
+        let leased = store.lease_due(Utc::now(), 10).await.unwrap();
+        assert_eq!(leased.len(), 1, "first lease should hand out the row");
+
+        // Simulate crash: do not call delete/mark_failed. A fresh
+        // lease_due immediately afterwards must NOT re-hand-out the
+        // row because the lease is still live.
+        let leased_again = store.lease_due(Utc::now(), 10).await.unwrap();
+        assert!(
+            leased_again.is_empty(),
+            "live lease must hide the row from concurrent workers"
+        );
+
+        // After the lease window elapses, the row becomes visible again.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let recovered = store.lease_due(Utc::now(), 10).await.unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "stale lease must be recoverable by a subsequent lease_due"
+        );
+        assert_eq!(recovered[0].event_id, "a");
+    }
+
+    #[tokio::test]
+    async fn memory_earliest_next_retry_includes_stale_leases() {
+        // A stale lease must not keep the row out of
+        // `earliest_next_retry` — otherwise the worker would sleep
+        // forever while a crashed-worker row sits waiting.
+        let store = MemoryWebhookDeliveryStore::with_lease_expiry(
+            chrono::Duration::milliseconds(30),
+        );
+        store.enqueue(sample_delivery("a", -1)).await.unwrap();
+        let _ = store.lease_due(Utc::now(), 10).await.unwrap();
+
+        // Fresh lease — the row's schedule is still tracked here
+        // because `earliest_next_retry` returns Option, but the
+        // important thing is that after expiry we still see it.
+        let _before = store.earliest_next_retry().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        // Stale lease re-surfaces the row.
+        assert!(store.earliest_next_retry().await.unwrap().is_some());
     }
 }

@@ -180,7 +180,14 @@ async fn send_and_handle(
             }
         };
 
-    let outcome = send_once(&http, &config.url, config.secret.as_bytes(), &payload).await;
+    let outcome = send_once(
+        &http,
+        &config.url,
+        config.secret.as_bytes(),
+        &payload,
+        &delivery,
+    )
+    .await;
     match outcome {
         SendOutcome::Success => {
             if let Err(err) = store.delete(&delivery.event_id).await {

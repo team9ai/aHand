@@ -231,6 +231,18 @@ async fn happy_path_posts_signed_payload_and_deletes_row() {
     assert!(signature.to_str().unwrap().starts_with("sha256="));
     assert!(request.headers.get("x-ahand-event-id").is_some());
     assert!(request.headers.get("x-ahand-timestamp").is_some());
+    // `X-AHand-Event-Timestamp` is the stable event-creation time; it
+    // must be present on every delivery and should be close to the
+    // payload's `occurredAt` (second precision).
+    let event_ts_header = request
+        .headers
+        .get("x-ahand-event-timestamp")
+        .expect("X-AHand-Event-Timestamp must be set");
+    let event_ts_secs: i64 = event_ts_header
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("event timestamp must be an integer number of seconds");
     let content_type = request.headers.get("content-type").unwrap();
     assert_eq!(content_type, "application/json");
     let ua = request.headers.get("user-agent").unwrap().to_str().unwrap();
@@ -243,9 +255,95 @@ async fn happy_path_posts_signed_payload_and_deletes_row() {
     assert_eq!(payload.event_type, "device.online");
     assert_eq!(payload.device_id, "device-1");
     assert_eq!(payload.external_user_id.as_deref(), Some("user-1"));
+    // The event timestamp header must match the delivery's creation
+    // time, which tracks the payload's `occurred_at`. Allow ~2s slack
+    // to cover the gap between `Utc::now()` calls inside
+    // `enqueue_typed`.
+    let payload_occurred = payload.occurred_at.timestamp();
+    assert!(
+        (payload_occurred - event_ts_secs).abs() <= 2,
+        "X-AHand-Event-Timestamp {event_ts_secs} should match payload.occurredAt {payload_occurred}"
+    );
 
     // Eventually the row is deleted.
     wait_for_store_len(&store, 0, Duration::from_secs(3)).await;
+
+    worker_task.abort();
+    gateway.shutdown();
+    remove_file_quiet(&dlq).await;
+}
+
+#[tokio::test]
+async fn event_timestamp_stable_across_retries() {
+    // When a retry fires after a transient 5xx, `X-AHand-Event-Timestamp`
+    // must stay pinned to the delivery's original `created_at` while
+    // `X-AHand-Timestamp` (the signing time, part of the HMAC input) is
+    // freshly computed for each POST. The gateway relies on this split
+    // to measure event-age latency and dedupe late retries independently
+    // from anti-replay.
+    let dlq = tmp_dlq("event-ts-stable");
+    remove_file_quiet(&dlq).await;
+
+    let gateway = MockGateway::start(
+        MockMode::AlwaysFail {
+            status: StatusCode::BAD_GATEWAY,
+        },
+        b"s3cret-bytes".to_vec(),
+    )
+    .await;
+
+    // max_retries high enough that the second attempt still retries (does
+    // not DLQ). First backoff is 2^1 = 2s.
+    let (webhook, worker, _store) =
+        make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
+    let worker_task = tokio::spawn(worker.run());
+
+    webhook.enqueue_offline("device-retry-ts", None).await.unwrap();
+
+    // Expect at least 2 delivery attempts: first immediate, second
+    // after the ~2s backoff. Allow 8s of wall-clock for CI slack.
+    assert!(
+        gateway
+            .wait_for_requests(2, Duration::from_secs(8))
+            .await,
+        "expected two delivery attempts"
+    );
+
+    let received = gateway.received().await;
+    assert!(
+        received.len() >= 2,
+        "expected >=2 attempts, got {}",
+        received.len()
+    );
+
+    let read_header = |req: &ReceivedRequest, name: &str| -> String {
+        req.headers
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} missing on request"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+
+    let first_event_ts = read_header(&received[0], "x-ahand-event-timestamp");
+    let first_sign_ts = read_header(&received[0], "x-ahand-timestamp");
+    let second_event_ts = read_header(&received[1], "x-ahand-event-timestamp");
+    let second_sign_ts = read_header(&received[1], "x-ahand-timestamp");
+
+    // Event timestamp is pinned to `delivery.created_at` — must match
+    // across both attempts.
+    assert_eq!(
+        first_event_ts, second_event_ts,
+        "X-AHand-Event-Timestamp must not change across retries",
+    );
+    // Signing timestamp is recomputed per attempt — with the 2s backoff
+    // the second one should be strictly greater.
+    let first_sign_secs: u64 = first_sign_ts.parse().unwrap();
+    let second_sign_secs: u64 = second_sign_ts.parse().unwrap();
+    assert!(
+        second_sign_secs > first_sign_secs,
+        "X-AHand-Timestamp must be freshly computed on retry: first={first_sign_secs}, second={second_sign_secs}"
+    );
 
     worker_task.abort();
     gateway.shutdown();

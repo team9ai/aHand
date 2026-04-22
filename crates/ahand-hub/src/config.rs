@@ -61,6 +61,11 @@ pub struct Config {
     /// from the plan's edge test must not spawn 1000 tasks —
     /// `Semaphore(webhook_max_concurrency)` clamps it.
     pub webhook_max_concurrency: usize,
+    /// Per-request HTTP timeout for outbound webhook POSTs, in
+    /// milliseconds. Spec § 2.2.4 mandates 5000ms; the default here
+    /// matches the deployed `task-definition.json` so a hub booted
+    /// without the env var still meets the spec.
+    pub webhook_timeout_ms: u64,
     pub store: StoreConfig,
 }
 
@@ -151,6 +156,10 @@ impl Config {
                 .map(|value| value.parse())
                 .transpose()?
                 .unwrap_or(50),
+            webhook_timeout_ms: getenv("AHAND_HUB_WEBHOOK_TIMEOUT_MS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(5_000),
             store: StoreConfig::Persistent {
                 database_url: required_env(&getenv, "AHAND_HUB_DATABASE_URL")?,
                 redis_url: required_env(&getenv, "AHAND_HUB_REDIS_URL")?,
@@ -253,6 +262,8 @@ mod tests {
         assert!(config.webhook_secret.is_none());
         assert_eq!(config.webhook_max_retries, 8);
         assert_eq!(config.webhook_max_concurrency, 50);
+        // Spec § 2.2.4 mandates a 5000ms default webhook timeout.
+        assert_eq!(config.webhook_timeout_ms, 5_000);
         assert_eq!(config.audit_fallback_path, default_audit_fallback_path());
         match config.store {
             StoreConfig::Persistent {
@@ -487,6 +498,29 @@ mod tests {
         assert_eq!(config.webhook_secret.as_deref(), Some("webhook-secret-value"));
         assert_eq!(config.webhook_max_retries, 3);
         assert_eq!(config.webhook_max_concurrency, 12);
+    }
+
+    #[test]
+    fn from_env_with_parses_webhook_timeout_ms() {
+        let mut env = base_required_env();
+        env.insert(
+            "AHAND_HUB_WEBHOOK_TIMEOUT_MS".to_string(),
+            "7500".to_string(),
+        );
+        let config = Config::from_env_with(|key| env.get(key).cloned()).unwrap();
+        assert_eq!(config.webhook_timeout_ms, 7_500);
+    }
+
+    #[test]
+    fn from_env_with_rejects_invalid_webhook_timeout_ms() {
+        let mut env = base_required_env();
+        env.insert(
+            "AHAND_HUB_WEBHOOK_TIMEOUT_MS".to_string(),
+            "not-a-number".to_string(),
+        );
+        // The parse error surfaces as a generic parse failure; what we
+        // care about is that it's not silently defaulted back to 5000.
+        assert!(Config::from_env_with(|key| env.get(key).cloned()).is_err());
     }
 
     #[test]

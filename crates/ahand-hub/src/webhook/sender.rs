@@ -7,6 +7,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ahand_hub_store::webhook_delivery_store::WebhookDelivery;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -66,11 +67,19 @@ pub fn verify(secret: &[u8], timestamp_secs: u64, raw_body: &[u8], signature_hea
 }
 
 /// POST the payload once. No retries, no store mutation — pure I/O.
+///
+/// `delivery` is the row the worker leased from the delivery store; its
+/// `created_at` is the original event-creation time and travels with
+/// every retry in the `X-AHand-Event-Timestamp` header. The freshly
+/// computed `X-AHand-Timestamp` is the signing time (included in the
+/// HMAC input) and changes on every retry so the gateway can still
+/// reject replays.
 pub async fn send_once(
     http: &reqwest::Client,
     url: &str,
     secret: &[u8],
     payload: &WebhookPayload,
+    delivery: &WebhookDelivery,
 ) -> SendOutcome {
     let body = match serde_json::to_vec(payload) {
         Ok(bytes) => bytes,
@@ -90,12 +99,20 @@ pub async fn send_once(
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
     let signature = sign(secret, timestamp_secs, &body);
+    // `X-AHand-Event-Timestamp` is the stable event-creation time, taken
+    // from the delivery row so it survives retries. Unlike
+    // `X-AHand-Timestamp`, it is NOT part of the HMAC input — the gateway
+    // uses it for latency metrics and late-retry deduplication, not for
+    // anti-replay. Negative `created_at` values (before the Unix epoch)
+    // can't occur for rows we produce, but `max(0)` keeps the cast safe.
+    let event_timestamp_secs = delivery.created_at.timestamp().max(0) as u64;
 
     let request = http
         .post(url)
         .header("Content-Type", "application/json")
         .header("X-AHand-Event-Id", payload.event_id.as_str())
         .header("X-AHand-Timestamp", timestamp_secs.to_string())
+        .header("X-AHand-Event-Timestamp", event_timestamp_secs.to_string())
         .header("X-AHand-Signature", signature)
         .body(body);
 
