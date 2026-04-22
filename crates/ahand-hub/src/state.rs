@@ -18,6 +18,25 @@ use ahand_hub_store::job_store::PgJobStore;
 use ahand_hub_store::presence_store::RedisPresenceStore;
 use async_trait::async_trait;
 use dashmap::{DashMap, mapref::entry::Entry};
+use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
+
+/// Control-plane rate limiter keyed by `external_user_id`.
+///
+/// Default policy: **10 requests per second sustained, 100-request burst**
+/// — matches the plan's § 8 guidance. Tuning hooks (env vars, per-scope
+/// caps) can be added later without changing the type alias.
+pub type ControlPlaneRateLimiter =
+    RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
+
+pub fn default_control_plane_rate_limiter() -> ControlPlaneRateLimiter {
+    // Burst = 100 means we allow up to 100 rapid requests before
+    // needing to wait for the 10-per-second replenishment to kick in.
+    // `Quota::per_second(10)` sets the sustained cap; `allow_burst(100)`
+    // widens the bucket.
+    let quota = Quota::per_second(std::num::NonZeroU32::new(10).expect("10 is non-zero"))
+        .allow_burst(std::num::NonZeroU32::new(100).expect("100 is non-zero"));
+    RateLimiter::keyed(quota)
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +48,8 @@ pub struct AppState {
     pub audit_store: Arc<dyn AuditStore>,
     audit_writer: Arc<crate::audit_writer::BufferedAuditStore>,
     pub jobs: Arc<crate::http::jobs::JobRuntime>,
+    pub control_jobs: Arc<crate::control_jobs::ControlJobTracker>,
+    pub control_rate_limiter: Arc<ControlPlaneRateLimiter>,
     pub connections: Arc<crate::ws::device_gateway::ConnectionRegistry>,
     pub browser_pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::BrowserResponse>>>,
     pub events: Arc<crate::events::EventBus>,
@@ -137,6 +158,8 @@ impl AppState {
         ));
 
         let browser_pending = Arc::new(DashMap::new());
+        let control_jobs = Arc::new(crate::control_jobs::ControlJobTracker::new());
+        let control_rate_limiter = Arc::new(default_control_plane_rate_limiter());
 
         let state = Self {
             auth: Arc::new(AuthService::new(&config.jwt_secret)),
@@ -147,6 +170,8 @@ impl AppState {
             audit_store,
             audit_writer,
             jobs,
+            control_jobs,
+            control_rate_limiter,
             connections,
             browser_pending,
             events,

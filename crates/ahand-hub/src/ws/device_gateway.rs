@@ -179,6 +179,28 @@ impl ConnectionRegistry {
         self.has_active(device_id)
     }
 
+    /// Public wrapper around [`Self::is_connected`] so the
+    /// control-plane HTTP handlers (which live outside the `ws`
+    /// module) can gate job dispatch on a live WS without reaching
+    /// into private state.
+    pub fn is_online(&self, device_id: &str) -> bool {
+        self.has_active(device_id)
+    }
+
+    /// Public wrapper around [`Self::send`] so the control-plane HTTP
+    /// handlers can dispatch envelopes to a device. The underlying
+    /// path is the same as the dashboard job flow; we expose it here
+    /// to keep the module boundary tight rather than promoting
+    /// `send` itself to public (which would also expose the retry
+    /// loop semantics to more call sites).
+    pub async fn send_envelope(
+        &self,
+        device_id: &str,
+        envelope: ahand_protocol::Envelope,
+    ) -> anyhow::Result<()> {
+        self.send(device_id, envelope).await
+    }
+
     pub(crate) fn has_seen_inbound(&self, device_id: &str, seq: u64) -> bool {
         if seq == 0 {
             return false;
@@ -601,6 +623,15 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                             );
                         }
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                    } else if dispatch_control_plane_event(&state, &envelope) {
+                        // The envelope's job_id was registered in the
+                        // control-plane tracker — the tee has already
+                        // published the event to SSE subscribers.
+                        // Skip JobRuntime (which would bail on an
+                        // unknown job id) and just advance seq/ack.
+                        state
+                            .connections
+                            .observe_inbound(&device_id, envelope.seq, envelope.ack)?;
                     } else {
                         state.jobs.handle_device_frame(&device_id, &frame).await?;
                     }
@@ -656,6 +687,99 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     }
 
     run_result
+}
+
+/// Publish any job-related envelope received from a daemon to the
+/// control-plane tracker, if the `job_id` is known to it.
+///
+/// Returns `true` if the envelope targeted a control-plane job (and
+/// was therefore handled here) — the caller should then skip
+/// [`crate::http::jobs::JobRuntime::handle_device_frame`] to avoid
+/// the "job not found" bail-out that would kill the WS. Returns
+/// `false` otherwise (not job-related, or a dashboard / JobRuntime
+/// job id the caller still needs to process).
+fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Envelope) -> bool {
+    let Some(payload) = envelope.payload.as_ref() else {
+        return false;
+    };
+    match payload {
+        ahand_protocol::envelope::Payload::JobEvent(event) => {
+            if state.control_jobs.get(&event.job_id).is_none() {
+                return false;
+            }
+            let Some(kind) = event.event.as_ref() else {
+                return true;
+            };
+            let control_event = match kind {
+                ahand_protocol::job_event::Event::StdoutChunk(chunk) => {
+                    crate::control_jobs::ControlJobEvent::Stdout {
+                        chunk: String::from_utf8_lossy(chunk).into_owned(),
+                    }
+                }
+                ahand_protocol::job_event::Event::StderrChunk(chunk) => {
+                    crate::control_jobs::ControlJobEvent::Stderr {
+                        chunk: String::from_utf8_lossy(chunk).into_owned(),
+                    }
+                }
+                ahand_protocol::job_event::Event::Progress(percent) => {
+                    crate::control_jobs::ControlJobEvent::Progress {
+                        // Percent is a u32 on the wire but the SDK
+                        // surface is 0..=100; clamp defensively.
+                        percent: (*percent).min(100) as u8,
+                        message: None,
+                    }
+                }
+            };
+            state.control_jobs.publish(&event.job_id, control_event);
+            true
+        }
+        ahand_protocol::envelope::Payload::JobFinished(finished) => {
+            let Some(channels) = state.control_jobs.get(&finished.job_id) else {
+                return false;
+            };
+            let duration_ms = channels.started_at.elapsed().as_millis().min(u64::MAX as u128)
+                as u64;
+            // `error == "cancelled"` and non-zero exit_code are the
+            // two ways a job can fail. We report them as an `error`
+            // event so the SDK can distinguish graceful completion
+            // from failure without peeking at the exit code.
+            let event = if finished.exit_code == 0 && finished.error.is_empty() {
+                crate::control_jobs::ControlJobEvent::Finished {
+                    exit_code: finished.exit_code,
+                    duration_ms,
+                }
+            } else {
+                crate::control_jobs::ControlJobEvent::Error {
+                    code: if finished.error == "cancelled" {
+                        "cancelled".into()
+                    } else {
+                        "exec_failed".into()
+                    },
+                    message: if finished.error.is_empty() {
+                        format!("exit code {}", finished.exit_code)
+                    } else {
+                        finished.error.clone()
+                    },
+                }
+            };
+            state.control_jobs.finalize(&finished.job_id, event);
+            true
+        }
+        ahand_protocol::envelope::Payload::JobRejected(rejected) => {
+            if state.control_jobs.get(&rejected.job_id).is_none() {
+                return false;
+            }
+            state.control_jobs.finalize(
+                &rejected.job_id,
+                crate::control_jobs::ControlJobEvent::Error {
+                    code: "rejected".into(),
+                    message: rejected.reason.clone(),
+                },
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 fn issue_hello_challenge() -> ahand_protocol::HelloChallenge {

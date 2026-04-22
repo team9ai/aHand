@@ -2,6 +2,7 @@ pub mod audit_writer;
 pub mod auth;
 pub mod bootstrap;
 pub mod config;
+pub mod control_jobs;
 pub mod events;
 pub mod http;
 pub mod output_stream;

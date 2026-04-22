@@ -10,6 +10,7 @@ pub mod api_error;
 pub mod audit;
 pub mod auth;
 pub mod browser;
+pub mod control_plane;
 pub mod devices;
 pub mod jobs;
 pub mod system;
@@ -18,6 +19,7 @@ pub mod terminal;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .merge(admin::router(state.clone()))
+        .merge(control_plane::router(state.clone()))
         .route("/api/health", get(system::health))
         .route("/api/stats", get(system::stats))
         .route("/api/auth/login", post(auth::login))

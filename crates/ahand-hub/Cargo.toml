@@ -17,6 +17,7 @@ chrono.workspace = true
 dashmap.workspace = true
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = "0.3"
+governor = "0.6"
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,6 +26,7 @@ tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+ulid = "1"
 url = "2"
 uuid.workspace = true
 
