@@ -55,23 +55,15 @@ async fn require_service_token(
     let Some(token) = value.strip_prefix("Bearer ") else {
         return Err(AdminError::Unauthorized);
     };
-    if !constant_time_eq(token.as_bytes(), state.service_token.as_bytes()) {
+    if !service_token_matches(state.service_token.as_bytes(), token.as_bytes()) {
         return Err(AdminError::Unauthorized);
     }
     Ok(next.run(req).await)
 }
 
-/// Length-aware constant-time byte comparison. Returns false for
-/// different-length inputs without leaking via early return timing.
-fn constant_time_eq(lhs: &[u8], rhs: &[u8]) -> bool {
-    if lhs.len() != rhs.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in lhs.iter().zip(rhs.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
+fn service_token_matches(expected: &[u8], actual: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    expected.ct_eq(actual).into()
 }
 
 #[derive(Debug, Deserialize)]

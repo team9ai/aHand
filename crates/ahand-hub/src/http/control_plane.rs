@@ -114,6 +114,11 @@ async fn create_job(
     Extension(claims): Extension<ControlPlaneJwtClaims>,
     body: Result<Json<CreateJobRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreateJobResponse>), ControlError> {
+    // Validate the scope claim before any DB access.
+    if claims.scope != "jobs:execute" {
+        return Err(ControlError::Forbidden);
+    }
+
     let Json(req) =
         body.map_err(|_| ControlError::BadRequest("invalid JSON body".into()))?;
     if req.tool.trim().is_empty() {
@@ -152,6 +157,12 @@ async fn create_job(
         // both to 403 deliberately — 404 would leak device-id
         // existence across user boundaries.
         return Err(ControlError::Forbidden);
+    }
+    // Enforce device_ids allowlist if the token is scoped to specific devices.
+    if let Some(allowed) = &claims.device_ids {
+        if !allowed.contains(&req.device_id) {
+            return Err(ControlError::Forbidden);
+        }
     }
     if !state.connections.is_online(&device.id) {
         return Err(ControlError::DeviceOffline);
@@ -214,13 +225,13 @@ async fn create_job(
     Ok((StatusCode::ACCEPTED, Json(CreateJobResponse { job_id })))
 }
 
-// NOTE: If a client calls this endpoint after the job's terminal event
-// (finished/error) has already been broadcast, the broadcast channel
-// sender will have been dropped by finalize(). The SSE stream will
-// immediately close (RecvError::Closed) with no events delivered.
-// Callers must connect before or concurrent with job dispatch; this
-// is the responsibility of the SDK layer. See CloudClient::spawn()
-// which opens the SSE stream immediately after POST /jobs.
+// NOTE: Late-joiner clients — those connecting AFTER the job's terminal
+// event (finished/error) has been broadcast and finalize() has removed
+// the tracker entry — receive HTTP 404 immediately. The broadcast
+// RecvError::Closed path below handles the case where the sender drops
+// while a subscriber is already actively streaming. These are distinct
+// scenarios. SDK callers must connect to /stream immediately after
+// POST /jobs to avoid the late-joiner 404.
 async fn stream_job(
     State(state): State<AppState>,
     Extension(claims): Extension<ControlPlaneJwtClaims>,
@@ -234,6 +245,12 @@ async fn stream_job(
         // 404, not 403: don't leak the existence of another user's
         // job via a status-code oracle.
         return Err(ControlError::JobNotFound);
+    }
+    // Enforce device_ids allowlist if the token is scoped to specific devices.
+    if let Some(allowed) = &claims.device_ids {
+        if !allowed.contains(&channels.device_id) {
+            return Err(ControlError::Forbidden);
+        }
     }
     let mut rx = channels.subscribe();
     // Release the per-entry Arc so the entry can be dropped when
@@ -340,6 +357,12 @@ async fn cancel_job(
         .ok_or(ControlError::JobNotFound)?;
     if channels.external_user_id != claims.external_user_id {
         return Err(ControlError::JobNotFound);
+    }
+    // Enforce device_ids allowlist if the token is scoped to specific devices.
+    if let Some(allowed) = &claims.device_ids {
+        if !allowed.contains(&channels.device_id) {
+            return Err(ControlError::Forbidden);
+        }
     }
     let device_id = channels.device_id.clone();
     drop(channels);

@@ -89,6 +89,24 @@ fn mint_cp_jwt(_server: &TestServer, external_user_id: &str) -> String {
     token
 }
 
+/// Mint a control-plane JWT with custom scope and/or device_ids allowlist.
+fn mint_cp_jwt_with_options(
+    external_user_id: &str,
+    scope: &str,
+    device_ids: Option<Vec<String>>,
+) -> String {
+    use ahand_hub_core::auth::mint_control_plane_jwt;
+    let (token, _) = mint_control_plane_jwt(
+        JWT_SECRET.as_bytes(),
+        external_user_id,
+        scope,
+        device_ids,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    token
+}
+
 /// Read the next JobRequest envelope from a daemon WS, asserting
 /// envelope shape. Returns the inner JobRequest.
 async fn recv_job_request(
@@ -1507,5 +1525,69 @@ async fn sse_late_joiner_after_terminal_event_gets_empty_stream() {
     );
 
     drop(device);
+    server.shutdown().await;
+}
+
+// ── R2-1: device_ids allowlist enforcement ────────────────────────────────────
+
+#[tokio::test]
+async fn create_job_rejects_device_not_in_allowlist() {
+    // Token scoped to "other-device" but posting to "dev-al-1" → 403.
+    let server = spawn_server_with_state(test_state().await).await;
+    let _device = attach_owned_device(&server, "dev-al-1", "user-allow").await;
+    let token = mint_cp_jwt_with_options(
+        "user-allow",
+        "jobs:execute",
+        Some(vec!["other-device".to_string()]),
+    );
+    let resp = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({ "device_id": "dev-al-1", "tool": "echo" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_job_allows_device_in_allowlist() {
+    // Token scoped to exactly "dev-al-2" — posting to that device → 202.
+    let server = spawn_server_with_state(test_state().await).await;
+    let _device = attach_owned_device(&server, "dev-al-2", "user-al2").await;
+    let token = mint_cp_jwt_with_options(
+        "user-al2",
+        "jobs:execute",
+        Some(vec!["dev-al-2".to_string()]),
+    );
+    let resp = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({ "device_id": "dev-al-2", "tool": "echo" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    server.shutdown().await;
+}
+
+// ── R2-5: scope claim validation ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn create_job_rejects_wrong_scope() {
+    // Token with scope "jobs:read" must be rejected 403 before any DB work.
+    let server = spawn_server_with_state(test_state().await).await;
+    let _device = attach_owned_device(&server, "dev-scope", "user-scope").await;
+    let token = mint_cp_jwt_with_options("user-scope", "jobs:read", None);
+    let resp = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({ "device_id": "dev-scope", "tool": "echo" }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
     server.shutdown().await;
 }
