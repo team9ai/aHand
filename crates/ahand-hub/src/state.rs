@@ -9,6 +9,7 @@ use ahand_hub_core::services::device_manager::DeviceManager;
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceAdminStore, DeviceStore, JobStore};
 use ahand_hub_core::{HubError, Result};
+use chrono::{DateTime, Utc};
 use ahand_hub_store::audit_store::PgAuditStore;
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::device_store::PgDeviceStore;
@@ -533,9 +534,9 @@ impl DeviceAdminStore for MemoryDeviceStore {
         device_id: &str,
         public_key: &[u8],
         external_user_id: &str,
-    ) -> Result<Device> {
+    ) -> Result<(Device, DateTime<Utc>)> {
         if let Some(persistent) = &self.persistent {
-            let device = persistent
+            let (device, registered_at) = persistent
                 .pre_register(device_id, public_key, external_user_id)
                 .await?;
             self.devices.insert(
@@ -545,7 +546,7 @@ impl DeviceAdminStore for MemoryDeviceStore {
                     last_signed_at_ms: 0,
                 },
             );
-            return Ok(device);
+            return Ok((device, registered_at));
         }
 
         // Memory-backed: mirror the PgDeviceStore semantics exactly so
@@ -554,6 +555,11 @@ impl DeviceAdminStore for MemoryDeviceStore {
         match self.devices.entry(device_id.into()) {
             Entry::Occupied(mut entry) => {
                 let existing_user_id = entry.get().device.external_user_id.clone();
+                // Ownership check: if a row exists and is already claimed by a
+                // different external user, reject. A row with external_user_id = None
+                // (device inserted via the legacy bootstrap flow) can be claimed by
+                // any caller — this is intentional behavior that allows admin
+                // pre-registration to adopt unclaimed devices.
                 if let Some(existing_user) = existing_user_id.as_ref() {
                     if existing_user != external_user_id {
                         return Err(HubError::DeviceOwnedByDifferentUser {
@@ -566,9 +572,13 @@ impl DeviceAdminStore for MemoryDeviceStore {
                 let stored = entry.get_mut();
                 stored.device.public_key = Some(public_key.to_vec());
                 stored.device.external_user_id = Some(external_user_id.into());
-                Ok(stored.device.clone())
+                // Memory store has no persistent registered_at; use now() as a
+                // best-effort stable value (callers using the in-memory backend are
+                // in tests only — the real stable timestamp only matters for Postgres).
+                Ok((stored.device.clone(), Utc::now()))
             }
             Entry::Vacant(entry) => {
+                let registered_at = Utc::now();
                 let device = Device {
                     id: device_id.into(),
                     public_key: Some(public_key.to_vec()),
@@ -584,7 +594,7 @@ impl DeviceAdminStore for MemoryDeviceStore {
                     device: device.clone(),
                     last_signed_at_ms: 0,
                 });
-                Ok(device)
+                Ok((device, registered_at))
             }
         }
     }

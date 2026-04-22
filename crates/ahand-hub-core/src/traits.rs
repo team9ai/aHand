@@ -27,12 +27,16 @@ pub trait DeviceAdminStore: Send + Sync {
     ///   `public_key`, return the existing row unchanged
     /// - if a row exists with a different `external_user_id`, return
     ///   [`crate::HubError::DeviceOwnedByDifferentUser`]
+    ///
+    /// Returns `(Device, registered_at)` where `registered_at` is the stable
+    /// timestamp from the DB row (i.e. the first time the device was inserted,
+    /// not `Utc::now()` on each call).
     async fn pre_register(
         &self,
         device_id: &str,
         public_key: &[u8],
         external_user_id: &str,
-    ) -> Result<Device>;
+    ) -> Result<(Device, DateTime<Utc>)>;
 
     async fn find_by_id(&self, device_id: &str) -> Result<Option<Device>>;
 

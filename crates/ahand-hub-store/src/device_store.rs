@@ -4,6 +4,7 @@ use ahand_hub_core::device::{Device, NewDevice};
 use ahand_hub_core::traits::{DeviceAdminStore, DeviceStore};
 use ahand_hub_core::{HubError, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use sqlx::Row;
 
@@ -190,24 +191,44 @@ impl DeviceAdminStore for PgDeviceStore {
         device_id: &str,
         public_key: &[u8],
         external_user_id: &str,
-    ) -> Result<Device> {
-        // Idempotency: if a matching row already exists with the same
-        // external_user_id AND same public_key, return it unchanged. If
-        // external_user_id differs, reject. Anything else (public_key
-        // differs) is treated as an update — the admin is the source of
-        // truth for the device's public key.
-        if let Some(existing) = self.find_by_id(device_id).await? {
-            if let Some(existing_user) = existing.external_user_id.as_ref() {
-                if existing_user != external_user_id {
-                    return Err(HubError::DeviceOwnedByDifferentUser {
-                        device_id: device_id.into(),
-                        existing_external_user_id: existing_user.clone(),
-                    });
-                }
+    ) -> Result<(Device, DateTime<Utc>)> {
+        // Wrap the SELECT + INSERT in a single transaction with FOR UPDATE
+        // to prevent concurrent calls from racing on ownership checks
+        // (TOCTOU fix). The FOR UPDATE lock serializes concurrent claims
+        // for the same device_id at the DB level.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        // Lock the row if it already exists.
+        let existing: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT id, external_user_id FROM devices WHERE id = $1 FOR UPDATE",
+        )
+        .bind(device_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        // Ownership check: if a row exists and is already claimed by a
+        // different external user, reject. A row with external_user_id = NULL
+        // (device inserted via the legacy bootstrap flow) can be claimed by
+        // any caller — this is intentional behavior that allows admin
+        // pre-registration to adopt unclaimed devices.
+        if let Some((_, Some(existing_user))) = &existing {
+            if existing_user != external_user_id {
+                return Err(HubError::DeviceOwnedByDifferentUser {
+                    device_id: device_id.into(),
+                    existing_external_user_id: existing_user.clone(),
+                });
             }
         }
 
-        sqlx::query(
+        // Upsert: insert new row or update public_key + external_user_id.
+        // registered_at is set on first INSERT via DEFAULT now() and is
+        // never overwritten on conflict — it is the stable creation timestamp.
+        let registered_at: DateTime<Utc> = sqlx::query_scalar(
             r#"
             INSERT INTO devices (
                 id, public_key, hostname, os, capabilities, version, auth_method, external_user_id
@@ -216,6 +237,7 @@ impl DeviceAdminStore for PgDeviceStore {
             ON CONFLICT (id) DO UPDATE
             SET public_key = EXCLUDED.public_key,
                 external_user_id = EXCLUDED.external_user_id
+            RETURNING registered_at
             "#,
         )
         .bind(device_id)
@@ -226,13 +248,22 @@ impl DeviceAdminStore for PgDeviceStore {
         .bind(None::<String>)
         .bind("preregistered")
         .bind(external_user_id)
-        .execute(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(|err| HubError::Internal(err.to_string()))?;
 
-        self.get(device_id)
+        tx.commit()
+            .await
+            .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        let device = self
+            .get(device_id)
             .await?
-            .ok_or_else(|| HubError::Internal(format!("preregistered device missing: {device_id}")))
+            .ok_or_else(|| {
+                HubError::Internal(format!("preregistered device missing: {device_id}"))
+            })?;
+
+        Ok((device, registered_at))
     }
 
     async fn find_by_id(&self, device_id: &str) -> Result<Option<Device>> {

@@ -140,6 +140,11 @@ impl WorkerHandle {
                 continue;
             }
 
+            // tokio::Notify coalesces multiple notify_one() calls into a single
+            // stored notification. If this select is not yet awaiting (e.g., while
+            // the for-loop is processing a batch), the notification is stored and
+            // consumed on the next iteration. This means all rows enqueued during
+            // a batch pass are correctly processed on the following wake.
             tokio::select! {
                 _ = notify.notified() => {}
                 _ = shutdown.notified() => return,
@@ -229,20 +234,29 @@ async fn dlq_and_delete(
     delivery: &WebhookDelivery,
     reason: &str,
 ) {
-    if let Err(err) = append_dlq(dlq_path, delivery, reason).await {
-        tracing::error!(
-            event_id = %delivery.event_id,
-            error = %err,
-            path = %dlq_path.display(),
-            "webhook worker: failed to append to DLQ",
-        );
-    }
-    if let Err(err) = store.delete(&delivery.event_id).await {
-        tracing::warn!(
-            event_id = %delivery.event_id,
-            error = %err,
-            "webhook worker: failed to delete DLQed row",
-        );
+    match append_dlq(dlq_path, delivery, reason).await {
+        Ok(()) => {
+            // DLQ write succeeded — safe to remove from retry queue.
+            if let Err(err) = store.delete(&delivery.event_id).await {
+                tracing::error!(
+                    event_id = %delivery.event_id,
+                    error = %err,
+                    "webhook worker: failed to delete after DLQ",
+                );
+            }
+        }
+        Err(err) => {
+            // DLQ write failed — leave row in retry queue so the
+            // operator can recover. Deleting here would silently lose
+            // the event with no durable record of the failure.
+            tracing::error!(
+                event_id = %delivery.event_id,
+                error = %err,
+                path = %dlq_path.display(),
+                "webhook worker: DLQ write failed; leaving row in webhook_deliveries for manual recovery",
+            );
+            // Do not delete — at-least-once semantics preserved.
+        }
     }
 }
 

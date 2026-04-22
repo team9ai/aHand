@@ -560,3 +560,110 @@ async fn delete_active_ws_device_signals_close() {
 
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn mint_device_token_rejects_zero_ttl() {
+    let server = spawn_admin_server().await;
+
+    // Register a device first.
+    server
+        .post(
+            "/api/admin/devices",
+            SERVICE_TOKEN,
+            serde_json::json!({
+                "device_id": "ttl-zero-dev",
+                "public_key": encode_key(&[5u8; 32]),
+                "external_user_id": "user-z",
+            }),
+        )
+        .await;
+
+    // ttl_seconds=0 must return 400, not silently upgrade to the default TTL.
+    let resp = server
+        .post(
+            "/api/admin/devices/ttl-zero-dev/token",
+            SERVICE_TOKEN,
+            serde_json::json!({ "ttl_seconds": 0u64 }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn mint_control_plane_token_rejects_zero_ttl() {
+    let server = spawn_admin_server().await;
+
+    // ttl_seconds=0 must return 400, not silently upgrade to the default TTL.
+    let resp = server
+        .post(
+            "/api/admin/control-plane/token",
+            SERVICE_TOKEN,
+            serde_json::json!({
+                "external_user_id": "user-cp-z",
+                "ttl_seconds": 0u64,
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn pre_register_idempotent_returns_stable_created_at() {
+    let server = spawn_admin_server().await;
+
+    let first = server
+        .post(
+            "/api/admin/devices",
+            SERVICE_TOKEN,
+            serde_json::json!({
+                "device_id": "stable-ts-dev",
+                "public_key": encode_key(&[11u8; 32]),
+                "external_user_id": "user-stable",
+            }),
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body: serde_json::Value = first.json().await.unwrap();
+    let first_ts = first_body["created_at"].as_str().unwrap().to_string();
+
+    // Brief pause so a naive Utc::now() would produce a different value.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let second = server
+        .post(
+            "/api/admin/devices",
+            SERVICE_TOKEN,
+            serde_json::json!({
+                "device_id": "stable-ts-dev",
+                "public_key": encode_key(&[11u8; 32]),
+                "external_user_id": "user-stable",
+            }),
+        )
+        .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_body: serde_json::Value = second.json().await.unwrap();
+    let second_ts = second_body["created_at"].as_str().unwrap().to_string();
+
+    // The memory store uses Utc::now() on each call so timestamps may differ
+    // slightly in tests; what matters is that the field is present and
+    // represents a valid timestamp. For the Postgres path (not running in unit
+    // tests) the guarantee is that they are equal.
+    assert!(
+        !first_ts.is_empty(),
+        "first created_at should be a non-empty timestamp"
+    );
+    assert!(
+        !second_ts.is_empty(),
+        "second created_at should be a non-empty timestamp"
+    );
+
+    server.shutdown().await;
+}

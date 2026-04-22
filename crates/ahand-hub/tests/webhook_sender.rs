@@ -123,11 +123,19 @@ async fn handle(
     // Verify HMAC first. The real gateway must reject bad sigs with
     // 401; our mock does the same so a mis-signed payload round-trip
     // is observable.
+    //
+    // Timestamp is now part of the signed material (anti-replay), so
+    // we extract it from the X-AHand-Timestamp header before verifying.
     let signature = headers
         .get("x-ahand-signature")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    let signature_ok = verify(state.secret.as_ref(), &body, signature);
+    let timestamp_secs: u64 = headers
+        .get("x-ahand-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let signature_ok = verify(state.secret.as_ref(), timestamp_secs, &body, signature);
     state.verify_calls.fetch_add(1, Ordering::SeqCst);
 
     state.received.lock().await.push(ReceivedRequest {
@@ -333,6 +341,7 @@ async fn retries_exhausted_moves_row_to_dlq() {
 
 #[tokio::test]
 async fn unauthorized_moves_row_to_dlq_without_retry() {
+    // 401 is a permanent failure; the row must DLQ on the first attempt.
     let dlq = tmp_dlq("unauth");
     remove_file_quiet(&dlq).await;
 
@@ -360,6 +369,48 @@ async fn unauthorized_moves_row_to_dlq_without_retry() {
             .unwrap()
             .contains("401"),
     );
+
+    worker_task.abort();
+    gateway.shutdown();
+    remove_file_quiet(&dlq).await;
+}
+
+#[tokio::test]
+async fn too_many_requests_retries_with_backoff() {
+    // 429 Too Many Requests is a transient rate-limit response; the worker
+    // must NOT DLQ the row but increment attempts and schedule a retry.
+    let dlq = tmp_dlq("429-retry");
+    remove_file_quiet(&dlq).await;
+
+    let gateway = MockGateway::start(
+        MockMode::AlwaysFail {
+            status: StatusCode::TOO_MANY_REQUESTS,
+        },
+        b"s3cret-bytes".to_vec(),
+    )
+    .await;
+    let (webhook, worker, store) =
+        make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
+    let worker_task = tokio::spawn(worker.run());
+
+    webhook.enqueue_offline("device-1", None).await.unwrap();
+
+    // Wait for the first POST to land and attempts to increment.
+    assert!(gateway.wait_for_requests(1, Duration::from_secs(3)).await);
+    let row = wait_for_attempts(&store, "device-1", 1, Duration::from_secs(3)).await;
+
+    // Row must still be in the store (not DLQed).
+    assert_eq!(row.attempts, 1, "attempts should be 1 after first 429");
+    let delta = (row.next_retry_at - chrono::Utc::now()).num_seconds();
+    assert!(
+        (1..=3).contains(&delta),
+        "expected next_retry_at ~2s out after 429, got {}s",
+        delta
+    );
+
+    // DLQ must be empty — 429 is retriable.
+    let dlq_lines = read_dlq_lines(&dlq).await;
+    assert_eq!(dlq_lines.len(), 0, "429 must not DLQ the row");
 
     worker_task.abort();
     gateway.shutdown();
@@ -467,11 +518,17 @@ async fn duplicate_event_id_upserts_single_row() {
 
 #[test]
 fn sign_produces_stable_hex_header() {
-    let sig = sign(b"secret", b"{\"a\":1}");
-    assert_eq!(
-        sig,
-        "sha256=aa9e2e3575f5d7098b6caccd790888c36d5fdb63342a73bada2d6a51747a8494"
-    );
+    // Signed input is: "1700000000" + "." + body — timestamp is now
+    // part of the HMAC material so replay attacks (changing only
+    // X-AHand-Timestamp) invalidate the signature.
+    let ts = 1_700_000_000u64;
+    let body = b"{\"a\":1}";
+    let sig = sign(b"secret", ts, body);
+    assert!(sig.starts_with("sha256="), "unexpected prefix: {sig}");
+    // Round-trip: verify must accept the same timestamp.
+    assert!(verify(b"secret", ts, body, &sig));
+    // Different timestamp must NOT verify (anti-replay).
+    assert!(!verify(b"secret", ts + 1, body, &sig));
 }
 
 #[test]

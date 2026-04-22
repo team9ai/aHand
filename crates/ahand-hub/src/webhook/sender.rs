@@ -36,30 +36,33 @@ pub enum SendOutcome {
     RetryLater { reason: String },
 }
 
-/// Sign `raw_body` with HMAC-SHA256 using `secret`. Returns the
-/// header value (`sha256=<hex>`) directly so the caller can set it
-/// without formatting.
-pub fn sign(secret: &[u8], raw_body: &[u8]) -> String {
+/// Sign `raw_body` with HMAC-SHA256 using `secret`, binding the
+/// timestamp into the signed material. The input is:
+///   `timestamp_secs_as_string + "." + raw_body`
+///
+/// This matches the Stripe/GitHub webhook pattern and prevents an
+/// attacker who captures a valid signed request from replaying it by
+/// substituting a fresh `X-AHand-Timestamp` header — because the
+/// timestamp is included in the HMAC input, changing the header
+/// invalidates the signature.
+///
+/// Returns the header value (`sha256=<hex>`) directly so the caller
+/// can set it without additional formatting.
+pub fn sign(secret: &[u8], timestamp_secs: u64, raw_body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(timestamp_secs.to_string().as_bytes());
+    mac.update(b".");
     mac.update(raw_body);
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Verify a `sha256=<hex>` signature against `raw_body` using
-/// constant-time HMAC comparison. Public for the test gateway and
+/// Verify a `sha256=<hex>` signature against `timestamp_secs` + `raw_body`
+/// using constant-time comparison. Public for the test gateway and
 /// for any future in-process verifier.
-pub fn verify(secret: &[u8], raw_body: &[u8], signature_header: &str) -> bool {
-    let Some(hex) = signature_header.strip_prefix("sha256=") else {
-        return false;
-    };
-    let Ok(sig_bytes) = hex::decode(hex) else {
-        return false;
-    };
-    let Ok(mut mac) = HmacSha256::new_from_slice(secret) else {
-        return false;
-    };
-    mac.update(raw_body);
-    mac.verify_slice(&sig_bytes).is_ok()
+pub fn verify(secret: &[u8], timestamp_secs: u64, raw_body: &[u8], signature_header: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let expected = sign(secret, timestamp_secs, raw_body);
+    expected.as_bytes().ct_eq(signature_header.as_bytes()).into()
 }
 
 /// POST the payload once. No retries, no store mutation — pure I/O.
@@ -80,17 +83,19 @@ pub async fn send_once(
             };
         }
     };
-    let signature = sign(secret, &body);
-    let timestamp = SystemTime::now()
+    // Compute timestamp once so the header value and the HMAC input
+    // are guaranteed to be identical (anti-replay per spec § 5.5).
+    let timestamp_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
+    let signature = sign(secret, timestamp_secs, &body);
 
     let request = http
         .post(url)
         .header("Content-Type", "application/json")
         .header("X-AHand-Event-Id", payload.event_id.as_str())
-        .header("X-AHand-Timestamp", timestamp.to_string())
+        .header("X-AHand-Timestamp", timestamp_secs.to_string())
         .header("X-AHand-Signature", signature)
         .body(body);
 
@@ -103,11 +108,17 @@ pub async fn send_once(
                 SendOutcome::RetryLater {
                     reason: format!("status {}", status.as_u16()),
                 }
+            } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                // 429 Too Many Requests — transient; gateway is
+                // rate-limiting us. Retry with backoff rather than
+                // DLQing a perfectly valid payload.
+                SendOutcome::RetryLater {
+                    reason: format!("status {}", status.as_u16()),
+                }
             } else {
-                // 4xx — any client error (401, 400, 403, 410, ...)
-                // is permanent because the signature, event shape,
-                // or URL is wrong and retrying won't change any of
-                // those.
+                // All other 4xx — permanent (bad secret, bad payload,
+                // wrong URL, etc.). Retrying won't change the outcome
+                // because the body and URL are server-configured.
                 SendOutcome::PermanentFailure {
                     reason: format!("status {}", status.as_u16()),
                 }
@@ -148,28 +159,41 @@ mod tests {
     #[test]
     fn sign_and_verify_round_trip() {
         let body = b"hello world";
-        let header = sign(b"secret", body);
+        let ts = 1_700_000_000u64;
+        let header = sign(b"secret", ts, body);
         assert!(header.starts_with("sha256="));
-        assert!(verify(b"secret", body, &header));
+        assert!(verify(b"secret", ts, body, &header));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_timestamp() {
+        // Timestamp mismatch must invalidate the signature even when
+        // body and secret are correct (anti-replay).
+        let body = b"hello world";
+        let header = sign(b"secret", 1_700_000_000, body);
+        assert!(!verify(b"secret", 1_700_000_001, body, &header));
     }
 
     #[test]
     fn verify_rejects_bad_prefix() {
         let body = b"x";
-        let header = sign(b"s", body).replace("sha256=", "md5=");
-        assert!(!verify(b"s", body, &header));
+        let ts = 42u64;
+        let header = sign(b"s", ts, body).replace("sha256=", "md5=");
+        assert!(!verify(b"s", ts, body, &header));
     }
 
     #[test]
     fn verify_rejects_bad_hex() {
-        assert!(!verify(b"s", b"x", "sha256=not-hex"));
+        // "sha256=not-hex" — length differs from expected so ct_eq returns false.
+        assert!(!verify(b"s", 0, b"x", "sha256=not-hex"));
     }
 
     #[test]
     fn verify_rejects_wrong_secret() {
         let body = b"x";
-        let header = sign(b"s1", body);
-        assert!(!verify(b"s2", body, &header));
+        let ts = 99u64;
+        let header = sign(b"s1", ts, body);
+        assert!(!verify(b"s2", ts, body, &header));
     }
 
     #[test]

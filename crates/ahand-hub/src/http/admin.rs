@@ -89,12 +89,9 @@ pub struct PreRegisterRequest {
 #[derive(Debug, Serialize)]
 pub struct PreRegisterResponse {
     pub device_id: String,
-    /// Best-effort "created at" timestamp. Pre-register is idempotent, so
-    /// on a repeat call we return the current server time rather than
-    /// tracking a per-row creation timestamp (the underlying row may
-    /// have been touched by a daemon hello since). Consumers treating
-    /// this as "row insertion time" must pre-register once and remember
-    /// the value; the field exists to satisfy the plan contract.
+    /// Stable `registered_at` timestamp from the DB row. Pre-register is
+    /// idempotent: repeated calls for the same device return the original
+    /// insertion timestamp, not the current server time.
     pub created_at: DateTime<Utc>,
 }
 
@@ -112,13 +109,13 @@ async fn pre_register(
         ));
     }
     let public_key = decode_public_key(&req.public_key)?;
-    let device = state
+    let (device, registered_at) = state
         .devices
         .pre_register(&req.device_id, &public_key, &req.external_user_id)
         .await?;
     Ok(Json(PreRegisterResponse {
         device_id: device.id,
-        created_at: Utc::now(),
+        created_at: registered_at,
     }))
 }
 
@@ -158,6 +155,9 @@ async fn mint_device_token(
     body: Option<Json<MintDeviceTokenRequest>>,
 ) -> Result<Json<DeviceTokenResponse>, AdminError> {
     let req = body.map(|Json(v)| v).unwrap_or_default();
+    if req.ttl_seconds == Some(0) {
+        return Err(AdminError::BadRequest("ttl_seconds must be > 0".into()));
+    }
     let device = state
         .devices
         .find_by_id(&device_id)
@@ -212,6 +212,9 @@ async fn mint_control_plane_token(
         return Err(AdminError::BadRequest(
             "external_user_id must not be empty".into(),
         ));
+    }
+    if req.ttl_seconds == Some(0) {
+        return Err(AdminError::BadRequest("ttl_seconds must be > 0".into()));
     }
     let scope = req.scope.unwrap_or_else(|| "jobs:execute".into());
     let ttl = req

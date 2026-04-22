@@ -50,7 +50,9 @@ pub struct Config {
     /// Some; `from_env` rejects configurations that set one without
     /// the other.
     pub webhook_secret: Option<String>,
-    /// Max retry attempts before a delivery is moved to the DLQ.
+    /// Total number of delivery attempts before moving to DLQ.
+    /// Includes the initial attempt. Default: 8 means 1 initial + 7 retries.
+    /// Set to 1 to disable retries (attempt once then DLQ on failure).
     /// Exponential backoff caps at 256s, so the worst-case age of a
     /// row in the queue is `sum(2^i for i in 1..=webhook_max_retries)`
     /// bounded by `webhook_max_retries * 256s`.
