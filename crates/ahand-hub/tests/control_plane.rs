@@ -1429,3 +1429,83 @@ async fn stderr_and_progress_with_message_render_correctly() {
     drop(device);
     server.shutdown().await;
 }
+
+#[tokio::test]
+async fn sse_late_joiner_after_terminal_event_gets_empty_stream() {
+    // Test that a client connecting AFTER the job finishes gets a 404.
+    // finalize() removes the tracker entry when a terminal event is
+    // published; any subsequent GET /stream will find no entry and
+    // return 404 immediately rather than hanging or panicking.
+    // This is the documented behavior for late-joiner clients — the
+    // SDK layer (CloudClient::spawn) is responsible for connecting
+    // the SSE stream before or concurrent with the POST /jobs call.
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-late", "user-late").await;
+    let token = mint_cp_jwt(&server, "user-late");
+
+    // Dispatch the job.
+    let job_id = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({ "device_id": "cp-late", "tool": "echo" }),
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await
+    .unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = recv_job_request(&mut device).await;
+
+    // Finalize the job via a terminal event BEFORE the client connects to SSE.
+    send_envelope(
+        &mut device,
+        ahand_protocol::Envelope {
+            device_id: "cp-late".into(),
+            msg_id: "fin-late".into(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
+                job_id: job_id.clone(),
+                exit_code: 0,
+                error: String::new(),
+            })),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Wait for the tracker entry to be removed by the finalize path.
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if server.state().control_jobs.get(&job_id).is_none() {
+            break;
+        }
+    }
+    assert!(
+        server.state().control_jobs.get(&job_id).is_none(),
+        "tracker entry should be gone after terminal event"
+    );
+
+    // Now connect SSE as a late joiner — job entry is already cleaned up.
+    // Expect 404: the tracker has no entry for this job_id.
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{}/stream",
+            server.http_base_url(),
+            job_id
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "late-joiner should get 404 (job entry cleaned up after finalize), got {}",
+        resp.status()
+    );
+
+    drop(device);
+    server.shutdown().await;
+}

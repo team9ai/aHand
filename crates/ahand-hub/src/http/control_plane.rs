@@ -214,6 +214,13 @@ async fn create_job(
     Ok((StatusCode::ACCEPTED, Json(CreateJobResponse { job_id })))
 }
 
+// NOTE: If a client calls this endpoint after the job's terminal event
+// (finished/error) has already been broadcast, the broadcast channel
+// sender will have been dropped by finalize(). The SSE stream will
+// immediately close (RecvError::Closed) with no events delivered.
+// Callers must connect before or concurrent with job dispatch; this
+// is the responsibility of the SDK layer. See CloudClient::spawn()
+// which opens the SSE stream immediately after POST /jobs.
 async fn stream_job(
     State(state): State<AppState>,
     Extension(claims): Extension<ControlPlaneJwtClaims>,

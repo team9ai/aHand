@@ -210,7 +210,7 @@ impl ControlJobTracker {
 }
 
 fn correlation_key(external_user_id: &str, correlation_id: &str) -> String {
-    format!("{external_user_id}:{correlation_id}")
+    format!("{}:{}:{}", external_user_id.len(), external_user_id, correlation_id)
 }
 
 #[cfg(test)]
