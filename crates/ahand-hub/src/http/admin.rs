@@ -67,6 +67,7 @@ fn service_token_matches(expected: &[u8], actual: &[u8]) -> bool {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreRegisterRequest {
     pub device_id: String,
     /// Base64-encoded device public key (ed25519). Validated for non-empty
@@ -79,6 +80,7 @@ pub struct PreRegisterRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreRegisterResponse {
     pub device_id: String,
     /// Stable `registered_at` timestamp from the DB row. Pre-register is
@@ -93,11 +95,11 @@ async fn pre_register(
 ) -> Result<Json<PreRegisterResponse>, AdminError> {
     let Json(req) = body.map_err(|_| AdminError::BadRequest("invalid JSON body".into()))?;
     if req.device_id.is_empty() {
-        return Err(AdminError::BadRequest("device_id must not be empty".into()));
+        return Err(AdminError::BadRequest("deviceId must not be empty".into()));
     }
     if req.external_user_id.is_empty() {
         return Err(AdminError::BadRequest(
-            "external_user_id must not be empty".into(),
+            "externalUserId must not be empty".into(),
         ));
     }
     let public_key = decode_public_key(&req.public_key)?;
@@ -105,6 +107,27 @@ async fn pre_register(
         .devices
         .pre_register(&req.device_id, &public_key, &req.external_user_id)
         .await?;
+    // Per spec § 2.2.4, `device.registered` fires when the service
+    // token pre-registers a device. The WS hello-accept path also
+    // emits this event for legacy self-registering devices that
+    // bypassed the admin API; both are idempotent on the downstream
+    // gateway because it dedupes by `eventId`.
+    //
+    // A failure to enqueue must not roll back the pre-register — the
+    // row is durably inserted and the caller still gets a success
+    // response. A dropped webhook is a dashboard nit, not a
+    // correctness problem.
+    if let Err(err) = state
+        .webhook
+        .enqueue_registered(&device.id, Some(&req.external_user_id))
+        .await
+    {
+        tracing::warn!(
+            device_id = %device.id,
+            error = %err,
+            "failed to enqueue device.registered webhook after admin pre_register",
+        );
+    }
     Ok(Json(PreRegisterResponse {
         device_id: device.id,
         created_at: registered_at,
@@ -118,22 +141,25 @@ fn decode_public_key(value: &str) -> Result<Vec<u8>, AdminError> {
         .decode(value)
         .ok()
         .filter(|bytes| !bytes.is_empty())
-        .ok_or_else(|| AdminError::BadRequest("public_key must be non-empty base64".into()))
+        .ok_or_else(|| AdminError::BadRequest("publicKey must be non-empty base64".into()))
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct MintDeviceTokenRequest {
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TokenResponse {
     pub token: String,
     pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeviceTokenResponse {
     pub token: String,
     pub device_id: String,
@@ -148,7 +174,7 @@ async fn mint_device_token(
 ) -> Result<Json<DeviceTokenResponse>, AdminError> {
     let req = body.map(|Json(v)| v).unwrap_or_default();
     if req.ttl_seconds == Some(0) {
-        return Err(AdminError::BadRequest("ttl_seconds must be > 0".into()));
+        return Err(AdminError::BadRequest("ttlSeconds must be > 0".into()));
     }
     let device = state
         .devices
@@ -175,6 +201,7 @@ async fn mint_device_token(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MintControlPlaneRequest {
     pub external_user_id: String,
     #[serde(default)]
@@ -186,6 +213,7 @@ pub struct MintControlPlaneRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ControlPlaneTokenResponse {
     pub token: String,
     pub external_user_id: String,
@@ -195,6 +223,12 @@ pub struct ControlPlaneTokenResponse {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Scopes that the hub accepts for control-plane tokens. Anything
+/// outside this list would mint a token that downstream endpoints
+/// silently reject; we fail the mint request with 400 up-front
+/// instead so callers see the problem immediately.
+const VALID_CONTROL_PLANE_SCOPES: &[&str] = &["jobs:execute"];
+
 async fn mint_control_plane_token(
     State(state): State<AppState>,
     body: Result<Json<MintControlPlaneRequest>, axum::extract::rejection::JsonRejection>,
@@ -202,13 +236,22 @@ async fn mint_control_plane_token(
     let Json(req) = body.map_err(|_| AdminError::BadRequest("invalid JSON body".into()))?;
     if req.external_user_id.is_empty() {
         return Err(AdminError::BadRequest(
-            "external_user_id must not be empty".into(),
+            "externalUserId must not be empty".into(),
         ));
     }
     if req.ttl_seconds == Some(0) {
-        return Err(AdminError::BadRequest("ttl_seconds must be > 0".into()));
+        return Err(AdminError::BadRequest("ttlSeconds must be > 0".into()));
     }
     let scope = req.scope.unwrap_or_else(|| "jobs:execute".into());
+    // R6-6: reject unknown scopes up-front rather than silently minting
+    // a token that downstream control-plane endpoints would reject with
+    // 403. The whitelist is small today (only jobs:execute) but this
+    // guards against typos and future scopes wired unevenly.
+    if !VALID_CONTROL_PLANE_SCOPES.contains(&scope.as_str()) {
+        return Err(AdminError::BadRequest(format!(
+            "unsupported scope: {scope:?}; valid scopes: {VALID_CONTROL_PLANE_SCOPES:?}"
+        )));
+    }
     let ttl = req
         .ttl_seconds
         .map(Duration::from_secs)
@@ -267,11 +310,13 @@ async fn delete_device(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListDevicesQuery {
     pub external_user_id: String,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AdminDeviceDto {
     pub device_id: String,
     pub external_user_id: Option<String>,
@@ -303,10 +348,10 @@ async fn list_devices(
     query: Result<Query<ListDevicesQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Result<Json<Vec<AdminDeviceDto>>, AdminError> {
     let Query(query) =
-        query.map_err(|_| AdminError::BadRequest("external_user_id is required".into()))?;
+        query.map_err(|_| AdminError::BadRequest("externalUserId is required".into()))?;
     if query.external_user_id.is_empty() {
         return Err(AdminError::BadRequest(
-            "external_user_id must not be empty".into(),
+            "externalUserId must not be empty".into(),
         ));
     }
     let devices = state

@@ -81,8 +81,8 @@ const BASE_OPTS: Omit<CloudClientOptions, "fetch"> = {
 describe("CloudClient.spawn", () => {
   it("happy path: stdout → stderr → progress → finished", async () => {
     const { fn, calls } = mockFetch([
-      // POST /api/control/jobs → 201 {job_id}
-      () => jsonResponse({ job_id: "job-001" }, 201),
+      // POST /api/control/jobs → 201 {jobId}
+      () => jsonResponse({ jobId: "job-001" }, 201),
       // GET /stream → SSE
       () =>
         sseResponse([
@@ -115,14 +115,14 @@ describe("CloudClient.spawn", () => {
     // Verify request shape.
     expect(calls[0].url).toBe("https://hub.test/api/control/jobs");
     const body = JSON.parse(calls[0].init?.body as string);
-    expect(body).toMatchObject({ device_id: "dev-1", tool: "bash", args: ["-c", "echo hello"] });
+    expect(body).toMatchObject({ deviceId: "dev-1", tool: "bash", args: ["-c", "echo hello"] });
     expect(calls[1].url).toBe("https://hub.test/api/control/jobs/job-001/stream");
     expect(calls[1].init?.headers).toMatchObject({ Authorization: "Bearer test-token" });
   });
 
   it("sends optional fields (env, cwd, timeoutMs, correlationId, interactive)", async () => {
     const { fn, calls } = mockFetch([
-      () => jsonResponse({ job_id: "job-x" }, 201),
+      () => jsonResponse({ jobId: "job-x" }, 201),
       () => sseResponse([sseEvent("finished", { exitCode: 0, durationMs: 1 })]),
     ]);
     const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
@@ -139,8 +139,8 @@ describe("CloudClient.spawn", () => {
     expect(body).toMatchObject({
       cwd: "/tmp",
       env: { A: "1" },
-      timeout_ms: 5000,
-      correlation_id: "cid-1",
+      timeoutMs: 5000,
+      correlationId: "cid-1",
       interactive: true,
     });
   });
@@ -181,7 +181,7 @@ describe("CloudClient.spawn", () => {
 
   it("bad: SSE ends without finished event → stream_ended", async () => {
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j" }, 201),
+      () => jsonResponse({ jobId: "j" }, 201),
       () => sseResponse([sseEvent("stdout", { chunk: "partial" })]), // stream closes without finished
     ]);
     const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
@@ -191,7 +191,7 @@ describe("CloudClient.spawn", () => {
 
   it("bad: SSE error event → CloudClientError(job_error)", async () => {
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j" }, 201),
+      () => jsonResponse({ jobId: "j" }, 201),
       () => sseResponse([sseEvent("error", { code: "rejected", message: "denied" })]),
     ]);
     const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
@@ -240,7 +240,7 @@ describe("CloudClient.spawn", () => {
 
     let cancelCalled = false;
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j-abort" }, 201),
+      () => jsonResponse({ jobId: "j-abort" }, 201),
       () => new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
       () => { cancelCalled = true; return new Response(null, { status: 202 }); },
     ]);
@@ -285,7 +285,7 @@ describe("CloudClient.spawn", () => {
     });
 
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j" }, 201),
+      () => jsonResponse({ jobId: "j" }, 201),
       () => new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
     ]);
 
@@ -300,7 +300,7 @@ describe("CloudClient.spawn", () => {
     // A single event whose JSON payload contains literal newlines inside the string.
     const withNewlines = "line1\nline2\nline3";
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j" }, 201),
+      () => jsonResponse({ jobId: "j" }, 201),
       () =>
         sseResponse([
           sseEvent("stdout", { chunk: withNewlines }),
@@ -315,7 +315,7 @@ describe("CloudClient.spawn", () => {
 
   it("edge: unknown SSE event type → silently ignored", async () => {
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j" }, 201),
+      () => jsonResponse({ jobId: "j" }, 201),
       () =>
         sseResponse([
           "event: future_event\ndata: {\"surprise\":true}\n\n",
@@ -329,7 +329,7 @@ describe("CloudClient.spawn", () => {
 
   it("edge: keepalive comments → skipped without disturbing state", async () => {
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j" }, 201),
+      () => jsonResponse({ jobId: "j" }, 201),
       () =>
         sseResponse([
           sseKeepalive,
@@ -349,7 +349,7 @@ describe("CloudClient.spawn", () => {
   it("edge: callback throws → subsequent chunks still delivered", async () => {
     let callCount = 0;
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j" }, 201),
+      () => jsonResponse({ jobId: "j" }, 201),
       () =>
         sseResponse([
           sseEvent("stdout", { chunk: "a" }),
@@ -382,7 +382,7 @@ describe("CloudClient.spawn", () => {
       start(c) { c.enqueue(encoder.encode(crlfEvent)); c.close(); },
     });
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j" }, 201),
+      () => jsonResponse({ jobId: "j" }, 201),
       () => new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
     ]);
     const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
@@ -434,7 +434,7 @@ describe("CloudClient.spawn", () => {
       },
     });
     const { fn } = mockFetch([
-      () => jsonResponse({ job_id: "j" }, 201),
+      () => jsonResponse({ jobId: "j" }, 201),
       () => new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
     ]);
     const client = new CloudClient({ ...BASE_OPTS, fetch: fn });

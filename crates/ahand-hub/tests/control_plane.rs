@@ -188,16 +188,16 @@ async fn create_job_happy_path_dispatches_and_streams_events() {
         &server,
         &token,
         serde_json::json!({
-            "device_id": "cp-dev-1",
+            "deviceId": "cp-dev-1",
             "tool": "echo",
             "args": ["hello"],
-            "timeout_ms": 30_000,
+            "timeoutMs": 30_000,
         }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: serde_json::Value = resp.json().await.unwrap();
-    let job_id = body["job_id"].as_str().unwrap().to_string();
+    let job_id = body["jobId"].as_str().unwrap().to_string();
     assert!(!job_id.is_empty());
 
     // Daemon should now see a JobRequest with our ulid.
@@ -332,7 +332,7 @@ async fn missing_authorization_returns_401() {
     let server = spawn_server_with_state(test_state().await).await;
     let resp = reqwest::Client::new()
         .post(format!("{}/api/control/jobs", server.http_base_url()))
-        .json(&serde_json::json!({ "device_id": "x", "tool": "echo" }))
+        .json(&serde_json::json!({ "deviceId": "x", "tool": "echo" }))
         .send()
         .await
         .unwrap();
@@ -346,7 +346,7 @@ async fn malformed_jwt_returns_401() {
     let resp = post_create_job(
         &server,
         "not-a-real-jwt",
-        serde_json::json!({ "device_id": "x", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "x", "tool": "echo" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -367,7 +367,7 @@ async fn device_jwt_is_rejected_as_control_plane_token() {
     let resp = post_create_job(
         &server,
         &device_token,
-        serde_json::json!({ "device_id": "x", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "x", "tool": "echo" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -384,7 +384,7 @@ async fn mismatched_external_user_id_returns_403() {
         &server,
         &token,
         serde_json::json!({
-            "device_id": "cp-dev-403",
+            "deviceId": "cp-dev-403",
             "tool": "echo",
         }),
     )
@@ -404,7 +404,7 @@ async fn device_without_external_user_id_returns_403() {
     let resp = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "device-1", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "device-1", "tool": "echo" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -418,7 +418,7 @@ async fn unknown_device_returns_404() {
     let resp = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "ghost", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "ghost", "tool": "echo" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -441,7 +441,7 @@ async fn offline_device_returns_404() {
     let resp = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-offline", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "cp-offline", "tool": "echo" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -459,7 +459,7 @@ async fn missing_tool_returns_400() {
     let resp = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-missing-tool" }),
+        serde_json::json!({ "deviceId": "cp-missing-tool" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -468,7 +468,7 @@ async fn missing_tool_returns_400() {
     let empty = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-missing-tool", "tool": "   " }),
+        serde_json::json!({ "deviceId": "cp-missing-tool", "tool": "   " }),
     )
     .await;
     assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
@@ -498,7 +498,7 @@ async fn missing_device_id_returns_400() {
     let resp = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "", "tool": "echo" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -515,16 +515,16 @@ async fn duplicate_correlation_id_returns_same_job_id() {
         &server,
         &token,
         serde_json::json!({
-            "device_id": "cp-corr",
+            "deviceId": "cp-corr",
             "tool": "sleep",
             "args": ["5"],
-            "correlation_id": "idem-1",
+            "correlationId": "idem-1",
         }),
     )
     .await;
     assert_eq!(first.status(), StatusCode::ACCEPTED);
     let first_body: serde_json::Value = first.json().await.unwrap();
-    let first_id = first_body["job_id"].as_str().unwrap().to_string();
+    let first_id = first_body["jobId"].as_str().unwrap().to_string();
 
     // Drain the first JobRequest so the second call won't see it on
     // the socket.
@@ -534,17 +534,17 @@ async fn duplicate_correlation_id_returns_same_job_id() {
         &server,
         &token,
         serde_json::json!({
-            "device_id": "cp-corr",
+            "deviceId": "cp-corr",
             "tool": "sleep",
             "args": ["5"],
-            "correlation_id": "idem-1",
+            "correlationId": "idem-1",
         }),
     )
     .await;
     // Idempotent re-post returns 200 (not 202) with the same job_id.
     assert_eq!(second.status(), StatusCode::OK);
     let second_body: serde_json::Value = second.json().await.unwrap();
-    assert_eq!(second_body["job_id"].as_str(), Some(first_id.as_str()));
+    assert_eq!(second_body["jobId"].as_str(), Some(first_id.as_str()));
 
     // The daemon should NOT have received a second JobRequest. We
     // probe the socket briefly; if a second request arrives within
@@ -576,14 +576,14 @@ async fn correlation_id_per_user_does_not_collide() {
         &server,
         &a_token,
         serde_json::json!({
-            "device_id": "cp-corr-a",
+            "deviceId": "cp-corr-a",
             "tool": "echo",
-            "correlation_id": "shared",
+            "correlationId": "shared",
         }),
     )
     .await;
     assert_eq!(a_resp.status(), StatusCode::ACCEPTED);
-    let a_id = a_resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+    let a_id = a_resp.json::<serde_json::Value>().await.unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -592,14 +592,14 @@ async fn correlation_id_per_user_does_not_collide() {
         &server,
         &b_token,
         serde_json::json!({
-            "device_id": "cp-corr-b",
+            "deviceId": "cp-corr-b",
             "tool": "echo",
-            "correlation_id": "shared",
+            "correlationId": "shared",
         }),
     )
     .await;
     assert_eq!(b_resp.status(), StatusCode::ACCEPTED);
-    let b_id = b_resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+    let b_id = b_resp.json::<serde_json::Value>().await.unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -627,9 +627,9 @@ async fn rate_limit_returns_429() {
             &server,
             &token,
             serde_json::json!({
-                "device_id": "cp-rl",
+                "deviceId": "cp-rl",
                 "tool": "echo",
-                "correlation_id": format!("burst-{i}"),
+                "correlationId": format!("burst-{i}"),
             }),
         )
         .await;
@@ -644,6 +644,122 @@ async fn rate_limit_returns_429() {
             .any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
         "expected at least one 429 in {statuses:?}"
     );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn stream_job_rate_limited_returns_429() {
+    // A valid JWT must not be able to open unlimited SSE streams. We
+    // create one job, then hammer /stream with the same job_id from
+    // the same user until we observe a 429. Default limiter: burst=100,
+    // rps=10 — blast ~150 requests rapidly and assert at least one
+    // comes back 429 after the create_job call has already consumed
+    // some of the budget.
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-rl-stream", "user-rl-stream").await;
+    let token = mint_cp_jwt(&server, "user-rl-stream");
+
+    let create = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "cp-rl-stream",
+            "tool": "sleep",
+            "args": ["30"],
+        }),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::ACCEPTED);
+    let job_id = create.json::<serde_json::Value>().await.unwrap()["jobId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = recv_job_request(&mut device).await;
+
+    let client = reqwest::Client::new();
+    let mut statuses = Vec::new();
+    for _ in 0..150 {
+        let resp = client
+            .get(format!(
+                "{}/api/control/jobs/{}/stream",
+                server.http_base_url(),
+                job_id
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        // Close the SSE connection immediately to keep churn high.
+        drop(resp);
+        statuses.push(status);
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+    }
+    assert!(
+        statuses
+            .iter()
+            .any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
+        "expected at least one 429 in {statuses:?}"
+    );
+
+    drop(device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancel_job_rate_limited_returns_429() {
+    // Same as above but for /cancel — a valid JWT must not be able to
+    // spam the cancel endpoint (which would otherwise fan out an
+    // unbounded stream of CancelJob envelopes to the daemon).
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-rl-cancel", "user-rl-cancel").await;
+    let token = mint_cp_jwt(&server, "user-rl-cancel");
+
+    let create = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "cp-rl-cancel",
+            "tool": "sleep",
+            "args": ["30"],
+        }),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::ACCEPTED);
+    let job_id = create.json::<serde_json::Value>().await.unwrap()["jobId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = recv_job_request(&mut device).await;
+
+    let client = reqwest::Client::new();
+    let mut statuses = Vec::new();
+    for _ in 0..150 {
+        let resp = client
+            .post(format!(
+                "{}/api/control/jobs/{}/cancel",
+                server.http_base_url(),
+                job_id
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        statuses.push(resp.status());
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+    }
+    assert!(
+        statuses
+            .iter()
+            .any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
+        "expected at least one 429 in {statuses:?}"
+    );
+
+    drop(device);
     server.shutdown().await;
 }
 
@@ -672,10 +788,10 @@ async fn stream_other_users_job_returns_404_not_403() {
     let resp = post_create_job(
         &server,
         &owner_token,
-        serde_json::json!({ "device_id": "cp-xuser", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "cp-xuser", "tool": "echo" }),
     )
     .await;
-    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -720,13 +836,13 @@ async fn cancel_routes_cancel_envelope_and_returns_202() {
         &server,
         &token,
         serde_json::json!({
-            "device_id": "cp-cancel",
+            "deviceId": "cp-cancel",
             "tool": "sleep",
             "args": ["30"],
         }),
     )
     .await;
-    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -777,12 +893,12 @@ async fn two_concurrent_sse_clients_receive_all_events() {
     let job_id = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-fanout", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "cp-fanout", "tool": "echo" }),
     )
     .await
     .json::<serde_json::Value>()
     .await
-    .unwrap()["job_id"]
+    .unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -883,12 +999,12 @@ async fn sse_client_disconnect_cleans_up_on_terminal_event() {
     let job_id = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-dc", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "cp-dc", "tool": "echo" }),
     )
     .await
     .json::<serde_json::Value>()
     .await
-    .unwrap()["job_id"]
+    .unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -961,12 +1077,12 @@ async fn many_sse_disconnects_do_not_leak_entries() {
     let job_id = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-stress", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "cp-stress", "tool": "echo" }),
     )
     .await
     .json::<serde_json::Value>()
     .await
-    .unwrap()["job_id"]
+    .unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1027,12 +1143,12 @@ async fn large_stdout_chunk_delivered_intact() {
     let job_id = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-big", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "cp-big", "tool": "echo" }),
     )
     .await
     .json::<serde_json::Value>()
     .await
-    .unwrap()["job_id"]
+    .unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1153,12 +1269,12 @@ async fn rejected_envelope_finalizes_as_error() {
     let job_id = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-reject", "tool": "curl" }),
+        serde_json::json!({ "deviceId": "cp-reject", "tool": "curl" }),
     )
     .await
     .json::<serde_json::Value>()
     .await
-    .unwrap()["job_id"]
+    .unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1225,12 +1341,12 @@ async fn exit_code_non_zero_reports_error_event() {
     let job_id = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-exit", "tool": "false" }),
+        serde_json::json!({ "deviceId": "cp-exit", "tool": "false" }),
     )
     .await
     .json::<serde_json::Value>()
     .await
-    .unwrap()["job_id"]
+    .unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1296,12 +1412,12 @@ async fn cancelled_finish_reports_cancelled_error_code() {
     let job_id = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-canc-code", "tool": "sleep" }),
+        serde_json::json!({ "deviceId": "cp-canc-code", "tool": "sleep" }),
     )
     .await
     .json::<serde_json::Value>()
     .await
-    .unwrap()["job_id"]
+    .unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1370,12 +1486,12 @@ async fn stderr_and_progress_with_message_render_correctly() {
     let job_id = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-err-ch", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "cp-err-ch", "tool": "echo" }),
     )
     .await
     .json::<serde_json::Value>()
     .await
-    .unwrap()["job_id"]
+    .unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1465,12 +1581,12 @@ async fn sse_late_joiner_after_terminal_event_gets_empty_stream() {
     let job_id = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "cp-late", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "cp-late", "tool": "echo" }),
     )
     .await
     .json::<serde_json::Value>()
     .await
-    .unwrap()["job_id"]
+    .unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1543,7 +1659,7 @@ async fn create_job_rejects_device_not_in_allowlist() {
     let resp = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "dev-al-1", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "dev-al-1", "tool": "echo" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1565,7 +1681,7 @@ async fn create_job_allows_device_in_allowlist() {
     let resp = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "dev-al-2", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "dev-al-2", "tool": "echo" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -1588,14 +1704,14 @@ async fn stream_job_rejects_device_not_in_allowlist() {
         &server,
         &full_token,
         serde_json::json!({
-            "device_id": "dev-stream-al",
+            "deviceId": "dev-stream-al",
             "tool": "sleep",
             "args": ["30"],
         }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
-    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1639,14 +1755,14 @@ async fn cancel_job_rejects_device_not_in_allowlist() {
         &server,
         &full_token,
         serde_json::json!({
-            "device_id": "dev-cancel-al",
+            "deviceId": "dev-cancel-al",
             "tool": "sleep",
             "args": ["30"],
         }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
-    let job_id = resp.json::<serde_json::Value>().await.unwrap()["job_id"]
+    let job_id = resp.json::<serde_json::Value>().await.unwrap()["jobId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1687,7 +1803,7 @@ async fn create_job_rejects_wrong_scope() {
     let resp = post_create_job(
         &server,
         &token,
-        serde_json::json!({ "device_id": "dev-scope", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "dev-scope", "tool": "echo" }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -1708,11 +1824,11 @@ async fn stream_job_rejects_wrong_scope() {
     let create_resp = post_create_job(
         &server,
         &full_token,
-        serde_json::json!({ "device_id": "dev-stream-scope", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "dev-stream-scope", "tool": "echo" }),
     )
     .await;
     let create_body: serde_json::Value = create_resp.json().await.unwrap();
-    let job_id = create_body["job_id"].as_str().unwrap().to_string();
+    let job_id = create_body["jobId"].as_str().unwrap().to_string();
 
     // Attempt to stream it with the read-only token → 403.
     let resp = reqwest::Client::new()
@@ -1741,11 +1857,11 @@ async fn cancel_job_rejects_wrong_scope() {
     let create_resp = post_create_job(
         &server,
         &full_token,
-        serde_json::json!({ "device_id": "dev-cancel-scope", "tool": "echo" }),
+        serde_json::json!({ "deviceId": "dev-cancel-scope", "tool": "echo" }),
     )
     .await;
     let create_body: serde_json::Value = create_resp.json().await.unwrap();
-    let job_id = create_body["job_id"].as_str().unwrap().to_string();
+    let job_id = create_body["jobId"].as_str().unwrap().to_string();
 
     // Attempt to cancel it with the read-only token → 403.
     let resp = reqwest::Client::new()

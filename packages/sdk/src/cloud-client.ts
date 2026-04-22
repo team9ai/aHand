@@ -6,9 +6,9 @@
 //! custom Authorization headers in browsers).
 //!
 //! The hub's wire contract (Task 1.4):
-//!   * POST `/api/control/jobs` — body is snake_case
-//!     `{device_id, tool, args, cwd, env, timeout_ms, interactive,
-//!      correlation_id}`; success returns `{job_id: string}` (201/202
+//!   * POST `/api/control/jobs` — body is camelCase
+//!     `{deviceId, tool, args, cwd, env, timeoutMs, interactive,
+//!      correlationId}`; success returns `{jobId: string}` (201/202
 //!     on create, 200 on idempotent replay).
 //!   * GET  `/api/control/jobs/{id}/stream` — SSE with camelCase
 //!     JSON payloads per event. Event types: `stdout` `{chunk}`,
@@ -252,15 +252,15 @@ export class CloudClient {
     }
 
     const requestBody: Record<string, unknown> = {
-      device_id: p.deviceId,
+      deviceId: p.deviceId,
       tool: p.tool,
     };
     if (p.args !== undefined) requestBody.args = p.args;
     if (p.cwd !== undefined) requestBody.cwd = p.cwd;
     if (p.env !== undefined) requestBody.env = p.env;
-    if (p.timeoutMs !== undefined) requestBody.timeout_ms = p.timeoutMs;
+    if (p.timeoutMs !== undefined) requestBody.timeoutMs = p.timeoutMs;
     if (p.interactive !== undefined) requestBody.interactive = p.interactive;
-    if (p.correlationId !== undefined) requestBody.correlation_id = p.correlationId;
+    if (p.correlationId !== undefined) requestBody.correlationId = p.correlationId;
 
     let postRes: Response;
     try {
@@ -278,12 +278,12 @@ export class CloudClient {
     }
     if (!postRes.ok) throw await toTypedHttpError(postRes);
 
-    const postJson = (await postRes.json()) as { job_id?: string };
-    const jobId = postJson.job_id;
+    const postJson = (await postRes.json()) as { jobId?: string };
+    const jobId = postJson.jobId;
     if (!jobId) {
       throw new CloudClientError(
         "server_error",
-        "Hub response missing job_id",
+        "Hub response missing jobId",
         { httpStatus: postRes.status },
       );
     }

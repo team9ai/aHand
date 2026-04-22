@@ -197,7 +197,8 @@ impl DeviceAdminStore for PgDeviceStore {
         // both proceed to INSERT ... ON CONFLICT DO UPDATE, and one wins.
         // The loser receives a Postgres unique constraint violation which
         // we detect here and retry once — the second attempt finds the row
-        // already inserted and succeeds via the ON CONFLICT DO UPDATE path.
+        // already inserted and either wins ownership via the WHERE guard
+        // (if it matches) or surfaces DeviceOwnedByDifferentUser cleanly.
         for attempt in 0..2u8 {
             match self
                 .pre_register_once(device_id, public_key, external_user_id)
@@ -209,7 +210,8 @@ impl DeviceAdminStore for PgDeviceStore {
                 {
                     if attempt == 0 {
                         // Race on first insert — retry once; second attempt
-                        // sees the existing row and succeeds via ON CONFLICT.
+                        // sees the existing row and either wins or gets
+                        // DeviceOwnedByDifferentUser via the WHERE guard.
                         continue;
                     }
                     return Err(HubError::Internal(msg));
@@ -325,7 +327,18 @@ impl PgDeviceStore {
         // RETURNING all device fields so we can construct the Device directly
         // without a second SELECT after commit (avoids a spurious 500 if the
         // replica is briefly unavailable after a successful write).
-        let row = sqlx::query(
+        //
+        // TOCTOU fix (R6-1): the DO UPDATE is gated on ownership — the
+        // existing row must be unclaimed (external_user_id IS NULL) or
+        // owned by the calling user. If two concurrent callers with
+        // different external_user_id both pass the SELECT FOR UPDATE
+        // ownership check (because no row existed yet), one INSERTs
+        // first and the other hits ON CONFLICT DO UPDATE with a WHERE
+        // clause that filters out the conflicting row — fetch_optional
+        // returns None and we re-read the winner's external_user_id to
+        // surface DeviceOwnedByDifferentUser instead of silently
+        // hijacking ownership.
+        let row_opt = sqlx::query(
             r#"
             INSERT INTO devices (
                 id, public_key, hostname, os, capabilities, version, auth_method, external_user_id
@@ -334,6 +347,8 @@ impl PgDeviceStore {
             ON CONFLICT (id) DO UPDATE
             SET public_key = EXCLUDED.public_key,
                 external_user_id = EXCLUDED.external_user_id
+            WHERE devices.external_user_id IS NULL
+               OR devices.external_user_id = EXCLUDED.external_user_id
             RETURNING id, public_key, hostname, os, capabilities, version, auth_method, external_user_id, registered_at
             "#,
         )
@@ -345,9 +360,32 @@ impl PgDeviceStore {
         .bind(None::<String>)
         .bind("preregistered")
         .bind(external_user_id)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|err| HubError::Internal(err.to_string()))?;
+
+        let row = match row_opt {
+            Some(r) => r,
+            None => {
+                // Race: the existing row is owned by a *different*
+                // external user, and the upstream SELECT FOR UPDATE
+                // missed it (row was inserted between our SELECT and
+                // the INSERT). Re-query outside the upsert to produce
+                // the correct DeviceOwnedByDifferentUser error.
+                let current: Option<String> = sqlx::query_scalar(
+                    "SELECT external_user_id FROM devices WHERE id = $1",
+                )
+                .bind(device_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|err| HubError::Internal(err.to_string()))?
+                .flatten();
+                return Err(HubError::DeviceOwnedByDifferentUser {
+                    device_id: device_id.into(),
+                    existing_external_user_id: current.unwrap_or_default(),
+                });
+            }
+        };
 
         let registered_at: DateTime<Utc> = row
             .try_get("registered_at")

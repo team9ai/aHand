@@ -55,6 +55,7 @@ pub fn test_config() -> Config {
         webhook_secret: None,
         webhook_max_retries: 8,
         webhook_max_concurrency: 50,
+        webhook_timeout_ms: 5_000,
         store: StoreConfig::Memory,
     }
 }
@@ -84,6 +85,7 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
         webhook_secret: None,
         webhook_max_retries: 8,
         webhook_max_concurrency: 50,
+        webhook_timeout_ms: 5_000,
         store: StoreConfig::Persistent {
             database_url: stack.database_url().into(),
             redis_url: stack.redis_url().into(),
@@ -115,6 +117,29 @@ pub async fn test_state() -> AppState {
         .await
         .unwrap();
     state.devices.mark_offline("device-1").await.unwrap();
+    state
+}
+
+/// Build an `AppState` whose outbound webhook is configured against an
+/// unreachable URL. Every `enqueue_*` call still persists to the
+/// underlying `MemoryWebhookDeliveryStore`, which tests can inspect via
+/// `state.webhook.store()`. Deliveries will never succeed (the URL
+/// routes nowhere) but that's fine — we only care about verifying that
+/// admin / ws code paths enqueued the expected events.
+pub async fn test_state_with_webhook() -> AppState {
+    let mut config = test_config();
+    // Port 1 is reserved; a POST here fails fast on every platform so
+    // the worker doesn't build up wall-clock debt during tests.
+    config.webhook_url = Some("http://127.0.0.1:1/webhook".into());
+    config.webhook_secret = Some("test-webhook-secret".into());
+    // Keep attempts small so the worker doesn't spam the log if the
+    // test takes a while to assert.
+    config.webhook_max_retries = 1;
+    config.webhook_max_concurrency = 2;
+    let state = AppState::from_config(config)
+        .await
+        .expect("test state should build");
+    state.devices.mark_offline("device-2").await.ok();
     state
 }
 

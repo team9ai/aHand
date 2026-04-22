@@ -29,7 +29,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use support::{
     read_hello_accepted, read_hello_challenge, signed_hello, spawn_server_with_state, test_state,
-    TestServer,
+    test_state_with_webhook, TestServer,
 };
 
 const JWT_SECRET: &[u8] = b"service-test-secret";
@@ -78,16 +78,16 @@ async fn pre_register_happy_path_and_token_mint_roundtrip() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "team9-device-1",
-                "public_key": encode_key(&[7u8; 32]),
-                "external_user_id": "user-1",
+                "deviceId": "team9-device-1",
+                "publicKey": encode_key(&[7u8; 32]),
+                "externalUserId": "user-1",
             }),
         )
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["device_id"], "team9-device-1");
-    assert!(body["created_at"].is_string());
+    assert_eq!(body["deviceId"], "team9-device-1");
+    assert!(body["createdAt"].is_string());
 
     let mint = server
         .post_json(
@@ -97,7 +97,7 @@ async fn pre_register_happy_path_and_token_mint_roundtrip() {
         )
         .await;
     let token = mint["token"].as_str().unwrap();
-    assert_eq!(mint["external_user_id"], "user-1");
+    assert_eq!(mint["externalUserId"], "user-1");
     let claims = verify_device_jwt(JWT_SECRET, token).unwrap();
     assert_eq!(claims.sub, "team9-device-1");
     assert_eq!(claims.external_user_id, "user-1");
@@ -118,9 +118,9 @@ async fn pre_register_idempotent_on_matching_external_user() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "dev-idem",
-                "public_key": encode_key(&[9u8; 32]),
-                "external_user_id": "user-x",
+                "deviceId": "dev-idem",
+                "publicKey": encode_key(&[9u8; 32]),
+                "externalUserId": "user-x",
             }),
         )
         .await;
@@ -132,15 +132,15 @@ async fn pre_register_idempotent_on_matching_external_user() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "dev-idem",
-                "public_key": encode_key(&[9u8; 32]),
-                "external_user_id": "user-x",
+                "deviceId": "dev-idem",
+                "publicKey": encode_key(&[9u8; 32]),
+                "externalUserId": "user-x",
             }),
         )
         .await;
     assert_eq!(second.status(), StatusCode::OK);
     let second_body: serde_json::Value = second.json().await.unwrap();
-    assert_eq!(first_body["device_id"], second_body["device_id"]);
+    assert_eq!(first_body["deviceId"], second_body["deviceId"]);
 
     server.shutdown().await;
 }
@@ -154,9 +154,9 @@ async fn pre_register_conflicts_on_different_external_user() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "dev-owned",
-                "public_key": encode_key(&[4u8; 32]),
-                "external_user_id": "user-a",
+                "deviceId": "dev-owned",
+                "publicKey": encode_key(&[4u8; 32]),
+                "externalUserId": "user-a",
             }),
         )
         .await;
@@ -167,9 +167,9 @@ async fn pre_register_conflicts_on_different_external_user() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "dev-owned",
-                "public_key": encode_key(&[4u8; 32]),
-                "external_user_id": "user-b",
+                "deviceId": "dev-owned",
+                "publicKey": encode_key(&[4u8; 32]),
+                "externalUserId": "user-b",
             }),
         )
         .await;
@@ -199,9 +199,9 @@ async fn admin_endpoints_require_service_token() {
             "/api/admin/devices",
             "not-the-service-token",
             serde_json::json!({
-                "device_id": "dev-x",
-                "public_key": encode_key(&[1u8; 32]),
-                "external_user_id": "user-x",
+                "deviceId": "dev-x",
+                "publicKey": encode_key(&[1u8; 32]),
+                "externalUserId": "user-x",
             }),
         )
         .await;
@@ -229,7 +229,7 @@ async fn pre_register_rejects_malformed_input() {
         .post(
             "/api/admin/devices",
             SERVICE_TOKEN,
-            serde_json::json!({ "device_id": "x" }),
+            serde_json::json!({ "deviceId": "x" }),
         )
         .await;
     assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
@@ -240,9 +240,9 @@ async fn pre_register_rejects_malformed_input() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "",
-                "public_key": encode_key(&[1u8; 32]),
-                "external_user_id": "u",
+                "deviceId": "",
+                "publicKey": encode_key(&[1u8; 32]),
+                "externalUserId": "u",
             }),
         )
         .await;
@@ -254,9 +254,9 @@ async fn pre_register_rejects_malformed_input() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "z",
-                "public_key": encode_key(&[1u8; 32]),
-                "external_user_id": "",
+                "deviceId": "z",
+                "publicKey": encode_key(&[1u8; 32]),
+                "externalUserId": "",
             }),
         )
         .await;
@@ -268,9 +268,9 @@ async fn pre_register_rejects_malformed_input() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "z",
-                "public_key": "!!!not-base64!!!",
-                "external_user_id": "u",
+                "deviceId": "z",
+                "publicKey": "!!!not-base64!!!",
+                "externalUserId": "u",
             }),
         )
         .await;
@@ -304,9 +304,9 @@ async fn mint_device_token_clamps_to_seven_days() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "clamp-dev",
-                "public_key": encode_key(&[3u8; 32]),
-                "external_user_id": "user-c",
+                "deviceId": "clamp-dev",
+                "publicKey": encode_key(&[3u8; 32]),
+                "externalUserId": "user-c",
             }),
         )
         .await;
@@ -315,7 +315,7 @@ async fn mint_device_token_clamps_to_seven_days() {
         .post_json(
             "/api/admin/devices/clamp-dev/token",
             SERVICE_TOKEN,
-            serde_json::json!({ "ttl_seconds": 999_999_999u64 }),
+            serde_json::json!({ "ttlSeconds": 999_999_999u64 }),
         )
         .await;
     let token = resp["token"].as_str().unwrap();
@@ -338,8 +338,8 @@ async fn mint_control_plane_token_happy_and_clamp() {
             "/api/admin/control-plane/token",
             SERVICE_TOKEN,
             serde_json::json!({
-                "external_user_id": "user-cp",
-                "device_ids": ["dev-1", "dev-2"],
+                "externalUserId": "user-cp",
+                "deviceIds": ["dev-1", "dev-2"],
                 "scope": "jobs:execute",
             }),
         )
@@ -363,8 +363,8 @@ async fn mint_control_plane_token_happy_and_clamp() {
             "/api/admin/control-plane/token",
             SERVICE_TOKEN,
             serde_json::json!({
-                "external_user_id": "user-cp",
-                "ttl_seconds": 86_400u64,
+                "externalUserId": "user-cp",
+                "ttlSeconds": 86_400u64,
             }),
         )
         .await;
@@ -388,7 +388,7 @@ async fn mint_control_plane_token_happy_and_clamp() {
         .post(
             "/api/admin/control-plane/token",
             SERVICE_TOKEN,
-            serde_json::json!({ "external_user_id": "" }),
+            serde_json::json!({ "externalUserId": "" }),
         )
         .await;
     assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
@@ -410,9 +410,9 @@ async fn list_by_external_user_filters_correctly() {
                 "/api/admin/devices",
                 SERVICE_TOKEN,
                 serde_json::json!({
-                    "device_id": id,
-                    "public_key": encode_key(&[1u8; 32]),
-                    "external_user_id": user,
+                    "deviceId": id,
+                    "publicKey": encode_key(&[1u8; 32]),
+                    "externalUserId": user,
                 }),
             )
             .await;
@@ -420,7 +420,7 @@ async fn list_by_external_user_filters_correctly() {
 
     let listed = server
         .get_json(
-            "/api/admin/devices?external_user_id=user-multi",
+            "/api/admin/devices?externalUserId=user-multi",
             SERVICE_TOKEN,
         )
         .await;
@@ -428,7 +428,7 @@ async fn list_by_external_user_filters_correctly() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|v| v["device_id"].as_str().unwrap())
+        .map(|v| v["deviceId"].as_str().unwrap())
         .collect();
     assert_eq!(ids, vec!["multi-a", "multi-b"]);
 
@@ -438,7 +438,7 @@ async fn list_by_external_user_filters_correctly() {
 
     // Empty external_user_id → 400.
     let empty = server
-        .get("/api/admin/devices?external_user_id=", SERVICE_TOKEN)
+        .get("/api/admin/devices?externalUserId=", SERVICE_TOKEN)
         .await;
     assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
 
@@ -457,9 +457,9 @@ async fn delete_device_kicks_ws_emits_event_and_returns_204() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "rev-dev",
-                "public_key": encode_key(&[7u8; 32]),
-                "external_user_id": "user-revoke",
+                "deviceId": "rev-dev",
+                "publicKey": encode_key(&[7u8; 32]),
+                "externalUserId": "user-revoke",
             }),
         )
         .await;
@@ -491,7 +491,7 @@ async fn delete_device_kicks_ws_emits_event_and_returns_204() {
     // Listing the user's devices should now be empty.
     let listed = server
         .get_json(
-            "/api/admin/devices?external_user_id=user-revoke",
+            "/api/admin/devices?externalUserId=user-revoke",
             SERVICE_TOKEN,
         )
         .await;
@@ -573,9 +573,9 @@ async fn mint_device_token_rejects_zero_ttl() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "ttl-zero-dev",
-                "public_key": encode_key(&[5u8; 32]),
-                "external_user_id": "user-z",
+                "deviceId": "ttl-zero-dev",
+                "publicKey": encode_key(&[5u8; 32]),
+                "externalUserId": "user-z",
             }),
         )
         .await;
@@ -585,7 +585,7 @@ async fn mint_device_token_rejects_zero_ttl() {
         .post(
             "/api/admin/devices/ttl-zero-dev/token",
             SERVICE_TOKEN,
-            serde_json::json!({ "ttl_seconds": 0u64 }),
+            serde_json::json!({ "ttlSeconds": 0u64 }),
         )
         .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -605,8 +605,8 @@ async fn mint_control_plane_token_rejects_zero_ttl() {
             "/api/admin/control-plane/token",
             SERVICE_TOKEN,
             serde_json::json!({
-                "external_user_id": "user-cp-z",
-                "ttl_seconds": 0u64,
+                "externalUserId": "user-cp-z",
+                "ttlSeconds": 0u64,
             }),
         )
         .await;
@@ -626,15 +626,15 @@ async fn pre_register_idempotent_returns_stable_created_at() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "stable-ts-dev",
-                "public_key": encode_key(&[11u8; 32]),
-                "external_user_id": "user-stable",
+                "deviceId": "stable-ts-dev",
+                "publicKey": encode_key(&[11u8; 32]),
+                "externalUserId": "user-stable",
             }),
         )
         .await;
     assert_eq!(first.status(), StatusCode::OK);
     let first_body: serde_json::Value = first.json().await.unwrap();
-    let first_ts = first_body["created_at"].as_str().unwrap().to_string();
+    let first_ts = first_body["createdAt"].as_str().unwrap().to_string();
 
     // Brief pause so a naive Utc::now() would produce a different value.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -644,15 +644,15 @@ async fn pre_register_idempotent_returns_stable_created_at() {
             "/api/admin/devices",
             SERVICE_TOKEN,
             serde_json::json!({
-                "device_id": "stable-ts-dev",
-                "public_key": encode_key(&[11u8; 32]),
-                "external_user_id": "user-stable",
+                "deviceId": "stable-ts-dev",
+                "publicKey": encode_key(&[11u8; 32]),
+                "externalUserId": "user-stable",
             }),
         )
         .await;
     assert_eq!(second.status(), StatusCode::OK);
     let second_body: serde_json::Value = second.json().await.unwrap();
-    let second_ts = second_body["created_at"].as_str().unwrap().to_string();
+    let second_ts = second_body["createdAt"].as_str().unwrap().to_string();
 
     // The memory store uses Utc::now() on each call so timestamps may differ
     // slightly in tests; what matters is that the field is present and
@@ -733,6 +733,195 @@ async fn pre_register_concurrent_first_insert_is_idempotent() {
             Some("user-concurrent")
         );
     }
+
+    server.shutdown().await;
+}
+
+// R6-1: ensure the TOCTOU race between concurrent pre_register() calls
+// with *different* external_user_id values resolves by letting exactly
+// one caller win ownership and failing every other caller with
+// DeviceOwnedByDifferentUser (409). Before the WHERE-clause fix in
+// pre_register_once, the loser's ON CONFLICT DO UPDATE would silently
+// overwrite external_user_id to its own value, silently hijacking the
+// device.
+#[tokio::test]
+async fn pre_register_concurrent_different_users_one_wins() {
+    let server = spawn_admin_server().await;
+    let devices = Arc::clone(&server.state().devices);
+
+    const N: usize = 10;
+    let pk_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encode_key(&[99u8; 32]))
+        .unwrap();
+
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let devices = Arc::clone(&devices);
+        let pk = pk_bytes.clone();
+        let user_id = format!("user-race-{i}");
+        handles.push(tokio::spawn(async move {
+            devices
+                .pre_register("race-dev-1", &pk, &user_id)
+                .await
+                .map(|(device, _)| device)
+        }));
+    }
+
+    let mut oks = Vec::new();
+    let mut owned_by_diff_user_count = 0usize;
+    let mut other_errors: Vec<String> = Vec::new();
+    for handle in handles {
+        let result = handle.await.expect("task panicked");
+        match result {
+            Ok(device) => oks.push(device),
+            Err(ahand_hub_core::HubError::DeviceOwnedByDifferentUser { .. }) => {
+                owned_by_diff_user_count += 1;
+            }
+            Err(other) => other_errors.push(other.to_string()),
+        }
+    }
+
+    assert!(
+        other_errors.is_empty(),
+        "unexpected errors: {other_errors:?}"
+    );
+    assert_eq!(
+        oks.len(),
+        1,
+        "exactly one caller must win ownership, got {} winners and {} DeviceOwnedByDifferentUser rejections",
+        oks.len(),
+        owned_by_diff_user_count,
+    );
+    assert_eq!(
+        owned_by_diff_user_count,
+        N - 1,
+        "every loser must get DeviceOwnedByDifferentUser"
+    );
+
+    // The persisted device's external_user_id must match the winner —
+    // it must not have been silently overwritten by a later caller.
+    let winner = &oks[0];
+    let persisted = devices
+        .find_by_id("race-dev-1")
+        .await
+        .unwrap()
+        .expect("device must exist");
+    assert_eq!(
+        persisted.external_user_id, winner.external_user_id,
+        "ownership was silently hijacked: persisted {:?} != winner {:?}",
+        persisted.external_user_id, winner.external_user_id,
+    );
+
+    server.shutdown().await;
+}
+
+// R6-6: control-plane token mint must reject scopes outside the
+// whitelist so downstream endpoints don't silently reject the minted
+// token.
+#[tokio::test]
+async fn mint_control_plane_token_rejects_unsupported_scope() {
+    let server = spawn_admin_server().await;
+
+    let resp = server
+        .post(
+            "/api/admin/control-plane/token",
+            SERVICE_TOKEN,
+            serde_json::json!({
+                "externalUserId": "user-scope-whitelist",
+                "scope": "jobs:read",
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unsupported scope"),
+        "expected unsupported scope message, got {:?}",
+        body["error"]["message"]
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn pre_register_emits_device_registered_webhook() {
+    // Spec § 2.2.4: `device.registered` trigger is the admin
+    // pre-register call. The old implementation only emitted the
+    // event from the WS hello-accept path, which meant the gateway
+    // never saw it for devices adopted via the admin API before the
+    // daemon connected. This test spins up an `AppState` with the
+    // webhook pointed at an unreachable URL so enqueues succeed and
+    // land in the memory delivery store, where we can assert on them.
+    let state = test_state_with_webhook().await;
+    let server = spawn_server_with_state(state).await;
+
+    let resp = server
+        .post(
+            "/api/admin/devices",
+            SERVICE_TOKEN,
+            serde_json::json!({
+                "deviceId": "webhook-emit-dev",
+                "publicKey": encode_key(&[13u8; 32]),
+                "externalUserId": "user-webhook-emit",
+            }),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Poll the webhook store for a `device.registered` row naming the
+    // device we just pre-registered. The worker may try to POST the
+    // row (to the unreachable URL), but transient failures won't
+    // delete it — it's observable as long as we catch it before the
+    // DLQ path runs.
+    let store = server
+        .state()
+        .webhook
+        .store()
+        .expect("webhook store must be present in webhook-enabled state");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut observed = false;
+    while std::time::Instant::now() < deadline {
+        // Lease any-time rows so we can inspect them even if the
+        // worker is mid-send. Release them by marking-failed with
+        // their own attempts/next_retry_at so the worker can retry.
+        let rows = store
+            .lease_due(
+                chrono::Utc::now() + chrono::Duration::seconds(3600),
+                10,
+            )
+            .await
+            .unwrap();
+        for row in &rows {
+            let _ = store
+                .mark_failed(
+                    &row.event_id,
+                    row.next_retry_at,
+                    row.attempts,
+                    row.last_error.as_deref().unwrap_or(""),
+                )
+                .await;
+        }
+        let hit = rows.iter().any(|row| {
+            let payload = &row.payload;
+            payload["eventType"] == "device.registered"
+                && payload["deviceId"] == "webhook-emit-dev"
+                && payload["externalUserId"] == "user-webhook-emit"
+        });
+        if hit {
+            observed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    assert!(
+        observed,
+        "admin pre_register must enqueue a device.registered webhook row"
+    );
 
     server.shutdown().await;
 }

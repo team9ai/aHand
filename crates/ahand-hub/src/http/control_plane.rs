@@ -82,6 +82,7 @@ fn header_bearer(value: &HeaderValue) -> Option<String> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateJobRequest {
     pub device_id: String,
     pub tool: String,
@@ -105,6 +106,7 @@ pub struct CreateJobRequest {
 const DEFAULT_JOB_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateJobResponse {
     pub job_id: String,
 }
@@ -128,7 +130,7 @@ async fn create_job(
     }
     if req.device_id.is_empty() {
         return Err(ControlError::BadRequest(
-            "device_id must not be empty".into(),
+            "deviceId must not be empty".into(),
         ));
     }
 
@@ -239,6 +241,17 @@ async fn stream_job(
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ControlError> {
     if claims.scope != "jobs:execute" {
         return Err(ControlError::Forbidden);
+    }
+    // Rate-limit BEFORE the job lookup: a valid JWT must not be able
+    // to open unlimited concurrent SSE streams (each allocates a
+    // broadcast::Receiver + an Arc handle) by hammering this
+    // endpoint. Same budget as create_job — per-user token bucket.
+    if state
+        .control_rate_limiter
+        .check_key(&claims.external_user_id)
+        .is_err()
+    {
+        return Err(ControlError::RateLimited);
     }
     let channels = state
         .control_jobs
@@ -356,6 +369,16 @@ async fn cancel_job(
 ) -> Result<StatusCode, ControlError> {
     if claims.scope != "jobs:execute" {
         return Err(ControlError::Forbidden);
+    }
+    // Rate-limit BEFORE the job lookup: prevents a valid JWT from
+    // spamming /cancel unbounded, which would otherwise fan out an
+    // unbounded stream of CancelJob envelopes to the daemon.
+    if state
+        .control_rate_limiter
+        .check_key(&claims.external_user_id)
+        .is_err()
+    {
+        return Err(ControlError::RateLimited);
     }
     let channels = state
         .control_jobs
