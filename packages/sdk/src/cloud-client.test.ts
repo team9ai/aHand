@@ -390,6 +390,36 @@ describe("CloudClient.spawn", () => {
     await client.spawn({ deviceId: "d", tool: "t", onStdout: (c) => chunks.push(c) });
     expect(chunks).toEqual(["crlf-test"]);
   });
+
+  it("bad: 500 POST → CloudClientError(server_error)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({ error: { message: "internal" } }, 500)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.spawn({ deviceId: "d", tool: "t" }).catch((e) => e);
+    expect((err as CloudClientError).code).toBe("server_error");
+    expect((err as CloudClientError).httpStatus).toBe(500);
+  });
+
+  it("bad: fetch throws network error → CloudClientError(network)", async () => {
+    const netErr = new Error("ECONNREFUSED");
+    const { fn } = mockFetch([() => { throw netErr; }]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.spawn({ deviceId: "d", tool: "t" }).catch((e) => e);
+    expect((err as CloudClientError).code).toBe("network");
+    expect((err as CloudClientError).cause).toBe(netErr);
+  });
+
+  it("bad: abort during getAuthToken → CloudClientError(abort)", async () => {
+    const ctrl = new AbortController();
+    const client = new CloudClient({
+      hubUrl: "https://hub.test",
+      getAuthToken: async () => {
+        ctrl.abort(); // abort fires during token refresh
+        return "token"; // still returns a token
+      },
+    });
+    const err = await client.spawn({ deviceId: "d", tool: "t", signal: ctrl.signal }).catch((e) => e);
+    expect((err as CloudClientError).code).toBe("abort");
+  });
 });
 
 describe("CloudClient.cancel", () => {

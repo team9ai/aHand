@@ -235,14 +235,17 @@ export class CloudClient {
    * `CloudClientError` otherwise.
    */
   async spawn(p: SpawnParams): Promise<SpawnResult> {
-    // Fast-path: if already aborted before we do anything, throw
-    // immediately — don't even burn a token lookup.
+    // Fast-path: if already aborted before token fetch, skip everything
     if (p.signal?.aborted) {
       throw new CloudClientError("abort", "Aborted before request");
     }
 
     const fetchImpl = this.fetchImpl();
     const token = await this.opts.getAuthToken();
+    // Re-check after async token fetch — signal may have fired during refresh
+    if (p.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
 
     const requestBody: Record<string, unknown> = {
       device_id: p.deviceId,
