@@ -1,17 +1,35 @@
 {
   "name": "@ahand/sdk",
   "version": "0.1.2",
-  "private": true,
   "description": "AHand cloud control plane SDK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/team9ai/aHand.git",
+    "directory": "packages/sdk"
+  },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "pnpm run build",
     "test": "vitest run",
     "lint": "tsc --noEmit"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "ahand",
+    "cloud",
+    "control-plane",
+    "sdk"
+  ],
+  "author": "team9ai",
   "license": "Apache-2.0",
   "dependencies": {
     "@ahand/proto": "workspace:*",
