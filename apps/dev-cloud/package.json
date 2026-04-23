@@ -14,8 +14,8 @@
   "author": "",
   "license": "Apache-2.0",
   "dependencies": {
-    "@ahand/proto": "workspace:*",
-    "@ahand/sdk": "workspace:*",
+    "@ahandai/proto": "workspace:*",
+    "@ahandai/sdk": "workspace:*",
     "@hono/node-server": "^1.19.9",
     "@hono/node-ws": "^1.1.1",
     "@hono/zod-validator": "^0.7.6",

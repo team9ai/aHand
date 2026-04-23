@@ -1,5 +1,5 @@
-import { Envelope } from "@ahand/proto";
-import type { Envelope as EnvelopeMsg } from "@ahand/proto";
+import { Envelope } from "@ahandai/proto";
+import type { Envelope as EnvelopeMsg } from "@ahandai/proto";
 
 export function encodeEnvelope(msg: EnvelopeMsg): Uint8Array {
   return Envelope.encode(msg).finish();

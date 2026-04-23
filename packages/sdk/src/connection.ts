@@ -4,7 +4,7 @@ import type {
   Hello as HelloMsg,
   Envelope as EnvelopeMsg,
   PolicyUpdate as PolicyUpdateMsg,
-} from "@ahand/proto";
+} from "@ahandai/proto";
 import { makeEnvelope, decodeEnvelope } from "./codec.ts";
 import { Job } from "./job.ts";
 import { Outbox, prepareOutbound } from "./outbox.ts";
