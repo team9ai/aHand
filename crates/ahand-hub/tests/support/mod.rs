@@ -40,8 +40,9 @@ pub fn test_config() -> Config {
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,
-        device_heartbeat_interval_ms: 30_000,
-        device_heartbeat_timeout_ms: 90_000,
+        device_staleness_probe_interval_ms: 30_000,
+        device_staleness_timeout_ms: 180_000,
+        device_expected_heartbeat_secs: 60,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
         job_timeout_grace_ms: 50,
@@ -50,6 +51,11 @@ pub fn test_config() -> Config {
         audit_retention_days: 90,
         audit_fallback_path: std::env::temp_dir().join("ahand-hub-test-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
+        webhook_url: None,
+        webhook_secret: None,
+        webhook_max_retries: 8,
+        webhook_max_concurrency: 50,
+        webhook_timeout_ms: 5_000,
         store: StoreConfig::Memory,
     }
 }
@@ -63,8 +69,9 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,
-        device_heartbeat_interval_ms: 30_000,
-        device_heartbeat_timeout_ms: 90_000,
+        device_staleness_probe_interval_ms: 30_000,
+        device_staleness_timeout_ms: 180_000,
+        device_expected_heartbeat_secs: 60,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
         job_timeout_grace_ms: 50,
@@ -74,6 +81,11 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
         audit_fallback_path: std::env::temp_dir()
             .join("ahand-hub-persistent-test-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
+        webhook_url: None,
+        webhook_secret: None,
+        webhook_max_retries: 8,
+        webhook_max_concurrency: 50,
+        webhook_timeout_ms: 5_000,
         store: StoreConfig::Persistent {
             database_url: stack.database_url().into(),
             redis_url: stack.redis_url().into(),
@@ -100,10 +112,34 @@ pub async fn test_state() -> AppState {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
     state.devices.mark_offline("device-1").await.unwrap();
+    state
+}
+
+/// Build an `AppState` whose outbound webhook is configured against an
+/// unreachable URL. Every `enqueue_*` call still persists to the
+/// underlying `MemoryWebhookDeliveryStore`, which tests can inspect via
+/// `state.webhook.store()`. Deliveries will never succeed (the URL
+/// routes nowhere) but that's fine — we only care about verifying that
+/// admin / ws code paths enqueued the expected events.
+pub async fn test_state_with_webhook() -> AppState {
+    let mut config = test_config();
+    // Port 1 is reserved; a POST here fails fast on every platform so
+    // the worker doesn't build up wall-clock debt during tests.
+    config.webhook_url = Some("http://127.0.0.1:1/webhook".into());
+    config.webhook_secret = Some("test-webhook-secret".into());
+    // Keep attempts small so the worker doesn't spam the log if the
+    // test takes a while to assert.
+    config.webhook_max_retries = 1;
+    config.webhook_max_concurrency = 2;
+    let state = AppState::from_config(config)
+        .await
+        .expect("test state should build");
+    state.devices.mark_offline("device-2").await.ok();
     state
 }
 
@@ -126,6 +162,7 @@ pub async fn test_state_with_browser_device() -> AppState {
             capabilities: vec!["exec".into(), "browser".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
@@ -148,6 +185,14 @@ pub struct TestServer {
 impl TestServer {
     pub fn http_base_url(&self) -> &str {
         &self.base_http_url
+    }
+
+    pub fn events(&self) -> std::sync::Arc<ahand_hub::events::EventBus> {
+        self.state.events.clone()
+    }
+
+    pub fn state(&self) -> &AppState {
+        &self.state
     }
 
     pub fn ws_url(&self, path: &str) -> String {

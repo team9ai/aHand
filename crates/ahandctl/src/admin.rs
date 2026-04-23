@@ -741,7 +741,9 @@ fn is_process_running(pid: u32) -> bool {
             let stdout = String::from_utf8_lossy(&output.stdout);
             // Check if the PID appears as a word in the output (locale-independent)
             output.status.success()
-                && stdout.split_whitespace().any(|w| w == pid.to_string().as_str())
+                && stdout
+                    .split_whitespace()
+                    .any(|w| w == pid.to_string().as_str())
         })
         .unwrap_or(false)
 }

@@ -36,7 +36,16 @@ message Envelope {
     UpdateStatus     update_status     = 28;
     StdinChunk       stdin_chunk       = 29;
     TerminalResize   terminal_resize   = 30;
+    Heartbeat        heartbeat         = 31;
   }
+}
+
+// Heartbeat — periodic keep-alive sent from daemon to hub over the existing
+// WebSocket. The hub forwards each heartbeat as a `device.heartbeat` webhook
+// event and uses its arrival to refresh TTL-based presence state.
+message Heartbeat {
+  uint64 sent_at_ms    = 1;
+  string daemon_version = 2;
 }
 
 // HelloChallenge - server nonce that must be signed in the initial Hello response.

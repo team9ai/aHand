@@ -87,6 +87,9 @@ export class DeviceConnection extends EventEmitter {
         cwd: opts?.cwd ?? "",
         env: opts?.env ?? {},
         timeoutMs: opts?.timeoutMs ?? 0,
+        // `interactive` is a proto field for future PTY sessions. SDK callers
+        // cannot opt in yet; default to non-interactive.
+        interactive: false,
       },
     });
 

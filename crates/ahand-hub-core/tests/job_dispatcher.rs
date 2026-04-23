@@ -34,6 +34,7 @@ impl OnlineDeviceStore {
                 version: Some("0.1.2".into()),
                 auth_method: "ed25519".into(),
                 online: true,
+                external_user_id: None,
             },
         }
     }
@@ -76,6 +77,7 @@ impl DeviceStore for OfflineDeviceStore {
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
             online: false,
+            external_user_id: None,
         }))
     }
 
@@ -89,6 +91,7 @@ impl DeviceStore for OfflineDeviceStore {
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
             online: false,
+            external_user_id: None,
         }])
     }
 

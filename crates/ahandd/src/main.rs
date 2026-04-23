@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use ahand_protocol::Envelope;
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use config::ConnectionMode;
 use tokio::signal::unix::{SignalKind, signal};
@@ -242,7 +243,6 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let connection_mode = cfg.connection_mode();
-    let device_id = cfg.device_id();
     let debug_ipc = cfg.debug_ipc.unwrap_or(false);
     let ipc_socket_path = cfg.ipc_socket_path();
     let ipc_socket_mode = cfg.ipc_socket_mode();
@@ -305,6 +305,16 @@ async fn main() -> anyhow::Result<()> {
     let main_future = async {
         match connection_mode {
             ConnectionMode::AHandCloud => {
+                let hub_cfg = cfg.hub_config();
+                let identity_path = hub_cfg
+                    .private_key_path
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(device_identity::default_identity_path);
+                let identity = device_identity::DeviceIdentity::load_or_create(&identity_path)
+                    .context("failed to load device identity")?;
+                let device_id = identity.device_id();
+
                 info!(
                     server_url = %cfg.server_url,
                     device_id = %device_id,
@@ -348,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             ConnectionMode::OpenClawGateway => {
+                let device_id = cfg.device_id();
                 let oc_config = cfg.openclaw_config();
                 let host = oc_config.gateway_host.as_deref().unwrap_or("127.0.0.1");
                 let port = oc_config.gateway_port.unwrap_or(18789);

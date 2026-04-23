@@ -1,17 +1,33 @@
 {
   "name": "@ahand/proto",
   "version": "0.1.2",
-  "private": true,
   "description": "ts-proto generated types for ahand protocol",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/team9ai/aHand.git",
+    "directory": "packages/proto-ts"
+  },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "pnpm run build",
     "generate": "buf generate",
     "lint": "tsc --noEmit"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "ahand",
+    "protobuf"
+  ],
+  "author": "team9ai",
   "license": "Apache-2.0",
   "devDependencies": {
     "@bufbuild/buf": "^1.64.0",

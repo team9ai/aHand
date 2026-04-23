@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ahand_protocol::{
-    BrowserResponse, Envelope, Hello, HelloAccepted, HelloChallenge, JobFinished, JobRejected,
-    envelope, hello,
+    BrowserResponse, Envelope, Heartbeat, Hello, HelloAccepted, HelloChallenge, JobFinished,
+    JobRejected, envelope, hello,
 };
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -55,6 +56,40 @@ impl crate::executor::EnvelopeSink for BufferedEnvelopeSender {
     }
 }
 
+/// Coarse outcome of a single `connect()` attempt, used by library callers
+/// that want to observe handshake success/failure without scraping logs.
+#[derive(Debug, Clone)]
+pub enum ConnectOutcome {
+    /// The Hello handshake was accepted.
+    HandshakeAccepted,
+    /// Every configured auth mode was rejected by the hub.
+    HandshakeRejected(String),
+    /// Transport-level failure (dial, TLS, malformed frame, …).
+    Session(String),
+    /// The session completed cleanly (remote closed, etc.).
+    Disconnected,
+}
+
+/// Sink for [`ConnectOutcome`] events. `run_with_reporter` calls this for
+/// every handshake attempt so callers can drive state machines off it.
+pub trait ClientReporter: Send + Sync + 'static {
+    fn report(&self, outcome: ConnectOutcome);
+}
+
+impl<F> ClientReporter for F
+where
+    F: Fn(ConnectOutcome) + Send + Sync + 'static,
+{
+    fn report(&self, outcome: ConnectOutcome) {
+        (self)(outcome)
+    }
+}
+
+struct NoopReporter;
+impl ClientReporter for NoopReporter {
+    fn report(&self, _outcome: ConnectOutcome) {}
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -66,6 +101,36 @@ pub async fn run(
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
 ) -> anyhow::Result<()> {
+    run_with_reporter(
+        config,
+        device_id,
+        registry,
+        store,
+        session_mgr,
+        approval_mgr,
+        approval_broadcast_tx,
+        browser_mgr,
+        Arc::new(NoopReporter),
+    )
+    .await
+}
+
+/// Variant of [`run`] that pushes every handshake outcome into `reporter`.
+///
+/// Library callers (e.g. `public_api::spawn`) use this to drive a status
+/// channel without modifying the reconnect loop.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_reporter(
+    config: Config,
+    device_id: String,
+    registry: Arc<JobRegistry>,
+    store: Option<Arc<RunStore>>,
+    session_mgr: Arc<SessionManager>,
+    approval_mgr: Arc<ApprovalManager>,
+    approval_broadcast_tx: broadcast::Sender<Envelope>,
+    browser_mgr: Arc<BrowserManager>,
+    reporter: Arc<dyn ClientReporter>,
+) -> anyhow::Result<()> {
     let hub_config = config.hub_config();
     let identity_path = hub_config
         .private_key_path
@@ -74,6 +139,13 @@ pub async fn run(
         .unwrap_or_else(crate::device_identity::default_identity_path);
     let identity = DeviceIdentity::load_or_create(&identity_path)?;
     let bearer_token = hub_config.bootstrap_token.clone();
+    // Prefer millisecond precision when provided (library callers thread
+    // a `Duration` through), else fall back to the TOML-friendly
+    // `heartbeat_interval_secs`, else default to 60s.
+    let heartbeat_interval = match hub_config.heartbeat_interval_ms {
+        Some(ms) => Duration::from_millis(ms.max(1)),
+        None => Duration::from_secs(hub_config.heartbeat_interval_secs.unwrap_or(60).max(1)),
+    };
 
     // Outbox survives across reconnects.
     let outbox = Arc::new(Mutex::new(Outbox::new(10_000)));
@@ -83,11 +155,12 @@ pub async fn run(
     loop {
         info!(url = %config.server_url, "connecting to cloud");
 
-        match connect(
+        let attempt = connect_reporting(
             &config.server_url,
             &device_id,
             &identity,
             bearer_token.clone(),
+            heartbeat_interval,
             &session_mgr,
             &registry,
             &store,
@@ -95,11 +168,14 @@ pub async fn run(
             &approval_mgr,
             &approval_broadcast_tx,
             &browser_mgr,
+            reporter.as_ref(),
         )
-        .await
-        {
+        .await;
+
+        match attempt {
             Ok(()) => {
                 info!("disconnected from cloud");
+                reporter.report(ConnectOutcome::Disconnected);
                 backoff = 1;
             }
             Err(e) => {
@@ -115,11 +191,12 @@ pub async fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn connect(
+async fn connect_reporting(
     url: &str,
     device_id: &str,
     identity: &DeviceIdentity,
     bearer_token: Option<String>,
+    heartbeat_interval: Duration,
     session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
@@ -127,16 +204,18 @@ async fn connect(
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
+    reporter: &dyn ClientReporter,
 ) -> anyhow::Result<()> {
     let auth_modes = hello_auth_modes(bearer_token.as_deref());
     let mut last_handshake_error = None;
 
     for auth_mode in auth_modes {
-        match connect_with_auth(
+        let outcome = connect_with_auth(
             url,
             device_id,
             identity,
             &auth_mode,
+            heartbeat_interval,
             session_mgr,
             registry,
             store,
@@ -144,19 +223,25 @@ async fn connect(
             approval_mgr,
             approval_broadcast_tx,
             browser_mgr,
+            reporter,
         )
-        .await
-        {
+        .await;
+        match outcome {
             Ok(()) => return Ok(()),
             Err(ConnectError::HandshakeRejected(err)) => {
                 warn!(?auth_mode, error = %err, "hello auth rejected");
                 last_handshake_error = Some(err);
             }
-            Err(ConnectError::Session(err)) => return Err(err),
+            Err(ConnectError::Session(err)) => {
+                reporter.report(ConnectOutcome::Session(err.to_string()));
+                return Err(err);
+            }
         }
     }
 
-    Err(last_handshake_error.unwrap_or_else(|| anyhow::anyhow!("device hello rejected")))
+    let err = last_handshake_error.unwrap_or_else(|| anyhow::anyhow!("device hello rejected"));
+    reporter.report(ConnectOutcome::HandshakeRejected(err.to_string()));
+    Err(err)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -165,6 +250,7 @@ async fn connect_with_auth(
     device_id: &str,
     identity: &DeviceIdentity,
     auth_mode: &HelloAuthMode,
+    heartbeat_interval: Duration,
     session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
@@ -172,6 +258,7 @@ async fn connect_with_auth(
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
+    reporter: &dyn ClientReporter,
 ) -> Result<(), ConnectError> {
     let (ws_stream, _) = tokio_tungstenite::connect_async(url)
         .await
@@ -205,6 +292,7 @@ async fn connect_with_auth(
         .map_err(ConnectError::Session)?;
     let accepted = recv_hello_accepted(&mut stream).await?;
     info!(auth_method = %accepted.auth_method, "hello accepted");
+    reporter.report(ConnectOutcome::HandshakeAccepted);
 
     // Replay unacked messages from previous connection.
     let unacked = outbox
@@ -249,6 +337,20 @@ async fn connect_with_auth(
             }
         }
     });
+
+    // Task: periodic Heartbeat envelopes over the buffered sender. Exits when
+    // `tx` is dropped (session end) because `BufferedEnvelopeSender::send`
+    // fails once the underlying mpsc closes — that is the only termination
+    // path and happens cooperatively without a separate shutdown signal.
+    let heartbeat_sender = tx.clone();
+    let heartbeat_device_id = device_id.to_string();
+    let daemon_version = env!("CARGO_PKG_VERSION").to_string();
+    let heartbeat_task = spawn_heartbeat_task(
+        heartbeat_sender,
+        heartbeat_device_id,
+        daemon_version,
+        heartbeat_interval,
+    );
 
     let caller_uid = "cloud";
 
@@ -361,7 +463,9 @@ async fn connect_with_auth(
             }
             Some(envelope::Payload::StdinChunk(chunk)) => {
                 use crate::executor::StdinInput;
-                registry.send_stdin(&chunk.job_id, StdinInput::Data(chunk.data)).await;
+                registry
+                    .send_stdin(&chunk.job_id, StdinInput::Data(chunk.data))
+                    .await;
             }
             Some(envelope::Payload::TerminalResize(resize)) => {
                 use crate::executor::StdinInput;
@@ -379,11 +483,61 @@ async fn connect_with_auth(
         }
     }
 
-    // Drop tx so the send task exits.
+    // Abort the heartbeat task BEFORE dropping `tx`. The heartbeat task
+    // holds its own clone of the `BufferedEnvelopeSender`, so if we
+    // dropped `tx` first, the send task's mpsc receiver would still see
+    // a live sender (from the heartbeat clone) and block on `rx.recv()`
+    // indefinitely — `send_handle.await` would hang until the WS broke
+    // naturally. Aborting the heartbeat task drops its sender clone, so
+    // dropping `tx` here leaves zero senders and `rx.recv()` resolves to
+    // `None`.
+    heartbeat_task.abort();
+    let _ = heartbeat_task.await;
     drop(tx);
     let _ = send_handle.await;
 
     Ok(())
+}
+
+/// Spawn the heartbeat-emission task.
+///
+/// Exits cleanly via one of:
+///   * `heartbeat_sender.send(...)` returns `Err` (underlying mpsc closed)
+///   * the returned `JoinHandle` is aborted by the caller at connection tear-down
+fn spawn_heartbeat_task<S>(
+    heartbeat_sender: S,
+    device_id: String,
+    daemon_version: String,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()>
+where
+    S: crate::executor::EnvelopeSink + 'static,
+{
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // `interval` fires immediately on the first tick; skip it so the
+        // first heartbeat lands `interval` after connection open rather
+        // than racing with the Hello handshake.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let envelope = Envelope {
+                device_id: device_id.clone(),
+                msg_id: new_msg_id(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::Heartbeat(Heartbeat {
+                    sent_at_ms: now_ms(),
+                    daemon_version: daemon_version.clone(),
+                })),
+                ..Default::default()
+            };
+            if heartbeat_sender.send(envelope).is_err() {
+                // Sender closed → session tore down. Exit cleanly so the
+                // JoinHandle resolves without the parent needing to abort.
+                break;
+            }
+        }
+    })
 }
 
 pub fn build_hello_envelope(
@@ -954,6 +1108,85 @@ mod tests {
         let err = classify_hello_accepted_message(Message::Close(None)).unwrap_err();
 
         assert!(matches!(err, ConnectError::Session(_)));
+    }
+
+    // ── Heartbeat task exit paths ──────────────────────────────────
+    //
+    // The task spawned by `spawn_heartbeat_task` must exit cleanly via
+    // exactly two paths:
+    //   1. The `EnvelopeSink::send` call returns `Err(())` because the
+    //      underlying mpsc has been closed (e.g. session tore down).
+    //   2. The returned `JoinHandle` is explicitly aborted.
+    //
+    // Both branches are exercised below so the coverage tooling doesn't
+    // have to rely on the full integration test.
+
+    #[derive(Clone)]
+    struct CountingSink {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+        fail_after: usize,
+    }
+
+    impl crate::executor::EnvelopeSink for CountingSink {
+        fn send(&self, _envelope: Envelope) -> Result<(), ()> {
+            let n = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n > self.fail_after { Err(()) } else { Ok(()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_task_exits_when_send_errors() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = CountingSink {
+            count: count.clone(),
+            fail_after: 1,
+        };
+        let handle = super::spawn_heartbeat_task(
+            sink,
+            "device-exit-send".into(),
+            "test-version".into(),
+            std::time::Duration::from_millis(10),
+        );
+
+        // Sink fails after the first successful send. Task should exit
+        // within a few ticks.
+        let joined = tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("heartbeat task did not exit on send error");
+        assert!(joined.is_ok(), "heartbeat task panicked: {joined:?}");
+        assert!(
+            count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "expected at least one attempted send after the initial OK",
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_task_stops_when_aborted() {
+        // Sink that never fails — exits only via abort.
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = CountingSink {
+            count: count.clone(),
+            fail_after: usize::MAX,
+        };
+        let handle = super::spawn_heartbeat_task(
+            sink,
+            "device-exit-abort".into(),
+            "test-version".into(),
+            std::time::Duration::from_millis(10),
+        );
+        // Let the ticker fire at least once so we exercise the tick arm.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+        let joined = handle.await;
+        // JoinHandle on aborted task resolves to JoinError::is_cancelled.
+        assert!(
+            joined
+                .as_ref()
+                .err()
+                .map(|e| e.is_cancelled())
+                .unwrap_or(false),
+            "aborted heartbeat task should resolve as cancelled, got {joined:?}",
+        );
     }
 
     #[test]

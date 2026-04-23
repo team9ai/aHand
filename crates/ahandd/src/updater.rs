@@ -68,11 +68,7 @@ impl From<UpdateCommand> for UpdateParams {
 
 /// Attempt to start an update. Returns `true` if the update task was spawned,
 /// `false` if another update is already in progress.
-pub fn spawn_update<T: EnvelopeSink>(
-    params: UpdateParams,
-    device_id: String,
-    tx: T,
-) -> bool {
+pub fn spawn_update<T: EnvelopeSink>(params: UpdateParams, device_id: String, tx: T) -> bool {
     // Downgrade protection: reject if target <= current.
     let current = env!("CARGO_PKG_VERSION");
     let current_ver = match Version::parse(current) {
@@ -118,11 +114,7 @@ pub fn spawn_update<T: EnvelopeSink>(
 
 // ── Core update logic ──────────────────────────────────────────────
 
-async fn execute_update<T: EnvelopeSink>(
-    params: UpdateParams,
-    device_id: String,
-    tx: T,
-) {
+async fn execute_update<T: EnvelopeSink>(params: UpdateParams, device_id: String, tx: T) {
     let current_version: String = env!("CARGO_PKG_VERSION").into();
     let mut attempt = 0u32;
 
@@ -203,9 +195,9 @@ async fn try_update<T: EnvelopeSink>(
         "",
     );
 
-    let bytes = download_binary(&params.download_url).await.map_err(|e| {
-        UpdateError::Retriable(format!("download failed: {}", e))
-    })?;
+    let bytes = download_binary(&params.download_url)
+        .await
+        .map_err(|e| UpdateError::Retriable(format!("download failed: {}", e)))?;
 
     // ── 2. Verify checksum ─────────────────────────────────────
     send_status(
@@ -220,9 +212,8 @@ async fn try_update<T: EnvelopeSink>(
     );
 
     if !params.checksum_sha256.is_empty() {
-        verify_checksum(&bytes, &params.checksum_sha256).map_err(|e| {
-            UpdateError::Retriable(format!("checksum mismatch: {}", e))
-        })?;
+        verify_checksum(&bytes, &params.checksum_sha256)
+            .map_err(|e| UpdateError::Retriable(format!("checksum mismatch: {}", e)))?;
     }
 
     // ── 3. Verify signature ────────────────────────────────────
@@ -244,9 +235,8 @@ async fn try_update<T: EnvelopeSink>(
         "",
     );
 
-    install_binary(&bytes, &params.target_version).map_err(|e| {
-        UpdateError::Retriable(format!("installation failed: {}", e))
-    })?;
+    install_binary(&bytes, &params.target_version)
+        .map_err(|e| UpdateError::Retriable(format!("installation failed: {}", e)))?;
 
     // ── 5. Restart ─────────────────────────────────────────────
     send_status(
@@ -260,9 +250,7 @@ async fn try_update<T: EnvelopeSink>(
         "",
     );
 
-    restart_daemon().map_err(|e| {
-        UpdateError::Retriable(format!("restart failed: {}", e))
-    })?;
+    restart_daemon().map_err(|e| UpdateError::Retriable(format!("restart failed: {}", e)))?;
 
     // If exec() succeeded we never reach here; this is a fallback.
     Ok(())
@@ -286,11 +274,7 @@ fn verify_checksum(data: &[u8], expected_hex: &str) -> anyhow::Result<()> {
     let digest = Sha256::digest(data);
     let actual_hex = hex::encode(digest);
     if actual_hex != expected_hex {
-        anyhow::bail!(
-            "expected {}, got {}",
-            expected_hex,
-            actual_hex
-        );
+        anyhow::bail!("expected {}, got {}", expected_hex, actual_hex);
     }
     Ok(())
 }
@@ -313,7 +297,8 @@ fn verify_signature(data: &[u8], signature_bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 fn install_binary(data: &[u8], target_version: &str) -> anyhow::Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let bin_dir = home.join(".ahand").join("bin");
     std::fs::create_dir_all(&bin_dir)?;
 
@@ -343,7 +328,8 @@ fn install_binary(data: &[u8], target_version: &str) -> anyhow::Result<()> {
 }
 
 fn restart_daemon() -> anyhow::Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
     let bin_path = home.join(".ahand").join("bin").join("ahandd");
 
     info!(path = %bin_path.display(), "exec()-ing new daemon binary");

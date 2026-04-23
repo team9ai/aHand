@@ -81,6 +81,24 @@ pub struct HubConfig {
 
     /// Path to the persisted Ed25519 private key used for Hello signing.
     pub private_key_path: Option<String>,
+
+    /// Heartbeat interval in seconds. The daemon sends a `Heartbeat`
+    /// envelope on its hub WebSocket every `heartbeat_interval_secs`
+    /// seconds so the hub can refresh TTL-based presence and forward the
+    /// event as `device.heartbeat` webhooks. `None` falls back to the
+    /// library default (60s).
+    ///
+    /// When both this and [`Self::heartbeat_interval_ms`] are set,
+    /// `heartbeat_interval_ms` wins (finer-grained override, mainly used
+    /// by tests that need sub-second cadence).
+    pub heartbeat_interval_secs: Option<u64>,
+
+    /// Sub-second override for [`Self::heartbeat_interval_secs`]. Not
+    /// typically exposed through TOML — the library surface uses this to
+    /// thread `DaemonConfig.heartbeat_interval: Duration` down without
+    /// losing sub-second precision.
+    #[serde(default)]
+    pub heartbeat_interval_ms: Option<u64>,
 }
 
 /// OpenClaw Gateway connection configuration
