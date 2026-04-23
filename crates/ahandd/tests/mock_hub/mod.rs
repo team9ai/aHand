@@ -147,9 +147,7 @@ async fn handle_conn(
                 })),
                 ..Default::default()
             };
-            let _ = sink
-                .send(WsMessage::Binary(accepted.encode_to_vec()))
-                .await;
+            let _ = sink.send(WsMessage::Binary(accepted.encode_to_vec())).await;
             // Keep the connection open until the client closes it, and
             // record every `Heartbeat` envelope observed on the way.
             while let Some(m) = src.next().await {

@@ -30,8 +30,8 @@ use reqwest::StatusCode;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use support::{
-    read_hello_accepted, read_hello_challenge, signed_hello, spawn_server_with_state, test_state,
-    TestServer,
+    TestServer, read_hello_accepted, read_hello_challenge, signed_hello, spawn_server_with_state,
+    test_state,
 };
 
 const JWT_SECRET: &str = "service-test-secret";
@@ -44,14 +44,14 @@ async fn attach_owned_device(
     server: &TestServer,
     device_id: &str,
     external_user_id: &str,
-) -> tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-> {
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     use ed25519_dalek::SigningKey;
     // Seed the device row with the expected public key and
     // external_user_id BEFORE the daemon says hello — this mirrors
     // the "admin pre-register → daemon hello" flow.
-    let verifying = SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes();
+    let verifying = SigningKey::from_bytes(&[7u8; 32])
+        .verifying_key()
+        .to_bytes();
     server
         .state()
         .devices
@@ -283,11 +283,13 @@ async fn create_job_happy_path_dispatches_and_streams_events() {
             device_id: "cp-dev-1".into(),
             msg_id: "ev-3".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
-                job_id: job_id.clone(),
-                exit_code: 0,
-                error: String::new(),
-            })),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
             ..Default::default()
         },
     )
@@ -549,11 +551,8 @@ async fn duplicate_correlation_id_returns_same_job_id() {
     // The daemon should NOT have received a second JobRequest. We
     // probe the socket briefly; if a second request arrives within
     // 200ms we fail the test.
-    let no_second = tokio::time::timeout(
-        Duration::from_millis(200),
-        recv_job_request(&mut device),
-    )
-    .await;
+    let no_second =
+        tokio::time::timeout(Duration::from_millis(200), recv_job_request(&mut device)).await;
     assert!(
         no_second.is_err(),
         "duplicate correlation_id unexpectedly re-dispatched a job"
@@ -639,9 +638,7 @@ async fn rate_limit_returns_429() {
         }
     }
     assert!(
-        statuses
-            .iter()
-            .any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
+        statuses.iter().any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
         "expected at least one 429 in {statuses:?}"
     );
     server.shutdown().await;
@@ -698,9 +695,7 @@ async fn stream_job_rate_limited_returns_429() {
         }
     }
     assert!(
-        statuses
-            .iter()
-            .any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
+        statuses.iter().any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
         "expected at least one 429 in {statuses:?}"
     );
 
@@ -753,9 +748,7 @@ async fn cancel_job_rate_limited_returns_429() {
         }
     }
     assert!(
-        statuses
-            .iter()
-            .any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
+        statuses.iter().any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
         "expected at least one 429 in {statuses:?}"
     );
 
@@ -959,11 +952,13 @@ async fn two_concurrent_sse_clients_receive_all_events() {
             device_id: "cp-fanout".into(),
             msg_id: "fin".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
-                job_id: job_id.clone(),
-                exit_code: 0,
-                error: String::new(),
-            })),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
             ..Default::default()
         },
     )
@@ -979,7 +974,10 @@ async fn two_concurrent_sse_clients_receive_all_events() {
         .unwrap();
     for body in [&body_a, &body_b] {
         assert!(body.contains("broadcast"), "body missing stdout: {body}");
-        assert!(body.contains("event: finished"), "body missing finished: {body}");
+        assert!(
+            body.contains("event: finished"),
+            "body missing finished: {body}"
+        );
     }
 
     drop(device);
@@ -1038,11 +1036,13 @@ async fn sse_client_disconnect_cleans_up_on_terminal_event() {
             device_id: "cp-dc".into(),
             msg_id: "fin".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
-                job_id: job_id.clone(),
-                exit_code: 0,
-                error: String::new(),
-            })),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
             ..Default::default()
         },
     )
@@ -1110,11 +1110,13 @@ async fn many_sse_disconnects_do_not_leak_entries() {
             device_id: "cp-stress".into(),
             msg_id: "fin".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
-                job_id: job_id.clone(),
-                exit_code: 0,
-                error: String::new(),
-            })),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
             ..Default::default()
         },
     )
@@ -1204,9 +1206,7 @@ async fn large_stdout_chunk_delivered_intact() {
             ts_ms: now_ms(),
             payload: Some(envelope::Payload::JobEvent(ahand_protocol::JobEvent {
                 job_id: job_id.clone(),
-                event: Some(ahand_protocol::job_event::Event::StdoutChunk(
-                    chunk.clone(),
-                )),
+                event: Some(ahand_protocol::job_event::Event::StdoutChunk(chunk.clone())),
             })),
             ..Default::default()
         },
@@ -1218,11 +1218,13 @@ async fn large_stdout_chunk_delivered_intact() {
             device_id: "cp-big".into(),
             msg_id: "fin".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
-                job_id: job_id.clone(),
-                exit_code: 0,
-                error: String::new(),
-            })),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
             ..Default::default()
         },
     )
@@ -1247,7 +1249,10 @@ async fn large_stdout_chunk_delivered_intact() {
         .expect("stdout block had no data line");
     let json_payload = &data_line[6..];
     let parsed: serde_json::Value = serde_json::from_str(json_payload).expect("valid JSON payload");
-    let decoded_chunk = parsed["chunk"].as_str().expect("chunk is a string").to_string();
+    let decoded_chunk = parsed["chunk"]
+        .as_str()
+        .expect("chunk is a string")
+        .to_string();
     assert_eq!(
         decoded_chunk.len(),
         chunk_len,
@@ -1311,10 +1316,12 @@ async fn rejected_envelope_finalizes_as_error() {
             device_id: "cp-reject".into(),
             msg_id: "rej".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobRejected(ahand_protocol::JobRejected {
-                job_id: job_id.clone(),
-                reason: "policy-denied".into(),
-            })),
+            payload: Some(envelope::Payload::JobRejected(
+                ahand_protocol::JobRejected {
+                    job_id: job_id.clone(),
+                    reason: "policy-denied".into(),
+                },
+            )),
             ..Default::default()
         },
     )
@@ -1326,7 +1333,10 @@ async fn rejected_envelope_finalizes_as_error() {
         .unwrap();
     assert!(body.contains("event: error"), "body was {body}");
     assert!(body.contains(r#""code":"rejected""#), "body was {body}");
-    assert!(body.contains(r#""message":"policy-denied""#), "body was {body}");
+    assert!(
+        body.contains(r#""message":"policy-denied""#),
+        "body was {body}"
+    );
 
     drop(device);
     server.shutdown().await;
@@ -1382,11 +1392,13 @@ async fn exit_code_non_zero_reports_error_event() {
             device_id: "cp-exit".into(),
             msg_id: "fin".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
-                job_id: job_id.clone(),
-                exit_code: 42,
-                error: String::new(),
-            })),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 42,
+                    error: String::new(),
+                },
+            )),
             ..Default::default()
         },
     )
@@ -1453,11 +1465,13 @@ async fn cancelled_finish_reports_cancelled_error_code() {
             device_id: "cp-canc-code".into(),
             msg_id: "fin".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
-                job_id: job_id.clone(),
-                exit_code: -1,
-                error: "cancelled".into(),
-            })),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: -1,
+                    error: "cancelled".into(),
+                },
+            )),
             ..Default::default()
         },
     )
@@ -1543,11 +1557,13 @@ async fn stderr_and_progress_with_message_render_correctly() {
             device_id: "cp-err-ch".into(),
             msg_id: "fin".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
-                job_id: job_id.clone(),
-                exit_code: 0,
-                error: String::new(),
-            })),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
             ..Default::default()
         },
     )
@@ -1599,11 +1615,13 @@ async fn sse_late_joiner_after_terminal_event_gets_empty_stream() {
             device_id: "cp-late".into(),
             msg_id: "fin-late".into(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::JobFinished(ahand_protocol::JobFinished {
-                job_id: job_id.clone(),
-                exit_code: 0,
-                error: String::new(),
-            })),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
             ..Default::default()
         },
     )

@@ -205,9 +205,7 @@ impl DeviceAdminStore for PgDeviceStore {
                 .await
             {
                 Ok(result) => return Ok(result),
-                Err(HubError::Internal(msg))
-                    if msg.contains("duplicate key") =>
-                {
+                Err(HubError::Internal(msg)) if msg.contains("duplicate key") => {
                     if attempt == 0 {
                         // Race on first insert — retry once; second attempt
                         // sees the existing row and either wins or gets
@@ -299,13 +297,12 @@ impl PgDeviceStore {
             .map_err(|err| HubError::Internal(err.to_string()))?;
 
         // Lock the row if it already exists.
-        let existing: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT id, external_user_id FROM devices WHERE id = $1 FOR UPDATE",
-        )
-        .bind(device_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|err| HubError::Internal(err.to_string()))?;
+        let existing: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, external_user_id FROM devices WHERE id = $1 FOR UPDATE")
+                .bind(device_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|err| HubError::Internal(err.to_string()))?;
 
         // Ownership check: if a row exists and is already claimed by a
         // different external user, reject. A row with external_user_id = NULL
@@ -372,14 +369,13 @@ impl PgDeviceStore {
                 // missed it (row was inserted between our SELECT and
                 // the INSERT). Re-query outside the upsert to produce
                 // the correct DeviceOwnedByDifferentUser error.
-                let current: Option<String> = sqlx::query_scalar(
-                    "SELECT external_user_id FROM devices WHERE id = $1",
-                )
-                .bind(device_id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|err| HubError::Internal(err.to_string()))?
-                .flatten();
+                let current: Option<String> =
+                    sqlx::query_scalar("SELECT external_user_id FROM devices WHERE id = $1")
+                        .bind(device_id)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|err| HubError::Internal(err.to_string()))?
+                        .flatten();
                 return Err(HubError::DeviceOwnedByDifferentUser {
                     device_id: device_id.into(),
                     existing_external_user_id: current.unwrap_or_default(),

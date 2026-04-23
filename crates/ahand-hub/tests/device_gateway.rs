@@ -213,7 +213,10 @@ async fn daemon_heartbeats_keep_connection_online_past_staleness_timeout() {
             Err(_) => break,
         }
     }
-    assert!(forwarded >= 1, "expected at least one forwarded device.heartbeat event");
+    assert!(
+        forwarded >= 1,
+        "expected at least one forwarded device.heartbeat event"
+    );
 
     let _ = shutdown_tx.send(true);
     forwarder.await.unwrap();

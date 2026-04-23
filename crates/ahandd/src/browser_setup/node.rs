@@ -101,7 +101,10 @@ pub async fn ensure(
                 emit(
                     progress,
                     Phase::Done,
-                    format!("Node.js v{ver}.x already installed at {}", dirs.node.display()),
+                    format!(
+                        "Node.js v{ver}.x already installed at {}",
+                        dirs.node.display()
+                    ),
                 );
                 return Ok(inspect().await);
             }
@@ -117,7 +120,10 @@ pub async fn ensure(
     emit(
         progress,
         Phase::Starting,
-        format!("Installing Node.js v{NODE_LTS_VERSION} to {}", dirs.node.display()),
+        format!(
+            "Installing Node.js v{NODE_LTS_VERSION} to {}",
+            dirs.node.display()
+        ),
     );
 
     install_node(&dirs, progress).await.context(
@@ -135,7 +141,10 @@ pub async fn ensure(
     emit(
         progress,
         Phase::Done,
-        format!("Node.js v{NODE_LTS_VERSION} ready at {}", dirs.node.display()),
+        format!(
+            "Node.js v{NODE_LTS_VERSION} ready at {}",
+            dirs.node.display()
+        ),
     );
 
     Ok(inspect().await)
@@ -157,10 +166,7 @@ async fn read_node_major_version(node_bin: &Path) -> Option<u32> {
         .ok()
 }
 
-async fn install_node(
-    dirs: &Dirs,
-    progress: &(dyn Fn(ProgressEvent) + Send + Sync),
-) -> Result<()> {
+async fn install_node(dirs: &Dirs, progress: &(dyn Fn(ProgressEvent) + Send + Sync)) -> Result<()> {
     let (os, arch) = platform_info();
     let tarball = format!("node-v{NODE_LTS_VERSION}-{os}-{arch}.tar.xz");
     let url = format!("https://nodejs.org/dist/v{NODE_LTS_VERSION}/{tarball}");

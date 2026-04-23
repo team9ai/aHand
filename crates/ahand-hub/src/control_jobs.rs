@@ -210,7 +210,12 @@ impl ControlJobTracker {
 }
 
 fn correlation_key(external_user_id: &str, correlation_id: &str) -> String {
-    format!("{}:{}:{}", external_user_id.len(), external_user_id, correlation_id)
+    format!(
+        "{}:{}:{}",
+        external_user_id.len(),
+        external_user_id,
+        correlation_id
+    )
 }
 
 #[cfg(test)]
@@ -313,26 +318,11 @@ mod tests {
     #[test]
     fn publish_without_subscriber_is_noop() {
         let t = ControlJobTracker::new();
-        t.register(
-            "job-1".into(),
-            "dev".into(),
-            "user".into(),
-            None,
-        );
+        t.register("job-1".into(), "dev".into(), "user".into(), None);
         // No panic, and the event is silently dropped.
-        t.publish(
-            "job-1",
-            ControlJobEvent::Stdout {
-                chunk: "hi".into(),
-            },
-        );
+        t.publish("job-1", ControlJobEvent::Stdout { chunk: "hi".into() });
         // Publishing to an unknown job id is a no-op.
-        t.publish(
-            "nope",
-            ControlJobEvent::Stdout {
-                chunk: "hi".into(),
-            },
-        );
+        t.publish("nope", ControlJobEvent::Stdout { chunk: "hi".into() });
     }
 
     #[test]

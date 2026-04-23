@@ -125,8 +125,7 @@ impl WorkerHandle {
                     if delta.num_milliseconds() <= 0 {
                         Duration::from_millis(0)
                     } else {
-                        Duration::from_millis(delta.num_milliseconds() as u64)
-                            .min(MAX_IDLE_SLEEP)
+                        Duration::from_millis(delta.num_milliseconds() as u64).min(MAX_IDLE_SLEEP)
                     }
                 }
                 Ok(None) => MAX_IDLE_SLEEP,
@@ -160,25 +159,24 @@ async fn send_and_handle(
     http: reqwest::Client,
     delivery: WebhookDelivery,
 ) {
-    let payload: super::WebhookPayload =
-        match serde_json::from_value(delivery.payload.clone()) {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::error!(
-                    event_id = %delivery.event_id,
-                    error = %err,
-                    "webhook worker: corrupt payload, moving to DLQ",
-                );
-                dlq_and_delete(
-                    store.as_ref(),
-                    &config.dlq_path,
-                    &delivery,
-                    &format!("payload decode failed: {err}"),
-                )
-                .await;
-                return;
-            }
-        };
+    let payload: super::WebhookPayload = match serde_json::from_value(delivery.payload.clone()) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::error!(
+                event_id = %delivery.event_id,
+                error = %err,
+                "webhook worker: corrupt payload, moving to DLQ",
+            );
+            dlq_and_delete(
+                store.as_ref(),
+                &config.dlq_path,
+                &delivery,
+                &format!("payload decode failed: {err}"),
+            )
+            .await;
+            return;
+        }
+    };
 
     let outcome = send_once(
         &http,
@@ -218,8 +216,7 @@ async fn send_and_handle(
                 dlq_and_delete(store.as_ref(), &config.dlq_path, &delivery, &reason).await;
                 return;
             }
-            let backoff =
-                super::sender::backoff_secs(next_attempts as u32);
+            let backoff = super::sender::backoff_secs(next_attempts as u32);
             let next_retry_at = Utc::now() + chrono::Duration::seconds(backoff as i64);
             if let Err(err) = store
                 .mark_failed(&delivery.event_id, next_retry_at, next_attempts, &reason)
@@ -265,7 +262,12 @@ async fn dlq_and_delete(
             // Apply a back-off so we don't spin on a disk-full condition
             let backoff = chrono::Utc::now() + chrono::Duration::minutes(5);
             if let Err(store_err) = store
-                .mark_failed(&delivery.event_id, backoff, delivery.attempts, "dlq_write_failed")
+                .mark_failed(
+                    &delivery.event_id,
+                    backoff,
+                    delivery.attempts,
+                    "dlq_write_failed",
+                )
                 .await
             {
                 tracing::error!(

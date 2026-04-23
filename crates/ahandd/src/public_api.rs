@@ -187,10 +187,9 @@ impl PartialEq for DaemonStatus {
                 a == b
             }
             (DaemonStatus::Offline, DaemonStatus::Offline) => true,
-            (
-                DaemonStatus::Error { kind: ka, .. },
-                DaemonStatus::Error { kind: kb, .. },
-            ) => ka == kb,
+            (DaemonStatus::Error { kind: ka, .. }, DaemonStatus::Error { kind: kb, .. }) => {
+                ka == kb
+            }
             _ => false,
         }
     }
@@ -344,8 +343,11 @@ fn classify_error(e: &anyhow::Error) -> ErrorKind {
     // NOTE: This matches on error message substrings, which is brittle.
     // Prefer structured errors from ahand_client when those become available.
     // Auth errors: hub explicitly mentions 401/unauthorized/jwt rejection.
-    if s.contains("401") || s.contains("unauthorized") || s.contains("invalid jwt")
-        || s.contains("jwt expired") || s.contains("auth rejected")
+    if s.contains("401")
+        || s.contains("unauthorized")
+        || s.contains("invalid jwt")
+        || s.contains("jwt expired")
+        || s.contains("auth rejected")
     {
         return ErrorKind::Auth;
     }

@@ -463,10 +463,7 @@ mod tests {
         let _ = store.lease_due(Utc::now(), 10).await.unwrap();
 
         let future = Utc::now() + Duration::seconds(5);
-        store
-            .mark_failed("a", future, 1, "boom")
-            .await
-            .unwrap();
+        store.mark_failed("a", future, 1, "boom").await.unwrap();
 
         // Not due yet
         let leased = store.lease_due(Utc::now(), 10).await.unwrap();
@@ -534,9 +531,8 @@ mod tests {
         // available again once the lease expires. Tests override the
         // expiration window so we don't have to wait 5 wall-clock
         // minutes; production uses the default.
-        let store = MemoryWebhookDeliveryStore::with_lease_expiry(
-            chrono::Duration::milliseconds(50),
-        );
+        let store =
+            MemoryWebhookDeliveryStore::with_lease_expiry(chrono::Duration::milliseconds(50));
         store.enqueue(sample_delivery("a", -1)).await.unwrap();
 
         let leased = store.lease_due(Utc::now(), 10).await.unwrap();
@@ -567,9 +563,8 @@ mod tests {
         // A stale lease must not keep the row out of
         // `earliest_next_retry` — otherwise the worker would sleep
         // forever while a crashed-worker row sits waiting.
-        let store = MemoryWebhookDeliveryStore::with_lease_expiry(
-            chrono::Duration::milliseconds(30),
-        );
+        let store =
+            MemoryWebhookDeliveryStore::with_lease_expiry(chrono::Duration::milliseconds(30));
         store.enqueue(sample_delivery("a", -1)).await.unwrap();
         let _ = store.lease_due(Utc::now(), 10).await.unwrap();
 

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use ahand_hub_core::HubError;
 use ahand_hub_core::device::{Device, NewDevice};
 use ahand_hub_core::services::device_manager::DeviceManager;
 use ahand_hub_core::traits::DeviceStore;
-use ahand_hub_core::HubError;
 use async_trait::async_trait;
 
 struct FixedDeviceStore {

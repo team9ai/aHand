@@ -51,11 +51,17 @@ fn print_summary(reports: &[browser_setup::CheckReport]) {
             CheckStatus::Missing => {
                 println!("  {}: still missing", report.label);
             }
-            CheckStatus::Outdated { current, required, .. } => {
+            CheckStatus::Outdated {
+                current, required, ..
+            } => {
                 println!("  {}: {current} (need {required})", report.label);
             }
             CheckStatus::NoneDetected { tried } => {
-                println!("  {}: none detected (tried: {})", report.label, tried.join(", "));
+                println!(
+                    "  {}: none detected (tried: {})",
+                    report.label,
+                    tried.join(", ")
+                );
             }
         }
     }

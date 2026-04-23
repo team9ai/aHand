@@ -28,10 +28,7 @@ use crate::state::AppState;
 /// [`require_service_token`].
 pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/admin/devices",
-            post(pre_register).get(list_devices),
-        )
+        .route("/api/admin/devices", post(pre_register).get(list_devices))
         .route("/api/admin/devices/{id}", delete_method(delete_device))
         .route("/api/admin/devices/{id}/token", post(mint_device_token))
         .route(
@@ -189,9 +186,10 @@ async fn mint_device_token(
         .ttl_seconds
         .map(Duration::from_secs)
         .unwrap_or(Duration::ZERO);
-    let (token, expires_at) = state
-        .auth
-        .mint_device_jwt_with_external_user(&device.id, &external_user_id, ttl)?;
+    let (token, expires_at) =
+        state
+            .auth
+            .mint_device_jwt_with_external_user(&device.id, &external_user_id, ttl)?;
     Ok(Json(DeviceTokenResponse {
         token,
         device_id: device.id,
@@ -358,7 +356,9 @@ async fn list_devices(
         .devices
         .list_by_external_user(&query.external_user_id)
         .await?;
-    Ok(Json(devices.into_iter().map(AdminDeviceDto::from).collect()))
+    Ok(Json(
+        devices.into_iter().map(AdminDeviceDto::from).collect(),
+    ))
 }
 
 #[derive(Debug)]
@@ -437,4 +437,6 @@ impl From<HubError> for AdminError {
 
 /// Re-export for wiring with `ahand_hub_core::auth::verify_*` in tests
 /// and downstream tasks without leaking an extra dependency.
-pub use auth::{verify_control_plane_jwt as verify_control_plane, verify_device_jwt as verify_device};
+pub use auth::{
+    verify_control_plane_jwt as verify_control_plane, verify_device_jwt as verify_device,
+};

@@ -18,8 +18,8 @@ pub mod updater;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Context as _;
 use ahand_protocol::Envelope;
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use config::ConnectionMode;
 use tokio::signal::unix::{SignalKind, signal};

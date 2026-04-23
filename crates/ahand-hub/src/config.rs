@@ -111,12 +111,10 @@ impl Config {
                 .map(|value| value.parse())
                 .transpose()?
                 .unwrap_or(180_000),
-            device_expected_heartbeat_secs: getenv(
-                "AHAND_HUB_DEVICE_EXPECTED_HEARTBEAT_SECS",
-            )
-            .map(|value| value.parse())
-            .transpose()?
-            .unwrap_or(60),
+            device_expected_heartbeat_secs: getenv("AHAND_HUB_DEVICE_EXPECTED_HEARTBEAT_SECS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(60),
             device_presence_ttl_secs: getenv("AHAND_HUB_DEVICE_PRESENCE_TTL_SECS")
                 .map(|value| value.parse())
                 .transpose()?
@@ -146,8 +144,7 @@ impl Config {
                 .transpose()?
                 .unwrap_or(60 * 60 * 1000),
             webhook_url: getenv("AHAND_HUB_WEBHOOK_URL").filter(|v| !v.trim().is_empty()),
-            webhook_secret: getenv("AHAND_HUB_WEBHOOK_SECRET")
-                .filter(|v| !v.trim().is_empty()),
+            webhook_secret: getenv("AHAND_HUB_WEBHOOK_SECRET").filter(|v| !v.trim().is_empty()),
             webhook_max_retries: getenv("AHAND_HUB_WEBHOOK_MAX_RETRIES")
                 .map(|value| value.parse())
                 .transpose()?
@@ -495,7 +492,10 @@ mod tests {
             config.webhook_url.as_deref(),
             Some("https://gateway.example/webhook")
         );
-        assert_eq!(config.webhook_secret.as_deref(), Some("webhook-secret-value"));
+        assert_eq!(
+            config.webhook_secret.as_deref(),
+            Some("webhook-secret-value")
+        );
         assert_eq!(config.webhook_max_retries, 3);
         assert_eq!(config.webhook_max_concurrency, 12);
     }

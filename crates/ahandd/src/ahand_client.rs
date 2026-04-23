@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ahand_protocol::{
-    BrowserResponse, Envelope, Hello, HelloAccepted, HelloChallenge, Heartbeat, JobFinished,
+    BrowserResponse, Envelope, Heartbeat, Hello, HelloAccepted, HelloChallenge, JobFinished,
     JobRejected, envelope, hello,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -463,7 +463,9 @@ async fn connect_with_auth(
             }
             Some(envelope::Payload::StdinChunk(chunk)) => {
                 use crate::executor::StdinInput;
-                registry.send_stdin(&chunk.job_id, StdinInput::Data(chunk.data)).await;
+                registry
+                    .send_stdin(&chunk.job_id, StdinInput::Data(chunk.data))
+                    .await;
             }
             Some(envelope::Payload::TerminalResize(resize)) => {
                 use crate::executor::StdinInput;
@@ -1127,15 +1129,8 @@ mod tests {
 
     impl crate::executor::EnvelopeSink for CountingSink {
         fn send(&self, _envelope: Envelope) -> Result<(), ()> {
-            let n = self
-                .count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                + 1;
-            if n > self.fail_after {
-                Err(())
-            } else {
-                Ok(())
-            }
+            let n = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n > self.fail_after { Err(()) } else { Ok(()) }
         }
     }
 
@@ -1185,7 +1180,11 @@ mod tests {
         let joined = handle.await;
         // JoinHandle on aborted task resolves to JoinError::is_cancelled.
         assert!(
-            joined.as_ref().err().map(|e| e.is_cancelled()).unwrap_or(false),
+            joined
+                .as_ref()
+                .err()
+                .map(|e| e.is_cancelled())
+                .unwrap_or(false),
             "aborted heartbeat task should resolve as cancelled, got {joined:?}",
         );
     }

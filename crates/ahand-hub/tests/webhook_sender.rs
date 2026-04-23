@@ -15,9 +15,7 @@ use std::time::Duration;
 use ahand_hub::webhook::sender::{backoff_secs, sign, verify};
 use ahand_hub::webhook::worker::WorkerHandle;
 use ahand_hub::webhook::{Webhook, WebhookConfig, WebhookPayload};
-use ahand_hub_store::webhook_delivery_store::{
-    MemoryWebhookDeliveryStore, WebhookDeliveryStore,
-};
+use ahand_hub_store::webhook_delivery_store::{MemoryWebhookDeliveryStore, WebhookDeliveryStore};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
@@ -115,11 +113,7 @@ impl MockGateway {
     }
 }
 
-async fn handle(
-    State(state): State<MockState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> StatusCode {
+async fn handle(State(state): State<MockState>, headers: HeaderMap, body: Bytes) -> StatusCode {
     // Verify HMAC first. The real gateway must reject bad sigs with
     // 401; our mock does the same so a mis-signed payload round-trip
     // is observable.
@@ -159,13 +153,8 @@ fn make_webhook_and_worker(
     max_retries: u32,
     max_concurrency: usize,
     dlq_path: PathBuf,
-) -> (
-    Arc<Webhook>,
-    WorkerHandle,
-    Arc<dyn WebhookDeliveryStore>,
-) {
-    let store: Arc<dyn WebhookDeliveryStore> =
-        Arc::new(MemoryWebhookDeliveryStore::new());
+) -> (Arc<Webhook>, WorkerHandle, Arc<dyn WebhookDeliveryStore>) {
+    let store: Arc<dyn WebhookDeliveryStore> = Arc::new(MemoryWebhookDeliveryStore::new());
     let config = WebhookConfig {
         url: gateway_url.into(),
         secret: "s3cret-bytes".into(),
@@ -213,8 +202,7 @@ async fn happy_path_posts_signed_payload_and_deletes_row() {
     let secret = b"s3cret-bytes".to_vec();
     let gateway = MockGateway::start(MockMode::Ok, secret).await;
 
-    let (webhook, worker, store) =
-        make_webhook_and_worker(&gateway.url, 8, 4, dlq.clone());
+    let (webhook, worker, store) = make_webhook_and_worker(&gateway.url, 8, 4, dlq.clone());
     let worker_task = tokio::spawn(worker.run());
 
     webhook
@@ -246,10 +234,7 @@ async fn happy_path_posts_signed_payload_and_deletes_row() {
     let content_type = request.headers.get("content-type").unwrap();
     assert_eq!(content_type, "application/json");
     let ua = request.headers.get("user-agent").unwrap().to_str().unwrap();
-    assert!(
-        ua.starts_with("ahand-hub-webhook/"),
-        "unexpected UA: {ua}",
-    );
+    assert!(ua.starts_with("ahand-hub-webhook/"), "unexpected UA: {ua}",);
 
     let payload: WebhookPayload = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(payload.event_type, "device.online");
@@ -294,18 +279,18 @@ async fn event_timestamp_stable_across_retries() {
 
     // max_retries high enough that the second attempt still retries (does
     // not DLQ). First backoff is 2^1 = 2s.
-    let (webhook, worker, _store) =
-        make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
+    let (webhook, worker, _store) = make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
     let worker_task = tokio::spawn(worker.run());
 
-    webhook.enqueue_offline("device-retry-ts", None).await.unwrap();
+    webhook
+        .enqueue_offline("device-retry-ts", None)
+        .await
+        .unwrap();
 
     // Expect at least 2 delivery attempts: first immediate, second
     // after the ~2s backoff. Allow 8s of wall-clock for CI slack.
     assert!(
-        gateway
-            .wait_for_requests(2, Duration::from_secs(8))
-            .await,
+        gateway.wait_for_requests(2, Duration::from_secs(8)).await,
         "expected two delivery attempts"
     );
 
@@ -361,8 +346,7 @@ async fn server_error_schedules_retry_and_increments_attempts() {
         b"s3cret-bytes".to_vec(),
     )
     .await;
-    let (webhook, worker, store) =
-        make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
+    let (webhook, worker, store) = make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
     let worker_task = tokio::spawn(worker.run());
 
     webhook.enqueue_offline("device-1", None).await.unwrap();
@@ -403,8 +387,7 @@ async fn retries_exhausted_moves_row_to_dlq() {
         b"s3cret-bytes".to_vec(),
     )
     .await;
-    let (webhook, worker, store) =
-        make_webhook_and_worker(&gateway.url, 2, 2, dlq.clone());
+    let (webhook, worker, store) = make_webhook_and_worker(&gateway.url, 2, 2, dlq.clone());
     let worker_task = tokio::spawn(worker.run());
 
     webhook.enqueue_offline("device-1", None).await.unwrap();
@@ -417,12 +400,7 @@ async fn retries_exhausted_moves_row_to_dlq() {
     let dlq_lines = read_dlq_lines(&dlq).await;
     assert_eq!(dlq_lines.len(), 1);
     assert_eq!(dlq_lines[0]["payload"]["eventType"], "device.offline");
-    assert!(
-        dlq_lines[0]["lastError"]
-            .as_str()
-            .unwrap()
-            .contains("500"),
-    );
+    assert!(dlq_lines[0]["lastError"].as_str().unwrap().contains("500"),);
 
     // A subsequent enqueue after DLQ draining must still work.
     webhook.enqueue_offline("device-2", None).await.unwrap();
@@ -450,8 +428,7 @@ async fn unauthorized_moves_row_to_dlq_without_retry() {
         b"s3cret-bytes".to_vec(),
     )
     .await;
-    let (webhook, worker, store) =
-        make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
+    let (webhook, worker, store) = make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
     let worker_task = tokio::spawn(worker.run());
 
     webhook.enqueue_offline("device-1", None).await.unwrap();
@@ -461,12 +438,7 @@ async fn unauthorized_moves_row_to_dlq_without_retry() {
     assert_eq!(gateway.received().await.len(), 1);
     let dlq_lines = read_dlq_lines(&dlq).await;
     assert_eq!(dlq_lines.len(), 1);
-    assert!(
-        dlq_lines[0]["lastError"]
-            .as_str()
-            .unwrap()
-            .contains("401"),
-    );
+    assert!(dlq_lines[0]["lastError"].as_str().unwrap().contains("401"),);
 
     worker_task.abort();
     gateway.shutdown();
@@ -487,8 +459,7 @@ async fn too_many_requests_retries_with_backoff() {
         b"s3cret-bytes".to_vec(),
     )
     .await;
-    let (webhook, worker, store) =
-        make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
+    let (webhook, worker, store) = make_webhook_and_worker(&gateway.url, 8, 2, dlq.clone());
     let worker_task = tokio::spawn(worker.run());
 
     webhook.enqueue_offline("device-1", None).await.unwrap();
@@ -524,8 +495,7 @@ async fn signature_mismatch_is_detected_by_receiver() {
     remove_file_quiet(&dlq).await;
     let gateway = MockGateway::start(MockMode::Ok, b"correct-secret".to_vec()).await;
 
-    let store: Arc<dyn WebhookDeliveryStore> =
-        Arc::new(MemoryWebhookDeliveryStore::new());
+    let store: Arc<dyn WebhookDeliveryStore> = Arc::new(MemoryWebhookDeliveryStore::new());
     let config = WebhookConfig {
         url: gateway.url.clone(),
         secret: "wrong-secret".into(),
@@ -565,8 +535,7 @@ async fn concurrent_enqueue_is_bounded_by_semaphore() {
     // them through a 5-permit semaphore. The success path still
     // drains every row, so we just assert the mock received 100
     // and the store emptied.
-    let (webhook, worker, store) =
-        make_webhook_and_worker(&gateway.url, 8, 5, dlq.clone());
+    let (webhook, worker, store) = make_webhook_and_worker(&gateway.url, 8, 5, dlq.clone());
     let worker_task = tokio::spawn(worker.run());
 
     for n in 0..100 {
@@ -576,7 +545,11 @@ async fn concurrent_enqueue_is_bounded_by_semaphore() {
             .unwrap();
     }
 
-    assert!(gateway.wait_for_requests(100, Duration::from_secs(10)).await);
+    assert!(
+        gateway
+            .wait_for_requests(100, Duration::from_secs(10))
+            .await
+    );
     wait_for_store_len(&store, 0, Duration::from_secs(10)).await;
 
     worker_task.abort();
@@ -651,11 +624,13 @@ async fn dlq_write_failure_applies_backoff_not_spin() {
 
     // max_retries=1 means the very first (and only) failed send triggers
     // the DLQ path: next_attempts(1) >= max_retries(1).
-    let (webhook, worker, store) =
-        make_webhook_and_worker(unreachable_url, 1, 2, bad_dlq.clone());
+    let (webhook, worker, store) = make_webhook_and_worker(unreachable_url, 1, 2, bad_dlq.clone());
     let worker_task = tokio::spawn(worker.run());
 
-    webhook.enqueue_offline("device-dlq-fail", None).await.unwrap();
+    webhook
+        .enqueue_offline("device-dlq-fail", None)
+        .await
+        .unwrap();
 
     // Wait for the row to stay in the store AND have last_error="dlq_write_failed",
     // meaning the back-off mark_failed was applied.
@@ -663,16 +638,18 @@ async fn dlq_write_failure_applies_backoff_not_spin() {
     let end = tokio::time::Instant::now() + deadline;
     let row = loop {
         let leased = store
-            .lease_due(
-                chrono::Utc::now() + chrono::Duration::seconds(7200),
-                10,
-            )
+            .lease_due(chrono::Utc::now() + chrono::Duration::seconds(7200), 10)
             .await
             .unwrap();
         // Release each row so we don't interfere with the worker.
         for r in &leased {
             let _ = store
-                .mark_failed(&r.event_id, r.next_retry_at, r.attempts, r.last_error.as_deref().unwrap_or(""))
+                .mark_failed(
+                    &r.event_id,
+                    r.next_retry_at,
+                    r.attempts,
+                    r.last_error.as_deref().unwrap_or(""),
+                )
                 .await;
         }
         if let Some(r) = leased
@@ -739,10 +716,7 @@ async fn wait_for_attempts(
     let end = tokio::time::Instant::now() + deadline;
     loop {
         let leased = store
-            .lease_due(
-                chrono::Utc::now() + chrono::Duration::seconds(3600),
-                10,
-            )
+            .lease_due(chrono::Utc::now() + chrono::Duration::seconds(3600), 10)
             .await
             .unwrap();
         // Immediately release by marking failed with the same
@@ -761,9 +735,7 @@ async fn wait_for_attempts(
             return row;
         }
         if tokio::time::Instant::now() >= end {
-            panic!(
-                "attempts never reached {want} within {deadline:?} (leased={leased:?})",
-            );
+            panic!("attempts never reached {want} within {deadline:?} (leased={leased:?})",);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

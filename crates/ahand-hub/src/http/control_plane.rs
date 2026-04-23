@@ -78,7 +78,11 @@ async fn require_control_plane_jwt(
 }
 
 fn header_bearer(value: &HeaderValue) -> Option<String> {
-    value.to_str().ok()?.strip_prefix("Bearer ").map(String::from)
+    value
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+        .map(String::from)
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,12 +125,9 @@ async fn create_job(
         return Err(ControlError::Forbidden);
     }
 
-    let Json(req) =
-        body.map_err(|_| ControlError::BadRequest("invalid JSON body".into()))?;
+    let Json(req) = body.map_err(|_| ControlError::BadRequest("invalid JSON body".into()))?;
     if req.tool.trim().is_empty() {
-        return Err(ControlError::BadRequest(
-            "tool must not be empty".into(),
-        ));
+        return Err(ControlError::BadRequest("tool must not be empty".into()));
     }
     if req.device_id.is_empty() {
         return Err(ControlError::BadRequest(
@@ -177,10 +178,7 @@ async fn create_job(
             .control_jobs
             .find_by_correlation(&claims.external_user_id, cid)
     {
-        return Ok((
-            StatusCode::OK,
-            Json(CreateJobResponse { job_id: existing }),
-        ));
+        return Ok((StatusCode::OK, Json(CreateJobResponse { job_id: existing })));
     }
 
     let job_id = ulid::Ulid::new().to_string();
@@ -309,8 +307,11 @@ async fn stream_job(
         }
     };
 
-    Ok(Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keepalive")))
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
 }
 
 fn render_sse_event(event: &ControlJobEvent) -> Event {
@@ -326,14 +327,8 @@ fn render_sse_event(event: &ControlJobEvent) -> Event {
     // the `data` field — dropping the `event` tag that serde would
     // otherwise include.
     let (name, payload) = match event {
-        ControlJobEvent::Stdout { chunk } => (
-            "stdout",
-            serde_json::json!({ "chunk": chunk }),
-        ),
-        ControlJobEvent::Stderr { chunk } => (
-            "stderr",
-            serde_json::json!({ "chunk": chunk }),
-        ),
+        ControlJobEvent::Stdout { chunk } => ("stdout", serde_json::json!({ "chunk": chunk })),
+        ControlJobEvent::Stderr { chunk } => ("stderr", serde_json::json!({ "chunk": chunk })),
         ControlJobEvent::Progress { percent, message } => (
             "progress",
             match message {
@@ -461,12 +456,8 @@ mod render_tests {
     #[test]
     fn all_event_variants_render_without_panic() {
         for ev in [
-            ControlJobEvent::Stdout {
-                chunk: "x".into(),
-            },
-            ControlJobEvent::Stderr {
-                chunk: "y".into(),
-            },
+            ControlJobEvent::Stdout { chunk: "x".into() },
+            ControlJobEvent::Stderr { chunk: "y".into() },
             ControlJobEvent::Progress {
                 percent: 0,
                 message: None,
@@ -521,11 +512,7 @@ impl IntoResponse for ControlError {
                 "FORBIDDEN",
                 "Control-plane JWT does not grant access to this device".to_string(),
             ),
-            ControlError::BadRequest(msg) => (
-                StatusCode::BAD_REQUEST,
-                "VALIDATION_ERROR",
-                msg,
-            ),
+            ControlError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR", msg),
             ControlError::DeviceNotFound => (
                 StatusCode::NOT_FOUND,
                 "DEVICE_NOT_FOUND",

@@ -1,8 +1,6 @@
 use anyhow::Result;
 
-use crate::browser_setup::{
-    self, CheckReport, CheckStatus, FixHint, PlatformCommand,
-};
+use crate::browser_setup::{self, CheckReport, CheckStatus, FixHint, PlatformCommand};
 
 /// Entry point for `ahandd browser-doctor`.
 pub async fn run() -> Result<()> {
@@ -39,7 +37,11 @@ pub async fn run() -> Result<()> {
 
 fn print_check(report: &CheckReport) {
     let (marker, line) = match &report.status {
-        CheckStatus::Ok { version, path, source } => {
+        CheckStatus::Ok {
+            version,
+            path,
+            source,
+        } => {
             let suffix = match source {
                 crate::browser_setup::CheckSource::Managed => String::new(),
                 crate::browser_setup::CheckSource::System => " (system)".into(),
@@ -63,7 +65,11 @@ fn print_check(report: &CheckReport) {
             "[\u{2717}]",
             format!("{:<17} not found", format!("{}:", report.label)),
         ),
-        CheckStatus::Outdated { current, required, path } => (
+        CheckStatus::Outdated {
+            current,
+            required,
+            path,
+        } => (
             "[\u{2717}]",
             format!(
                 "{:<17} {current} (need {required}) at {}",

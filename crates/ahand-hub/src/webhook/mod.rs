@@ -172,8 +172,13 @@ impl Webhook {
         device_id: &str,
         external_user_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.enqueue_typed("device.online", device_id, external_user_id, serde_json::json!({}))
-            .await
+        self.enqueue_typed(
+            "device.online",
+            device_id,
+            external_user_id,
+            serde_json::json!({}),
+        )
+        .await
     }
 
     /// Enqueue a `device.offline` event. Noops when disabled.
@@ -182,8 +187,13 @@ impl Webhook {
         device_id: &str,
         external_user_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.enqueue_typed("device.offline", device_id, external_user_id, serde_json::json!({}))
-            .await
+        self.enqueue_typed(
+            "device.offline",
+            device_id,
+            external_user_id,
+            serde_json::json!({}),
+        )
+        .await
     }
 
     /// Enqueue a `device.heartbeat` event. `sent_at_ms` is the

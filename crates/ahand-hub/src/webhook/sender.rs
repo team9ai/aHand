@@ -63,7 +63,10 @@ pub fn sign(secret: &[u8], timestamp_secs: u64, raw_body: &[u8]) -> String {
 pub fn verify(secret: &[u8], timestamp_secs: u64, raw_body: &[u8], signature_header: &str) -> bool {
     use subtle::ConstantTimeEq;
     let expected = sign(secret, timestamp_secs, raw_body);
-    expected.as_bytes().ct_eq(signature_header.as_bytes()).into()
+    expected
+        .as_bytes()
+        .ct_eq(signature_header.as_bytes())
+        .into()
 }
 
 /// POST the payload once. No retries, no store mutation — pure I/O.

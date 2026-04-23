@@ -377,7 +377,12 @@ mod tests {
             iat: (now - ChronoDuration::seconds(310)).timestamp(),
             token_type: TokenType::Device,
         };
-        let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET)).unwrap();
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(SECRET),
+        )
+        .unwrap();
         let err = verify_device_jwt(SECRET, &token).unwrap_err();
         assert!(matches!(err, HubError::InvalidToken(_)));
     }
@@ -404,8 +409,12 @@ mod tests {
             iat: now.timestamp(),
             token_type: TokenType::Device,
         };
-        let token =
-            encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET)).unwrap();
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(SECRET),
+        )
+        .unwrap();
         let err = verify_device_jwt(SECRET, &token).unwrap_err();
         assert!(matches!(err, HubError::InvalidToken(_)));
     }
@@ -432,8 +441,12 @@ mod tests {
             iat: now.timestamp(),
             token_type: TokenType::ControlPlane,
         };
-        let token =
-            encode(&Header::default(), &claims, &EncodingKey::from_secret(SECRET)).unwrap();
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(SECRET),
+        )
+        .unwrap();
         let err = verify_control_plane_jwt(SECRET, &token).unwrap_err();
         assert!(matches!(err, HubError::InvalidToken(_)));
     }
@@ -442,11 +455,7 @@ mod tests {
     fn auth_service_admin_wrapper_matches_free_functions() {
         let service = AuthService::new("unit-test-secret");
         let (token, _) = service
-            .mint_device_jwt_with_external_user(
-                "device-1",
-                "user-9",
-                Duration::from_secs(60),
-            )
+            .mint_device_jwt_with_external_user("device-1", "user-9", Duration::from_secs(60))
             .unwrap();
         let claims = service.verify_device_jwt(&token).unwrap();
         assert_eq!(claims.sub, "device-1");
@@ -462,13 +471,20 @@ mod tests {
             .unwrap();
         let cp_claims = service.verify_control_plane_jwt(&cp_token).unwrap();
         assert_eq!(cp_claims.external_user_id, "user-9");
-        assert_eq!(cp_claims.device_ids.as_deref().unwrap(), &["d1".to_string()]);
+        assert_eq!(
+            cp_claims.device_ids.as_deref().unwrap(),
+            &["d1".to_string()]
+        );
     }
 
     #[test]
     fn clamp_ttl_uses_default_for_zero() {
         assert_eq!(
-            clamp_ttl(Duration::ZERO, Duration::from_secs(5), Duration::from_secs(10)),
+            clamp_ttl(
+                Duration::ZERO,
+                Duration::from_secs(5),
+                Duration::from_secs(10)
+            ),
             Duration::from_secs(5)
         );
     }
@@ -488,7 +504,11 @@ mod tests {
     #[test]
     fn clamp_ttl_passes_through_in_range() {
         assert_eq!(
-            clamp_ttl(Duration::from_secs(7), Duration::from_secs(5), Duration::from_secs(10)),
+            clamp_ttl(
+                Duration::from_secs(7),
+                Duration::from_secs(5),
+                Duration::from_secs(10)
+            ),
             Duration::from_secs(7)
         );
     }

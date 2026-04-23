@@ -411,9 +411,7 @@ where
             warn!(job_id = %job_id, error = %e, "pty job join error");
             finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store)
         }
-        None => {
-            finish(&device_id, &job_id, -1, "unknown error", &tx, &store)
-        }
+        None => finish(&device_id, &job_id, -1, "unknown error", &tx, &store),
     }
 }
 

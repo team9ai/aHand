@@ -70,13 +70,9 @@ async fn payload_data_varies_by_event_type() {
         .enqueue_heartbeat("device-1", None, 99, 180)
         .await
         .unwrap();
-    let rows = store
-        .lease_due(chrono::Utc::now(), 10)
-        .await
-        .unwrap();
+    let rows = store.lease_due(chrono::Utc::now(), 10).await.unwrap();
     assert_eq!(rows.len(), 1);
-    let payload: WebhookPayload =
-        serde_json::from_value(rows[0].payload.clone()).unwrap();
+    let payload: WebhookPayload = serde_json::from_value(rows[0].payload.clone()).unwrap();
     assert_eq!(payload.event_type, "device.heartbeat");
     assert_eq!(payload.data["sentAtMs"], 99);
     assert_eq!(payload.data["presenceTtlSeconds"], 180);

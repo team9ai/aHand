@@ -17,9 +17,9 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahand_hub::events::DashboardEvent;
 use ahand_hub_core::auth::{verify_control_plane_jwt, verify_device_jwt};
 use ahand_hub_core::traits::DeviceAdminStore;
-use ahand_hub::events::DashboardEvent;
 use base64::Engine;
 use futures_util::SinkExt;
 use prost::Message;
@@ -28,8 +28,8 @@ use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use support::{
-    read_hello_accepted, read_hello_challenge, signed_hello, spawn_server_with_state, test_state,
-    test_state_with_webhook, TestServer,
+    TestServer, read_hello_accepted, read_hello_challenge, signed_hello, spawn_server_with_state,
+    test_state, test_state_with_webhook,
 };
 
 const JWT_SECRET: &[u8] = b"service-test-secret";
@@ -481,7 +481,10 @@ async fn delete_device_kicks_ws_emits_event_and_returns_204() {
     drain(&mut events_rx).await;
 
     let deleted = reqwest::Client::new()
-        .delete(format!("{}/api/admin/devices/rev-dev", server.http_base_url()))
+        .delete(format!(
+            "{}/api/admin/devices/rev-dev",
+            server.http_base_url()
+        ))
         .bearer_auth(SERVICE_TOKEN)
         .send()
         .await
@@ -506,7 +509,10 @@ async fn delete_device_kicks_ws_emits_event_and_returns_204() {
 
     // Second delete → 404.
     let gone = reqwest::Client::new()
-        .delete(format!("{}/api/admin/devices/rev-dev", server.http_base_url()))
+        .delete(format!(
+            "{}/api/admin/devices/rev-dev",
+            server.http_base_url()
+        ))
         .bearer_auth(SERVICE_TOKEN)
         .send()
         .await
@@ -543,7 +549,10 @@ async fn delete_active_ws_device_signals_close() {
     // Some(device), existing_user is None, delete_device returns true,
     // kick_device fires close signal, event emitted with externalUserId=null.
     let resp = reqwest::Client::new()
-        .delete(format!("{}/api/admin/devices/device-1", server.http_base_url()))
+        .delete(format!(
+            "{}/api/admin/devices/device-1",
+            server.http_base_url()
+        ))
         .bearer_auth(SERVICE_TOKEN)
         .send()
         .await
@@ -728,10 +737,7 @@ async fn pre_register_concurrent_first_insert_is_idempotent() {
             "task {i} returned different external_user_id"
         );
         assert_eq!(device.id, "concurrent-dev-1");
-        assert_eq!(
-            device.external_user_id.as_deref(),
-            Some("user-concurrent")
-        );
+        assert_eq!(device.external_user_id.as_deref(), Some("user-concurrent"));
     }
 
     server.shutdown().await;
@@ -890,10 +896,7 @@ async fn pre_register_emits_device_registered_webhook() {
         // worker is mid-send. Release them by marking-failed with
         // their own attempts/next_retry_at so the worker can retry.
         let rows = store
-            .lease_due(
-                chrono::Utc::now() + chrono::Duration::seconds(3600),
-                10,
-            )
+            .lease_due(chrono::Utc::now() + chrono::Duration::seconds(3600), 10)
             .await
             .unwrap();
         for row in &rows {

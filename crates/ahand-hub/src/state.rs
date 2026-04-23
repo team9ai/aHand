@@ -9,7 +9,6 @@ use ahand_hub_core::services::device_manager::DeviceManager;
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceAdminStore, DeviceStore, JobStore};
 use ahand_hub_core::{HubError, Result};
-use chrono::{DateTime, Utc};
 use ahand_hub_store::audit_store::PgAuditStore;
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::device_store::PgDeviceStore;
@@ -21,6 +20,7 @@ use ahand_hub_store::webhook_delivery_store::{
     MemoryWebhookDeliveryStore, PgWebhookDeliveryStore, WebhookDeliveryStore,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use dashmap::{DashMap, mapref::entry::Entry};
 use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
 
@@ -55,7 +55,8 @@ pub struct AppState {
     pub control_jobs: Arc<crate::control_jobs::ControlJobTracker>,
     pub control_rate_limiter: Arc<ControlPlaneRateLimiter>,
     pub connections: Arc<crate::ws::device_gateway::ConnectionRegistry>,
-    pub browser_pending: Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::BrowserResponse>>>,
+    pub browser_pending:
+        Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::BrowserResponse>>>,
     pub events: Arc<crate::events::EventBus>,
     pub output_stream: Arc<crate::output_stream::OutputStream>,
     pub bootstrap_tokens: Arc<crate::bootstrap::BootstrapCredentials>,
@@ -107,8 +108,7 @@ impl AppState {
                 None,
                 None,
                 crate::bootstrap::BootstrapCredentials::memory(),
-                Arc::new(MemoryWebhookDeliveryStore::new())
-                    as Arc<dyn WebhookDeliveryStore>,
+                Arc::new(MemoryWebhookDeliveryStore::new()) as Arc<dyn WebhookDeliveryStore>,
             ),
             crate::config::StoreConfig::Persistent {
                 database_url,
@@ -133,8 +133,7 @@ impl AppState {
                         bootstrap_redis,
                         bootstrap_reservation_ttl,
                     )),
-                    Arc::new(PgWebhookDeliveryStore::new(pool))
-                        as Arc<dyn WebhookDeliveryStore>,
+                    Arc::new(PgWebhookDeliveryStore::new(pool)) as Arc<dyn WebhookDeliveryStore>,
                 )
             }
         };

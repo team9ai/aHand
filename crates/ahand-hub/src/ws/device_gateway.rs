@@ -821,8 +821,11 @@ fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Env
             let Some(channels) = state.control_jobs.get(&finished.job_id) else {
                 return false;
             };
-            let duration_ms = channels.started_at.elapsed().as_millis().min(u64::MAX as u128)
-                as u64;
+            let duration_ms = channels
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
             // `error == "cancelled"` and non-zero exit_code are the
             // two ways a job can fail. We report them as an `error`
             // event so the SDK can distinguish graceful completion
