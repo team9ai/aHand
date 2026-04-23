@@ -1,5 +1,5 @@
 {
-  "name": "@ahand/proto",
+  "name": "@ahandai/proto",
   "version": "0.1.2",
   "description": "ts-proto generated types for ahand protocol",
   "main": "dist/index.js",

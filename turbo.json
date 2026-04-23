@@ -63,7 +63,7 @@
 
     // ── Proto (TypeScript) ── source of truth for TS types ───────────
     //  generate → build, then SDK and dev-cloud depend on it.
-    "@ahand/proto#build": {
+    "@ahandai/proto#build": {
       "dependsOn": [
         "generate"
       ],
@@ -77,7 +77,7 @@
       ]
     },
     // ── SDK ── depends on proto ──────────────────────────────────────
-    "@ahand/sdk#test": {
+    "@ahandai/sdk#test": {
       "dependsOn": [
         "build"
       ],

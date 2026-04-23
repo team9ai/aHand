@@ -4,7 +4,7 @@ import type {
   JobFinished as JobFinishedMsg,
   JobRejected as JobRejectedMsg,
   ApprovalRequest as ApprovalRequestMsg,
-} from "@ahand/proto";
+} from "@ahandai/proto";
 
 export interface JobResult {
   exitCode: number;
