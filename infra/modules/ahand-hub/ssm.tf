@@ -89,9 +89,12 @@ resource "aws_ssm_parameter" "device_bootstrap_device_id" {
 }
 
 resource "aws_ssm_parameter" "webhook_url" {
-  name  = "/ahand-hub/${var.env}/WEBHOOK_URL"
-  type  = "String"
-  value = "${var.gateway_public_url}/api/ahand/hub-webhook"
+  name = "/ahand-hub/${var.env}/WEBHOOK_URL"
+  type = "String"
+  # Gateway uses NestJS URI versioning (defaultVersion='1') so the
+  # controller path resolves under /api/v1/ahand/hub-webhook, not
+  # /api/ahand/...
+  value = "${var.gateway_public_url}/api/v1/ahand/hub-webhook"
   tags  = local.common_tags
 }
 

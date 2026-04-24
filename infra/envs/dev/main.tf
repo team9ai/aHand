@@ -12,7 +12,12 @@ module "ahand_hub" {
   vpc_id                     = var.vpc_id
   subnet_ids                 = var.subnet_ids
   traefik_security_group_id  = var.traefik_security_group_id
-  gateway_public_url         = "https://gateway.dev.team9.ai"
+  # Note: team9 gateway is at api.dev.team9.ai (not gateway.dev.*). Path
+  # is /api/v1/ahand/hub-webhook because the gateway has URI versioning
+  # with defaultVersion='1'. The ssm.tf module concats ${gateway_public_url}
+  # with the webhook path; set this to the BASE (no path), which the
+  # module already expects.
+  gateway_public_url         = "https://api.dev.team9.ai"
   redis_mode                 = "create"
 }
 
