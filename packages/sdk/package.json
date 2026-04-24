@@ -1,7 +1,8 @@
 {
   "name": "@ahandai/sdk",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "AHand cloud control plane SDK",
+  "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": [
