@@ -1122,3 +1122,18 @@ async fn control_browser_404_device_offline_on_send_failure() {
     //      `map_service_error` in `http/browser.rs:127-131`).
     panic!("see #[ignore] reason — test stub only");
 }
+
+#[tokio::test]
+#[ignore = "Requires fault-injecting DeviceStore (no test surface today). \
+  Unblock condition: refactor MemoryDeviceStore to support fault injection, \
+  or introduce a trait with a mock that returns Err on get(). \
+  This stub keeps the gap visible."]
+async fn control_browser_500_when_device_store_errors() {
+    // Sketch (not runnable today):
+    // 1. Build harness with a DeviceStore that returns Err on get(deviceId).
+    // 2. Mint a control-plane JWT.
+    // 3. POST /api/control/browser.
+    // 4. Assert: status == 500, error.code == "INTERNAL_ERROR".
+    // 5. Verify tracing::error! captured the raw HubError.
+    panic!("Stub — see #[ignore] reason");
+}

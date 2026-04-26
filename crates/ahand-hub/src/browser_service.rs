@@ -126,7 +126,7 @@ pub async fn execute(
                 device_id = %input.device_id,
                 "device store lookup failed",
             );
-            BrowserServiceError::Internal("device store error".to_string())
+            BrowserServiceError::Internal("Internal server error".to_string())
         })?
         .ok_or_else(|| BrowserServiceError::DeviceNotFound {
             device_id: input.device_id.clone(),
