@@ -40,12 +40,7 @@ fn encode_key(bytes: &[u8]) -> String {
 }
 
 async fn drain(rx: &mut broadcast::Receiver<DashboardEvent>) {
-    loop {
-        match tokio::time::timeout(Duration::from_millis(30), rx.recv()).await {
-            Ok(Ok(_)) => continue,
-            _ => break,
-        }
-    }
+    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(30), rx.recv()).await {}
 }
 
 async fn wait_for_event(

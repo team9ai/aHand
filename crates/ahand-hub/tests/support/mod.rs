@@ -398,14 +398,11 @@ impl TestDevice {
     pub async fn recv_job_request(&mut self) -> JobRequest {
         while let Some(message) = self.socket.next().await {
             let message = message.unwrap();
-            match message {
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    let envelope = Envelope::decode(data.as_ref()).unwrap();
-                    if let Some(envelope::Payload::JobRequest(job)) = envelope.payload {
-                        return job;
-                    }
+            if let tokio_tungstenite::tungstenite::Message::Binary(data) = message {
+                let envelope = Envelope::decode(data.as_ref()).unwrap();
+                if let Some(envelope::Payload::JobRequest(job)) = envelope.payload {
+                    return job;
                 }
-                _ => {}
             }
         }
 
@@ -456,14 +453,11 @@ impl TestDevice {
     pub async fn recv_browser_request(&mut self) -> BrowserRequest {
         while let Some(message) = self.socket.next().await {
             let message = message.unwrap();
-            match message {
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    let envelope = Envelope::decode(data.as_ref()).unwrap();
-                    if let Some(envelope::Payload::BrowserRequest(req)) = envelope.payload {
-                        return req;
-                    }
+            if let tokio_tungstenite::tungstenite::Message::Binary(data) = message {
+                let envelope = Envelope::decode(data.as_ref()).unwrap();
+                if let Some(envelope::Payload::BrowserRequest(req)) = envelope.payload {
+                    return req;
                 }
-                _ => {}
             }
         }
         panic!("device socket closed before a browser request arrived");
@@ -488,14 +482,11 @@ impl TestDevice {
     pub async fn recv_cancel_request(&mut self) -> CancelJob {
         while let Some(message) = self.socket.next().await {
             let message = message.unwrap();
-            match message {
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    let envelope = Envelope::decode(data.as_ref()).unwrap();
-                    if let Some(envelope::Payload::CancelJob(cancel)) = envelope.payload {
-                        return cancel;
-                    }
+            if let tokio_tungstenite::tungstenite::Message::Binary(data) = message {
+                let envelope = Envelope::decode(data.as_ref()).unwrap();
+                if let Some(envelope::Payload::CancelJob(cancel)) = envelope.payload {
+                    return cancel;
                 }
-                _ => {}
             }
         }
 

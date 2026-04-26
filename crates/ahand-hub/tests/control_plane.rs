@@ -638,7 +638,7 @@ async fn rate_limit_returns_429() {
         }
     }
     assert!(
-        statuses.iter().any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
         "expected at least one 429 in {statuses:?}"
     );
     server.shutdown().await;
@@ -695,7 +695,7 @@ async fn stream_job_rate_limited_returns_429() {
         }
     }
     assert!(
-        statuses.iter().any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
         "expected at least one 429 in {statuses:?}"
     );
 
@@ -748,7 +748,7 @@ async fn cancel_job_rate_limited_returns_429() {
         }
     }
     assert!(
-        statuses.iter().any(|s| *s == StatusCode::TOO_MANY_REQUESTS),
+        statuses.contains(&StatusCode::TOO_MANY_REQUESTS),
         "expected at least one 429 in {statuses:?}"
     );
 

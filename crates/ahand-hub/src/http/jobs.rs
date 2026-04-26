@@ -256,17 +256,16 @@ impl JobRuntime {
                     self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
                 }
-                if job.status != JobStatus::Running {
-                    if let Err(err) = self
+                if job.status != JobStatus::Running
+                    && let Err(err) = self
                         .transition_job(
                             &finished.job_id,
                             JobStatus::Running,
                             &format!("device:{device_id}"),
                         )
                         .await
-                    {
-                        return self.handle_stale_device_frame_error(device_id, seq, ack, err);
-                    }
+                {
+                    return self.handle_stale_device_frame_error(device_id, seq, ack, err);
                 }
                 let status = if finished.error == "cancelled" {
                     JobStatus::Cancelled

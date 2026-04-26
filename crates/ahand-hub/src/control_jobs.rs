@@ -190,11 +190,11 @@ impl ControlJobTracker {
             // Only remove if the correlation entry still points at
             // this job id — a later POST under the same correlation
             // id may have been rejected earlier, but defense in depth.
-            if let Some(existing) = self.correlation_index.get(&key) {
-                if existing.value() == job_id {
-                    drop(existing);
-                    self.correlation_index.remove(&key);
-                }
+            if let Some(existing) = self.correlation_index.get(&key)
+                && existing.value() == job_id
+            {
+                drop(existing);
+                self.correlation_index.remove(&key);
             }
         }
     }

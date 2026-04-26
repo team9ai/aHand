@@ -18,7 +18,7 @@
 //! for both audit and webhook DLQ, so we derive a sibling filename
 //! rather than insisting on a separate env var.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -311,7 +311,7 @@ async fn append_dlq(
 /// Given `/var/lib/ahand-hub/audit-fallback.jsonl`, returns
 /// `/var/lib/ahand-hub/webhook_dlq.jsonl`. If the input is a file
 /// (no parent), returns `webhook_dlq.jsonl` in the cwd-equivalent.
-pub fn dlq_path_from_audit_fallback(audit_fallback: &PathBuf) -> PathBuf {
+pub fn dlq_path_from_audit_fallback(audit_fallback: &Path) -> PathBuf {
     match audit_fallback.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.join("webhook_dlq.jsonl"),
         _ => PathBuf::from("webhook_dlq.jsonl"),

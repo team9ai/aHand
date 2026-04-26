@@ -162,10 +162,10 @@ async fn create_job(
         return Err(ControlError::Forbidden);
     }
     // Enforce device_ids allowlist if the token is scoped to specific devices.
-    if let Some(allowed) = &claims.device_ids {
-        if !allowed.contains(&req.device_id) {
-            return Err(ControlError::Forbidden);
-        }
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&req.device_id)
+    {
+        return Err(ControlError::Forbidden);
     }
     if !state.connections.is_online(&device.id) {
         return Err(ControlError::DeviceOffline);
@@ -261,10 +261,10 @@ async fn stream_job(
         return Err(ControlError::JobNotFound);
     }
     // Enforce device_ids allowlist if the token is scoped to specific devices.
-    if let Some(allowed) = &claims.device_ids {
-        if !allowed.contains(&channels.device_id) {
-            return Err(ControlError::Forbidden);
-        }
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&channels.device_id)
+    {
+        return Err(ControlError::Forbidden);
     }
     let mut rx = channels.subscribe();
     // Release the per-entry Arc so the entry can be dropped when
@@ -383,10 +383,10 @@ async fn cancel_job(
         return Err(ControlError::JobNotFound);
     }
     // Enforce device_ids allowlist if the token is scoped to specific devices.
-    if let Some(allowed) = &claims.device_ids {
-        if !allowed.contains(&channels.device_id) {
-            return Err(ControlError::Forbidden);
-        }
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&channels.device_id)
+    {
+        return Err(ControlError::Forbidden);
     }
     let device_id = channels.device_id.clone();
     drop(channels);

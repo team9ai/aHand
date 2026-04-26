@@ -562,13 +562,13 @@ impl DeviceAdminStore for MemoryDeviceStore {
                 // (device inserted via the legacy bootstrap flow) can be claimed by
                 // any caller — this is intentional behavior that allows admin
                 // pre-registration to adopt unclaimed devices.
-                if let Some(existing_user) = existing_user_id.as_ref() {
-                    if existing_user != external_user_id {
-                        return Err(HubError::DeviceOwnedByDifferentUser {
-                            device_id: device_id.into(),
-                            existing_external_user_id: existing_user.clone(),
-                        });
-                    }
+                if let Some(existing_user) = existing_user_id.as_ref()
+                    && existing_user != external_user_id
+                {
+                    return Err(HubError::DeviceOwnedByDifferentUser {
+                        device_id: device_id.into(),
+                        existing_external_user_id: existing_user.clone(),
+                    });
                 }
                 // Update the row: overwrite public_key + external_user_id.
                 let stored = entry.get_mut();

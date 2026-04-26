@@ -664,8 +664,8 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                         // device via DELETE /api/admin/devices/{id} the
                         // WS is torn down via `kick_device`, so staleness
                         // is bounded to the handshake-to-close window.
-                        if state.webhook.is_enabled() {
-                            if let Err(err) = state
+                        if state.webhook.is_enabled()
+                            && let Err(err) = state
                                 .webhook
                                 .enqueue_heartbeat(
                                     &device_id,
@@ -674,13 +674,12 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                                     ttl,
                                 )
                                 .await
-                            {
-                                tracing::warn!(
-                                    device_id = %device_id,
-                                    error = %err,
-                                    "failed to enqueue device.heartbeat webhook",
-                                );
-                            }
+                        {
+                            tracing::warn!(
+                                device_id = %device_id,
+                                error = %err,
+                                "failed to enqueue device.heartbeat webhook",
+                            );
                         }
                     } else if let Some(ahand_protocol::envelope::Payload::BrowserResponse(ref browser_resp)) = envelope.payload {
                         if let Some((_, sender)) = state.browser_pending.remove(&browser_resp.request_id) {
@@ -733,14 +732,14 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     if let Some(task) = staleness_monitor_task.take() {
         task.abort();
     }
-    if let Some(reservation) = bootstrap_reservation.take() {
-        if let Err(err) = state.bootstrap_tokens.release(&reservation).await {
-            tracing::warn!(
-                device_id = %reservation.device_id,
-                error = %err,
-                "failed to release bootstrap reservation"
-            );
-        }
+    if let Some(reservation) = bootstrap_reservation.take()
+        && let Err(err) = state.bootstrap_tokens.release(&reservation).await
+    {
+        tracing::warn!(
+            device_id = %reservation.device_id,
+            error = %err,
+            "failed to release bootstrap reservation"
+        );
     }
     if let Some((device_id, connection_id)) = active_connection.take()
         && state
