@@ -34,8 +34,14 @@ impl EnvelopeSink for mpsc::UnboundedSender<Envelope> {
 /// Result of mapping a `JobRequest.tool` field to the actual binary the
 /// daemon will exec. Pure data so the resolution rules can be unit-tested
 /// without spawning real processes.
+///
+/// Exposed (`pub`) so the SDK ↔ daemon `tool` contract can be locked down
+/// from an integration test (`tests/job_request_tool.rs`). The set of
+/// accepted tool tokens is part of the public contract — bumping a string
+/// here without updating the SDK side is exactly what the contract test
+/// catches.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedTool {
+pub struct ResolvedTool {
     /// Binary path/name passed to `Command::new`.
     pub path: String,
     /// Args inserted before `req.args` (e.g. `-l` for login-shell mode).
@@ -53,7 +59,10 @@ pub(crate) struct ResolvedTool {
 ///
 /// Any other `tool` value is treated as a literal executable path or
 /// PATH-resolvable binary name; no leading args.
-pub(crate) fn resolve_tool(tool: &str, shell_env: Option<&str>) -> ResolvedTool {
+///
+/// `pub` for the same reason as [`ResolvedTool`]: this is the contract
+/// surface validated by `tests/job_request_tool.rs`.
+pub fn resolve_tool(tool: &str, shell_env: Option<&str>) -> ResolvedTool {
     if tool == "$SHELL" || tool == "shell" {
         ResolvedTool {
             path: shell_env.unwrap_or("/bin/sh").to_string(),
