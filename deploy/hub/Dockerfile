@@ -46,7 +46,10 @@ FROM node:${NODE_VERSION} AS dashboard
 WORKDIR /app
 
 ENV NODE_ENV=production
-ENV PORT=3100
+# `pnpm start` runs `next start -p 1516`. Keep the EXPOSE/PORT
+# aligned with that — the smoke tests and compose file map an
+# external port to this internal one.
+ENV PORT=1516
 
 RUN corepack enable
 
@@ -59,6 +62,6 @@ COPY --from=dashboard-build /repo/node_modules /app/node_modules
 COPY --from=dashboard-build /repo/apps/hub-dashboard /app/apps/hub-dashboard
 
 WORKDIR /app/apps/hub-dashboard
-EXPOSE 3100
+EXPOSE 1516
 
 CMD ["pnpm", "start"]

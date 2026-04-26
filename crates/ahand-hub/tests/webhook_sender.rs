@@ -405,7 +405,7 @@ async fn retries_exhausted_moves_row_to_dlq() {
     // A subsequent enqueue after DLQ draining must still work.
     webhook.enqueue_offline("device-2", None).await.unwrap();
     assert_eq!(
-        store.len().await.unwrap(),
+        store.pending_count().await.unwrap(),
         1,
         "new enqueues after DLQ must still persist",
     );
@@ -584,7 +584,7 @@ async fn duplicate_event_id_upserts_single_row() {
     store.enqueue(delivery_v1).await.unwrap();
     store.enqueue(delivery_v2).await.unwrap();
 
-    assert_eq!(store.len().await.unwrap(), 1);
+    assert_eq!(store.pending_count().await.unwrap(), 1);
 }
 
 #[test]
@@ -662,7 +662,7 @@ async fn dlq_write_failure_applies_backoff_not_spin() {
         if tokio::time::Instant::now() >= end {
             panic!(
                 "row never got dlq_write_failed back-off within {deadline:?}; store len={}",
-                store.len().await.unwrap()
+                store.pending_count().await.unwrap()
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -692,14 +692,14 @@ async fn wait_for_store_len(
 ) {
     let end = tokio::time::Instant::now() + deadline;
     while tokio::time::Instant::now() < end {
-        if store.len().await.unwrap() == want {
+        if store.pending_count().await.unwrap() == want {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!(
         "store len never reached {want} within {deadline:?} (last = {})",
-        store.len().await.unwrap()
+        store.pending_count().await.unwrap()
     );
 }
 

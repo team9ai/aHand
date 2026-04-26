@@ -15,8 +15,14 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-socket2 = "0.5"
-# Used on macOS only, where socket2 0.5 doesn't expose TCP_KEEPCNT via
+# `feature = "all"` is required to expose `TcpKeepalive::with_retries`
+# (TCP_KEEPCNT) on Linux. Without it the cfg-gated branch in
+# `apply_tcp_keepalive` (Linux/non-macOS path) fails to compile in CI
+# even though local macOS builds succeed. macOS still falls back to
+# raw setsockopt below — `with_retries` is not exposed for macOS in
+# socket2 even with "all".
+socket2 = { version = "0.6", features = ["all"] }
+# Used on macOS, where socket2 doesn't expose TCP_KEEPCNT via
 # `TcpKeepalive::with_retries` — we set it through raw setsockopt to keep
 # the keepalive budget at ~60s (30s idle + 3×10s probes) instead of the
 # kernel default of 8 probes (~110s). See `apply_tcp_keepalive` in

@@ -56,7 +56,7 @@ async fn enabled_enqueue_persists_and_notifies() {
         .await
         .unwrap();
 
-    assert_eq!(store.len().await.unwrap(), 2);
+    assert_eq!(store.pending_count().await.unwrap(), 2);
 }
 
 #[tokio::test]

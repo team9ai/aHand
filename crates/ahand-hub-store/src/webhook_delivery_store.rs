@@ -88,8 +88,10 @@ pub trait WebhookDeliveryStore: Send + Sync {
 
     /// Count of rows in the store. Tests use this to assert that the
     /// worker deleted the row after a 2xx response; there is no
-    /// operational consumer.
-    async fn len(&self) -> anyhow::Result<usize>;
+    /// operational consumer. Named `pending_count` rather than `len` so
+    /// `clippy::len_without_is_empty` doesn't ask for an `is_empty`
+    /// counterpart that no caller would use.
+    async fn pending_count(&self) -> anyhow::Result<usize>;
 }
 
 /// Postgres-backed [`WebhookDeliveryStore`]. Expects migration 0003 to
@@ -218,7 +220,7 @@ impl WebhookDeliveryStore for PgWebhookDeliveryStore {
         Ok(ts)
     }
 
-    async fn len(&self) -> anyhow::Result<usize> {
+    async fn pending_count(&self) -> anyhow::Result<usize> {
         let row = sqlx::query("SELECT COUNT(*)::BIGINT AS n FROM webhook_deliveries")
             .fetch_one(&self.pool)
             .await?;
@@ -405,7 +407,7 @@ impl WebhookDeliveryStore for MemoryWebhookDeliveryStore {
             .min())
     }
 
-    async fn len(&self) -> anyhow::Result<usize> {
+    async fn pending_count(&self) -> anyhow::Result<usize> {
         Ok(self.rows.len())
     }
 }
@@ -483,7 +485,7 @@ mod tests {
         let store = MemoryWebhookDeliveryStore::new();
         store.enqueue(sample_delivery("a", -1)).await.unwrap();
         store.delete("a").await.unwrap();
-        assert_eq!(store.len().await.unwrap(), 0);
+        assert_eq!(store.pending_count().await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -514,14 +516,14 @@ mod tests {
             .mark_failed("missing", Utc::now(), 1, "boom")
             .await
             .unwrap();
-        assert_eq!(store.len().await.unwrap(), 0);
+        assert_eq!(store.pending_count().await.unwrap(), 0);
     }
 
     #[tokio::test]
     async fn memory_arc_constructor_returns_shared_store() {
         let store = MemoryWebhookDeliveryStore::arc();
         store.enqueue(sample_delivery("a", -1)).await.unwrap();
-        assert_eq!(store.len().await.unwrap(), 1);
+        assert_eq!(store.pending_count().await.unwrap(), 1);
     }
 
     #[tokio::test]

@@ -358,11 +358,7 @@ impl TestServer {
         let started_at = tokio::time::Instant::now();
         let mut body = String::new();
 
-        loop {
-            let Some(remaining) = duration.checked_sub(started_at.elapsed()) else {
-                break;
-            };
-
+        while let Some(remaining) = duration.checked_sub(started_at.elapsed()) {
             match tokio::time::timeout(remaining, stream.next()).await {
                 Ok(Some(Ok(chunk))) => body.push_str(&String::from_utf8_lossy(&chunk)),
                 Ok(Some(Err(err))) => panic!("failed reading SSE chunk: {err}"),
@@ -398,14 +394,11 @@ impl TestDevice {
     pub async fn recv_job_request(&mut self) -> JobRequest {
         while let Some(message) = self.socket.next().await {
             let message = message.unwrap();
-            match message {
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    let envelope = Envelope::decode(data.as_ref()).unwrap();
-                    if let Some(envelope::Payload::JobRequest(job)) = envelope.payload {
-                        return job;
-                    }
+            if let tokio_tungstenite::tungstenite::Message::Binary(data) = message {
+                let envelope = Envelope::decode(data.as_ref()).unwrap();
+                if let Some(envelope::Payload::JobRequest(job)) = envelope.payload {
+                    return job;
                 }
-                _ => {}
             }
         }
 
@@ -456,14 +449,11 @@ impl TestDevice {
     pub async fn recv_browser_request(&mut self) -> BrowserRequest {
         while let Some(message) = self.socket.next().await {
             let message = message.unwrap();
-            match message {
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    let envelope = Envelope::decode(data.as_ref()).unwrap();
-                    if let Some(envelope::Payload::BrowserRequest(req)) = envelope.payload {
-                        return req;
-                    }
+            if let tokio_tungstenite::tungstenite::Message::Binary(data) = message {
+                let envelope = Envelope::decode(data.as_ref()).unwrap();
+                if let Some(envelope::Payload::BrowserRequest(req)) = envelope.payload {
+                    return req;
                 }
-                _ => {}
             }
         }
         panic!("device socket closed before a browser request arrived");
@@ -488,14 +478,11 @@ impl TestDevice {
     pub async fn recv_cancel_request(&mut self) -> CancelJob {
         while let Some(message) = self.socket.next().await {
             let message = message.unwrap();
-            match message {
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    let envelope = Envelope::decode(data.as_ref()).unwrap();
-                    if let Some(envelope::Payload::CancelJob(cancel)) = envelope.payload {
-                        return cancel;
-                    }
+            if let tokio_tungstenite::tungstenite::Message::Binary(data) = message {
+                let envelope = Envelope::decode(data.as_ref()).unwrap();
+                if let Some(envelope::Payload::CancelJob(cancel)) = envelope.payload {
+                    return cancel;
                 }
-                _ => {}
             }
         }
 

@@ -309,13 +309,13 @@ impl PgDeviceStore {
         // (device inserted via the legacy bootstrap flow) can be claimed by
         // any caller — this is intentional behavior that allows admin
         // pre-registration to adopt unclaimed devices.
-        if let Some((_, Some(existing_user))) = &existing {
-            if existing_user != external_user_id {
-                return Err(HubError::DeviceOwnedByDifferentUser {
-                    device_id: device_id.into(),
-                    existing_external_user_id: existing_user.clone(),
-                });
-            }
+        if let Some((_, Some(existing_user))) = &existing
+            && existing_user != external_user_id
+        {
+            return Err(HubError::DeviceOwnedByDifferentUser {
+                device_id: device_id.into(),
+                existing_external_user_id: existing_user.clone(),
+            });
         }
 
         // Upsert: insert new row or update public_key + external_user_id.
