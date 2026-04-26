@@ -146,6 +146,7 @@ pub async fn run(
         approval_mgr,
         approval_broadcast_tx,
         browser_mgr,
+        file_mgr,
         Arc::new(NoopReporter),
     )
     .await
@@ -165,6 +166,7 @@ pub async fn run_with_reporter(
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
+    file_mgr: Arc<FileManager>,
     reporter: Arc<dyn ClientReporter>,
 ) -> anyhow::Result<()> {
     let hub_config = config.hub_config();
