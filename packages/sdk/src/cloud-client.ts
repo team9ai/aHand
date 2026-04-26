@@ -400,7 +400,7 @@ export class CloudClient {
     }
     if (!res.ok) throw await toTypedHttpError(res);
 
-    const json = (await res.json()) as {
+    let json: {
       success?: boolean;
       data?: unknown;
       error?: string | null;
@@ -408,6 +408,43 @@ export class CloudClient {
       binary_mime?: string | null;
       duration_ms?: number;
     };
+    try {
+      json = (await res.json()) as typeof json;
+    } catch (e: unknown) {
+      // `res.json()` can fail two ways after the headers/status looked
+      // OK: (a) the signal aborted while we were still draining the
+      // body, or (b) the body wasn't valid JSON (e.g. an upstream
+      // gateway swapped in an HTML 502 page with a 200 status). Both
+      // need to surface as proper `CloudClientError`s so callers don't
+      // see a raw `SyntaxError` / `AbortError` leaking through.
+      if (e instanceof DOMException && e.name === "AbortError") {
+        throw new CloudClientError(
+          "abort",
+          "browser request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw new CloudClientError("network", String(e), { cause: e });
+    }
+
+    // Strict shape check: a missing or non-boolean `success` field
+    // means the hub's wire contract has drifted (e.g. a serializer
+    // change emitting `success: 1`). Coercing `=== true` would silently
+    // turn every such response into `success: false` with no signal —
+    // throw instead so the regression is immediately visible.
+    if (typeof json.success !== "boolean") {
+      throw new CloudClientError(
+        "server_error",
+        "Hub response malformed: 'success' field missing or not a boolean",
+      );
+    }
 
     // Decode base64 binary payload into a Uint8Array. `Buffer` is
     // available everywhere this SDK runs (Node + Tauri renderer with
@@ -424,7 +461,7 @@ export class CloudClient {
         : undefined;
 
     return {
-      success: json.success === true,
+      success: json.success,
       data: json.data ?? undefined,
       error: json.error ? json.error : undefined,
       binary,

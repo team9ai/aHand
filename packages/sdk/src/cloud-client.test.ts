@@ -833,6 +833,102 @@ describe("CloudClient.browser", () => {
     });
     expect(calls).toBe(1);
   });
+
+  it("bad: abort during getAuthToken → no fetch call, code=abort", async () => {
+    // Regression guard for the post-token-fetch abort fast-path. If
+    // someone removes the second `signal?.aborted` check, an abort that
+    // fires while the token is being refreshed would still proceed to
+    // call fetch — this test catches that.
+    let fetchCalls = 0;
+    const fn = (async () => {
+      fetchCalls++;
+      return jsonResponse({ success: true, duration_ms: 1 }, 200);
+    }) as unknown as typeof fetch;
+    const ctrl = new AbortController();
+    const client = new CloudClient({
+      hubUrl: "https://hub.test",
+      getAuthToken: async () => {
+        // Simulate a slow token refresh; fire abort while we wait.
+        await new Promise((r) => setTimeout(r, 10));
+        return "tok";
+      },
+      fetch: fn,
+    });
+    const promise = client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "snapshot",
+      signal: ctrl.signal,
+    });
+    // Abort while getAuthToken is still pending.
+    setTimeout(() => ctrl.abort(), 1);
+    const err = await promise.catch((e) => e);
+    expect((err as CloudClientError).code).toBe("abort");
+    expect(fetchCalls).toBe(0);
+  });
+
+  it("bad: response missing 'success' field → CloudClientError(server_error)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ duration_ms: 1 }, 200),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await expect(
+      client.browser({ deviceId: "d", sessionId: "s", action: "snapshot" }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("bad: response with non-boolean 'success' (e.g. 1) → CloudClientError(server_error)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ success: 1, duration_ms: 1 }, 200),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await expect(
+      client.browser({ deviceId: "d", sessionId: "s", action: "snapshot" }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("bad: HTTP 400 → CloudClientError(bad_request)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ error: { message: "invalid params" } }, 400),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(CloudClientError);
+    expect((err as CloudClientError).code).toBe("bad_request");
+    expect((err as CloudClientError).httpStatus).toBe(400);
+  });
+
+  it("bad: HTTP 502 → CloudClientError(server_error) (non-mapped 5xx)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 502)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("server_error");
+    expect((err as CloudClientError).httpStatus).toBe(502);
+  });
+
+  it("bad: HTTP 503 → CloudClientError(server_error) (non-mapped 5xx)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 503)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("server_error");
+    expect((err as CloudClientError).httpStatus).toBe(503);
+  });
+
+  it("bad: HTTP 418 → CloudClientError(bad_request) (non-mapped 4xx)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 418)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("bad_request");
+    expect((err as CloudClientError).httpStatus).toBe(418);
+  });
 });
 
 describe("CloudClientError", () => {
