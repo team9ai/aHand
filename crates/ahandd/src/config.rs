@@ -260,37 +260,52 @@ fn default_server_url() -> String {
 /// Expand a leading `~` in a path pattern to the user's home directory.
 ///
 /// Supports `~/...` (Unix) and `~\...` (Windows) prefixes, as well as a bare
-/// `~`. If [`dirs::home_dir`] returns `None`, the original pattern is returned
-/// unchanged and a warning is logged — we avoid panicking so daemon startup is
-/// never blocked by tilde expansion failures.
-fn expand_tilde(pattern: &str) -> String {
+/// `~`. Patterns without a leading tilde pass through unchanged.
+///
+/// I2: previous behavior was to log a warning and return the original
+/// pattern when [`dirs::home_dir`] resolved to `None`, which silently
+/// fails the *wrong* way for denylists / dangerous_paths — the literal
+/// pattern `~/.ssh/**` never matches a canonicalized absolute path, so
+/// the user's intent ("this is dangerous") becomes "this is allowed".
+/// We now fail loudly: `Config::load` returns an error and daemon startup
+/// aborts. The operator must either set `HOME` or use absolute paths.
+fn expand_tilde_with(pattern: &str, home: Option<&Path>) -> anyhow::Result<String> {
     if let Some(rest) = pattern
         .strip_prefix("~/")
         .or_else(|| pattern.strip_prefix("~\\"))
     {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
-        }
-        tracing::warn!(
-            pattern = %pattern,
-            "cannot expand tilde: dirs::home_dir() returned None; leaving pattern as-is"
-        );
-    } else if pattern == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home.to_string_lossy().into_owned();
-        }
-        tracing::warn!(
-            "cannot expand tilde: dirs::home_dir() returned None; leaving `~` as-is"
-        );
+        let home = home.ok_or_else(|| {
+            anyhow::anyhow!(
+                "config pattern {pattern:?} starts with `~` but the user's home \
+                 directory cannot be determined (is HOME unset?); use an \
+                 absolute path or set HOME"
+            )
+        })?;
+        return Ok(home.join(rest).to_string_lossy().into_owned());
     }
-    pattern.to_string()
+    if pattern == "~" {
+        let home = home.ok_or_else(|| {
+            anyhow::anyhow!(
+                "config pattern \"~\" cannot be resolved: dirs::home_dir() \
+                 returned None (is HOME unset?); use an absolute path or set HOME"
+            )
+        })?;
+        return Ok(home.to_string_lossy().into_owned());
+    }
+    Ok(pattern.to_string())
+}
+
+fn expand_tilde(pattern: &str) -> anyhow::Result<String> {
+    expand_tilde_with(pattern, dirs::home_dir().as_deref())
 }
 
 /// Apply [`expand_tilde`] to every entry in a mutable string list in place.
-fn expand_tildes_in_place(list: &mut Vec<String>) {
+/// Stops on the first failure so the caller sees the offending pattern.
+fn expand_tildes_in_place(list: &mut Vec<String>) -> anyhow::Result<()> {
     for item in list.iter_mut() {
-        *item = expand_tilde(item);
+        *item = expand_tilde(item)?;
     }
+    Ok(())
 }
 
 impl Config {
@@ -303,9 +318,9 @@ impl Config {
         // canonicalized absolute paths, so `~/.ssh/**` would otherwise never
         // match `/home/user/.ssh/...`.
         if let Some(ref mut fp) = config.file_policy {
-            expand_tildes_in_place(&mut fp.path_allowlist);
-            expand_tildes_in_place(&mut fp.path_denylist);
-            expand_tildes_in_place(&mut fp.dangerous_paths);
+            expand_tildes_in_place(&mut fp.path_allowlist)?;
+            expand_tildes_in_place(&mut fp.path_denylist)?;
+            expand_tildes_in_place(&mut fp.dangerous_paths)?;
         }
 
         Ok(config)
@@ -392,22 +407,60 @@ mod tilde_tests {
     fn expand_tilde_for_home_rooted_patterns() {
         let home = dirs::home_dir().expect("home dir required for this test");
         assert_eq!(
-            expand_tilde("~/.ssh/**"),
+            expand_tilde("~/.ssh/**").unwrap(),
             format!("{}/.ssh/**", home.display())
         );
-        assert_eq!(expand_tilde("~"), home.to_string_lossy().to_string());
+        assert_eq!(
+            expand_tilde("~").unwrap(),
+            home.to_string_lossy().to_string()
+        );
     }
 
     #[test]
     fn expand_tilde_leaves_absolute_and_other_paths_alone() {
-        assert_eq!(expand_tilde("/etc/passwd"), "/etc/passwd");
-        assert_eq!(expand_tilde("./relative"), "./relative");
-        assert_eq!(expand_tilde("no_tilde_here"), "no_tilde_here");
+        assert_eq!(expand_tilde("/etc/passwd").unwrap(), "/etc/passwd");
+        assert_eq!(expand_tilde("./relative").unwrap(), "./relative");
+        assert_eq!(expand_tilde("no_tilde_here").unwrap(), "no_tilde_here");
     }
 
     #[test]
     fn expand_tilde_does_not_touch_middle_tildes() {
         // Tildes inside a path (not at the start) stay literal.
-        assert_eq!(expand_tilde("/tmp/~backup"), "/tmp/~backup");
+        assert_eq!(expand_tilde("/tmp/~backup").unwrap(), "/tmp/~backup");
+    }
+
+    #[test]
+    fn expand_tilde_with_no_home_dir_fails_loud_for_tilde_patterns() {
+        // I2 regression: when the home directory is unavailable, a tilde
+        // pattern previously passed through verbatim. The downstream
+        // glob-match compares canonicalized absolute paths against the
+        // literal pattern, so `~/.ssh/**` would silently never match —
+        // catastrophic for `path_denylist` / `dangerous_paths` where the
+        // operator's intent ("this is dangerous") flips to "this is allowed".
+        // The pre-check must reject the config so daemon startup aborts.
+        let err = expand_tilde_with("~/.ssh/**", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("HOME") || msg.contains("home"),
+            "error message should reference HOME: {msg}"
+        );
+
+        let err = expand_tilde_with("~", None).unwrap_err();
+        assert!(
+            err.to_string().contains("home") || err.to_string().contains("HOME"),
+            "bare-tilde error should reference home, got: {err}"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_with_no_home_dir_passes_non_tilde_patterns_through() {
+        // Patterns without a leading tilde shouldn't care whether HOME is
+        // set — they're absolute or relative and need no expansion.
+        assert_eq!(expand_tilde_with("/etc/passwd", None).unwrap(), "/etc/passwd");
+        assert_eq!(expand_tilde_with("./rel", None).unwrap(), "./rel");
+        assert_eq!(
+            expand_tilde_with("/tmp/~backup", None).unwrap(),
+            "/tmp/~backup"
+        );
     }
 }
