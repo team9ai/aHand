@@ -214,12 +214,26 @@ async fn watchdog_detects_silent_zombie_and_reconnects() {
 /// `#[ignore]` and gated behind the `disable-ws-ping` feature so it
 /// only compiles when an operator opts in.
 ///
-/// Why this needs manual orchestration: with the in-process silent mock
-/// the kernel on the server side keeps auto-ACKing TCP keepalive probes
-/// (the socket is open at the OS level), so OS keepalive never actually
-/// fires no matter how long we wait. To genuinely exercise the
-/// kernel-level fallback, run this test while externally dropping
-/// traffic to the loopback peer — for example, on macOS:
+/// Two preconditions for this test to actually validate TCP keepalive
+/// (rather than passing for the wrong reason):
+///
+/// 1. **WS Ping disabled** — the `disable-ws-ping` feature gates out the
+///    WS Ping task in `connect_with_auth`. Without that, the watchdog
+///    would short-circuit recovery long before TCP keepalive kicks in.
+///
+/// 2. **`heartbeat_interval` set well above the TCP keepalive window** —
+///    the read-loop watchdog times out at `2 × heartbeat_interval` on
+///    its own (independent of WS Ping), so a small heartbeat would also
+///    recover the zombie via the read-timeout path and credit TCP
+///    keepalive for work it didn't do. We use 300s here so the read
+///    timeout (600s) is roughly 10× the TCP keepalive budget (~60s) —
+///    if the test passes inside 90s, the kernel-level path is the only
+///    one that could have surfaced the dead peer.
+///
+/// 3. **Traffic dropped externally** — the in-process silent mock keeps
+///    its TCP socket open, and the kernel auto-ACKs keepalive probes
+///    regardless of userspace. To make probes actually fail, drop
+///    traffic outside the process. On macOS:
 ///
 /// ```bash
 /// echo "block drop quick on lo0 proto tcp from any to 127.0.0.1 port = $PORT" \
@@ -228,10 +242,11 @@ async fn watchdog_detects_silent_zombie_and_reconnects() {
 ///   --ignored watchdog_disabled_still_recovers_via_tcp_keepalive
 /// ```
 ///
-/// Expected behavior with traffic dropped: 30s idle + 3 × 10s probes ≈
-/// 60s after the last received byte, the kernel marks the socket dead,
-/// the daemon's read loop surfaces an error, and the outer reconnect
-/// loop drops back to `Connecting` — well within the 90s budget.
+/// Expected behavior: 30s idle + 3 × 10s probes ≈ 60s after the last
+/// received byte the kernel marks the socket dead, `stream.next()`
+/// surfaces an error, and the outer reconnect loop drops back to
+/// `Connecting` — well within the 90s budget and well before the 600s
+/// read-loop timeout.
 ///
 /// The point of the test: prove that even if the WS Ping watchdog were
 /// to silently regress (typo in the ping task, wrong cfg gate, etc.),
@@ -243,8 +258,12 @@ async fn watchdog_detects_silent_zombie_and_reconnects() {
 async fn watchdog_disabled_still_recovers_via_tcp_keepalive() {
     let mock = mock_hub::start_silent_after_handshake().await;
     let tmp = TempDir::new().unwrap();
+    // 300s heartbeat → 600s read-loop timeout. Must be far above the ~60s
+    // TCP keepalive window so the read-timeout path can't preempt and
+    // credit TCP keepalive for work it didn't do — see precondition (2)
+    // in the doc comment.
     let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
-        .heartbeat_interval(Duration::from_secs(1))
+        .heartbeat_interval(Duration::from_secs(300))
         .build();
 
     let handle = spawn(config).await.expect("spawn ok");
