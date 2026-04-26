@@ -294,7 +294,16 @@ where
     };
 
     // --- Build command --------------------------------------------------
-    let mut cmd = CommandBuilder::new(&req.tool);
+    // INVARIANT: every spawn path must pipe `req.tool` through
+    // `resolve_tool`, so the SDK's `$SHELL` / `shell` sentinels work the
+    // same for `interactive=false` (run_job) and `interactive=true` (here).
+    // Skipping this here would silently break interactive jobs with ENOENT.
+    let resolved = resolve_tool(&req.tool, std::env::var("SHELL").ok().as_deref());
+
+    let mut cmd = CommandBuilder::new(&resolved.path);
+    for leading in &resolved.leading_args {
+        cmd.arg(leading);
+    }
     cmd.args(&req.args);
 
     if !req.cwd.is_empty() {
