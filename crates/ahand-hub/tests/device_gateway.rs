@@ -98,8 +98,14 @@ async fn idle_device_connection_times_out_and_marks_presence_offline() {
 #[tokio::test]
 async fn daemon_heartbeats_keep_connection_online_past_staleness_timeout() {
     let mut config = test_config();
-    config.device_staleness_probe_interval_ms = 20;
-    config.device_staleness_timeout_ms = 60;
+    // The original 60ms timeout / 20ms heartbeat ratio is too tight for
+    // CI: if the forwarder task's first scheduled heartbeat is delayed
+    // >60ms by CPU starvation, the staleness probe trips and closes the
+    // WS, which kills the forwarder permanently. Bumping to 500ms /
+    // 50ms preserves the test intent (heartbeats < timeout keep the
+    // device online) with enough scheduling slack to survive contention.
+    config.device_staleness_probe_interval_ms = 50;
+    config.device_staleness_timeout_ms = 500;
     let state = ahand_hub::state::AppState::from_config(config)
         .await
         .expect("test state should build");
@@ -152,7 +158,7 @@ async fn daemon_heartbeats_keep_connection_online_past_staleness_timeout() {
                     let _ = socket.close(None).await;
                     break;
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
                     let envelope = ahand_protocol::Envelope {
                         device_id: "device-1".into(),
                         msg_id: format!(
@@ -183,17 +189,12 @@ async fn daemon_heartbeats_keep_connection_online_past_staleness_timeout() {
         }
     });
 
-    // Sleep past the 60ms staleness timeout, then poll the admin
-    // listing for online=true. A single fixed-time check raced against
-    // the 20ms staleness probe on CPU-starved CI runners — a heartbeat
-    // arriving slightly later than the probe could leave the test
-    // sampling the brief window between "marked stale" and "next
-    // heartbeat marks online again". Polling within a generous deadline
-    // preserves the test's intent (online survives the staleness
-    // window thanks to forwarded heartbeats) without depending on a
-    // single moment of perfect alignment.
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-    let online_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    // Sleep past the 500ms staleness timeout, then poll the admin
+    // listing for online=true. The poll absorbs the small window
+    // between "staleness probe sampled" and "next heartbeat marked
+    // online" so we don't fail on a single-moment misalignment.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    let online_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut last_online = serde_json::Value::Null;
     while tokio::time::Instant::now() < online_deadline {
         let listed = server.get_json("/api/devices", "service-test-token").await;
