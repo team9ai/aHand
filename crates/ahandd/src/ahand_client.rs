@@ -424,7 +424,17 @@ async fn connect_with_auth(
         }
     }
 
-    // Drop tx so the send task exits.
+    // Signal connection close to detached approval tasks BEFORE awaiting
+    // the send task. send_handle's `rx.recv()` only returns once every
+    // sender clone is dropped, and any pending file-approval task spawned
+    // by handle_file_request still owns a `tx_clone`. Without this drop,
+    // the approval task would only release its sender after the
+    // ApprovalManager 24h timeout — wedging connect_with_auth's
+    // teardown for a full day.
+    drop(_close_guard);
+
+    // Drop the local sender so the send task exits as soon as the last
+    // approval task notices the close signal and releases its clone.
     drop(tx);
     let _ = send_handle.await;
 
@@ -902,11 +912,12 @@ async fn handle_file_request<T>(
     // Pre-flight policy check — runs the same allowlist/denylist checks that
     // dispatch would, but also surfaces `dangerous_paths` hits as
     // "needs_approval". If any path is outright denied, short-circuit with
-    // the FileError. Otherwise we carry `policy_needs_approval` forward so
-    // the session-mode branch below can escalate to approval even when the
-    // session itself would Allow.
-    let policy_needs_approval = match file_mgr.check_request_approval(&req).await {
-        Ok(flag) => flag,
+    // the FileError. Otherwise we carry the structured `policy_escalation`
+    // forward so the session-mode branch below can escalate to approval —
+    // and use the specific reason from policy (which path / why) rather
+    // than a generic "dangerous_paths" string.
+    let policy_escalation = match file_mgr.check_request_approval(&req).await {
+        Ok(escalation) => escalation,
         Err(err) => {
             warn!(request_id = %req.request_id, code = err.code, "file request denied by policy pre-check");
             send_file_response(ahand_protocol::FileResponse {
@@ -960,23 +971,29 @@ async fn handle_file_request<T>(
             ));
             return;
         }
-        SessionDecision::Allow if !policy_needs_approval => {
-            // Fast path — no dangerous paths involved, session would allow.
+        SessionDecision::Allow if policy_escalation.is_none() => {
+            // Fast path — nothing dangerous, session would allow.
             let response = file_mgr.handle(&req).await;
             send_file_response(response);
             return;
         }
         SessionDecision::Allow => {
-            // Session would Allow, but the path is listed in
-            // `dangerous_paths`. Force the approval flow regardless.
+            // Session would Allow, but policy pre-check flagged the
+            // request (dangerous path, recursive permanent delete, glob
+            // scan cap hit, etc.). Force the approval flow with the
+            // specific reason policy gave us — operators see e.g.
+            // "path '/etc/passwd' is listed in dangerous_paths" rather
+            // than a generic "path is listed in dangerous_paths" line.
+            let escalation = policy_escalation
+                .as_ref()
+                .expect("guarded by SessionDecision::Allow if policy_escalation.is_none()");
             info!(
                 request_id = %req.request_id,
-                "file request touches dangerous_paths — forcing approval flow"
+                kind = ?escalation.kind,
+                reason = %escalation.reason,
+                "file request escalated to approval by policy pre-check"
             );
-            (
-                "path is listed in dangerous_paths".to_string(),
-                Vec::new(),
-            )
+            (escalation.reason.clone(), Vec::new())
         }
         SessionDecision::NeedsApproval {
             reason,
