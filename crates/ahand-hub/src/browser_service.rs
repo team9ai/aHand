@@ -110,10 +110,13 @@ pub async fn execute(
     state: &AppState,
     input: BrowserCommandInput,
 ) -> Result<BrowserResponse, BrowserServiceError> {
-    // Suppress unused-field warning until Task 9 wires the correlation
-    // id through into structured logging / audit. Keeping it as a real
-    // field on the struct preserves the public API.
-    let _ = input.correlation_id;
+    // NOTE(idempotency): `input.correlation_id` is intentionally unused.
+    // Hub-layer dedupe for /api/control/browser is deferred — see the
+    // module doc-comment in `crates/ahand-hub/src/http/control_plane.rs:20-32`
+    // and the spec follow-up #2 ("Tool-args redaction" / hub-side idempotency)
+    // at docs/superpowers/specs/2026-04-26-claw-hive-ahand-browser-tool-design.md.
+    // The field is kept on `BrowserCommandInput` so the wire schema stays
+    // stable when dedupe lands.
 
     // 1. Device lookup + online check.
     let device = state
