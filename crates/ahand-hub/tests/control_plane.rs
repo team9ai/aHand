@@ -207,45 +207,40 @@ async fn create_job_happy_path_dispatches_and_streams_events() {
     assert_eq!(received.args, vec!["hello".to_string()]);
     assert_eq!(received.timeout_ms, 30_000);
 
-    // Stream the job in parallel with emitting events from the fake
-    // daemon. We open the SSE, then race a task that emits stdout,
-    // progress, and finished.
-    let stream_task = tokio::spawn({
-        let server_url = server.http_base_url().to_string();
-        let token = token.clone();
-        let job_id = job_id.clone();
-        async move {
-            let resp = reqwest::Client::new()
-                .get(format!("{server_url}/api/control/jobs/{job_id}/stream"))
-                .bearer_auth(&token)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            assert!(
-                resp.headers()
-                    .get("content-type")
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .starts_with("text/event-stream")
-            );
-            let mut stream = resp.bytes_stream();
-            let mut body = String::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.unwrap();
-                body.push_str(&String::from_utf8_lossy(&chunk));
-                if body.contains("event: finished") {
-                    break;
-                }
+    // Send the GET in the test task so awaiting send() returns AFTER
+    // the handler has called channels.subscribe(). Spawning send+read
+    // in a task with a fixed sleep raced with subscribe on slow CI
+    // and dropped early frames; doing send() in main is deterministic.
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/stream",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    let stream_task = tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        let mut body = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            body.push_str(&String::from_utf8_lossy(&chunk));
+            if body.contains("event: finished") {
+                break;
             }
-            body
         }
+        body
     });
-
-    // Give the SSE subscriber a moment to attach to the broadcast
-    // before we start emitting events (avoids dropping early frames).
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     send_envelope(
         &mut device,
@@ -1183,35 +1178,31 @@ async fn large_stdout_chunk_delivered_intact() {
     }
     let chunk_len = chunk.len();
 
-    let stream_task = {
-        let server_url = server.http_base_url().to_string();
-        let token = token.clone();
-        let job_id = job_id.clone();
-        tokio::spawn(async move {
-            let resp = reqwest::Client::new()
-                .get(format!("{server_url}/api/control/jobs/{job_id}/stream"))
-                .bearer_auth(&token)
-                .send()
-                .await
-                .unwrap();
-            let mut stream = resp.bytes_stream();
-            let mut body = Vec::new();
-            while let Some(c) = stream.next().await {
-                let c = c.unwrap();
-                body.extend_from_slice(&c);
-                // Stop once finished arrives.
-                if std::str::from_utf8(&body)
-                    .map(|s| s.contains("event: finished"))
-                    .unwrap_or(false)
-                {
-                    break;
-                }
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/stream",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let stream_task = tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(c) = stream.next().await {
+            let c = c.unwrap();
+            body.extend_from_slice(&c);
+            // Stop once finished arrives.
+            if std::str::from_utf8(&body)
+                .map(|s| s.contains("event: finished"))
+                .unwrap_or(false)
+            {
+                break;
             }
-            body
-        })
-    };
-
-    tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        body
+    });
 
     send_envelope(
         &mut device,
@@ -1300,30 +1291,26 @@ async fn rejected_envelope_finalizes_as_error() {
         .to_string();
     let _ = recv_job_request(&mut device).await;
 
-    let stream_task = {
-        let server_url = server.http_base_url().to_string();
-        let token = token.clone();
-        let job_id = job_id.clone();
-        tokio::spawn(async move {
-            let resp = reqwest::Client::new()
-                .get(format!("{server_url}/api/control/jobs/{job_id}/stream"))
-                .bearer_auth(&token)
-                .send()
-                .await
-                .unwrap();
-            let mut stream = resp.bytes_stream();
-            let mut body = String::new();
-            while let Some(c) = stream.next().await {
-                body.push_str(&String::from_utf8_lossy(&c.unwrap()));
-                if body.contains("event: error") {
-                    break;
-                }
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/stream",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let stream_task = tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        let mut body = String::new();
+        while let Some(c) = stream.next().await {
+            body.push_str(&String::from_utf8_lossy(&c.unwrap()));
+            if body.contains("event: error") {
+                break;
             }
-            body
-        })
-    };
-
-    tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        body
+    });
 
     send_envelope(
         &mut device,
@@ -1377,29 +1364,26 @@ async fn exit_code_non_zero_reports_error_event() {
         .to_string();
     let _ = recv_job_request(&mut device).await;
 
-    let stream_task = {
-        let server_url = server.http_base_url().to_string();
-        let token = token.clone();
-        let job_id = job_id.clone();
-        tokio::spawn(async move {
-            let resp = reqwest::Client::new()
-                .get(format!("{server_url}/api/control/jobs/{job_id}/stream"))
-                .bearer_auth(&token)
-                .send()
-                .await
-                .unwrap();
-            let mut stream = resp.bytes_stream();
-            let mut body = String::new();
-            while let Some(c) = stream.next().await {
-                body.push_str(&String::from_utf8_lossy(&c.unwrap()));
-                if body.contains("event: error") {
-                    break;
-                }
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/stream",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let stream_task = tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        let mut body = String::new();
+        while let Some(c) = stream.next().await {
+            body.push_str(&String::from_utf8_lossy(&c.unwrap()));
+            if body.contains("event: error") {
+                break;
             }
-            body
-        })
-    };
-    tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        body
+    });
 
     send_envelope(
         &mut device,
@@ -1450,29 +1434,26 @@ async fn cancelled_finish_reports_cancelled_error_code() {
         .to_string();
     let _ = recv_job_request(&mut device).await;
 
-    let stream_task = {
-        let server_url = server.http_base_url().to_string();
-        let token = token.clone();
-        let job_id = job_id.clone();
-        tokio::spawn(async move {
-            let resp = reqwest::Client::new()
-                .get(format!("{server_url}/api/control/jobs/{job_id}/stream"))
-                .bearer_auth(&token)
-                .send()
-                .await
-                .unwrap();
-            let mut stream = resp.bytes_stream();
-            let mut body = String::new();
-            while let Some(c) = stream.next().await {
-                body.push_str(&String::from_utf8_lossy(&c.unwrap()));
-                if body.contains("event: error") {
-                    break;
-                }
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/stream",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let stream_task = tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        let mut body = String::new();
+        while let Some(c) = stream.next().await {
+            body.push_str(&String::from_utf8_lossy(&c.unwrap()));
+            if body.contains("event: error") {
+                break;
             }
-            body
-        })
-    };
-    tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        body
+    });
 
     send_envelope(
         &mut device,
