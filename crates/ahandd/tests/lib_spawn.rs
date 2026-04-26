@@ -209,3 +209,75 @@ async fn watchdog_detects_silent_zombie_and_reconnects() {
 
     handle.shutdown().await.expect("shutdown clean");
 }
+
+/// Manual TCP-keepalive smoke test. **Not a normal CI test**: marked
+/// `#[ignore]` and gated behind the `disable-ws-ping` feature so it
+/// only compiles when an operator opts in.
+///
+/// Why this needs manual orchestration: with the in-process silent mock
+/// the kernel on the server side keeps auto-ACKing TCP keepalive probes
+/// (the socket is open at the OS level), so OS keepalive never actually
+/// fires no matter how long we wait. To genuinely exercise the
+/// kernel-level fallback, run this test while externally dropping
+/// traffic to the loopback peer — for example, on macOS:
+///
+/// ```bash
+/// echo "block drop quick on lo0 proto tcp from any to 127.0.0.1 port = $PORT" \
+///   | sudo pfctl -ef -
+/// cargo test -p ahandd --features disable-ws-ping --test lib_spawn -- \
+///   --ignored watchdog_disabled_still_recovers_via_tcp_keepalive
+/// ```
+///
+/// Expected behavior with traffic dropped: 30s idle + 3 × 10s probes ≈
+/// 60s after the last received byte, the kernel marks the socket dead,
+/// the daemon's read loop surfaces an error, and the outer reconnect
+/// loop drops back to `Connecting` — well within the 90s budget.
+///
+/// The point of the test: prove that even if the WS Ping watchdog were
+/// to silently regress (typo in the ping task, wrong cfg gate, etc.),
+/// OS-level TCP keepalive still recovers a zombie connection on its
+/// own. That is what "defense-in-depth" means here.
+#[cfg(feature = "disable-ws-ping")]
+#[tokio::test]
+#[ignore = "manual smoke test - requires pfctl/iptables to drop traffic to the peer"]
+async fn watchdog_disabled_still_recovers_via_tcp_keepalive() {
+    let mock = mock_hub::start_silent_after_handshake().await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
+        .heartbeat_interval(Duration::from_secs(1))
+        .build();
+
+    let handle = spawn(config).await.expect("spawn ok");
+    let mut status = handle.subscribe_status();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(*status.borrow(), DaemonStatus::Online { .. }) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("daemon never reached Online");
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            if matches!(*status.borrow(), DaemonStatus::Connecting) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect(
+        "TCP keepalive never tripped. With WS Ping disabled and traffic \
+         dropped externally, the kernel must detect the dead peer within \
+         ~60s and the daemon must fall back to Connecting. If you ran \
+         this without dropping traffic, the kernel will keep auto-ACKing \
+         probes forever and the test will (correctly) hang — that is \
+         intentional, see the doc comment above.",
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}

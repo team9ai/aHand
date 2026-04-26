@@ -278,10 +278,19 @@ async fn connect_with_auth(
     browser_mgr: &Arc<BrowserManager>,
     reporter: &dyn ClientReporter,
 ) -> Result<(), ConnectError> {
-    let (ws_stream, _) = tokio_tungstenite::connect_async(url)
+    // OS-level TCP keepalive is the lower-tier twin of the WS Ping/Pong
+    // watchdog: the watchdog catches application-level zombies in
+    // 2× heartbeat_interval; TCP keepalive catches OS-level zombies (NAT
+    // rewrite, sleep/wake) in ~60s regardless of WS traffic, and is
+    // critical on macOS where the default keepalive idle is 2 hours.
+    let tcp = connect_tcp_with_keepalive(url)
         .await
-        .map_err(anyhow::Error::from)
         .map_err(ConnectError::Session)?;
+    let (ws_stream, _) =
+        tokio_tungstenite::client_async_tls_with_config(url, tcp, None, None)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(ConnectError::Session)?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let challenge = recv_hello_challenge(&mut stream).await?;
@@ -385,21 +394,29 @@ async fn connect_with_auth(
     // notices, hub eventually marks device offline, UI stays "Online" until
     // the OS gives up on the dead socket (~hours). WS Ping/Pong forces a
     // round-trip — no Pong → no inbound message → watchdog fires → reconnect.
-    let ws_ping_tx = tx.clone();
-    let ws_ping_task = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(heartbeat_interval);
-        // Skip first tick so it doesn't race with the Hello handshake.
-        ticker.tick().await;
-        loop {
+    #[cfg(not(feature = "disable-ws-ping"))]
+    let ws_ping_task = {
+        let ws_ping_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(heartbeat_interval);
+            // Skip first tick so it doesn't race with the Hello handshake.
             ticker.tick().await;
-            if ws_ping_tx
-                .send_ping(now_ms().to_be_bytes().to_vec())
-                .is_err()
-            {
-                break;
+            loop {
+                ticker.tick().await;
+                if ws_ping_tx
+                    .send_ping(now_ms().to_be_bytes().to_vec())
+                    .is_err()
+                {
+                    break;
+                }
             }
-        }
-    });
+        })
+    };
+    // Dev-only: disable the WS Ping path so OS-level TCP keepalive is the
+    // sole liveness signal. Used by the manual smoke test that verifies
+    // the kernel-level fallback recovers a zombie connection on its own.
+    #[cfg(feature = "disable-ws-ping")]
+    let ws_ping_task: tokio::task::JoinHandle<()> = tokio::spawn(async {});
 
     let caller_uid = "cloud";
 
@@ -605,6 +622,84 @@ where
             }
         }
     })
+}
+
+/// Dial a TcpStream to the host:port from `url_str` and apply OS-level
+/// keepalive: 30s idle, 10s probe interval, 3 retries (≈60s to detect a
+/// dead peer). On macOS the kernel default is 2h idle, so without this
+/// the daemon would stay attached to a zombie socket for hours after a
+/// laptop sleep/wake even though the WS Ping watchdog has already fired.
+///
+/// Returns the tokio TcpStream so the caller can layer WebSocket (and
+/// optional TLS) on top via `client_async_tls_with_config`.
+async fn connect_tcp_with_keepalive(url_str: &str) -> anyhow::Result<tokio::net::TcpStream> {
+    use anyhow::Context;
+    let parsed = url::Url::parse(url_str).context("invalid websocket url")?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("websocket url missing host: {url_str}"))?;
+    let port = parsed.port().unwrap_or_else(|| match parsed.scheme() {
+        "wss" => 443,
+        _ => 80,
+    });
+    let addr = format!("{host}:{port}");
+    let stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("failed to dial {addr}"))?;
+    apply_tcp_keepalive(&stream).context("set TCP keepalive options")?;
+    Ok(stream)
+}
+
+/// Apply the canonical keepalive parameters to an already-connected TCP
+/// socket: 30s idle, 10s probe interval, 3 retries (~60s detection).
+/// Pulled out so unit tests can construct an arbitrary TcpStream
+/// (e.g. against a `TcpListener` on 127.0.0.1) and assert the options
+/// were set without going through the full WS handshake.
+///
+/// `with_retries` (TCP_KEEPCNT) is missing from socket2 0.5 on macOS, so
+/// we fall back to raw setsockopt there. Without it macOS would default
+/// to 8 retries (~110s detection), exceeding the 90s budget the WS
+/// reconnect path is built around.
+fn apply_tcp_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    #[allow(unused_mut)]
+    let mut keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        keepalive = keepalive.with_retries(3);
+    }
+    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    set_tcp_keepcnt_macos(stream, 3)?;
+
+    Ok(())
+}
+
+/// macOS / iOS path for `TCP_KEEPCNT`. socket2 0.5 doesn't expose this
+/// option for Apple targets, but the kernel honors it via raw
+/// setsockopt(IPPROTO_TCP, TCP_KEEPCNT). Returns the underlying io error
+/// so the caller's context can attach to it cleanly.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_tcp_keepcnt_macos(stream: &tokio::net::TcpStream, count: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let value: libc::c_int = count as libc::c_int;
+    // SAFETY: `fd` is owned by `stream` for the duration of this call;
+    // `&value` lives across the syscall; size matches `c_int`.
+    let ret = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub fn build_hello_envelope(
@@ -1157,8 +1252,114 @@ mod tests {
 
     use super::{
         BufferedEnvelopeSender, ConnectError, OutboundFrame, QueuedEnvelope,
-        classify_hello_accepted_message,
+        classify_hello_accepted_message, connect_tcp_with_keepalive,
     };
+
+    /// Spinning up a real `spawn(...)` daemon and reaching into its private
+    /// TcpStream just to read getsockopt would mean exposing the socket
+    /// across the public API for one test's benefit. Instead, drive the
+    /// exact helper the daemon's connect path uses
+    /// (`connect_tcp_with_keepalive`) against a throwaway local listener
+    /// and read the keepalive options back via socket2 — same setter
+    /// codepath, no API surface bloat.
+    ///
+    /// Without OS-level keepalive, the daemon would inherit macOS's 2-hour
+    /// idle default and stay attached to a zombie socket for hours after
+    /// laptop sleep/wake. This test pins the 30s/10s/3-retry budget that
+    /// makes TCP keepalive a meaningful second line of defense behind the
+    /// WS Ping/Pong watchdog.
+    #[tokio::test]
+    async fn socket_keepalive_options_are_set() {
+        // Bind a TCP listener and spawn an accept-and-park task so the
+        // dial completes; we never speak WebSocket on it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            // Hold the accepted socket open for the test's lifetime —
+            // dropping it would race the assertion with a TCP close.
+            std::future::pending::<()>().await;
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let stream = connect_tcp_with_keepalive(&url).await.expect("dial ok");
+        let sock = socket2::SockRef::from(&stream);
+
+        assert!(
+            sock.keepalive().expect("read SO_KEEPALIVE"),
+            "SO_KEEPALIVE must be on after connect_tcp_with_keepalive",
+        );
+
+        // Linux/BSDs path: socket2 exposes typed getters.
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            assert_eq!(
+                sock.keepalive_time().expect("read keepalive idle time"),
+                std::time::Duration::from_secs(30),
+                "TCP_KEEPIDLE must be 30s",
+            );
+            assert_eq!(
+                sock.keepalive_interval().expect("read keepalive probe interval"),
+                std::time::Duration::from_secs(10),
+                "TCP_KEEPINTVL must be 10s",
+            );
+            assert_eq!(
+                sock.keepalive_retries().expect("read keepalive retry count"),
+                3,
+                "TCP_KEEPCNT must be 3",
+            );
+        }
+
+        // macOS path: socket2 0.5 doesn't expose typed getters for
+        // TCP_KEEPALIVE / TCP_KEEPINTVL / TCP_KEEPCNT on Apple targets,
+        // so read them via raw getsockopt — the same syscall surface the
+        // production setter uses, just inverted.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            assert_eq!(
+                getsockopt_int(&stream, libc::TCP_KEEPALIVE),
+                30,
+                "TCP_KEEPALIVE (idle seconds) must be 30",
+            );
+            assert_eq!(
+                getsockopt_int(&stream, libc::TCP_KEEPINTVL),
+                10,
+                "TCP_KEEPINTVL must be 10s",
+            );
+            assert_eq!(
+                getsockopt_int(&stream, libc::TCP_KEEPCNT),
+                3,
+                "TCP_KEEPCNT must be 3 on macOS",
+            );
+        }
+    }
+
+    /// Read a single `c_int` TCP-level socket option via raw getsockopt.
+    /// Used by the macOS branch of `socket_keepalive_options_are_set`
+    /// because socket2 0.5 doesn't expose typed getters for the keepalive
+    /// timing options on Apple targets.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn getsockopt_int(stream: &tokio::net::TcpStream, opt: libc::c_int) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                opt,
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(
+            ret,
+            0,
+            "getsockopt({opt}) failed: {}",
+            std::io::Error::last_os_error(),
+        );
+        value
+    }
 
     #[test]
     fn auth_rejection_close_frame_is_classified_as_handshake_rejected() {
