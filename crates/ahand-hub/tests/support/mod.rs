@@ -273,11 +273,7 @@ impl TestServer {
         let started_at = tokio::time::Instant::now();
         let mut body = String::new();
 
-        loop {
-            let Some(remaining) = duration.checked_sub(started_at.elapsed()) else {
-                break;
-            };
-
+        while let Some(remaining) = duration.checked_sub(started_at.elapsed()) {
             match tokio::time::timeout(remaining, stream.next()).await {
                 Ok(Some(Ok(chunk))) => body.push_str(&String::from_utf8_lossy(&chunk)),
                 Ok(Some(Err(err))) => panic!("failed reading SSE chunk: {err}"),
