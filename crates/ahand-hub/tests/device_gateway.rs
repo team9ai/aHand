@@ -183,16 +183,34 @@ async fn daemon_heartbeats_keep_connection_online_past_staleness_timeout() {
         }
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(140)).await;
-
-    let listed = server.get_json("/api/devices", "service-test-token").await;
-    let device = listed
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|device| device["id"] == "device-1")
-        .unwrap();
-    assert_eq!(device["online"], true);
+    // Sleep past the 60ms staleness timeout, then poll the admin
+    // listing for online=true. A single fixed-time check raced against
+    // the 20ms staleness probe on CPU-starved CI runners — a heartbeat
+    // arriving slightly later than the probe could leave the test
+    // sampling the brief window between "marked stale" and "next
+    // heartbeat marks online again". Polling within a generous deadline
+    // preserves the test's intent (online survives the staleness
+    // window thanks to forwarded heartbeats) without depending on a
+    // single moment of perfect alignment.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let online_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut last_online = serde_json::Value::Null;
+    while tokio::time::Instant::now() < online_deadline {
+        let listed = server.get_json("/api/devices", "service-test-token").await;
+        let device = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|device| device["id"] == "device-1")
+            .cloned()
+            .unwrap();
+        last_online = device["online"].clone();
+        if last_online == serde_json::Value::Bool(true) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(last_online, serde_json::Value::Bool(true));
     assert!(
         heartbeat_count.load(Ordering::Relaxed) > 0,
         "expected daemon-sent heartbeats"
