@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use ahand_hub_core::{HubError, Result};
 use redis::AsyncCommands;
-use redis::aio::ConnectionManager;
 use redis::Script;
+use redis::aio::ConnectionManager;
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

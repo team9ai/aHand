@@ -82,6 +82,7 @@ pub struct JobRuntime {
 }
 
 impl JobRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         dispatcher: Arc<JobDispatcher>,
         jobs: Arc<dyn JobStore>,
@@ -260,17 +261,16 @@ impl JobRuntime {
                     self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
                 }
-                if job.status != JobStatus::Running {
-                    if let Err(err) = self
+                if job.status != JobStatus::Running
+                    && let Err(err) = self
                         .transition_job(
                             &finished.job_id,
                             JobStatus::Running,
                             &format!("device:{device_id}"),
                         )
                         .await
-                    {
-                        return self.handle_stale_device_frame_error(device_id, seq, ack, err);
-                    }
+                {
+                    return self.handle_stale_device_frame_error(device_id, seq, ack, err);
                 }
                 let status = if finished.error == "cancelled" {
                     JobStatus::Cancelled
@@ -710,11 +710,13 @@ pub async fn send_stdin(
         .get(&job_id)
         .await
         .map_err(|_| ApiError::internal("Failed to load job"))?
-        .ok_or_else(|| ApiError::new(
-            axum::http::StatusCode::NOT_FOUND,
-            "JOB_NOT_FOUND",
-            format!("Job {job_id} was not found"),
-        ))?;
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "JOB_NOT_FOUND",
+                format!("Job {job_id} was not found"),
+            )
+        })?;
     if is_terminal_status(job.status) {
         return Err(ApiError::gone(format!("Job {job_id} has already finished")));
     }
@@ -737,11 +739,13 @@ pub async fn send_stdin(
             },
         )
         .await
-        .map_err(|_| ApiError::new(
-            axum::http::StatusCode::CONFLICT,
-            "DEVICE_OFFLINE",
-            format!("Device {} is not currently connected", job.device_id),
-        ))?;
+        .map_err(|_| {
+            ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "DEVICE_OFFLINE",
+                format!("Device {} is not currently connected", job.device_id),
+            )
+        })?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -759,11 +763,13 @@ pub async fn send_resize(
         .get(&job_id)
         .await
         .map_err(|_| ApiError::internal("Failed to load job"))?
-        .ok_or_else(|| ApiError::new(
-            axum::http::StatusCode::NOT_FOUND,
-            "JOB_NOT_FOUND",
-            format!("Job {job_id} was not found"),
-        ))?;
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "JOB_NOT_FOUND",
+                format!("Job {job_id} was not found"),
+            )
+        })?;
     if is_terminal_status(job.status) {
         return Err(ApiError::gone(format!("Job {job_id} has already finished")));
     }
@@ -787,11 +793,13 @@ pub async fn send_resize(
             },
         )
         .await
-        .map_err(|_| ApiError::new(
-            axum::http::StatusCode::CONFLICT,
-            "DEVICE_OFFLINE",
-            format!("Device {} is not currently connected", job.device_id),
-        ))?;
+        .map_err(|_| {
+            ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "DEVICE_OFFLINE",
+                format!("Device {} is not currently connected", job.device_id),
+            )
+        })?;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

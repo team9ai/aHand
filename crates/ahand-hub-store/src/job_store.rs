@@ -93,7 +93,11 @@ impl JobStore for PgJobStore {
         rows.into_iter().map(map_job).collect()
     }
 
-    async fn transition_status(&self, job_id: &str, status: JobStatus) -> Result<Option<JobStatus>> {
+    async fn transition_status(
+        &self,
+        job_id: &str,
+        status: JobStatus,
+    ) -> Result<Option<JobStatus>> {
         let parsed =
             Uuid::parse_str(job_id).map_err(|err| HubError::InvalidToken(err.to_string()))?;
         let mut tx = self

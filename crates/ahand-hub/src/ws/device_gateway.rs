@@ -570,14 +570,14 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     if let Some(task) = heartbeat_task.take() {
         task.abort();
     }
-    if let Some(reservation) = bootstrap_reservation.take() {
-        if let Err(err) = state.bootstrap_tokens.release(&reservation).await {
-            tracing::warn!(
-                device_id = %reservation.device_id,
-                error = %err,
-                "failed to release bootstrap reservation"
-            );
-        }
+    if let Some(reservation) = bootstrap_reservation.take()
+        && let Err(err) = state.bootstrap_tokens.release(&reservation).await
+    {
+        tracing::warn!(
+            device_id = %reservation.device_id,
+            error = %err,
+            "failed to release bootstrap reservation"
+        );
     }
     if let Some((device_id, connection_id)) = active_connection.take()
         && state

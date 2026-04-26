@@ -499,7 +499,10 @@ fn resync_event(reason: &str) -> Event {
     Event::default().event("resync").data(reason)
 }
 
-fn persistent_history_needs_resync(history_first_seq: Option<u64>, last_event_id: Option<u64>) -> bool {
+fn persistent_history_needs_resync(
+    history_first_seq: Option<u64>,
+    last_event_id: Option<u64>,
+) -> bool {
     match (history_first_seq, last_event_id) {
         (None, Some(last_event_id)) => last_event_id > 0,
         (Some(first_seq), Some(last_event_id)) => first_seq > last_event_id.saturating_add(1),

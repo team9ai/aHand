@@ -500,7 +500,9 @@ async fn create_device_rejects_missing_id_field() {
 #[tokio::test]
 async fn get_device_returns_not_found_for_unknown_device() {
     let server = support::spawn_server_with_state(support::test_state().await).await;
-    let response = server.get("/api/devices/device-nonexistent", "service-test-token").await;
+    let response = server
+        .get("/api/devices/device-nonexistent", "service-test-token")
+        .await;
 
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 }

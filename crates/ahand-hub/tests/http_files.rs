@@ -11,12 +11,12 @@ mod support;
 use std::time::Duration;
 
 use ahand_protocol::{
-    file_request, file_response, FileError, FileErrorCode, FileReadText, FileRequest, FileResponse,
-    FileStatResult, FileType,
+    FileError, FileErrorCode, FileReadText, FileRequest, FileResponse, FileStatResult, FileType,
+    file_request, file_response,
 };
 use prost::Message;
 
-use support::{spawn_test_server, TestServer};
+use support::{TestServer, spawn_test_server};
 
 const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 

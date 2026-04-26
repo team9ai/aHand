@@ -1,13 +1,13 @@
 use std::time::Instant;
 
 use axum::{
+    Json,
     extract::{
         Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
