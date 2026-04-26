@@ -15,7 +15,13 @@ export interface ExecOptions {
   timeoutMs?: number;
 }
 
-export interface BrowserResult {
+/**
+ * Result envelope for a `DeviceConnection.browser()` (WebSocket data-plane)
+ * call. Distinct from the cloud-control-plane `BrowserResult` exported
+ * from `@ahandai/sdk` (defined in `cloud-client.ts`), which uses the
+ * snake_case-decoded HTTP response shape with `binary?: { data; mime }`.
+ */
+export interface DeviceBrowserResult {
   success: boolean;
   data: unknown;
   error?: string;
@@ -31,7 +37,7 @@ export class DeviceConnection extends EventEmitter {
   /** Pending browser request callbacks keyed by requestId. */
   private readonly _browserPending = new Map<
     string,
-    { resolve: (r: BrowserResult) => void; reject: (e: Error) => void }
+    { resolve: (r: DeviceBrowserResult) => void; reject: (e: Error) => void }
   >();
   /** Outbox for seq/ack tracking. Injected by AHandServer on reconnect. */
   private _outbox: Outbox;
@@ -157,7 +163,7 @@ export class DeviceConnection extends EventEmitter {
     action: string,
     params?: Record<string, unknown>,
     opts?: { timeoutMs?: number },
-  ): Promise<BrowserResult> {
+  ): Promise<DeviceBrowserResult> {
     const requestId = crypto.randomUUID();
     const envelope = makeEnvelope(this.deviceId, {
       browserRequest: {
@@ -169,24 +175,24 @@ export class DeviceConnection extends EventEmitter {
       },
     });
 
-    return new Promise<BrowserResult>((resolve, reject) => {
+    return new Promise<DeviceBrowserResult>((resolve, reject) => {
       this._browserPending.set(requestId, { resolve, reject });
       this._send(envelope);
     });
   }
 
   /** Open a URL in a browser session. */
-  browserOpen(sessionId: string, url: string): Promise<BrowserResult> {
+  browserOpen(sessionId: string, url: string): Promise<DeviceBrowserResult> {
     return this.browser(sessionId, "open", { url });
   }
 
   /** Take an accessibility snapshot of the page. */
-  browserSnapshot(sessionId: string): Promise<BrowserResult> {
+  browserSnapshot(sessionId: string): Promise<DeviceBrowserResult> {
     return this.browser(sessionId, "snapshot");
   }
 
   /** Click an element by selector. */
-  browserClick(sessionId: string, selector: string): Promise<BrowserResult> {
+  browserClick(sessionId: string, selector: string): Promise<DeviceBrowserResult> {
     return this.browser(sessionId, "click", { selector });
   }
 
@@ -195,12 +201,12 @@ export class DeviceConnection extends EventEmitter {
     sessionId: string,
     selector: string,
     value: string,
-  ): Promise<BrowserResult> {
+  ): Promise<DeviceBrowserResult> {
     return this.browser(sessionId, "fill", { selector, value });
   }
 
   /** Take a screenshot. */
-  browserScreenshot(sessionId: string): Promise<BrowserResult> {
+  browserScreenshot(sessionId: string): Promise<DeviceBrowserResult> {
     return this.browser(sessionId, "screenshot");
   }
 
@@ -209,12 +215,12 @@ export class DeviceConnection extends EventEmitter {
     sessionId: string,
     selector: string,
     path?: string,
-  ): Promise<BrowserResult> {
+  ): Promise<DeviceBrowserResult> {
     return this.browser(sessionId, "download", { selector, ...(path ? { path } : {}) });
   }
 
   /** Export the page as PDF. */
-  browserPdf(sessionId: string, path?: string, fullPage?: boolean): Promise<BrowserResult> {
+  browserPdf(sessionId: string, path?: string, fullPage?: boolean): Promise<DeviceBrowserResult> {
     return this.browser(sessionId, "pdf", {
       ...(path ? { path } : {}),
       ...(fullPage ? { fullPage: true } : {}),
@@ -222,7 +228,7 @@ export class DeviceConnection extends EventEmitter {
   }
 
   /** Close a browser session. */
-  browserClose(sessionId: string): Promise<BrowserResult> {
+  browserClose(sessionId: string): Promise<DeviceBrowserResult> {
     return this.browser(sessionId, "close");
   }
 

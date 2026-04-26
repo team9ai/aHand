@@ -1,6 +1,6 @@
 export { AHandServer } from "./server.ts";
 export { DeviceConnection } from "./connection.ts";
-export type { ExecOptions, BrowserResult } from "./connection.ts";
+export type { ExecOptions, DeviceBrowserResult } from "./connection.ts";
 export { Job } from "./job.ts";
 export type { JobResult } from "./job.ts";
 export { encodeEnvelope, decodeEnvelope, makeEnvelope } from "./codec.ts";
@@ -11,4 +11,6 @@ export type {
   SpawnParams,
   SpawnResult,
   CloudClientErrorCode,
+  BrowserParams,
+  BrowserResult,
 } from "./cloud-client.ts";
