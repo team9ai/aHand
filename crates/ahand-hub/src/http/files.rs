@@ -7,6 +7,7 @@
 //! The response body is a raw protobuf-encoded `FileResponse` with the same
 //! content type.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -19,7 +20,7 @@ use ahand_protocol::{envelope, FileError, FileErrorCode, FileRequest, FileRespon
 
 use crate::auth::AuthContextExt;
 use crate::http::api_error::{ApiError, ApiResult};
-use crate::pending_file_requests::PendingFileRequestsError;
+use crate::pending_file_requests::{PendingFileRequests, PendingFileRequestsError};
 use crate::state::AppState;
 
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -29,6 +30,29 @@ const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 // (R17): the type is referenced by both this HTTP handler and by
 // `JobRuntime::handle_device_frame` in the WS layer, so it shouldn't be
 // scoped to the http module. AppState owns the shared instance.
+
+/// RAII guard that releases a reserved slot in `PendingFileRequests` on
+/// drop. Without this, a client that closes the connection mid-flight
+/// (or any other early-future-drop path) leaves the slot occupied:
+/// neither the `tokio::time::timeout` nor the `oneshot::Receiver` get a
+/// chance to run their drop handlers in a way that knows the slot exists,
+/// so the entry sits in the table until the device responds — and if
+/// the device never does, that's a permanent slot leak (1024-cap DoS).
+///
+/// `PendingFileRequests::cancel` is idempotent: if a `resolve()` has
+/// already removed the slot (the success path), the cancel is a no-op.
+/// We therefore don't need to "disarm" the guard on success.
+struct PendingSlotGuard {
+    table: Arc<PendingFileRequests>,
+    device_id: String,
+    request_id: String,
+}
+
+impl Drop for PendingSlotGuard {
+    fn drop(&mut self) {
+        self.table.cancel(&self.device_id, &self.request_id);
+    }
+}
 
 /// Handle a client-initiated file operation.
 ///
@@ -109,6 +133,20 @@ pub async fn file_operation(
         })?;
 
     let request_id = request.request_id.clone();
+
+    // Arm the slot guard immediately after a successful register(). Every
+    // exit path from this point on — explicit error returns, timeout,
+    // channel close, the success return after we encode the response, and
+    // the early future-drop case where the client closed the connection
+    // mid-flight — runs Drop on `_slot_guard`, which calls cancel().
+    // cancel() is idempotent against a slot already removed by resolve(),
+    // so the success path is a no-op.
+    let _slot_guard = PendingSlotGuard {
+        table: state.pending_file_requests.clone(),
+        device_id: device_id.clone(),
+        request_id: request_id.clone(),
+    };
+
     let envelope = ahand_protocol::Envelope {
         device_id: device_id.clone(),
         msg_id: format!("file-{}", request_id),
@@ -120,28 +158,17 @@ pub async fn file_operation(
         ..Default::default()
     };
 
-    if let Err(err) = state.connections.send(&device_id, envelope).await {
-        state
-            .pending_file_requests
-            .cancel(&device_id, &request_id);
-        return Err(err.into());
-    }
+    state.connections.send(&device_id, envelope).await?;
 
     let timeout_secs = DEFAULT_REQUEST_TIMEOUT_SECS;
     let response = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
-            state
-                .pending_file_requests
-                .cancel(&device_id, &request_id);
             return Err(ApiError::internal(
                 "file response channel closed unexpectedly",
             ));
         }
         Err(_) => {
-            state
-                .pending_file_requests
-                .cancel(&device_id, &request_id);
             return Err(ApiError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "DEVICE_TIMEOUT",

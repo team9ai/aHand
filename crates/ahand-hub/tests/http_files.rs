@@ -316,6 +316,71 @@ async fn file_response_from_wrong_device_does_not_resolve_other_waiter() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn file_operation_releases_slot_on_client_cancellation() {
+    // I1 regression: when the HTTP client drops the connection mid-flight
+    // (e.g. browser navigates away, network drop), Axum drops the handler
+    // future without ever running the timeout/error/channel-close branches
+    // that explicitly call `cancel()`. Without the RAII slot guard, the
+    // entry stays in `PendingFileRequests` until the device responds — and
+    // if the device never does, the slot is permanently leaked, eventually
+    // exhausting the 1024-slot capacity (slow DoS).
+    let server = spawn_test_server().await;
+    let token = dashboard_token(&server).await;
+    let mut device = server
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+
+    let url = format!("{}/api/devices/device-2/files", server.http_base_url());
+    let body = encoded_read_text("/tmp/fake.txt", "req-cancel");
+    let token_clone = token.clone();
+
+    let http_handle = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token_clone)
+            .header("content-type", PROTOBUF_CONTENT_TYPE)
+            .body(body)
+            .send()
+            .await
+    });
+
+    // Wait until the device sees the FileRequest — at that point the
+    // server has already registered the slot.
+    let received = device.recv_file_request().await;
+    assert_eq!(received.request_id, "req-cancel");
+    assert_eq!(
+        server.state_ref().pending_file_requests.in_flight(),
+        1,
+        "slot must be reserved while the request is in flight"
+    );
+
+    // Client closes the connection mid-flight. Aborting the JoinHandle
+    // drops the reqwest future, which closes the TCP connection. Axum
+    // then drops the handler future, which runs Drop on PendingSlotGuard.
+    http_handle.abort();
+    let _ = http_handle.await;
+
+    // Give Axum a few ticks to notice the connection close and drop the
+    // handler future.
+    let mut waited = Duration::ZERO;
+    let limit = Duration::from_secs(2);
+    let step = Duration::from_millis(25);
+    while server.state_ref().pending_file_requests.in_flight() > 0 {
+        if waited >= limit {
+            panic!(
+                "slot was not released after client cancellation; in_flight = {}",
+                server.state_ref().pending_file_requests.in_flight()
+            );
+        }
+        tokio::time::sleep(step).await;
+        waited += step;
+    }
+    assert_eq!(server.state_ref().pending_file_requests.in_flight(), 0);
+
+    server.shutdown().await;
+}
+
 // Timeout tests are intentionally NOT included here:
 // `DEFAULT_REQUEST_TIMEOUT_SECS = 30` in http/files.rs is baked at compile
 // time and the test support layer does not currently expose an override.

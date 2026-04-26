@@ -114,7 +114,9 @@ impl PendingFileRequests {
         }
     }
 
-    #[cfg(test)]
+    /// Current number of registered slots. Useful for tests and metrics —
+    /// production code should not branch on this (the value is racy with
+    /// concurrent register/resolve/cancel).
     pub fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::SeqCst)
     }
