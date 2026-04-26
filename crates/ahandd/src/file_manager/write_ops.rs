@@ -165,7 +165,14 @@ async fn handle_append(
         Ok(m) => m.len(),
         Err(_) => 0,
     };
-    enforce_size_limit(existing_size + app.content.len() as u64, max_write_bytes, req_path)?;
+    // `existing_size + content.len()` could overflow u64 in pathological
+    // cases (file near u64::MAX bytes). Wrapping would silently bypass
+    // the size cap, so saturate to u64::MAX on overflow — guaranteed to
+    // exceed any sane `max_write_bytes` and trip the limit. (debug
+    // builds also panic on raw `+` overflow, which is its own kind of
+    // surprise we want to avoid.)
+    let total = existing_size.saturating_add(app.content.len() as u64);
+    enforce_size_limit(total, max_write_bytes, req_path)?;
 
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)

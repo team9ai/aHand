@@ -79,7 +79,7 @@ pub async fn handle_read_text(
         .map_err(|e| io_to_file_error(e, resolved))?;
 
     // Determine which encoding we'll use for decoding individual line slices.
-    let encoding = resolve_encoding(&raw, req.encoding.as_deref())?;
+    let encoding = resolve_encoding(&raw, req.encoding.as_deref(), &req.path)?;
     let detected_encoding = encoding.name().to_string();
 
     // Line offsets computed on RAW bytes. `\n` (0x0A) is a single-byte in
@@ -262,6 +262,7 @@ pub async fn handle_read_text(
 fn resolve_encoding(
     raw: &[u8],
     encoding_hint: Option<&str>,
+    req_path: &str,
 ) -> Result<&'static encoding_rs::Encoding, FileError> {
     if let Some(name) = encoding_hint {
         if !name.is_empty() {
@@ -271,7 +272,7 @@ fn resolve_encoding(
             return encoding_rs::Encoding::for_label(name.as_bytes()).ok_or_else(|| {
                 file_error(
                     FileErrorCode::Encoding,
-                    "",
+                    req_path,
                     format!("unknown encoding: {name}"),
                 )
             });

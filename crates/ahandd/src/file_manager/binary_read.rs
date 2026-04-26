@@ -168,7 +168,7 @@ pub async fn handle_read_image(
             .map_err(|e| {
                 file_error(
                     FileErrorCode::Unspecified,
-                    "",
+                    &req_path,
                     format!("failed to read image: {e}"),
                 )
             })?;
@@ -176,7 +176,7 @@ pub async fn handle_read_image(
         let (header_width, header_height) = header_reader.into_dimensions().map_err(|e| {
             file_error(
                 FileErrorCode::Unspecified,
-                "",
+                &req_path,
                 format!("failed to read image dimensions: {e}"),
             )
         })?;
@@ -220,14 +220,14 @@ pub async fn handle_read_image(
             .map_err(|e| {
                 file_error(
                     FileErrorCode::Unspecified,
-                    "",
+                    &req_path,
                     format!("failed to read image: {e}"),
                 )
             })?;
         let img = reader.decode().map_err(|e| {
             file_error(
                 FileErrorCode::Unspecified,
-                "",
+                &req_path,
                 format!("failed to decode image: {e}"),
             )
         })?;
@@ -238,7 +238,7 @@ pub async fn handle_read_image(
         let output_format =
             resolve_output_format(requested_format, source_format);
         let quality = requested_quality.unwrap_or(DEFAULT_IMAGE_QUALITY);
-        let encoded = encode_image(&resized, output_format, quality, max_bytes)?;
+        let encoded = encode_image(&resized, output_format, quality, max_bytes, &req_path)?;
         Ok(FileReadImageResult {
             content: encoded.bytes,
             format: output_format_to_proto(output_format) as i32,
@@ -254,7 +254,7 @@ pub async fn handle_read_image(
     .map_err(|e| {
         file_error(
             FileErrorCode::Unspecified,
-            "",
+            &req.path,
             format!("image worker join error: {e}"),
         )
     })??;
@@ -311,16 +311,17 @@ fn encode_image(
     format: ImgFmt,
     quality: u8,
     max_bytes: Option<u64>,
+    req_path: &str,
 ) -> Result<EncodedImage, FileError> {
     // For lossless formats (PNG), quality is ignored and max_bytes can only be
     // met by resizing, which we don't do here. Return a single encode pass.
     if !format_supports_quality(format) {
-        let bytes = encode_single(img, format, quality)?;
+        let bytes = encode_single(img, format, quality, req_path)?;
         if let Some(budget) = max_bytes {
             if bytes.len() as u64 > budget {
                 return Err(file_error(
                     FileErrorCode::TooLarge,
-                    "",
+                    req_path,
                     format!(
                         "encoded image {} bytes exceeds requested max_bytes {} (lossless format has no quality knob)",
                         bytes.len(),
@@ -337,11 +338,11 @@ fn encode_image(
 
     // Lossy: iteratively lower quality until we fit. Start at requested quality.
     let mut q = quality;
-    let mut last = encode_single(img, format, q)?;
+    let mut last = encode_single(img, format, q, req_path)?;
     if let Some(budget) = max_bytes {
         while last.len() as u64 > budget && q > 10 {
             q = q.saturating_sub(10);
-            last = encode_single(img, format, q)?;
+            last = encode_single(img, format, q, req_path)?;
         }
         // If we still exceed the budget after hitting the quality floor, the
         // caller's max_bytes is unreachable — fail loudly instead of silently
@@ -349,7 +350,7 @@ fn encode_image(
         if last.len() as u64 > budget {
             return Err(file_error(
                 FileErrorCode::TooLarge,
-                "",
+                req_path,
                 format!(
                     "encoded image {} bytes exceeds requested max_bytes {} even at minimum quality",
                     last.len(),
@@ -370,6 +371,7 @@ fn encode_single(
     img: &DynamicImage,
     format: ImgFmt,
     quality: u8,
+    req_path: &str,
 ) -> Result<Vec<u8>, FileError> {
     let mut out = Vec::new();
     match format {
@@ -378,11 +380,11 @@ fn encode_single(
             let encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
             img.to_rgb8()
                 .write_with_encoder(encoder)
-                .map_err(|e| image_encode_error(e))?;
+                .map_err(|e| image_encode_error(e, req_path))?;
         }
         ImgFmt::Png => {
             img.write_to(&mut Cursor::new(&mut out), ImgFmt::Png)
-                .map_err(|e| image_encode_error(e))?;
+                .map_err(|e| image_encode_error(e, req_path))?;
         }
         ImgFmt::WebP => {
             // The `image` crate WebP encoder is lossless by default; quality
@@ -390,20 +392,20 @@ fn encode_single(
             let encoder = WebPEncoder::new_lossless(Cursor::new(&mut out));
             img.to_rgba8()
                 .write_with_encoder(encoder)
-                .map_err(|e| image_encode_error(e))?;
+                .map_err(|e| image_encode_error(e, req_path))?;
         }
         _ => {
             img.write_to(&mut Cursor::new(&mut out), format)
-                .map_err(|e| image_encode_error(e))?;
+                .map_err(|e| image_encode_error(e, req_path))?;
         }
     }
     Ok(out)
 }
 
-fn image_encode_error(e: image::ImageError) -> FileError {
+fn image_encode_error(e: image::ImageError, req_path: &str) -> FileError {
     file_error(
         FileErrorCode::Unspecified,
-        "",
+        req_path,
         format!("failed to encode image: {e}"),
     )
 }

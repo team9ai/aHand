@@ -88,9 +88,12 @@ pub async fn file_operation(
     // surfaced loudly instead of silently decoding random bytes.
     if let Some(ct) = headers.get(header::CONTENT_TYPE) {
         let ct_str = ct.to_str().unwrap_or("");
-        // Strip any `; charset=...` / parameter suffix.
+        // Strip any `; charset=...` / parameter suffix. Per RFC 7231
+        // §3.1.1.1 the type/subtype tokens are case-insensitive, so
+        // normalize before comparing — `Application/X-Protobuf` from
+        // a less-strict HTTP client must still be accepted.
         let base = ct_str.split(';').next().unwrap_or("").trim();
-        if !base.is_empty() && base != PROTOBUF_CONTENT_TYPE {
+        if !base.is_empty() && !base.eq_ignore_ascii_case(PROTOBUF_CONTENT_TYPE) {
             return Err(ApiError::new(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "UNSUPPORTED_MEDIA_TYPE",
