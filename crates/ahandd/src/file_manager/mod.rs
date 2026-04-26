@@ -399,12 +399,21 @@ impl FileManager {
                 } else {
                     // Resolve relative target against the link's PARENT
                     // directory (that's what the OS does when resolving
-                    // a relative symlink at read time).
+                    // a relative symlink at read time). Lexically
+                    // normalize so the resulting path doesn't carry raw
+                    // `..` components — `policy.check_path` would
+                    // otherwise reject the post-approval dispatch with
+                    // `InvalidPath`, even though the approval prompt
+                    // (which uses the same normalization in
+                    // `collect_request_paths`) showed the user a clean
+                    // canonical path. Without this, every approved
+                    // relative-target symlink that escapes its own
+                    // parent would fail at execution time.
                     let parent = checked
                         .resolved_path
                         .parent()
                         .unwrap_or_else(|| Path::new("/"));
-                    parent.join(&req.target)
+                    lexically_normalize(&parent.join(&req.target))
                 };
                 self.policy
                     .check_path(&target_path.to_string_lossy(), false, true)?;

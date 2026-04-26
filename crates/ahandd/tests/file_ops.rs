@@ -1653,6 +1653,79 @@ async fn edit_string_replace_refuses_oversized_existing_file_before_read() {
     );
 }
 
+#[tokio::test]
+async fn line_range_replace_refuses_oversized_existing_file_before_read() {
+    // I3 regression via the Write LineRangeReplace path
+    // (apply_line_range_replace also calls read_to_string on the full
+    // file before any size check; the same OOM hazard applies).
+    let dir = TempDir::new().unwrap();
+    let tmp_root = dir.path().canonicalize().unwrap();
+    let mgr = manager_with_max_write(&tmp_root, 50);
+
+    let file = tmp_root.join("big.txt");
+    fs::write(&file, vec![b'a'; 200]).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::LineRangeReplace(LineRangeReplace {
+                start_line: 1,
+                end_line: 1,
+                new_content: "b".into(),
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+    assert!(
+        err.message.contains("existing file"),
+        "expected the pre-read guard's message, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn byte_range_replace_refuses_oversized_existing_file_before_read() {
+    // I3 regression via the Write ByteRangeReplace path
+    // (apply_byte_range_replace uses raw `tokio::fs::read` rather than
+    // `read_to_string`, so the size guard has to live on this branch
+    // separately even though the OOM hazard is identical).
+    let dir = TempDir::new().unwrap();
+    let tmp_root = dir.path().canonicalize().unwrap();
+    let mgr = manager_with_max_write(&tmp_root, 50);
+
+    let file = tmp_root.join("big.bin");
+    fs::write(&file, vec![0u8; 200]).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::ByteRangeReplace(ByteRangeReplace {
+                byte_offset: 0,
+                byte_length: 1,
+                new_content: vec![1u8],
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+    assert!(
+        err.message.contains("existing file"),
+        "expected the pre-read guard's message, got: {}",
+        err.message
+    );
+}
+
 // ── FileEdit tests ─────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -2069,6 +2142,49 @@ async fn create_symlink_creates_link() {
     let metadata = fs::symlink_metadata(&link).unwrap();
     assert!(metadata.file_type().is_symlink());
     assert_eq!(fs::read_link(&link).unwrap(), target);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn create_symlink_with_relative_target_escaping_parent_is_normalized() {
+    // Round 3 spec/quality follow-up: the dispatch path used to call
+    // `parent.join(&req.target)` directly without lexical normalization.
+    // For a relative `target` like "../sibling.txt", the resulting
+    // policy-check string carries a raw `..` component and
+    // `policy.check_path` rejects it with InvalidPath — even though
+    // approval (which DID lexically normalize via `collect_request_paths`)
+    // has already shown the operator a clean canonical path. Without
+    // this fix every approved relative symlink that escapes its own
+    // parent would silently fail at execution time.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+
+    // Layout: <root>/sub/escape -> ../target.txt  ⇒ <root>/target.txt
+    let target = root.join("target.txt");
+    fs::write(&target, "x").unwrap();
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let link = sub.join("escape");
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: "../target.txt".into(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_symlink(resp);
+
+    let metadata = fs::symlink_metadata(&link).unwrap();
+    assert!(metadata.file_type().is_symlink());
+    // The on-disk symlink target is preserved as-is (we don't rewrite
+    // the user's relative target string), so reading it back should
+    // give exactly what they asked for.
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        std::path::PathBuf::from("../target.txt")
+    );
 }
 
 // ── FileChmod tests ────────────────────────────────────────────────────────

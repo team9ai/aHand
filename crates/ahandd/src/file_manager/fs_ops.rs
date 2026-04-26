@@ -708,26 +708,7 @@ pub async fn handle_move(
                 destination = %dest_resolved.display(),
                 "rename hit cross-device error; falling back to copy+delete"
             );
-            // Cross-filesystem: copy then delete.
-            let copy_req = FileCopy {
-                source: req.source.clone(),
-                destination: req.destination.clone(),
-                recursive: true,
-                overwrite: req.overwrite,
-            };
-            handle_copy(&copy_req, source_resolved, dest_resolved).await?;
-            let meta = tokio::fs::symlink_metadata(source_resolved)
-                .await
-                .map_err(|e| io_to_file_error(e, source_resolved))?;
-            if meta.is_dir() {
-                tokio::fs::remove_dir_all(source_resolved)
-                    .await
-                    .map_err(|e| io_to_file_error(e, source_resolved))?;
-            } else {
-                tokio::fs::remove_file(source_resolved)
-                    .await
-                    .map_err(|e| io_to_file_error(e, source_resolved))?;
-            }
+            cross_device_move_fallback(req, source_resolved, dest_resolved).await?;
         }
         Err(e) => return Err(io_to_file_error(e, source_resolved)),
     }
@@ -736,6 +717,41 @@ pub async fn handle_move(
         source: source_resolved.to_string_lossy().into_owned(),
         destination: dest_resolved.to_string_lossy().into_owned(),
     })
+}
+
+/// Cross-filesystem move payload. Extracted from `handle_move` so the
+/// fallback can be unit-tested directly: simulating the EXDEV trigger
+/// (`tokio::fs::rename` returning `CrossesDevices`) without a real
+/// multi-FS test environment requires either platform-specific tricks
+/// or runtime injection that's not worth the harness cost. Splitting
+/// the trigger from the payload lets us test each independently:
+/// `is_cross_device_error` covers detection, this helper covers the
+/// copy+delete sequence.
+async fn cross_device_move_fallback(
+    req: &FileMove,
+    source_resolved: &Path,
+    dest_resolved: &Path,
+) -> Result<(), FileError> {
+    let copy_req = FileCopy {
+        source: req.source.clone(),
+        destination: req.destination.clone(),
+        recursive: true,
+        overwrite: req.overwrite,
+    };
+    handle_copy(&copy_req, source_resolved, dest_resolved).await?;
+    let meta = tokio::fs::symlink_metadata(source_resolved)
+        .await
+        .map_err(|e| io_to_file_error(e, source_resolved))?;
+    if meta.is_dir() {
+        tokio::fs::remove_dir_all(source_resolved)
+            .await
+            .map_err(|e| io_to_file_error(e, source_resolved))?;
+    } else {
+        tokio::fs::remove_file(source_resolved)
+            .await
+            .map_err(|e| io_to_file_error(e, source_resolved))?;
+    }
+    Ok(())
 }
 
 /// I6: detect "cross-device" rename errors portably.
@@ -965,8 +981,10 @@ pub fn io_to_file_error(err: io::Error, path: &Path) -> FileError {
 
 #[cfg(test)]
 mod tests {
-    use super::is_cross_device_error;
+    use super::{cross_device_move_fallback, is_cross_device_error};
+    use ahand_protocol::FileMove;
     use std::io;
+    use std::path::Path;
 
     #[test]
     fn is_cross_device_error_detects_crosses_devices_kind() {
@@ -1015,5 +1033,60 @@ mod tests {
                 "expected not-cross-device for {e:?}"
             );
         }
+    }
+
+    /// Build a FileMove with the strings filled in to match the resolved
+    /// paths the helper sees in production. The helper only consumes
+    /// `req.source` / `req.destination` / `req.overwrite` to forward into
+    /// `handle_copy`, so the exact strings don't matter for correctness;
+    /// keeping them aligned with the `Path` arguments avoids surprises in
+    /// log lines.
+    fn move_req(source: &Path, destination: &Path, overwrite: bool) -> FileMove {
+        FileMove {
+            source: source.to_string_lossy().into_owned(),
+            destination: destination.to_string_lossy().into_owned(),
+            overwrite,
+        }
+    }
+
+    /// Cross-device payload for a single file: copy to destination, remove source.
+    /// Trigger detection is covered separately via `is_cross_device_error_*`;
+    /// this isolates the payload so we can verify it without staging a real
+    /// multi-FS environment (which CI runners don't reliably provide).
+    #[tokio::test]
+    async fn cross_device_move_fallback_moves_a_single_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        let dst = dir.path().join("dest.txt");
+        std::fs::write(&src, b"payload").unwrap();
+
+        let req = move_req(&src, &dst, false);
+        cross_device_move_fallback(&req, &src, &dst).await.unwrap();
+
+        assert!(!src.exists(), "source should be gone after fallback");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+    }
+
+    /// Cross-device payload for a directory tree: recursive copy then
+    /// `remove_dir_all` on the source. Verifies that `is_dir()`-branch
+    /// in the fallback uses the right unlink primitive (a previous
+    /// implementation could have called `remove_file` and silently
+    /// failed for directories).
+    #[tokio::test]
+    async fn cross_device_move_fallback_moves_a_directory_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src_tree");
+        let dst = dir.path().join("dst_tree");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(src.join("nested")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("nested/b.txt"), b"b").unwrap();
+
+        let req = move_req(&src, &dst, false);
+        cross_device_move_fallback(&req, &src, &dst).await.unwrap();
+
+        assert!(!src.exists(), "source tree should be gone");
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dst.join("nested/b.txt")).unwrap(), b"b");
     }
 }
