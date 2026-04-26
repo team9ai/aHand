@@ -85,6 +85,23 @@ fn mint_cp_jwt_with_device_ids(
     token
 }
 
+/// Mint a control-plane JWT with a custom `scope` claim. Mirrors
+/// `mint_cp_jwt_with_options` in `tests/control_plane.rs` and is used
+/// to exercise the scope-claim guard at the top of
+/// `browser_command_control` (control_plane.rs:626-632).
+fn mint_cp_jwt_with_scope(external_user_id: &str, scope: &str) -> String {
+    use ahand_hub_core::auth::mint_control_plane_jwt;
+    let (token, _) = mint_control_plane_jwt(
+        JWT_SECRET.as_bytes(),
+        external_user_id,
+        scope,
+        None,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    token
+}
+
 async fn login_token(server: &support::TestServer) -> String {
     let body = server
         .post_json(
@@ -293,6 +310,67 @@ async fn browser_command_timeout_returns_504() {
     assert_eq!(body["error"]["code"], "TIMEOUT");
 }
 
+/// Regression: when the HTTP client disconnects mid-await (axum drops
+/// the handler future before the oneshot or timeout resolves), the
+/// `browser_pending` entry must still be cleaned up. The fix is an RAII
+/// guard in `browser_service::execute()`; without it the entry would
+/// leak for the lifetime of the hub process if the daemon never
+/// responded.
+#[tokio::test]
+async fn browser_command_pending_cleared_on_client_cancel() {
+    let state = support::test_state_with_browser_device().await;
+    let server = spawn_server_with_state(state).await;
+    let token = login_token(&server).await;
+
+    // Attach a daemon that will never respond to the BrowserRequest.
+    let _device = server.attach_browser_device("device-1").await;
+
+    // Sanity: pending map starts empty.
+    assert_eq!(server.state().browser_pending.len(), 0);
+
+    // Reqwest client with a short timeout (200ms) — much shorter than
+    // the server-side `timeout_ms` (5_000ms). When the client times out,
+    // the connection is dropped and axum cancels the handler future
+    // mid-await on the oneshot.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+
+    let result = client
+        .post(format!("{}/api/browser", server.http_base_url()))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "device_id": "device-1",
+            "session_id": "sess-cancel",
+            "action": "snapshot",
+            "timeout_ms": 5_000
+        }))
+        .send()
+        .await;
+    assert!(
+        result.is_err(),
+        "expected client-side timeout/cancel, got {result:?}"
+    );
+
+    // After cancellation, the RAII guard's Drop should run and remove
+    // the pending entry. Allow a short grace for the server-side future
+    // to actually be dropped after the connection close propagates.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if server.state().browser_pending.is_empty() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "browser_pending still has {} entries after client cancel — guard did not fire",
+                server.state().browser_pending.len()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn browser_command_unauthenticated_returns_401() {
     let state = support::test_state_with_browser_device().await;
@@ -377,6 +455,27 @@ async fn control_browser_200_with_valid_jwt_and_owner_match() {
     assert!(
         body.get("duration_ms").and_then(|v| v.as_u64()).is_some(),
         "duration_ms missing or wrong type: {body}"
+    );
+
+    // T6 / I9: optional fields (`error`, `binary_data`, `binary_mime`)
+    // must be OMITTED from the JSON object — not serialized as `null` —
+    // when the daemon response carries no error and no binary payload.
+    // The dashboard endpoint asserts the same invariant (see
+    // `browser_command_roundtrip` above); a regression that flips to
+    // "always serialize as null" would silently break SDK consumers
+    // that branch on `"error" in body`.
+    let body_obj = body.as_object().expect("response body must be a JSON object");
+    assert!(
+        !body_obj.contains_key("error"),
+        "`error` should be omitted when absent; got: {body}"
+    );
+    assert!(
+        !body_obj.contains_key("binary_data"),
+        "`binary_data` should be omitted when absent; got: {body}"
+    );
+    assert!(
+        !body_obj.contains_key("binary_mime"),
+        "`binary_mime` should be omitted when absent; got: {body}"
     );
 
     drop(device);
@@ -738,5 +837,288 @@ async fn control_browser_returns_429_when_rate_limited() {
         "expected at least one 429 in {statuses:?}"
     );
 
+    // Assert non-429 responses are exactly 404 (DEVICE_NOT_FOUND). This
+    // guards against a regression that fires the rate-limiter BEFORE
+    // auth/lookup — in which case unauthed callers would also receive
+    // 429, and requests that pass the limiter would still be 404
+    // (since the device is unknown). If a non-429, non-404 leaks
+    // through (e.g. 401, 200), the ordering of guards has shifted and
+    // we want to know.
+    let non_429s: Vec<reqwest::StatusCode> = statuses
+        .iter()
+        .filter(|&&s| s != reqwest::StatusCode::TOO_MANY_REQUESTS)
+        .copied()
+        .collect();
+    assert!(
+        non_429s
+            .iter()
+            .all(|&s| s == reqwest::StatusCode::NOT_FOUND),
+        "Expected non-429 statuses to all be 404 (DEVICE_NOT_FOUND); got: {non_429s:?}"
+    );
+
     server.shutdown().await;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Additional gap coverage (review follow-ups).
+// ──────────────────────────────────────────────────────────────────────
+
+/// T1: scope-claim guard. The handler at
+/// `crates/ahand-hub/src/http/control_plane.rs:626-632` rejects JWTs
+/// whose `claims.scope != "jobs:execute"` with 403 FORBIDDEN before any
+/// DB / WS work. Mirrors `create_job_rejects_wrong_scope` in
+/// `tests/control_plane.rs:1815`.
+#[tokio::test]
+async fn control_browser_403_when_scope_not_jobs_execute() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    // Pre-register an owned, browser-capable device so a successful
+    // path WOULD return 200 — that proves the 403 we observe is from
+    // the scope guard, not a downstream failure.
+    let _device = attach_owned_browser_device(&server, "cb-scope", "user-scope").await;
+    let token = mint_cp_jwt_with_scope("user-scope", "jobs:read");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/control/browser", server.http_base_url()))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "device_id": "cb-scope",
+            "session_id": "x",
+            "action": "snapshot",
+            "params": {},
+            "timeout_ms": 1_000,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
+
+    drop(_device);
+    server.shutdown().await;
+}
+
+/// T2: idempotency — pin the CURRENT "no dedupe" behavior of
+/// `correlation_id`. The wire schema accepts the field but the
+/// `browser_service::execute` path does NOT dedupe (deferred — see
+/// the doc-comment at `crates/ahand-hub/src/http/control_plane.rs:24-29`).
+///
+/// Two sequential POSTs with the same `correlation_id` must BOTH cause
+/// a daemon dispatch — i.e. the daemon receives two `BrowserRequest`
+/// envelopes. If a future commit accidentally implements idempotency
+/// (or follows the spec), this test will fail and force a conscious
+/// decision: update the test or update the spec.
+#[tokio::test]
+async fn control_browser_correlation_id_does_not_dedupe_currently() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let mut device = attach_owned_browser_device(&server, "cb-corr", "user-corr").await;
+    let token = mint_cp_jwt("user-corr");
+
+    let base_url = server.http_base_url().to_string();
+
+    // First POST — kick off, then immediately respond from the daemon
+    // so the request completes cleanly before the second POST starts.
+    let first = {
+        let base_url = base_url.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/control/browser"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "device_id": "cb-corr",
+                    "session_id": "sess-corr-1",
+                    "action": "snapshot",
+                    "timeout_ms": 5_000,
+                    "correlation_id": "dup-corr-id",
+                }))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    let req1 = device.recv_browser_request().await;
+    device
+        .send_browser_response(BrowserResponse {
+            request_id: req1.request_id.clone(),
+            session_id: req1.session_id.clone(),
+            success: true,
+            result_json: r#"{"ok":1}"#.into(),
+            error: String::new(),
+            binary_data: Vec::new(),
+            binary_mime: String::new(),
+        })
+        .await;
+    let resp1 = first.await.unwrap();
+    assert_eq!(resp1.status(), reqwest::StatusCode::OK);
+
+    // Second POST — same `correlation_id`. Under "no dedupe" this MUST
+    // hit the daemon a second time and complete on its own merits.
+    let second = {
+        let base_url = base_url.clone();
+        let token = token.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/control/browser"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "device_id": "cb-corr",
+                    "session_id": "sess-corr-2",
+                    "action": "snapshot",
+                    "timeout_ms": 5_000,
+                    "correlation_id": "dup-corr-id",
+                }))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    // Crucial assertion: the daemon receives a SECOND BrowserRequest.
+    // If the hub had deduped on `correlation_id`, this `recv` would
+    // hang and the test would fail via the per-test timeout (or via
+    // `second` panicking on the JSON shape if the hub answered from
+    // a cache).
+    let req2 = tokio::time::timeout(
+        Duration::from_secs(3),
+        device.recv_browser_request(),
+    )
+    .await
+    .expect(
+        "daemon did not receive a second BrowserRequest within 3s — \
+         the hub appears to be deduping on correlation_id, which \
+         contradicts the documented current behavior at \
+         control_plane.rs:24-29. Update this test or the spec.",
+    );
+    // Distinct request_id confirms the hub minted a fresh dispatch
+    // rather than replaying the first one.
+    assert_ne!(
+        req2.request_id, req1.request_id,
+        "request_ids must differ — same id would imply hub-side replay/dedupe"
+    );
+    assert_eq!(req2.session_id, "sess-corr-2");
+    device
+        .send_browser_response(BrowserResponse {
+            request_id: req2.request_id.clone(),
+            session_id: req2.session_id.clone(),
+            success: true,
+            result_json: r#"{"ok":2}"#.into(),
+            error: String::new(),
+            binary_data: Vec::new(),
+            binary_mime: String::new(),
+        })
+        .await;
+    let resp2 = second.await.unwrap();
+    assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+    let body2: serde_json::Value = resp2.json().await.unwrap();
+    assert_eq!(body2["success"], true);
+    assert_eq!(body2["data"]["ok"], 2);
+
+    drop(device);
+    server.shutdown().await;
+}
+
+/// T3: `BrowserServiceError::ChannelClosed` → 500 INTERNAL_ERROR.
+///
+/// Reproduced by reaching into `state.browser_pending` after the
+/// envelope has been dispatched and dropping the oneshot `tx`. That
+/// makes `rx.await` in `browser_service::execute` resolve with
+/// `Err(RecvError)` → `ChannelClosed` → 500. Without this test, a
+/// future change that re-routed the channel (or swallowed the error)
+/// could go unnoticed.
+///
+/// We poll the daemon side for the `BrowserRequest` first to ensure
+/// the pending entry has been inserted (the handler inserts BEFORE
+/// dispatch), then yank-and-drop the sender out of `browser_pending`.
+#[tokio::test]
+async fn control_browser_500_when_response_channel_closed() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let mut device = attach_owned_browser_device(&server, "cb-chan", "user-chan").await;
+    let token = mint_cp_jwt("user-chan");
+
+    let api_task = {
+        let base_url = server.http_base_url().to_string();
+        let token = token.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/control/browser"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "device_id": "cb-chan",
+                    "session_id": "sess-chan",
+                    "action": "snapshot",
+                    // Long enough that the test forces ChannelClosed
+                    // before timeout could fire.
+                    "timeout_ms": 30_000,
+                }))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+
+    // Wait until the daemon has received the BrowserRequest. By that
+    // point the handler has already inserted the pending oneshot.
+    let req = device.recv_browser_request().await;
+
+    // Yank the sender out of `browser_pending` and drop it. The handler
+    // future is awaiting `rx`; dropping `tx` makes that resolve with
+    // `Err(RecvError)` → `ChannelClosed` → 500 INTERNAL_ERROR.
+    let removed = server
+        .state()
+        .browser_pending
+        .remove(&req.request_id)
+        .map(|(_, tx)| tx)
+        .expect(
+            "expected `browser_pending` entry for the dispatched request_id; \
+             handler must insert before WS dispatch",
+        );
+    drop(removed);
+
+    let response = api_task.await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
+
+    drop(device);
+    server.shutdown().await;
+}
+
+/// T4: `BrowserServiceError::SendFailed` → 404 DEVICE_OFFLINE (race).
+///
+/// This is distinct from the "device row says offline" branch covered
+/// by `control_browser_404_when_device_offline`. `SendFailed` fires
+/// when `state.connections.send` itself returns `Err` — i.e. the
+/// device was online at lookup time but the WS dropped before the hub
+/// could enqueue the envelope.
+///
+/// Reproducing this path reliably requires either (a) injecting a mock
+/// `ConnectionRegistry` that returns `Err` for a specific device, or
+/// (b) winning a tight race between the device-store online check and
+/// `connections.send`. Today `ConnectionRegistry` is a concrete struct
+/// (no trait surface — see `crates/ahand-hub/src/ws/device_gateway.rs`),
+/// so option (a) would require introducing a trait + a swappable impl
+/// on `AppState` purely for tests, which is a larger refactor than
+/// this gap-coverage task warrants. Option (b) is too flaky to land
+/// in CI.
+///
+/// Filed as `#[ignore]` so it shows up in `cargo test -- --ignored`
+/// and won't be silently lost. Remove the `#[ignore]` once
+/// `ConnectionRegistry` grows a trait or once a deterministic harness
+/// for this race exists.
+#[tokio::test]
+#[ignore = "Requires a mockable ConnectionRegistry to deterministically force \
+            connections.send -> Err. Tracked under SendFailed branch coverage; \
+            see test docstring for the unblock condition."]
+async fn control_browser_404_device_offline_on_send_failure() {
+    // Sketch (for the future implementer):
+    //   1. Inject a `ConnectionRegistry`-equivalent that returns
+    //      `Err("ws closed")` from `send()` for `device_id == "cb-send-fail"`.
+    //   2. Pre-register the device as owned + mark it `online: true`
+    //      in the device store (so the online check passes).
+    //   3. POST /api/control/browser with `device_id: "cb-send-fail"`.
+    //   4. Assert: status == 404, body["error"]["code"] == "DEVICE_OFFLINE",
+    //      and the message contains "Failed to send to device:" (per
+    //      `map_service_error` in `http/browser.rs:127-131`).
+    panic!("see #[ignore] reason — test stub only");
 }
