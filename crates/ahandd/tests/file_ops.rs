@@ -319,6 +319,38 @@ async fn list_directory_basic() {
 }
 
 #[tokio::test]
+async fn list_offset_beyond_retain_cap_returns_invalid_path() {
+    // C4 regression: the bounded heap can only retain 100_000 entries,
+    // so a paginated request whose `offset + max_results` exceeds that
+    // window cannot be served accurately. We must reject up front
+    // rather than silently return an empty page with `has_more = true`,
+    // which would loop the caller forever. The guard fires before any
+    // directory walk, so this test is cheap regardless of dir size.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    fs::write(root.join("a.txt"), "a").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::List(FileList {
+            path: root.to_string_lossy().into_owned(),
+            // 100_000 + 1 > LIST_HEAP_RETAIN_CAP (100_000).
+            max_results: Some(1),
+            offset: Some(100_000),
+            include_hidden: false,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+    assert!(
+        err.message.contains("100000") || err.message.contains("listing window"),
+        "error should mention the cap, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
 async fn list_pagination() {
     let dir = TempDir::new().unwrap();
     let (mgr, root) = test_manager(&dir);
@@ -1530,6 +1562,97 @@ async fn write_exceeds_max_bytes_returns_too_large() {
     assert_eq!(err.code, FileErrorCode::TooLarge as i32);
 }
 
+/// Build a tight-budget manager (max_write_bytes = `max`) over `root` so the
+/// I3 tests can prove the existing-size pre-check fires before any read.
+fn manager_with_max_write(tmp_root: &Path, max: u64) -> ahandd::file_manager::FileManager {
+    let root_str = tmp_root.to_string_lossy().into_owned();
+    ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec![format!("{}/**", root_str), root_str.clone()],
+        path_denylist: vec![],
+        max_read_bytes: 100_000_000,
+        max_write_bytes: max,
+        dangerous_paths: vec![],
+    })
+}
+
+#[tokio::test]
+async fn write_string_replace_refuses_oversized_existing_file_before_read() {
+    // I3 regression: `apply_string_replace` used to call
+    // `tokio::fs::read_to_string` on the existing file *before* any size
+    // check. A 100 GB file would OOM during the read even though
+    // post-read `enforce_size_limit` was guaranteed to reject the result.
+    // The fix is a stat-then-refuse pre-check; this test exercises it
+    // through the Write StringReplace path (which goes through
+    // `apply_string_replace`).
+    let dir = TempDir::new().unwrap();
+    let tmp_root = dir.path().canonicalize().unwrap();
+    let mgr = manager_with_max_write(&tmp_root, 50);
+
+    let file = tmp_root.join("big.txt");
+    // 200 bytes > max_write_bytes (50). Tiny in absolute terms, but it
+    // exercises the same code path that would OOM on 100 GB.
+    fs::write(&file, vec![b'a'; 200]).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: file.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::StringReplace(StringReplace {
+                old_string: "a".into(),
+                new_string: "b".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+    assert!(
+        err.message.contains("existing file"),
+        "expected the pre-read guard's message, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn edit_string_replace_refuses_oversized_existing_file_before_read() {
+    // I3 regression via the Edit StringReplace path. Edit has its own
+    // inline `read_to_string` (not delegated to apply_string_replace),
+    // so the pre-check has to fire there independently.
+    let dir = TempDir::new().unwrap();
+    let tmp_root = dir.path().canonicalize().unwrap();
+    let mgr = manager_with_max_write(&tmp_root, 50);
+
+    let file = tmp_root.join("big.txt");
+    fs::write(&file, vec![b'a'; 200]).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: file.to_string_lossy().into_owned(),
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_edit::Method::StringReplace(StringReplace {
+                old_string: "a".into(),
+                new_string: "b".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+    assert!(
+        err.message.contains("existing file"),
+        "expected the pre-read guard's message, got: {}",
+        err.message
+    );
+}
+
 // ── FileEdit tests ─────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1696,6 +1819,26 @@ async fn delete_non_recursive_on_non_empty_dir_returns_not_empty() {
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::NotEmpty as i32);
     assert!(sub.exists());
+}
+
+#[tokio::test]
+async fn delete_trash_non_recursive_on_non_empty_dir_returns_not_empty() {
+    // C5 regression: TRASH used to ignore `recursive` entirely and
+    // silently move the whole subtree to trash even when the caller
+    // passed `recursive=false`. PERMANENT enforces this guard; TRASH
+    // must too. The guard fires before `trash::delete()`, so this
+    // test does NOT touch the system trash.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let sub = root.join("notempty-trash");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("x"), "x").unwrap();
+
+    let resp = mgr.handle(&delete_req(&sub, false, false)).await;
+    let err = expect_error(resp);
+    assert_eq!(err.code, FileErrorCode::NotEmpty as i32);
+    assert!(sub.exists(), "directory must remain when guard fires");
+    assert!(sub.join("x").exists(), "child must remain when guard fires");
 }
 
 // ── Trash path guess (Option B fallback) ──────────────────────────────────
@@ -2781,11 +2924,16 @@ async fn check_request_approval_returns_true_for_dangerous_path_read() {
             no_follow_symlink: false,
         })),
     };
-    let needs_approval = mgr
+    let escalation = mgr
         .check_request_approval(&req)
         .await
         .expect("dangerous path must not be denied");
-    assert!(needs_approval, "dangerous_paths read must require approval");
+    let escalation = escalation.expect("dangerous_paths read must require approval");
+    assert_eq!(
+        escalation.kind,
+        ahandd::file_manager::EscalationKind::DangerousPath
+    );
+    assert_eq!(escalation.path.as_deref(), Some(secret.to_string_lossy().as_ref()));
 }
 
 #[tokio::test]
@@ -2802,10 +2950,10 @@ async fn check_request_approval_returns_false_for_normal_path() {
             no_follow_symlink: false,
         })),
     };
-    let needs_approval = mgr.check_request_approval(&req).await.unwrap();
+    let escalation = mgr.check_request_approval(&req).await.unwrap();
     assert!(
-        !needs_approval,
-        "non-dangerous path must NOT trigger approval"
+        escalation.is_none(),
+        "non-dangerous path must NOT trigger approval, got {escalation:?}"
     );
 }
 
@@ -2828,10 +2976,14 @@ async fn check_request_approval_returns_true_for_recursive_permanent_delete() {
             no_follow_symlink: false,
         })),
     };
-    let needs_approval = mgr.check_request_approval(&req).await.unwrap();
-    assert!(
-        needs_approval,
-        "recursive PERMANENT delete must require approval"
+    let escalation = mgr
+        .check_request_approval(&req)
+        .await
+        .unwrap()
+        .expect("recursive PERMANENT delete must require approval");
+    assert_eq!(
+        escalation.kind,
+        ahandd::file_manager::EscalationKind::RecursivePermanentDelete
     );
 }
 
@@ -2851,10 +3003,10 @@ async fn check_request_approval_returns_false_for_non_recursive_permanent_delete
             no_follow_symlink: false,
         })),
     };
-    let needs_approval = mgr.check_request_approval(&req).await.unwrap();
+    let escalation = mgr.check_request_approval(&req).await.unwrap();
     assert!(
-        !needs_approval,
-        "non-recursive permanent delete should NOT require approval by itself"
+        escalation.is_none(),
+        "non-recursive permanent delete should NOT require approval by itself, got {escalation:?}"
     );
 }
 
@@ -2876,10 +3028,14 @@ async fn check_request_approval_returns_true_for_dangerous_path_trash_delete() {
             no_follow_symlink: false,
         })),
     };
-    let needs_approval = mgr.check_request_approval(&req).await.unwrap();
-    assert!(
-        needs_approval,
-        "TRASH delete on a dangerous path must still require approval"
+    let escalation = mgr
+        .check_request_approval(&req)
+        .await
+        .unwrap()
+        .expect("TRASH delete on a dangerous path must still require approval");
+    assert_eq!(
+        escalation.kind,
+        ahandd::file_manager::EscalationKind::DangerousPath
     );
 }
 
@@ -2902,4 +3058,102 @@ async fn check_request_approval_denies_symlink_target_outside_allowlist() {
     };
     let err = mgr.check_request_approval(&req).await.unwrap_err();
     assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn check_request_approval_escalates_relative_symlink_target_into_dangerous_path() {
+    // C2 regression: FileCreateSymlink with a *relative* target that
+    // resolves into a path listed in `dangerous_paths` must escalate to
+    // approval. Previously only absolute targets were checked, so a
+    // crafted `target = "../secret.txt"` with `link_path` inside the
+    // allowlist would slip past dangerous_paths entirely.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = manager_with_dangerous(&dir, &["secret.txt"]);
+    std::fs::write(root.join("secret.txt"), "shhh").unwrap();
+    let sub = root.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let link = sub.join("escape");
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: "../secret.txt".into(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let escalation = mgr
+        .check_request_approval(&req)
+        .await
+        .expect("relative target inside allowlist must not be denied")
+        .expect("relative target resolving into dangerous_paths must escalate");
+    assert_eq!(
+        escalation.kind,
+        ahandd::file_manager::EscalationKind::DangerousPath
+    );
+}
+
+/// RAII guard that lowers the glob-approval scan cap for the lifetime of a
+/// test, restoring the original cap on drop (even on panic). Tests use this
+/// so they don't have to materialize tens of thousands of files just to
+/// exercise the "cap hit" branch.
+struct GlobScanCapGuard {
+    previous: usize,
+}
+
+impl GlobScanCapGuard {
+    fn set(cap: usize) -> Self {
+        Self {
+            previous: ahandd::file_manager::set_glob_approval_scan_cap(cap),
+        }
+    }
+}
+
+impl Drop for GlobScanCapGuard {
+    fn drop(&mut self) {
+        ahandd::file_manager::set_glob_approval_scan_cap(self.previous);
+    }
+}
+
+#[tokio::test]
+async fn check_request_approval_glob_fails_closed_when_scan_cap_hit() {
+    // C3 regression: when a glob pattern matches more than the safety cap,
+    // the pre-flight scan can't prove the unscanned tail is safe — it must
+    // escalate to approval rather than fail open.
+    //
+    // We override the production cap of 10_000 down to a tiny number so we
+    // only have to create a handful of files; otherwise this test would
+    // burn ~10k filesystem inodes per run.
+    use ahand_protocol::FileGlob;
+
+    let _cap_guard = GlobScanCapGuard::set(8);
+
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = manager_with_dangerous(&dir, &["needle.txt"]);
+    std::fs::write(root.join("needle.txt"), "x").unwrap();
+    let bulk = root.join("bulk");
+    std::fs::create_dir(&bulk).unwrap();
+    // 10 matches > cap of 8, so the iterator still has items past the cap
+    // and we must hit the CapHit branch (not Clean).
+    for i in 0..10 {
+        std::fs::write(bulk.join(format!("f{i}.txt")), b"x").unwrap();
+    }
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Glob(FileGlob {
+            base_path: Some(bulk.to_string_lossy().into_owned()),
+            pattern: "*.txt".into(),
+            max_results: None,
+        })),
+    };
+    let escalation = mgr
+        .check_request_approval(&req)
+        .await
+        .expect("oversized glob must not be denied — it must be escalated")
+        .expect("oversized glob (cap hit) must require approval");
+    assert_eq!(
+        escalation.kind,
+        ahandd::file_manager::EscalationKind::GlobScanCapHit
+    );
 }

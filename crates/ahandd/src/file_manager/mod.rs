@@ -10,7 +10,8 @@ pub mod policy;
 pub mod text_read;
 pub mod write_ops;
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ahand_protocol::{
     DeleteMode, FileError, FileErrorCode, FileRequest, FileResponse, file_request, file_response,
@@ -18,6 +19,56 @@ use ahand_protocol::{
 
 use crate::config::FilePolicyConfig;
 use policy::FilePolicyChecker;
+
+/// Cap on how many glob matches we walk during the pre-flight approval scan.
+/// Past this point we fail closed (`GlobScanOutcome::CapHit`) — see C3.
+///
+/// Stored as an atomic so integration tests (which can't use `cfg(test)` on
+/// the library crate) can lower it via [`set_glob_approval_scan_cap`] without
+/// having to materialize 10k+ files. Loaded once per scan; the atomic cost
+/// is negligible next to the filesystem walk.
+static GLOB_APPROVAL_SCAN_CAP: AtomicUsize = AtomicUsize::new(10_000);
+
+/// Override the glob approval scan cap. Returns the previous value so the
+/// caller can restore it. Intended for tests; production code does not call
+/// this.
+pub fn set_glob_approval_scan_cap(cap: usize) -> usize {
+    GLOB_APPROVAL_SCAN_CAP.swap(cap, Ordering::Relaxed)
+}
+
+/// Why `check_request_approval` decided a request must go through approval.
+/// The `reason` string is what surfaces in the approval prompt UI; `path`
+/// is the specific path that triggered the escalation, when applicable.
+#[derive(Debug, Clone)]
+pub struct ApprovalEscalation {
+    pub kind: EscalationKind,
+    pub reason: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationKind {
+    RecursivePermanentDelete,
+    DangerousPath,
+    DangerousGlobMatch,
+    /// Glob's safety cap was hit before we could check every match — we
+    /// can't prove the unscanned tail is safe, so we force approval.
+    GlobScanCapHit,
+}
+
+/// Outcome of pre-walking a glob pattern for `dangerous_paths` matches.
+#[derive(Debug)]
+enum GlobScanOutcome {
+    /// At least one matched path is in `dangerous_paths`. Carries the path
+    /// so the approval prompt can name the specific match.
+    FoundDangerous(String),
+    /// We scanned `GLOB_APPROVAL_SCAN_CAP` matches without finding a
+    /// dangerous one, but more matches remained. C3: fail closed — the
+    /// caller treats this the same as "found one" (force approval).
+    CapHit,
+    /// No dangerous matches in the entire glob expansion (under the cap).
+    Clean,
+}
 
 /// Top-level file manager — dispatches `FileRequest` variants to submodule handlers.
 #[derive(Debug, Clone)]
@@ -56,58 +107,87 @@ impl FileManager {
     /// Pre-check a FileRequest's paths against policy *before* dispatching.
     ///
     /// Used by the request handler to decide whether the request should go
-    /// through the approval flow. A request is escalated to approval when
-    /// ANY of the following are true:
+    /// through the approval flow. Returns:
+    /// - `Ok(None)` — no escalation needed; normal session-mode flow applies.
+    /// - `Ok(Some(reason))` — request must go through approval; the reason
+    ///   carries enough context for the approval prompt (which path
+    ///   triggered it and why).
+    /// - `Err(FileError)` — a path is flat-out denied by policy; the caller
+    ///   should return this error immediately.
     ///
-    /// - The policy marks at least one of the request's paths as dangerous
-    ///   (`dangerous_paths` glob match).
-    /// - For `FileGlob`, at least one matched path is dangerous (R4 —
-    ///   without this, a glob over an allowed directory could silently
-    ///   surface files in `dangerous_paths`).
-    /// - The request is `FileDelete` with `mode = DELETE_MODE_PERMANENT`
-    ///   and `recursive = true` (R9 + spec rule: recursive permanent delete
-    ///   always forces approval regardless of session mode).
-    ///
-    /// Returns:
-    /// - `Ok(true)` — the request must go through the approval flow.
-    /// - `Ok(false)` — normal session-mode flow applies.
-    /// - `Err(FileError)` — one of the paths is flat-out denied by policy;
-    ///   the caller should return this error immediately.
-    pub async fn check_request_approval(&self, req: &FileRequest) -> Result<bool, FileError> {
-        // R9: recursive PERMANENT delete forces approval even if none of the
-        // paths themselves are marked dangerous. The spec says this must
-        // escalate regardless of session mode (design.md:635).
+    /// Escalation conditions (any one of these triggers approval):
+    /// - **Recursive PERMANENT delete** — spec rule design.md:635.
+    /// - **Dangerous-path match** — any path the request touches is in
+    ///   `dangerous_paths`. This now correctly resolves relative symlink
+    ///   targets too.
+    /// - **Glob over a tree containing dangerous paths** — `glob_has_*`
+    ///   walks matches with a safety cap and FAILS CLOSED at the cap (i.e.
+    ///   we conservatively force approval rather than letting an unscanned
+    ///   tail bypass it).
+    pub async fn check_request_approval(
+        &self,
+        req: &FileRequest,
+    ) -> Result<Option<ApprovalEscalation>, FileError> {
+        // Recursive PERMANENT delete forces approval even if none of the
+        // paths themselves are marked dangerous (design.md:635).
         if let Some(file_request::Operation::Delete(d)) = &req.operation {
             if d.mode == DeleteMode::Permanent as i32 && d.recursive {
-                return Ok(true);
+                return Ok(Some(ApprovalEscalation {
+                    kind: EscalationKind::RecursivePermanentDelete,
+                    reason: "recursive permanent delete requires explicit approval"
+                        .to_string(),
+                    path: Some(d.path.clone()),
+                }));
             }
         }
 
-        // Walk the request's declared paths (R2 + existing behavior). The
-        // collect_request_paths helper already includes both link_path AND
-        // target for CreateSymlink (see R2).
-        let mut needs_approval = false;
+        // Walk the request's declared paths. collect_request_paths now
+        // resolves relative CreateSymlink targets against the link's
+        // parent (C2), so a relative target hitting `dangerous_paths` is
+        // correctly escalated here.
         for (path, is_write, no_follow) in collect_request_paths(req) {
             let result = self.policy.check_path(&path, is_write, no_follow)?;
             if result.needs_approval {
-                needs_approval = true;
+                return Ok(Some(ApprovalEscalation {
+                    kind: EscalationKind::DangerousPath,
+                    reason: format!("path '{}' is listed in dangerous_paths", path),
+                    path: Some(path),
+                }));
             }
         }
-        if needs_approval {
-            return Ok(true);
-        }
 
-        // R4: for Glob requests, also expand the pattern and check each
-        // matched path. A glob rooted in an allowed directory can still
-        // surface files in `dangerous_paths`, so we must pre-walk matches
-        // here. Capped to avoid pathological patterns.
+        // Glob expansion: walk matches and either find a dangerous one or
+        // hit the safety cap. C3: at the cap we FAIL CLOSED — conservatively
+        // require approval rather than treating "didn't find one in the
+        // first 10k matches" as "safe".
         if let Some(file_request::Operation::Glob(g)) = &req.operation {
-            if glob_has_dangerous_match(&self.policy, g)? {
-                return Ok(true);
+            match glob_has_dangerous_match(&self.policy, g)? {
+                GlobScanOutcome::FoundDangerous(p) => {
+                    return Ok(Some(ApprovalEscalation {
+                        kind: EscalationKind::DangerousGlobMatch,
+                        reason: format!(
+                            "glob pattern matches a path '{}' listed in dangerous_paths",
+                            p
+                        ),
+                        path: Some(p),
+                    }));
+                }
+                GlobScanOutcome::CapHit => {
+                    return Ok(Some(ApprovalEscalation {
+                        kind: EscalationKind::GlobScanCapHit,
+                        reason: format!(
+                            "glob pattern matches more than {} paths; approval required \
+                             because not all matches could be checked against dangerous_paths",
+                            GLOB_APPROVAL_SCAN_CAP.load(Ordering::Relaxed)
+                        ),
+                        path: None,
+                    }));
+                }
+                GlobScanOutcome::Clean => {}
             }
         }
 
-        Ok(false)
+        Ok(None)
     }
 
     /// Dispatch a `FileRequest` to the appropriate submodule handler.
@@ -340,6 +420,35 @@ impl FileManager {
     }
 }
 
+/// Lexical (purely textual) path normalization — collapses `.` and `..`
+/// components without touching the filesystem and without following
+/// symlinks. Used to resolve relative symlink targets so the policy
+/// checker sees a clean, canonical-shape path it can match against
+/// `dangerous_paths` entries.
+///
+/// We deliberately do NOT use `canonicalize` here: we want to evaluate
+/// the symlink-target string as a literal reference, not as something
+/// to follow on disk (which would also fail when the target doesn't
+/// exist yet, which is the common case).
+fn lexically_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                // pop() returns false when out is empty or the only
+                // component is a root/prefix; in either case we just
+                // can't go further up, which is fine — we leave `out`
+                // as-is and the resulting path stays inside whatever
+                // root we started with.
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Walk a FileRequest and return every path it touches, alongside the
 /// `is_write` and `no_follow_symlink` flags that dispatch would use.
 /// Shared between `check_request_approval` (pre-flight) and the dispatch
@@ -376,38 +485,56 @@ fn collect_request_paths(req: &FileRequest) -> Vec<(String, bool, bool)> {
             (r.destination.clone(), true, false),
         ],
         Operation::CreateSymlink(r) => {
-            // R2: check BOTH the symlink's own location (link_path) and the
+            // Check BOTH the symlink's own location (link_path) and the
             // target string. The target is validated with no_follow=true +
             // is_write=false — it's a read-only reference stored inside the
-            // symlink, not a path we operate on directly. If the target is
-            // absolute and outside the allowlist, we refuse at creation
-            // time so the symlink can't be used as an allowlist-bypass
-            // vector later.
+            // symlink, not a path we operate on directly.
+            //
+            // C2: relative targets are resolved against the link's parent
+            // directory and lexically normalized BEFORE the policy check.
+            // Without this, a `target = "../secret.txt"` attached to an
+            // allowed link_path in `<root>/sub/` would either bypass
+            // `dangerous_paths` entirely (if we skipped relative targets)
+            // or get rejected by the unrelated path-traversal guard (if
+            // we passed `<root>/sub/../secret.txt` raw to the checker).
+            // Lexical normalization gives us `<root>/secret.txt`, which
+            // dangerous_paths can match correctly.
             let mut paths = vec![(r.link_path.clone(), true, true)];
-            if !r.target.is_empty() && Path::new(&r.target).is_absolute() {
-                paths.push((r.target.clone(), false, true));
+            if !r.target.is_empty() {
+                let target = Path::new(&r.target);
+                if target.is_absolute() {
+                    paths.push((r.target.clone(), false, true));
+                } else if let Some(parent) = Path::new(&r.link_path).parent() {
+                    let resolved = lexically_normalize(&parent.join(target));
+                    paths.push((resolved.to_string_lossy().into_owned(), false, true));
+                }
             }
             paths
         }
     }
 }
 
-/// R4 helper: walk glob matches and return `true` as soon as any match is
-/// flagged as dangerous by policy. Capped to avoid blocking on a
-/// pathological pattern like `/**/*` that could enumerate millions of
-/// files.
+/// Walk glob matches and either find a dangerous one or hit the safety cap.
+///
+/// C3: returns `CapHit` when the cap is reached — the caller treats this
+/// the same as `FoundDangerous` (force approval). Previously we returned
+/// `false` past the cap, which fails OPEN: a pattern matching 10_001 paths
+/// where the dangerous one happened to be the 10_001st would silently slip
+/// through.
+///
+/// We still cap; the only change is what "we ran out of budget" means.
 fn glob_has_dangerous_match(
     policy: &FilePolicyChecker,
     req: &ahand_protocol::FileGlob,
-) -> Result<bool, FileError> {
-    const GLOB_APPROVAL_SCAN_CAP: usize = 10_000;
-
+) -> Result<GlobScanOutcome, FileError> {
     // Reject patterns that would have been rejected by dispatch anyway.
+    // These are syntactic violations, not "dangerous-path" hits — there
+    // are zero legitimate matches to scan, so the answer is Clean.
     if req.pattern.starts_with('/') {
-        return Ok(false);
+        return Ok(GlobScanOutcome::Clean);
     }
     if req.pattern.split(&['/', '\\'][..]).any(|seg| seg == "..") {
-        return Ok(false);
+        return Ok(GlobScanOutcome::Clean);
     }
 
     // Resolve the pattern against the (policy-canonicalized) base_path.
@@ -417,7 +544,7 @@ fn glob_has_dangerous_match(
             // policy.check_path on the base_path, so we can trust it.
             match policy.check_path(b, false, false) {
                 Ok(r) => Some(r.resolved_path),
-                Err(_) => return Ok(false),
+                Err(_) => return Ok(GlobScanOutcome::Clean),
             }
         }
         _ => None,
@@ -427,22 +554,37 @@ fn glob_has_dangerous_match(
         None => req.pattern.clone(),
     };
 
-    let glob_iter = match glob::glob(&full_pattern) {
+    let mut glob_iter = match glob::glob(&full_pattern) {
         Ok(g) => g,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(GlobScanOutcome::Clean),
     };
 
-    for entry in glob_iter.take(GLOB_APPROVAL_SCAN_CAP) {
+    let cap = GLOB_APPROVAL_SCAN_CAP.load(Ordering::Relaxed);
+    let mut scanned = 0usize;
+    while scanned < cap {
+        let Some(entry) = glob_iter.next() else {
+            return Ok(GlobScanOutcome::Clean);
+        };
+        scanned += 1;
         let Ok(path) = entry else {
             continue;
         };
         let path_str = path.to_string_lossy();
-        match policy.check_path(&path_str, false, false) {
-            Ok(result) if result.needs_approval => return Ok(true),
-            _ => {}
+        if let Ok(result) = policy.check_path(&path_str, false, false)
+            && result.needs_approval
+        {
+            return Ok(GlobScanOutcome::FoundDangerous(path_str.into_owned()));
         }
     }
-    Ok(false)
+
+    // We hit the cap. If at least one more match exists, we can't prove
+    // safety — fail closed. If the iterator is exhausted exactly at the
+    // cap, we did finish scanning; treat as Clean.
+    if glob_iter.next().is_some() {
+        Ok(GlobScanOutcome::CapHit)
+    } else {
+        Ok(GlobScanOutcome::Clean)
+    }
 }
 
 /// R10: post-create verification to mitigate the nonexistent-path symlink

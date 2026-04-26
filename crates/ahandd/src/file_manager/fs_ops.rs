@@ -90,6 +90,23 @@ pub async fn handle_list(req: &FileList, resolved: &Path) -> Result<FileListResu
 
     let max_results = req.max_results.unwrap_or(DEFAULT_LIST_MAX) as usize;
     let offset = req.offset.unwrap_or(0) as usize;
+    // C4: refuse pagination requests we structurally cannot answer
+    // correctly. The bounded heap retains at most LIST_HEAP_RETAIN_CAP
+    // entries, so anything past that window can't be served accurately —
+    // we'd silently return an empty page with `has_more = true`, leaving
+    // the caller to spin forever. Return InvalidArgument so the client
+    // can surface a proper error instead.
+    if offset.saturating_add(max_results) > LIST_HEAP_RETAIN_CAP {
+        return Err(file_error(
+            FileErrorCode::InvalidPath,
+            &req.path,
+            format!(
+                "offset+max_results exceeds the directory listing window of {} entries; \
+                 narrow the listing or use FileGlob for deep pagination",
+                LIST_HEAP_RETAIN_CAP
+            ),
+        ));
+    }
     // We need to retain offset+max_results entries to serve this page, plus a
     // small safety margin so near-tie mtimes at the boundary don't drop a
     // valid entry. Capped at LIST_HEAP_RETAIN_CAP regardless of request.
@@ -357,6 +374,26 @@ pub async fn handle_delete(
 
     match mode {
         DeleteMode::Trash => {
+            // C5: TRASH was previously a "soft" delete that ignored the
+            // `recursive` flag entirely — sending a TRASH delete on a
+            // non-empty directory would silently move the whole tree
+            // even when `recursive = false`. PERMANENT delete enforces
+            // this guard; TRASH must too. Otherwise a caller checking
+            // "is this a single-file delete?" via `recursive=false`
+            // can't trust the call won't take a whole subtree.
+            let mut items_deleted: u32 = 1;
+            if metadata.is_dir() {
+                let count = count_recursive(resolved).await;
+                if !req.recursive && count > 1 {
+                    return Err(file_error(
+                        FileErrorCode::NotEmpty,
+                        &req.path,
+                        "directory not empty (use recursive=true)",
+                    ));
+                }
+                items_deleted = count;
+            }
+
             let path_str = resolved.to_string_lossy().into_owned();
             tokio::task::block_in_place(|| trash::delete(resolved)).map_err(|e| {
                 file_error(
@@ -382,7 +419,7 @@ pub async fn handle_delete(
             Ok(FileDeleteResult {
                 path: path_str,
                 mode: DeleteMode::Trash as i32,
-                items_deleted: 1,
+                items_deleted,
                 trash_path,
             })
         }
@@ -665,7 +702,12 @@ pub async fn handle_move(
     // on cross-device renames.
     match tokio::fs::rename(source_resolved, dest_resolved).await {
         Ok(_) => {}
-        Err(e) if e.raw_os_error() == Some(18) /* EXDEV */ => {
+        Err(e) if is_cross_device_error(&e) => {
+            tracing::info!(
+                source = %source_resolved.display(),
+                destination = %dest_resolved.display(),
+                "rename hit cross-device error; falling back to copy+delete"
+            );
             // Cross-filesystem: copy then delete.
             let copy_req = FileCopy {
                 source: req.source.clone(),
@@ -694,6 +736,31 @@ pub async fn handle_move(
         source: source_resolved.to_string_lossy().into_owned(),
         destination: dest_resolved.to_string_lossy().into_owned(),
     })
+}
+
+/// I6: detect "cross-device" rename errors portably.
+///
+/// The previous check tested `raw_os_error() == Some(18)`, which is EXDEV on
+/// Linux/macOS but does NOT match Windows' `ERROR_NOT_SAME_DEVICE = 17`. On
+/// Windows, a cross-volume `MoveFile` would therefore skip the copy+delete
+/// fallback and surface as a generic IO error. We now prefer the stable
+/// `io::ErrorKind::CrossesDevices` (Rust 1.85+, mapped per platform by std)
+/// and keep the numeric checks as a defensive fallback for libc/Windows
+/// codes that std might not classify.
+fn is_cross_device_error(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::CrossesDevices {
+        return true;
+    }
+    match e.raw_os_error() {
+        // Unix: EXDEV (Linux, macOS, BSDs) is 18.
+        #[cfg(unix)]
+        Some(18) => true,
+        // Windows: ERROR_NOT_SAME_DEVICE = 17 (winerror.h). Distinct from
+        // the Unix EXDEV value despite the proximity.
+        #[cfg(windows)]
+        Some(17) => true,
+        _ => false,
+    }
 }
 
 pub async fn handle_create_symlink(
@@ -893,5 +960,60 @@ pub fn io_to_file_error(err: io::Error, path: &Path) -> FileError {
         code: code as i32,
         message: err.to_string(),
         path: path_str,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cross_device_error;
+    use std::io;
+
+    #[test]
+    fn is_cross_device_error_detects_crosses_devices_kind() {
+        // I6 regression: the stable `io::ErrorKind::CrossesDevices` must
+        // be classified as cross-device on every platform. Without this,
+        // Windows cross-volume moves would skip the copy+delete fallback.
+        let e = io::Error::new(io::ErrorKind::CrossesDevices, "synthetic");
+        assert!(is_cross_device_error(&e));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_cross_device_error_detects_unix_exdev_raw_code() {
+        // EXDEV = 18 on Linux/macOS; std maps this to the CrossesDevices
+        // kind on supported toolchains, but we keep the numeric fallback
+        // for resilience.
+        let e = io::Error::from_raw_os_error(18);
+        assert!(is_cross_device_error(&e));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_cross_device_error_detects_windows_not_same_device_raw_code() {
+        // ERROR_NOT_SAME_DEVICE = 17 (winerror.h). Distinct from Unix
+        // EXDEV (also 18 vs 17) — checking only the Unix value would
+        // silently miss this on Windows.
+        let e = io::Error::from_raw_os_error(17);
+        assert!(is_cross_device_error(&e));
+    }
+
+    #[test]
+    fn is_cross_device_error_rejects_unrelated_errors() {
+        // Anything else must NOT trigger the copy+delete fallback,
+        // otherwise we'd silently mask real failures (PermissionDenied,
+        // NotFound, etc.).
+        let cases = [
+            io::Error::from(io::ErrorKind::NotFound),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            io::Error::from(io::ErrorKind::AlreadyExists),
+            io::Error::from_raw_os_error(2),  // ENOENT
+            io::Error::from_raw_os_error(13), // EACCES
+        ];
+        for e in &cases {
+            assert!(
+                !is_cross_device_error(e),
+                "expected not-cross-device for {e:?}"
+            );
+        }
     }
 }

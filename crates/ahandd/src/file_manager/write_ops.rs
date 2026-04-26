@@ -97,6 +97,8 @@ pub async fn handle_edit(
         file_edit::Method::StringReplace(sr) => {
             handle_string_replace_edit(&req.path, resolved, sr, max_write_bytes).await
         }
+        // Note: line/byte range edits delegate to apply_*_replace and pre-check
+        // existing size there.
         file_edit::Method::LineRangeReplace(lr) => {
             handle_line_range_replace_edit(&req.path, resolved, lr, max_write_bytes).await
         }
@@ -198,7 +200,7 @@ async fn handle_string_replace_write(
     sr: &StringReplace,
     max_write_bytes: u64,
 ) -> Result<FileWriteResult, FileError> {
-    let (bytes, count) = apply_string_replace(req_path, resolved, sr).await?;
+    let (bytes, count) = apply_string_replace(req_path, resolved, sr, max_write_bytes).await?;
     enforce_size_limit(bytes.len() as u64, max_write_bytes, req_path)?;
     tokio::fs::write(resolved, &bytes)
         .await
@@ -218,7 +220,7 @@ async fn handle_line_range_replace_write(
     lr: &LineRangeReplace,
     max_write_bytes: u64,
 ) -> Result<FileWriteResult, FileError> {
-    let bytes = apply_line_range_replace(req_path, resolved, lr).await?;
+    let bytes = apply_line_range_replace(req_path, resolved, lr, max_write_bytes).await?;
     enforce_size_limit(bytes.len() as u64, max_write_bytes, req_path)?;
     tokio::fs::write(resolved, &bytes)
         .await
@@ -238,7 +240,7 @@ async fn handle_byte_range_replace_write(
     br: &ByteRangeReplace,
     max_write_bytes: u64,
 ) -> Result<FileWriteResult, FileError> {
-    let bytes = apply_byte_range_replace(req_path, resolved, br).await?;
+    let bytes = apply_byte_range_replace(req_path, resolved, br, max_write_bytes).await?;
     enforce_size_limit(bytes.len() as u64, max_write_bytes, req_path)?;
     tokio::fs::write(resolved, &bytes)
         .await
@@ -260,6 +262,7 @@ async fn handle_string_replace_edit(
     sr: &StringReplace,
     max_write_bytes: u64,
 ) -> Result<FileEditResult, FileError> {
+    enforce_existing_size_limit(resolved, max_write_bytes, req_path).await?;
     let existing = tokio::fs::read_to_string(resolved)
         .await
         .map_err(|e| io_to_file_error(e, resolved))?;
@@ -303,7 +306,7 @@ async fn handle_line_range_replace_edit(
     lr: &LineRangeReplace,
     max_write_bytes: u64,
 ) -> Result<FileEditResult, FileError> {
-    let bytes = apply_line_range_replace(req_path, resolved, lr).await?;
+    let bytes = apply_line_range_replace(req_path, resolved, lr, max_write_bytes).await?;
     enforce_size_limit(bytes.len() as u64, max_write_bytes, req_path)?;
     tokio::fs::write(resolved, &bytes)
         .await
@@ -322,7 +325,7 @@ async fn handle_byte_range_replace_edit(
     br: &ByteRangeReplace,
     max_write_bytes: u64,
 ) -> Result<FileEditResult, FileError> {
-    let bytes = apply_byte_range_replace(req_path, resolved, br).await?;
+    let bytes = apply_byte_range_replace(req_path, resolved, br, max_write_bytes).await?;
     enforce_size_limit(bytes.len() as u64, max_write_bytes, req_path)?;
     tokio::fs::write(resolved, &bytes)
         .await
@@ -341,7 +344,9 @@ async fn apply_string_replace(
     req_path: &str,
     resolved: &Path,
     sr: &StringReplace,
+    max_write_bytes: u64,
 ) -> Result<(Vec<u8>, u32), FileError> {
+    enforce_existing_size_limit(resolved, max_write_bytes, req_path).await?;
     let existing = tokio::fs::read_to_string(resolved)
         .await
         .map_err(|e| io_to_file_error(e, resolved))?;
@@ -372,6 +377,7 @@ async fn apply_line_range_replace(
     req_path: &str,
     resolved: &Path,
     lr: &LineRangeReplace,
+    max_write_bytes: u64,
 ) -> Result<Vec<u8>, FileError> {
     if lr.start_line == 0 || lr.end_line == 0 || lr.end_line < lr.start_line {
         return Err(file_error(
@@ -380,6 +386,7 @@ async fn apply_line_range_replace(
             "invalid line range (start/end must be 1-based and start<=end)",
         ));
     }
+    enforce_existing_size_limit(resolved, max_write_bytes, req_path).await?;
     let existing = tokio::fs::read_to_string(resolved)
         .await
         .map_err(|e| io_to_file_error(e, resolved))?;
@@ -413,7 +420,9 @@ async fn apply_byte_range_replace(
     req_path: &str,
     resolved: &Path,
     br: &ByteRangeReplace,
+    max_write_bytes: u64,
 ) -> Result<Vec<u8>, FileError> {
+    enforce_existing_size_limit(resolved, max_write_bytes, req_path).await?;
     let existing = tokio::fs::read(resolved)
         .await
         .map_err(|e| io_to_file_error(e, resolved))?;
@@ -482,4 +491,37 @@ fn enforce_size_limit(size: u64, max: u64, path: &str) -> Result<(), FileError> 
     } else {
         Ok(())
     }
+}
+
+/// I3: stat the existing file BEFORE we slurp it into memory for an
+/// edit/replace operation. Without this, a 100 GB file would OOM the
+/// process during `read_to_string` even though the final post-edit size
+/// would obviously also exceed `max_write_bytes`. We can't avoid loading
+/// the file entirely for `StringReplace` / `LineRangeReplace` /
+/// `ByteRangeReplace` (the operations need the whole content), but we
+/// can at least refuse the read up front when we already know the
+/// post-edit check is doomed to fail.
+///
+/// A missing file isn't an error here — the caller's read will surface
+/// it with the correct `NotFound` code. We only short-circuit when stat
+/// succeeds and the file is too big.
+async fn enforce_existing_size_limit(
+    resolved: &Path,
+    max: u64,
+    req_path: &str,
+) -> Result<(), FileError> {
+    if let Ok(meta) = tokio::fs::metadata(resolved).await {
+        let size = meta.len();
+        if size > max {
+            return Err(file_error(
+                FileErrorCode::TooLarge,
+                req_path,
+                format!(
+                    "existing file is {size} bytes (> max_write_bytes {max}); \
+                     refusing to load it into memory for edit"
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
