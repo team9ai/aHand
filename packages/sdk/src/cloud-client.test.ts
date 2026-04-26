@@ -399,6 +399,15 @@ describe("CloudClient.spawn", () => {
     expect((err as CloudClientError).httpStatus).toBe(500);
   });
 
+  it("bad: 504 POST → CloudClientError(timeout)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({ error: { message: "request timeout" } }, 504)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.spawn({ deviceId: "d", tool: "t" }).catch((e) => e);
+    expect((err as CloudClientError).code).toBe("timeout");
+    expect((err as CloudClientError).httpStatus).toBe(504);
+    expect((err as CloudClientError).message).toBe("request timeout");
+  });
+
   it("bad: fetch throws network error → CloudClientError(network)", async () => {
     const netErr = new Error("ECONNREFUSED");
     const { fn } = mockFetch([() => { throw netErr; }]);

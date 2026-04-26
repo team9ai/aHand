@@ -90,7 +90,8 @@ export type CloudClientErrorCode =
   | "stream_ended"
   | "job_error"
   | "abort"
-  | "network";
+  | "network"
+  | "timeout";
 
 /**
  * Typed error raised by `CloudClient`. Use `.code` to discriminate,
@@ -159,6 +160,9 @@ async function toTypedHttpError(res: Response): Promise<CloudClientError> {
       break;
     case 429:
       code = "rate_limited";
+      break;
+    case 504:
+      code = "timeout";
       break;
     default:
       code = res.status >= 500 ? "server_error" : "bad_request";
