@@ -258,16 +258,29 @@ async fn sent_job_fails_after_disconnect_grace_without_reconnect() {
     let job_id = created["job_id"].as_str().unwrap().to_string();
     let request = device.recv_job_request().await;
     assert_eq!(request.tool, "sleep");
+
+    // Synchronization barrier: ensure the server has actually committed
+    // the Pending → Sent transition before we drop the device. On slow
+    // CI runners the local view of job state can briefly lag the
+    // transitions performed by create_job; without this wait, dropping
+    // the device may race the in-flight transition and exercise the
+    // wrong code path (Pending ⇒ instant fail instead of Sent ⇒ grace).
+    let _ = wait_for_job_status(&server, &job_id, "sent", Duration::from_secs(1)).await;
+    let drop_t = std::time::Instant::now();
     drop(device);
 
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    let still_sent = server
-        .get_json(&format!("/api/jobs/{job_id}"), "service-test-token")
-        .await;
-    assert_eq!(still_sent["status"], "sent");
-
-    let stored = wait_for_job_status(&server, &job_id, "failed", Duration::from_secs(1)).await;
+    let stored = wait_for_job_status(&server, &job_id, "failed", Duration::from_secs(2)).await;
+    let elapsed = drop_t.elapsed();
     assert_eq!(stored["status"], "failed");
+    // Sanity: grace was actually applied. The test config sets it to
+    // 100 ms; we floor the assertion at 50 ms to absorb tokio scheduler
+    // jitter on slow CI runners, while still being tight enough that a
+    // regression to grace=0 (immediate fail) would trip the bound.
+    assert!(
+        elapsed >= Duration::from_millis(50),
+        "expected disconnect grace to delay failure by at least 50ms, \
+         observed {elapsed:?}"
+    );
 
     let body = server
         .read_sse_for(
