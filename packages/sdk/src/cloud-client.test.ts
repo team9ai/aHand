@@ -929,6 +929,156 @@ describe("CloudClient.browser", () => {
     expect((err as CloudClientError).code).toBe("bad_request");
     expect((err as CloudClientError).httpStatus).toBe(418);
   });
+
+  it("bad: 200 with non-JSON body → CloudClientError(server_error)", async () => {
+    // Upstream gateway can swap an HTML 502 page in front of a 200 status.
+    // `res.json()` then throws a `SyntaxError` which must surface as
+    // `server_error`, not a raw exception.
+    const fakeFetch = async () =>
+      new Response("<html>oops</html>", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("bad: AbortError thrown by res.json() body stream → CloudClientError(abort)", async () => {
+    // If the caller aborts while the body is still draining, `res.json()`
+    // throws an `AbortError`. That must surface as `abort`, not `network`.
+    const fakeFetch = async () => {
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.error(new DOMException("aborted", "AbortError"));
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "abort" });
+  });
+
+  it("bad: generic error in res.json() body stream → CloudClientError(network)", async () => {
+    // A mid-body `TypeError` (e.g. socket reset) must surface as `network`.
+    const fakeFetch = async () => {
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.error(new TypeError("network reset"));
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "network" });
+  });
+
+  it("forwards AbortSignal to underlying fetch", async () => {
+    // Sanity check: the caller-supplied signal must reach `fetch()` so
+    // aborts actually cancel the in-flight request.
+    let capturedSignal: AbortSignal | undefined | null;
+    const fakeFetch = async (
+      _input: unknown,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      capturedSignal = init?.signal;
+      return new Response(
+        JSON.stringify({ success: true, duration_ms: 1 }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    };
+    const ctrl = new AbortController();
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "snapshot",
+      signal: ctrl.signal,
+    });
+    expect(capturedSignal).toBe(ctrl.signal);
+  });
+
+  it("rejects malformed root: response is the literal value null", async () => {
+    // `JSON.parse("null")` is the literal value `null`. Reading
+    // `.success` off it would throw `TypeError: Cannot read properties
+    // of null` — guard must reject before that.
+    const fakeFetch = async () =>
+      new Response("null", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("rejects malformed root: response is a non-object (number)", async () => {
+    // A misbehaving proxy could emit a bare number/string. The root
+    // check must reject these as malformed instead of crashing on
+    // property access.
+    const fakeFetch = async () =>
+      new Response("42", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
 });
 
 describe("CloudClientError", () => {

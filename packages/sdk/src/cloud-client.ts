@@ -417,7 +417,7 @@ export class CloudClient {
       // gateway swapped in an HTML 502 page with a 200 status). Both
       // need to surface as proper `CloudClientError`s so callers don't
       // see a raw `SyntaxError` / `AbortError` leaking through.
-      if (e instanceof DOMException && e.name === "AbortError") {
+      if (isAbortError(e)) {
         throw new CloudClientError(
           "abort",
           "browser request aborted during response read",
@@ -438,11 +438,19 @@ export class CloudClient {
     // means the hub's wire contract has drifted (e.g. a serializer
     // change emitting `success: 1`). Coercing `=== true` would silently
     // turn every such response into `success: false` with no signal —
-    // throw instead so the regression is immediately visible.
-    if (typeof json.success !== "boolean") {
+    // throw instead so the regression is immediately visible. We also
+    // guard the root itself: `JSON.parse("null")` is the literal value
+    // `null`, and a misbehaving proxy could return any non-object
+    // primitive — accessing `.success` on those would throw a
+    // `TypeError` that would escape uncaught.
+    if (
+      json === null ||
+      typeof json !== "object" ||
+      typeof (json as { success?: unknown }).success !== "boolean"
+    ) {
       throw new CloudClientError(
         "server_error",
-        "Hub response malformed: 'success' field missing or not a boolean",
+        "Hub response malformed: 'success' field missing, not an object, or not a boolean",
       );
     }
 
@@ -461,7 +469,7 @@ export class CloudClient {
         : undefined;
 
     return {
-      success: json.success,
+      success: json.success as boolean,
       data: json.data ?? undefined,
       error: json.error ? json.error : undefined,
       binary,
