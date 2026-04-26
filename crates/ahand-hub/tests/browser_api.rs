@@ -65,6 +65,26 @@ fn mint_cp_jwt(external_user_id: &str) -> String {
     token
 }
 
+/// Mint a control-plane JWT with a custom `device_ids` allowlist (or
+/// `None` for the default — i.e. no per-device restriction). Mirrors
+/// the helper in `tests/control_plane.rs` so the browser handler's
+/// allowlist branch can be exercised end-to-end.
+fn mint_cp_jwt_with_device_ids(
+    external_user_id: &str,
+    device_ids: Option<Vec<String>>,
+) -> String {
+    use ahand_hub_core::auth::mint_control_plane_jwt;
+    let (token, _) = mint_control_plane_jwt(
+        JWT_SECRET.as_bytes(),
+        external_user_id,
+        "jobs:execute",
+        device_ids,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    token
+}
+
 async fn login_token(server: &support::TestServer) -> String {
     let body = server
         .post_json(
@@ -635,5 +655,88 @@ async fn control_browser_returns_binary_data_base64_encoded() {
     assert!(body["duration_ms"].as_u64().is_some());
 
     drop(device);
+    server.shutdown().await;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Parity tests: device-allowlist + rate-limit branches mirror the
+// `/api/control/jobs` suite (see `tests/control_plane.rs::
+// create_job_rejects_device_not_in_allowlist` and `rate_limit_returns_429`).
+// ──────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn control_browser_403_when_device_not_in_allowlist() {
+    // Token's `device_ids` claim restricts access to "other-device", but
+    // the request targets "cb-allowlist" (which the user *does* own) —
+    // the handler must refuse 403 with FORBIDDEN before any WS
+    // dispatch.
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let _device = attach_owned_browser_device(&server, "cb-allowlist", "user-allowlist").await;
+    let token = mint_cp_jwt_with_device_ids(
+        "user-allowlist",
+        Some(vec!["other-device".to_string()]),
+    );
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/control/browser", server.http_base_url()))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "device_id": "cb-allowlist",
+            "session_id": "x",
+            "action": "snapshot",
+            "timeout_ms": 5_000,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
+
+    drop(_device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_browser_returns_429_when_rate_limited() {
+    // Same approach as `control_plane::rate_limit_returns_429`: fire
+    // many requests concurrently so they hit the per-user limiter
+    // inside the same governor refill window. Default limiter is
+    // burst=100, rps=10 — 150 concurrent POSTs reliably trip 429.
+    //
+    // We deliberately target an *unknown* device so that requests
+    // which pass the rate-limit check fail fast with DEVICE_NOT_FOUND
+    // instead of blocking on the WS round-trip waiting for a daemon
+    // response. The rate-limit check happens BEFORE the device lookup
+    // in `browser_command_control`, so the 429 path is exercised
+    // identically.
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let token = mint_cp_jwt("user-rl-browser");
+
+    let base_url = server.http_base_url().to_string();
+    let token_ref = &token;
+    let base_url_ref = &base_url;
+    let futures = (0..150).map(|i| async move {
+        reqwest::Client::new()
+            .post(format!("{base_url_ref}/api/control/browser"))
+            .bearer_auth(token_ref)
+            .json(&serde_json::json!({
+                "device_id": "cb-rl-ghost",
+                "session_id": format!("burst-{i}"),
+                "action": "snapshot",
+                "timeout_ms": 5_000,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    });
+    let statuses: Vec<_> = futures_util::future::join_all(futures).await;
+    assert!(
+        statuses.contains(&reqwest::StatusCode::TOO_MANY_REQUESTS),
+        "expected at least one 429 in {statuses:?}"
+    );
+
     server.shutdown().await;
 }

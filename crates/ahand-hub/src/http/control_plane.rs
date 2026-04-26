@@ -17,10 +17,16 @@
 //! Rate limiting: per-`external_user_id` token bucket (see
 //! [`crate::state::default_control_plane_rate_limiter`]).
 //!
-//! Idempotency: POST accepts an optional `correlation_id`. A second
-//! POST with the same `(external_user_id, correlation_id)` pair while
-//! the original job is still live returns the original `job_id`
-//! without re-dispatching.
+//! Idempotency: `POST /api/control/jobs` accepts an optional
+//! `correlation_id`. A second POST with the same
+//! `(external_user_id, correlation_id)` pair while the original job is
+//! still live returns the original `job_id` without re-dispatching.
+//! `POST /api/control/browser` accepts the field in its wire schema
+//! but does not currently dedupe — `correlation_id` is forwarded into
+//! `BrowserCommandInput` but discarded by `browser_service::execute`.
+//! Hub-layer dedupe for the browser endpoint is tracked as a
+//! follow-up; today's worker semantics rely on best-effort retries
+//! via fresh requests.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -612,6 +618,19 @@ pub async fn browser_command_control(
     State(state): State<AppState>,
     body: Result<Json<ControlBrowserRequest>, JsonRejection>,
 ) -> ApiResult<Json<ControlBrowserResponse>> {
+    // Validate the scope claim before any DB / WS work, mirroring the
+    // sibling handlers (`create_job`, `stream_job`, `cancel_job`). A
+    // token minted with a non-`jobs:execute` scope (e.g. `jobs:read`)
+    // must be rejected before we touch the device store or rate
+    // limiter.
+    if claims.scope != "jobs:execute" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT scope does not permit this action",
+        ));
+    }
+
     let Json(body) = body.map_err(ApiError::from_json_rejection)?;
 
     // Per-user rate-limit BEFORE any DB / WS work, mirroring the jobs
