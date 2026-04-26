@@ -32,7 +32,10 @@ impl DeviceIdentity {
         }
     }
 
-    #[allow(dead_code)]
+    /// Deterministic identity used by integration tests (golden signature
+    /// fixtures, handshake roundtrips). Seed is fixed `[7u8; 32]`; do not
+    /// call from production code paths — anything signed by this key has
+    /// no real authentication value.
     pub fn generate_for_tests() -> Self {
         Self {
             signing_key: SigningKey::from_bytes(&[7u8; 32]),
