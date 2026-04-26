@@ -61,10 +61,26 @@ pub async fn start_rejecting_401() -> Mock {
     start(Behavior::RejectAuth).await
 }
 
+/// Start a mock hub that completes the handshake then **stops reading**
+/// from the socket. tokio_tungstenite auto-Pongs only as a side effect of
+/// reading frames via `stream.next()` — by never reading, our mock leaves
+/// every client Ping in the TCP recv buffer with no Pong reply. From the
+/// daemon's perspective the connection looks alive at the OS level
+/// (writes still succeed into the send buffer) but no inbound activity
+/// arrives. This is the zombie-TCP shape the watchdog is meant to catch.
+///
+/// We deliberately don't close the socket either — that would bypass the
+/// watchdog entirely (the daemon's read loop would see Close and break
+/// for that reason instead).
+pub async fn start_silent_after_handshake() -> Mock {
+    start(Behavior::SilentAfterHandshake).await
+}
+
 #[derive(Clone, Copy)]
 enum Behavior {
     Accept,
     RejectAuth,
+    SilentAfterHandshake,
 }
 
 async fn start(behavior: Behavior) -> Mock {
@@ -172,6 +188,27 @@ async fn handle_conn(
                 })))
                 .await;
             let _ = sink.close().await;
+        }
+        Behavior::SilentAfterHandshake => {
+            let accepted = Envelope {
+                device_id: "mock-hub".into(),
+                msg_id: "accepted-zombie".into(),
+                ts_ms: 0,
+                payload: Some(envelope::Payload::HelloAccepted(HelloAccepted {
+                    auth_method: "bootstrap".into(),
+                    update_suggestion: None,
+                })),
+                ..Default::default()
+            };
+            let _ = sink.send(WsMessage::Binary(accepted.encode_to_vec())).await;
+
+            // Hold sink + src open without ever reading — the WS is
+            // alive at the TCP level but no Pong reply ever goes back
+            // to the client. Sleep the task long enough for the
+            // daemon's watchdog to fire (orders of magnitude longer
+            // than any test's heartbeat_interval).
+            let _keep_alive = (sink, src);
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     }
 }

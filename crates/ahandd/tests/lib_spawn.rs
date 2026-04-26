@@ -145,3 +145,67 @@ async fn daemon_sends_heartbeat_on_interval() {
 
     handle.shutdown().await.expect("shutdown clean");
 }
+
+/// Watchdog regression: when the WS connection becomes a TCP zombie (server
+/// stops reading from the socket — accepts Pings but never sends Pongs back),
+/// the daemon must detect "no inbound activity for 2× heartbeat_interval"
+/// and tear down the connection so the outer reconnect loop can dial a
+/// fresh socket.
+///
+/// Without the watchdog (pre-1adb5d4) the daemon stayed `Online` indefinitely
+/// — the OS only surfaces the dead socket after hours, and the hub-side
+/// `mark_offline` already fired minutes earlier, so the local UI showed
+/// "Online" while ahand-integration on the cloud side saw zero registered
+/// backends. This test pins the recovery path: daemon goes Online, then
+/// drops back to Connecting once the watchdog fires.
+#[tokio::test]
+async fn watchdog_detects_silent_zombie_and_reconnects() {
+    let mock = mock_hub::start_silent_after_handshake().await;
+    let tmp = TempDir::new().unwrap();
+    // 200ms heartbeat → 400ms watchdog. Test must allow enough wall-clock
+    // budget for handshake + first ping cycle + watchdog timeout +
+    // reconnect attempt; pick generous bounds to avoid flakiness on slow
+    // CI runners.
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
+        .heartbeat_interval(Duration::from_millis(200))
+        .build();
+
+    let handle = spawn(config).await.expect("spawn ok");
+    let mut status = handle.subscribe_status();
+
+    // Step 1: daemon must reach Online (handshake completed against the
+    // silent mock).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(*status.borrow(), DaemonStatus::Online { .. }) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("daemon never reached Online");
+
+    // Step 2: with no Pong ever arriving, the read-loop watchdog must
+    // expire and the outer reconnect loop must report Disconnected,
+    // surfaced by the StatusReporter as DaemonStatus::Connecting.
+    // Budget = handshake skip (200ms) + Ping interval (200ms) + watchdog
+    // (400ms) + reconnect attempt slack. 5 seconds is plenty.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(*status.borrow(), DaemonStatus::Connecting) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect(
+        "watchdog never fired — daemon stayed Online despite the silent hub. \
+         The connection-liveness check in ahand_client::connect_with_auth \
+         is not triggering; check that the WS Ping task and the read-loop \
+         tokio::time::timeout wrapper are still both wired in.",
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
