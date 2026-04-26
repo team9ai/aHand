@@ -21,6 +21,34 @@ use thiserror::Error;
 
 use crate::state::AppState;
 
+/// RAII guard that removes a `browser_pending` entry on drop unless
+/// explicitly disarmed. Ensures cleanup even if the surrounding handler
+/// future is cancelled mid-`.await` (e.g. axum drops the future when the
+/// HTTP client disconnects or the worker SDK calls `controller.abort()`
+/// between `insert` and the oneshot resolving).
+///
+/// `DashMap::remove` is idempotent (returns `Option<_>`), so the WS
+/// gateway's success-path remove at `device_gateway.rs:685` and this
+/// guard's drop coexist safely.
+struct PendingGuard<'a> {
+    state: &'a AppState,
+    request_id: String,
+}
+
+impl<'a> PendingGuard<'a> {
+    fn new(state: &'a AppState, request_id: String) -> Self {
+        Self { state, request_id }
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        // Idempotent — harmless even if the WS gateway already removed
+        // the entry on the success path.
+        let _ = self.state.browser_pending.remove(&self.request_id);
+    }
+}
+
 /// Input to [`execute`]. The handler is expected to have already done
 /// any auth / ownership / rate-limiting checks that are specific to its
 /// endpoint and to have parsed the JSON request body.
@@ -76,7 +104,8 @@ pub enum BrowserServiceError {
 /// 4. Build a `BrowserRequest` envelope and send it via the WS gateway.
 /// 5. Await the response with the caller's `timeout_ms` (clamped to a
 ///    minimum of 1000ms, matching the original handler).
-/// 6. Clean up the pending entry on every error path.
+/// 6. Clean up the pending entry on every exit path via an RAII guard
+///    so cancellation of the handler future does not leak entries.
 pub async fn execute(
     state: &AppState,
     input: BrowserCommandInput,
@@ -91,7 +120,14 @@ pub async fn execute(
         .devices
         .get(&input.device_id)
         .await
-        .map_err(|e| BrowserServiceError::Internal(format!("device store: {e}")))?
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                device_id = %input.device_id,
+                "device store lookup failed",
+            );
+            BrowserServiceError::Internal("device store error".to_string())
+        })?
         .ok_or_else(|| BrowserServiceError::DeviceNotFound {
             device_id: input.device_id.clone(),
         })?;
@@ -109,10 +145,16 @@ pub async fn execute(
         });
     }
 
-    // 3. Oneshot registration.
+    // 3. Oneshot registration. The `_guard` ensures the pending entry is
+    //    removed on every exit path — including future cancellation
+    //    (axum dropping the handler future when the HTTP client
+    //    disconnects or aborts mid-await). `DashMap::remove` is
+    //    idempotent so the WS gateway's success-path cleanup at
+    //    `device_gateway.rs:685` and this guard coexist safely.
     let request_id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
     state.browser_pending.insert(request_id.clone(), tx);
+    let _guard = PendingGuard::new(state, request_id.clone());
 
     // 4. Build envelope + dispatch.
     let envelope = Envelope {
@@ -132,7 +174,6 @@ pub async fn execute(
     };
 
     if let Err(err) = state.connections.send(&input.device_id, envelope).await {
-        state.browser_pending.remove(&request_id);
         // Match the original handler: a WS-send failure is reported to
         // the caller as DEVICE_OFFLINE so it has the same external
         // contract regardless of whether the device went offline before
@@ -149,16 +190,10 @@ pub async fn execute(
     let timeout = Duration::from_millis(input.timeout_ms.max(1000));
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(_)) => {
-            state.browser_pending.remove(&request_id);
-            Err(BrowserServiceError::ChannelClosed)
-        }
-        Err(_) => {
-            state.browser_pending.remove(&request_id);
-            Err(BrowserServiceError::Timeout {
-                ms: input.timeout_ms,
-            })
-        }
+        Ok(Err(_)) => Err(BrowserServiceError::ChannelClosed),
+        Err(_) => Err(BrowserServiceError::Timeout {
+            ms: input.timeout_ms,
+        }),
     }
 }
 
