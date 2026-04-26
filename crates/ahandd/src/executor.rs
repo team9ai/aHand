@@ -56,7 +56,28 @@ where
         s.start_run(&job_id, &req);
     }
 
-    let mut cmd = Command::new(&req.tool);
+    // Resolve `tool` — special "$SHELL" / "shell" tokens mean "the user's
+    // default login shell" (read from the daemon process's $SHELL env, which
+    // Tauri/launchctl populate from the user's session). The daemon then
+    // execs that shell with `-l` (login mode) so `~/.bashrc`, `~/.zprofile`,
+    // `~/.zshrc`, etc. are sourced — that's how `brew` / `nvm` / `pyenv` shims
+    // get on PATH. Falls back to `/bin/sh` when $SHELL is unset.
+    //
+    // Any other `tool` value is treated as a literal executable path or PATH-
+    // resolvable binary name (the previous behavior, untouched).
+    let is_shell_sentinel = req.tool == "$SHELL" || req.tool == "shell";
+    let tool_path = if is_shell_sentinel {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+    } else {
+        req.tool.clone()
+    };
+
+    let mut cmd = Command::new(&tool_path);
+    if is_shell_sentinel {
+        // Login mode: source the user's profile/rc files so the spawned
+        // command sees the same PATH the user does in their terminal.
+        cmd.arg("-l");
+    }
     cmd.args(&req.args);
 
     if !req.cwd.is_empty() {
