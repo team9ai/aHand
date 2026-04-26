@@ -31,6 +31,51 @@ impl EnvelopeSink for mpsc::UnboundedSender<Envelope> {
     }
 }
 
+/// Result of mapping a `JobRequest.tool` field to the actual binary the
+/// daemon will exec. Pure data so the resolution rules can be unit-tested
+/// without spawning real processes.
+///
+/// Exposed (`pub`) so the SDK ↔ daemon `tool` contract can be locked down
+/// from an integration test (`tests/job_request_tool.rs`). The set of
+/// accepted tool tokens is part of the public contract — bumping a string
+/// here without updating the SDK side is exactly what the contract test
+/// catches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTool {
+    /// Binary path/name passed to `Command::new`.
+    pub path: String,
+    /// Args inserted before `req.args` (e.g. `-l` for login-shell mode).
+    pub leading_args: Vec<String>,
+}
+
+/// Resolve `tool` against the daemon's environment.
+///
+/// Special tokens `"$SHELL"` and `"shell"` mean "the user's default login
+/// shell" — caller passes `std::env::var("SHELL").ok().as_deref()` for
+/// `shell_env`. Resolution falls back to `/bin/sh` when `$SHELL` is unset.
+/// Sentinel mode also prepends `-l` so the spawned shell sources the user's
+/// profile / rc files (gives spawned commands the same PATH the user sees
+/// in their terminal — brew, nvm, pyenv shims, etc.).
+///
+/// Any other `tool` value is treated as a literal executable path or
+/// PATH-resolvable binary name; no leading args.
+///
+/// `pub` for the same reason as [`ResolvedTool`]: this is the contract
+/// surface validated by `tests/job_request_tool.rs`.
+pub fn resolve_tool(tool: &str, shell_env: Option<&str>) -> ResolvedTool {
+    if tool == "$SHELL" || tool == "shell" {
+        ResolvedTool {
+            path: shell_env.unwrap_or("/bin/sh").to_string(),
+            leading_args: vec!["-l".to_string()],
+        }
+    } else {
+        ResolvedTool {
+            path: tool.to_string(),
+            leading_args: Vec::new(),
+        }
+    }
+}
+
 /// Runs a job and sends Envelope-wrapped events back via the channel.
 ///
 /// Listens on `cancel_rx` for a cancellation signal.  When received the child
@@ -56,7 +101,12 @@ where
         s.start_run(&job_id, &req);
     }
 
-    let mut cmd = Command::new(&req.tool);
+    let resolved = resolve_tool(&req.tool, std::env::var("SHELL").ok().as_deref());
+
+    let mut cmd = Command::new(&resolved.path);
+    for leading in &resolved.leading_args {
+        cmd.arg(leading);
+    }
     cmd.args(&req.args);
 
     if !req.cwd.is_empty() {
@@ -244,7 +294,16 @@ where
     };
 
     // --- Build command --------------------------------------------------
-    let mut cmd = CommandBuilder::new(&req.tool);
+    // INVARIANT: every spawn path must pipe `req.tool` through
+    // `resolve_tool`, so the SDK's `$SHELL` / `shell` sentinels work the
+    // same for `interactive=false` (run_job) and `interactive=true` (here).
+    // Skipping this here would silently break interactive jobs with ENOENT.
+    let resolved = resolve_tool(&req.tool, std::env::var("SHELL").ok().as_deref());
+
+    let mut cmd = CommandBuilder::new(&resolved.path);
+    for leading in &resolved.leading_args {
+        cmd.arg(leading);
+    }
     cmd.args(&req.args);
 
     if !req.cwd.is_empty() {
@@ -411,9 +470,7 @@ where
             warn!(job_id = %job_id, error = %e, "pty job join error");
             finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store)
         }
-        None => {
-            finish(&device_id, &job_id, -1, "unknown error", &tx, &store)
-        }
+        None => finish(&device_id, &job_id, -1, "unknown error", &tx, &store),
     }
 }
 
@@ -477,4 +534,107 @@ fn new_msg_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!("d-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tool_resolution_tests {
+    use super::{ResolvedTool, resolve_tool};
+
+    #[test]
+    fn dollar_shell_sentinel_resolves_to_shell_env_with_login_flag() {
+        let r = resolve_tool("$SHELL", Some("/bin/zsh"));
+        assert_eq!(
+            r,
+            ResolvedTool {
+                path: "/bin/zsh".to_string(),
+                leading_args: vec!["-l".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn shell_sentinel_resolves_to_shell_env_with_login_flag() {
+        // The bare `"shell"` form (without `$`) is also accepted for
+        // ergonomics; older callers may emit either.
+        let r = resolve_tool("shell", Some("/bin/bash"));
+        assert_eq!(
+            r,
+            ResolvedTool {
+                path: "/bin/bash".to_string(),
+                leading_args: vec!["-l".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn shell_sentinel_falls_back_to_bin_sh_when_shell_env_is_unset() {
+        // Tauri/launchctl normally propagate $SHELL from the user's
+        // session, but if for some reason it isn't set the daemon must
+        // still spawn _something_ — `/bin/sh` is POSIX-mandated, so
+        // it's the safe fallback rather than failing with ENOENT.
+        let r = resolve_tool("$SHELL", None);
+        assert_eq!(
+            r,
+            ResolvedTool {
+                path: "/bin/sh".to_string(),
+                leading_args: vec!["-l".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_absolute_binary_path_is_passed_through_unchanged() {
+        let r = resolve_tool("/usr/bin/whoami", Some("/bin/zsh"));
+        assert_eq!(
+            r,
+            ResolvedTool {
+                path: "/usr/bin/whoami".to_string(),
+                leading_args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_path_resolvable_binary_name_is_passed_through_unchanged() {
+        let r = resolve_tool("git", Some("/bin/zsh"));
+        assert_eq!(
+            r,
+            ResolvedTool {
+                path: "git".to_string(),
+                leading_args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_bin_sh_is_a_literal_not_a_sentinel() {
+        // `/bin/sh` should NOT be treated as the "shell" sentinel — this
+        // matters because callers (claw-hive ahand integration) used to
+        // hardcode `/bin/sh` and we want them to still produce a literal
+        // pass-through if they ever revert. The sentinel is only the
+        // bare strings `"shell"` / `"$SHELL"`.
+        let r = resolve_tool("/bin/sh", Some("/bin/zsh"));
+        assert_eq!(
+            r,
+            ResolvedTool {
+                path: "/bin/sh".to_string(),
+                leading_args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn empty_tool_is_passed_through_as_empty_path_no_leading_args() {
+        // Garbage-in/garbage-out: validation lives at the wire layer
+        // (protocol DTOs reject empty tool); resolve_tool itself does not
+        // own that check, just the sentinel mapping.
+        let r = resolve_tool("", Some("/bin/zsh"));
+        assert_eq!(
+            r,
+            ResolvedTool {
+                path: String::new(),
+                leading_args: vec![],
+            }
+        );
+    }
 }

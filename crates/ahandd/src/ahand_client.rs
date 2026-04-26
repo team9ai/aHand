@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ahand_protocol::{
-    BrowserResponse, Envelope, Hello, HelloAccepted, HelloChallenge, JobFinished, JobRejected,
-    envelope, hello,
+    BrowserResponse, Envelope, Heartbeat, Hello, HelloAccepted, HelloChallenge, JobFinished,
+    JobRejected, envelope, hello,
 };
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -45,7 +46,7 @@ impl Drop for CloseGuard {
 
 #[derive(Clone)]
 struct BufferedEnvelopeSender {
-    tx: mpsc::UnboundedSender<QueuedEnvelope>,
+    tx: mpsc::UnboundedSender<OutboundFrame>,
     outbox: Arc<Mutex<Outbox>>,
 }
 
@@ -54,9 +55,27 @@ struct QueuedEnvelope {
     envelope: Envelope,
 }
 
+/// Multiplexed sink output. App-level Envelope frames go through the
+/// outbox-stamping pipeline; WebSocket-level Ping frames bypass the
+/// outbox and only exist to keep the connection liveness-checked from
+/// the daemon side. Pings are sent so the read loop sees a Pong (auto-
+/// replied by tungstenite per RFC 6455) before its watchdog timeout
+/// fires — that's how we detect zombie TCP connections that survived
+/// macOS sleep/wake or NAT timeout without any visible socket error.
+enum OutboundFrame {
+    Envelope(QueuedEnvelope),
+    WsPing(Vec<u8>),
+}
+
 impl BufferedEnvelopeSender {
-    fn new(tx: mpsc::UnboundedSender<QueuedEnvelope>, outbox: Arc<Mutex<Outbox>>) -> Self {
+    fn new(tx: mpsc::UnboundedSender<OutboundFrame>, outbox: Arc<Mutex<Outbox>>) -> Self {
         Self { tx, outbox }
+    }
+
+    /// Send a raw WebSocket Ping. Returns Err only if the receiver task has
+    /// already exited (session tearing down).
+    fn send_ping(&self, payload: Vec<u8>) -> Result<(), ()> {
+        self.tx.send(OutboundFrame::WsPing(payload)).map_err(|_| ())
     }
 }
 
@@ -67,9 +86,43 @@ impl crate::executor::EnvelopeSink for BufferedEnvelopeSender {
             prepare_outbound(&mut outbox, &mut envelope)
         };
         self.tx
-            .send(QueuedEnvelope { frame, envelope })
+            .send(OutboundFrame::Envelope(QueuedEnvelope { frame, envelope }))
             .map_err(|_| ())
     }
+}
+
+/// Coarse outcome of a single `connect()` attempt, used by library callers
+/// that want to observe handshake success/failure without scraping logs.
+#[derive(Debug, Clone)]
+pub enum ConnectOutcome {
+    /// The Hello handshake was accepted.
+    HandshakeAccepted,
+    /// Every configured auth mode was rejected by the hub.
+    HandshakeRejected(String),
+    /// Transport-level failure (dial, TLS, malformed frame, …).
+    Session(String),
+    /// The session completed cleanly (remote closed, etc.).
+    Disconnected,
+}
+
+/// Sink for [`ConnectOutcome`] events. `run_with_reporter` calls this for
+/// every handshake attempt so callers can drive state machines off it.
+pub trait ClientReporter: Send + Sync + 'static {
+    fn report(&self, outcome: ConnectOutcome);
+}
+
+impl<F> ClientReporter for F
+where
+    F: Fn(ConnectOutcome) + Send + Sync + 'static,
+{
+    fn report(&self, outcome: ConnectOutcome) {
+        (self)(outcome)
+    }
+}
+
+struct NoopReporter;
+impl ClientReporter for NoopReporter {
+    fn report(&self, _outcome: ConnectOutcome) {}
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -84,6 +137,36 @@ pub async fn run(
     browser_mgr: Arc<BrowserManager>,
     file_mgr: Arc<FileManager>,
 ) -> anyhow::Result<()> {
+    run_with_reporter(
+        config,
+        device_id,
+        registry,
+        store,
+        session_mgr,
+        approval_mgr,
+        approval_broadcast_tx,
+        browser_mgr,
+        Arc::new(NoopReporter),
+    )
+    .await
+}
+
+/// Variant of [`run`] that pushes every handshake outcome into `reporter`.
+///
+/// Library callers (e.g. `public_api::spawn`) use this to drive a status
+/// channel without modifying the reconnect loop.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_reporter(
+    config: Config,
+    device_id: String,
+    registry: Arc<JobRegistry>,
+    store: Option<Arc<RunStore>>,
+    session_mgr: Arc<SessionManager>,
+    approval_mgr: Arc<ApprovalManager>,
+    approval_broadcast_tx: broadcast::Sender<Envelope>,
+    browser_mgr: Arc<BrowserManager>,
+    reporter: Arc<dyn ClientReporter>,
+) -> anyhow::Result<()> {
     let hub_config = config.hub_config();
     let identity_path = hub_config
         .private_key_path
@@ -92,6 +175,13 @@ pub async fn run(
         .unwrap_or_else(crate::device_identity::default_identity_path);
     let identity = DeviceIdentity::load_or_create(&identity_path)?;
     let bearer_token = hub_config.bootstrap_token.clone();
+    // Prefer millisecond precision when provided (library callers thread
+    // a `Duration` through), else fall back to the TOML-friendly
+    // `heartbeat_interval_secs`, else default to 60s.
+    let heartbeat_interval = match hub_config.heartbeat_interval_ms {
+        Some(ms) => Duration::from_millis(ms.max(1)),
+        None => Duration::from_secs(hub_config.heartbeat_interval_secs.unwrap_or(60).max(1)),
+    };
 
     // Outbox survives across reconnects.
     let outbox = Arc::new(Mutex::new(Outbox::new(10_000)));
@@ -101,11 +191,12 @@ pub async fn run(
     loop {
         info!(url = %config.server_url, "connecting to cloud");
 
-        match connect(
+        let attempt = connect_reporting(
             &config.server_url,
             &device_id,
             &identity,
             bearer_token.clone(),
+            heartbeat_interval,
             &session_mgr,
             &registry,
             &store,
@@ -114,11 +205,14 @@ pub async fn run(
             &approval_broadcast_tx,
             &browser_mgr,
             &file_mgr,
+            reporter.as_ref(),
         )
-        .await
-        {
+        .await;
+
+        match attempt {
             Ok(()) => {
                 info!("disconnected from cloud");
+                reporter.report(ConnectOutcome::Disconnected);
                 backoff = 1;
             }
             Err(e) => {
@@ -134,11 +228,12 @@ pub async fn run(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn connect(
+async fn connect_reporting(
     url: &str,
     device_id: &str,
     identity: &DeviceIdentity,
     bearer_token: Option<String>,
+    heartbeat_interval: Duration,
     session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
@@ -147,16 +242,18 @@ async fn connect(
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
     file_mgr: &Arc<FileManager>,
+    reporter: &dyn ClientReporter,
 ) -> anyhow::Result<()> {
     let auth_modes = hello_auth_modes(bearer_token.as_deref());
     let mut last_handshake_error = None;
 
     for auth_mode in auth_modes {
-        match connect_with_auth(
+        let outcome = connect_with_auth(
             url,
             device_id,
             identity,
             &auth_mode,
+            heartbeat_interval,
             session_mgr,
             registry,
             store,
@@ -165,19 +262,25 @@ async fn connect(
             approval_broadcast_tx,
             browser_mgr,
             file_mgr,
+            reporter,
         )
-        .await
-        {
+        .await;
+        match outcome {
             Ok(()) => return Ok(()),
             Err(ConnectError::HandshakeRejected(err)) => {
                 warn!(?auth_mode, error = %err, "hello auth rejected");
                 last_handshake_error = Some(err);
             }
-            Err(ConnectError::Session(err)) => return Err(err),
+            Err(ConnectError::Session(err)) => {
+                reporter.report(ConnectOutcome::Session(err.to_string()));
+                return Err(err);
+            }
         }
     }
 
-    Err(last_handshake_error.unwrap_or_else(|| anyhow::anyhow!("device hello rejected")))
+    let err = last_handshake_error.unwrap_or_else(|| anyhow::anyhow!("device hello rejected"));
+    reporter.report(ConnectOutcome::HandshakeRejected(err.to_string()));
+    Err(err)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -186,6 +289,7 @@ async fn connect_with_auth(
     device_id: &str,
     identity: &DeviceIdentity,
     auth_mode: &HelloAuthMode,
+    heartbeat_interval: Duration,
     session_mgr: &Arc<SessionManager>,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
@@ -194,11 +298,21 @@ async fn connect_with_auth(
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
     file_mgr: &Arc<FileManager>,
+    reporter: &dyn ClientReporter,
 ) -> Result<(), ConnectError> {
-    let (ws_stream, _) = tokio_tungstenite::connect_async(url)
+    // OS-level TCP keepalive is the lower-tier twin of the WS Ping/Pong
+    // watchdog: the watchdog catches application-level zombies in
+    // 2× heartbeat_interval; TCP keepalive catches OS-level zombies (NAT
+    // rewrite, sleep/wake) in ~60s regardless of WS traffic, and is
+    // critical on macOS where the default keepalive idle is 2 hours.
+    let tcp = connect_tcp_with_keepalive(url)
         .await
-        .map_err(anyhow::Error::from)
         .map_err(ConnectError::Session)?;
+    let (ws_stream, _) =
+        tokio_tungstenite::client_async_tls_with_config(url, tcp, None, None)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(ConnectError::Session)?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let challenge = recv_hello_challenge(&mut stream).await?;
@@ -228,6 +342,7 @@ async fn connect_with_auth(
         .map_err(ConnectError::Session)?;
     let accepted = recv_hello_accepted(&mut stream).await?;
     info!(auth_method = %accepted.auth_method, "hello accepted");
+    reporter.report(ConnectOutcome::HandshakeAccepted);
 
     // Replay unacked messages from previous connection.
     let unacked = outbox
@@ -245,7 +360,9 @@ async fn connect_with_auth(
     }
 
     // Channel: executor sends Envelope objects, send task stamps + encodes + sends.
-    let (raw_tx, mut rx) = mpsc::unbounded_channel::<QueuedEnvelope>();
+    // Multiplexed with WS-level Ping frames so the same task is the sole writer
+    // to `sink` (avoids needing a Mutex around the sink).
+    let (raw_tx, mut rx) = mpsc::unbounded_channel::<OutboundFrame>();
     let tx = BufferedEnvelopeSender::new(raw_tx, Arc::clone(outbox));
     let store_send = store.clone();
 
@@ -264,30 +381,97 @@ async fn connect_with_auth(
         crate::updater::spawn_update(params, device_id.to_string(), tx.clone());
     }
 
-    // Task: receive Envelope from executors, stamp with outbox, encode, send over WS.
+    // Task: receive OutboundFrame from executors + ws-ping task, stamp + encode
+    // + send over WS. Multiplexed so the sink stays single-owner.
     let send_handle = tokio::spawn(async move {
-        while let Some(queued) = rx.recv().await {
-            // Log outbound envelopes to trace.
-            if let Some(s) = &store_send {
-                s.log_envelope(&queued.envelope, Direction::Outbound).await;
-            }
-            if sink
-                .send(tungstenite::Message::Binary(queued.frame))
-                .await
-                .is_err()
-            {
+        while let Some(frame) = rx.recv().await {
+            let msg = match frame {
+                OutboundFrame::Envelope(queued) => {
+                    // Log outbound envelopes to trace.
+                    if let Some(s) = &store_send {
+                        s.log_envelope(&queued.envelope, Direction::Outbound).await;
+                    }
+                    tungstenite::Message::Binary(queued.frame)
+                }
+                OutboundFrame::WsPing(payload) => tungstenite::Message::Ping(payload),
+            };
+            if sink.send(msg).await.is_err() {
                 break;
             }
         }
     });
+
+    // Task: periodic Heartbeat envelopes over the buffered sender. Exits when
+    // `tx` is dropped (session end) because `BufferedEnvelopeSender::send`
+    // fails once the underlying mpsc closes — that is the only termination
+    // path and happens cooperatively without a separate shutdown signal.
+    let heartbeat_sender = tx.clone();
+    let heartbeat_device_id = device_id.to_string();
+    let daemon_version = env!("CARGO_PKG_VERSION").to_string();
+    let heartbeat_task = spawn_heartbeat_task(
+        heartbeat_sender,
+        heartbeat_device_id,
+        daemon_version,
+        heartbeat_interval,
+    );
+
+    // Task: WS-level Ping every `heartbeat_interval`. Tungstenite-spec-compliant
+    // peers (including our hub) auto-reply with Pong, so the read loop's
+    // watchdog timeout (2× heartbeat_interval) is reset on every successful
+    // ping. The reason this exists alongside the app-level heartbeat: the
+    // app-level heartbeat is a fire-and-forget Binary frame, so a zombie
+    // TCP connection (Mac sleep/wake, NAT timeout) accepts the write into
+    // the OS send buffer without ever delivering the bytes — daemon never
+    // notices, hub eventually marks device offline, UI stays "Online" until
+    // the OS gives up on the dead socket (~hours). WS Ping/Pong forces a
+    // round-trip — no Pong → no inbound message → watchdog fires → reconnect.
+    #[cfg(not(feature = "disable-ws-ping"))]
+    let ws_ping_task = {
+        let ws_ping_tx = tx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(heartbeat_interval);
+            // Skip first tick so it doesn't race with the Hello handshake.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if ws_ping_tx
+                    .send_ping(now_ms().to_be_bytes().to_vec())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
+    // Dev-only: disable the WS Ping path so OS-level TCP keepalive is the
+    // sole liveness signal. Used by the manual smoke test that verifies
+    // the kernel-level fallback recovers a zombie connection on its own.
+    #[cfg(feature = "disable-ws-ping")]
+    let ws_ping_task: tokio::task::JoinHandle<()> = tokio::spawn(async {});
 
     let caller_uid = "cloud";
 
     // Register the cloud caller so session queries return it.
     session_mgr.register_caller(caller_uid).await;
 
+    // Watchdog: if no inbound activity (Pong, app message, anything) for
+    // 2× heartbeat_interval, we're talking to a zombie connection. Break
+    // out so the outer reconnect loop can dial a fresh socket.
+    let read_timeout = heartbeat_interval.saturating_mul(2);
+
     // Process incoming messages.
-    while let Some(msg) = stream.next().await {
+    loop {
+        let msg = match tokio::time::timeout(read_timeout, stream.next()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => break, // stream ended
+            Err(_) => {
+                warn!(
+                    timeout_secs = read_timeout.as_secs(),
+                    "no inbound activity (no Pong, no message) — closing zombie connection",
+                );
+                break;
+            }
+        };
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
@@ -406,7 +590,9 @@ async fn connect_with_auth(
             }
             Some(envelope::Payload::StdinChunk(chunk)) => {
                 use crate::executor::StdinInput;
-                registry.send_stdin(&chunk.job_id, StdinInput::Data(chunk.data)).await;
+                registry
+                    .send_stdin(&chunk.job_id, StdinInput::Data(chunk.data))
+                    .await;
             }
             Some(envelope::Payload::TerminalResize(resize)) => {
                 use crate::executor::StdinInput;
@@ -424,20 +610,148 @@ async fn connect_with_auth(
         }
     }
 
-    // Signal connection close to detached approval tasks BEFORE awaiting
-    // the send task. send_handle's `rx.recv()` only returns once every
-    // sender clone is dropped, and any pending file-approval task spawned
-    // by handle_file_request still owns a `tx_clone`. Without this drop,
-    // the approval task would only release its sender after the
-    // ApprovalManager 24h timeout — wedging connect_with_auth's
-    // teardown for a full day.
+    // Teardown order matters here. Three independent things still hold
+    // sender clones and could wedge `send_handle.await`:
+    //
+    // 1. Detached file-approval tasks spawned by handle_file_request hold
+    //    a `tx_clone` AND wait on `close_rx`. They only release their
+    //    clone once `close_tx` fires — which CloseGuard does on drop.
+    //    Without dropping the guard FIRST, the task would block until
+    //    the ApprovalManager 24h timeout and wedge teardown for a day.
+    //    (C1 round-3 fix.)
+    // 2. The heartbeat task holds its own clone of
+    //    `BufferedEnvelopeSender` — if we dropped `tx` first, the send
+    //    task's mpsc receiver would still see a live sender and block on
+    //    `rx.recv()` indefinitely until the WS broke naturally. Aborting
+    //    the task drops its clone.
+    // 3. Same logic for `ws_ping_task`.
     drop(_close_guard);
-
-    // Drop the local sender so the send task exits as soon as the last
-    // approval task notices the close signal and releases its clone.
+    heartbeat_task.abort();
+    let _ = heartbeat_task.await;
+    ws_ping_task.abort();
+    let _ = ws_ping_task.await;
     drop(tx);
     let _ = send_handle.await;
 
+    Ok(())
+}
+
+/// Spawn the heartbeat-emission task.
+///
+/// Exits cleanly via one of:
+///   * `heartbeat_sender.send(...)` returns `Err` (underlying mpsc closed)
+///   * the returned `JoinHandle` is aborted by the caller at connection tear-down
+fn spawn_heartbeat_task<S>(
+    heartbeat_sender: S,
+    device_id: String,
+    daemon_version: String,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()>
+where
+    S: crate::executor::EnvelopeSink + 'static,
+{
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // `interval` fires immediately on the first tick; skip it so the
+        // first heartbeat lands `interval` after connection open rather
+        // than racing with the Hello handshake.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let envelope = Envelope {
+                device_id: device_id.clone(),
+                msg_id: new_msg_id(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::Heartbeat(Heartbeat {
+                    sent_at_ms: now_ms(),
+                    daemon_version: daemon_version.clone(),
+                })),
+                ..Default::default()
+            };
+            if heartbeat_sender.send(envelope).is_err() {
+                // Sender closed → session tore down. Exit cleanly so the
+                // JoinHandle resolves without the parent needing to abort.
+                break;
+            }
+        }
+    })
+}
+
+/// Dial a TcpStream to the host:port from `url_str` and apply OS-level
+/// keepalive: 30s idle, 10s probe interval, 3 retries (≈60s to detect a
+/// dead peer). On macOS the kernel default is 2h idle, so without this
+/// the daemon would stay attached to a zombie socket for hours after a
+/// laptop sleep/wake even though the WS Ping watchdog has already fired.
+///
+/// Returns the tokio TcpStream so the caller can layer WebSocket (and
+/// optional TLS) on top via `client_async_tls_with_config`.
+async fn connect_tcp_with_keepalive(url_str: &str) -> anyhow::Result<tokio::net::TcpStream> {
+    use anyhow::Context;
+    let parsed = url::Url::parse(url_str).context("invalid websocket url")?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("websocket url missing host: {url_str}"))?;
+    let port = parsed.port().unwrap_or_else(|| match parsed.scheme() {
+        "wss" => 443,
+        _ => 80,
+    });
+    let addr = format!("{host}:{port}");
+    let stream = tokio::net::TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("failed to dial {addr}"))?;
+    apply_tcp_keepalive(&stream).context("set TCP keepalive options")?;
+    Ok(stream)
+}
+
+/// Apply the canonical keepalive parameters to an already-connected TCP
+/// socket: 30s idle, 10s probe interval, 3 retries (~60s detection).
+/// Pulled out so unit tests can construct an arbitrary TcpStream
+/// (e.g. against a `TcpListener` on 127.0.0.1) and assert the options
+/// were set without going through the full WS handshake.
+///
+/// `with_retries` (TCP_KEEPCNT) is missing from socket2 0.5 on macOS, so
+/// we fall back to raw setsockopt there. Without it macOS would default
+/// to 8 retries (~110s detection), exceeding the 90s budget the WS
+/// reconnect path is built around.
+fn apply_tcp_keepalive(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    #[allow(unused_mut)]
+    let mut keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        keepalive = keepalive.with_retries(3);
+    }
+    socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    set_tcp_keepcnt_macos(stream, 3)?;
+
+    Ok(())
+}
+
+/// macOS / iOS path for `TCP_KEEPCNT`. socket2 0.5 doesn't expose this
+/// option for Apple targets, but the kernel honors it via raw
+/// setsockopt(IPPROTO_TCP, TCP_KEEPCNT). Returns the underlying io error
+/// so the caller's context can attach to it cleanly.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn set_tcp_keepcnt_macos(stream: &tokio::net::TcpStream, count: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let value: libc::c_int = count as libc::c_int;
+    // SAFETY: `fd` is owned by `stream` for the duration of this call;
+    // `&value` lives across the syscall; size matches `c_int`.
+    let ret = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -1271,8 +1585,115 @@ mod tests {
     use crate::outbox::Outbox;
 
     use super::{
-        BufferedEnvelopeSender, ConnectError, QueuedEnvelope, classify_hello_accepted_message,
+        BufferedEnvelopeSender, ConnectError, OutboundFrame, QueuedEnvelope,
+        classify_hello_accepted_message, connect_tcp_with_keepalive,
     };
+
+    /// Spinning up a real `spawn(...)` daemon and reaching into its private
+    /// TcpStream just to read getsockopt would mean exposing the socket
+    /// across the public API for one test's benefit. Instead, drive the
+    /// exact helper the daemon's connect path uses
+    /// (`connect_tcp_with_keepalive`) against a throwaway local listener
+    /// and read the keepalive options back via socket2 — same setter
+    /// codepath, no API surface bloat.
+    ///
+    /// Without OS-level keepalive, the daemon would inherit macOS's 2-hour
+    /// idle default and stay attached to a zombie socket for hours after
+    /// laptop sleep/wake. This test pins the 30s/10s/3-retry budget that
+    /// makes TCP keepalive a meaningful second line of defense behind the
+    /// WS Ping/Pong watchdog.
+    #[tokio::test]
+    async fn socket_keepalive_options_are_set() {
+        // Bind a TCP listener and spawn an accept-and-park task so the
+        // dial completes; we never speak WebSocket on it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _accept = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            // Hold the accepted socket open for the test's lifetime —
+            // dropping it would race the assertion with a TCP close.
+            std::future::pending::<()>().await;
+        });
+
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let stream = connect_tcp_with_keepalive(&url).await.expect("dial ok");
+        let sock = socket2::SockRef::from(&stream);
+
+        assert!(
+            sock.keepalive().expect("read SO_KEEPALIVE"),
+            "SO_KEEPALIVE must be on after connect_tcp_with_keepalive",
+        );
+
+        // Linux/BSDs path: socket2 exposes typed getters.
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            assert_eq!(
+                sock.keepalive_time().expect("read keepalive idle time"),
+                std::time::Duration::from_secs(30),
+                "TCP_KEEPIDLE must be 30s",
+            );
+            assert_eq!(
+                sock.keepalive_interval().expect("read keepalive probe interval"),
+                std::time::Duration::from_secs(10),
+                "TCP_KEEPINTVL must be 10s",
+            );
+            assert_eq!(
+                sock.keepalive_retries().expect("read keepalive retry count"),
+                3,
+                "TCP_KEEPCNT must be 3",
+            );
+        }
+
+        // macOS path: socket2 0.5 doesn't expose typed getters for
+        // TCP_KEEPALIVE / TCP_KEEPINTVL / TCP_KEEPCNT on Apple targets,
+        // so read them via raw getsockopt — the same syscall surface the
+        // production setter uses, just inverted.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            assert_eq!(
+                getsockopt_int(&stream, libc::TCP_KEEPALIVE),
+                30,
+                "TCP_KEEPALIVE (idle seconds) must be 30",
+            );
+            assert_eq!(
+                getsockopt_int(&stream, libc::TCP_KEEPINTVL),
+                10,
+                "TCP_KEEPINTVL must be 10s",
+            );
+            assert_eq!(
+                getsockopt_int(&stream, libc::TCP_KEEPCNT),
+                3,
+                "TCP_KEEPCNT must be 3 on macOS",
+            );
+        }
+    }
+
+    /// Read a single `c_int` TCP-level socket option via raw getsockopt.
+    /// Used by the macOS branch of `socket_keepalive_options_are_set`
+    /// because socket2 0.5 doesn't expose typed getters for the keepalive
+    /// timing options on Apple targets.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn getsockopt_int(stream: &tokio::net::TcpStream, opt: libc::c_int) -> libc::c_int {
+        use std::os::fd::AsRawFd;
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                opt,
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(
+            ret,
+            0,
+            "getsockopt({opt}) failed: {}",
+            std::io::Error::last_os_error(),
+        );
+        value
+    }
 
     #[test]
     fn auth_rejection_close_frame_is_classified_as_handshake_rejected() {
@@ -1292,10 +1713,89 @@ mod tests {
         assert!(matches!(err, ConnectError::Session(_)));
     }
 
+    // ── Heartbeat task exit paths ──────────────────────────────────
+    //
+    // The task spawned by `spawn_heartbeat_task` must exit cleanly via
+    // exactly two paths:
+    //   1. The `EnvelopeSink::send` call returns `Err(())` because the
+    //      underlying mpsc has been closed (e.g. session tore down).
+    //   2. The returned `JoinHandle` is explicitly aborted.
+    //
+    // Both branches are exercised below so the coverage tooling doesn't
+    // have to rely on the full integration test.
+
+    #[derive(Clone)]
+    struct CountingSink {
+        count: Arc<std::sync::atomic::AtomicUsize>,
+        fail_after: usize,
+    }
+
+    impl crate::executor::EnvelopeSink for CountingSink {
+        fn send(&self, _envelope: Envelope) -> Result<(), ()> {
+            let n = self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if n > self.fail_after { Err(()) } else { Ok(()) }
+        }
+    }
+
+    #[tokio::test]
+    async fn heartbeat_task_exits_when_send_errors() {
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = CountingSink {
+            count: count.clone(),
+            fail_after: 1,
+        };
+        let handle = super::spawn_heartbeat_task(
+            sink,
+            "device-exit-send".into(),
+            "test-version".into(),
+            std::time::Duration::from_millis(10),
+        );
+
+        // Sink fails after the first successful send. Task should exit
+        // within a few ticks.
+        let joined = tokio::time::timeout(std::time::Duration::from_millis(500), handle)
+            .await
+            .expect("heartbeat task did not exit on send error");
+        assert!(joined.is_ok(), "heartbeat task panicked: {joined:?}");
+        assert!(
+            count.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "expected at least one attempted send after the initial OK",
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_task_stops_when_aborted() {
+        // Sink that never fails — exits only via abort.
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = CountingSink {
+            count: count.clone(),
+            fail_after: usize::MAX,
+        };
+        let handle = super::spawn_heartbeat_task(
+            sink,
+            "device-exit-abort".into(),
+            "test-version".into(),
+            std::time::Duration::from_millis(10),
+        );
+        // Let the ticker fire at least once so we exercise the tick arm.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+        let joined = handle.await;
+        // JoinHandle on aborted task resolves to JoinError::is_cancelled.
+        assert!(
+            joined
+                .as_ref()
+                .err()
+                .map(|e| e.is_cancelled())
+                .unwrap_or(false),
+            "aborted heartbeat task should resolve as cancelled, got {joined:?}",
+        );
+    }
+
     #[test]
     fn buffered_envelope_sender_stores_frames_before_transport_send() {
         let outbox = Arc::new(Mutex::new(Outbox::new(16)));
-        let (tx, rx) = mpsc::unbounded_channel::<QueuedEnvelope>();
+        let (tx, rx) = mpsc::unbounded_channel::<OutboundFrame>();
         let sender = BufferedEnvelopeSender::new(tx, outbox.clone());
 
         sender

@@ -1,5 +1,5 @@
 import type WebSocket from "ws";
-import type { AHandServer, DeviceConnection, Job } from "@ahand/sdk";
+import type { AHandServer, DeviceConnection, Job } from "@ahandai/sdk";
 import type { DashboardState } from "./state.ts";
 import type {
   AnyDashboardEvent,

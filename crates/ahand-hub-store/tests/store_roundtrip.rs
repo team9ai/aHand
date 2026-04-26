@@ -29,6 +29,7 @@ async fn store_roundtrip_persists_devices_jobs_and_presence() -> anyhow::Result<
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await?;
 
@@ -105,6 +106,7 @@ async fn deleting_a_device_clears_presence() -> anyhow::Result<()> {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await?;
     stack.presence.mark_online("device-2", "ws").await?;
@@ -159,6 +161,7 @@ async fn updating_job_status_records_lifecycle_timestamps() -> anyhow::Result<()
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await?;
 
@@ -343,6 +346,7 @@ async fn concurrent_terminal_transitions_do_not_overwrite_each_other() -> anyhow
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await?;
     let store = stack.jobs.clone();

@@ -10,6 +10,12 @@ pub struct Device {
     pub version: Option<String>,
     pub auth_method: String,
     pub online: bool,
+    /// Opaque identifier assigned by the team9 gateway (or any other
+    /// upstream tenant) that owns this device. `None` for devices that
+    /// were created via the legacy bootstrap flow and never claimed by
+    /// an external user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_user_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -21,4 +27,5 @@ pub struct NewDevice {
     pub capabilities: Vec<String>,
     pub version: Option<String>,
     pub auth_method: String,
+    pub external_user_id: Option<String>,
 }

@@ -42,7 +42,7 @@ services:
       AHAND_HUB_BASE_URL: http://hub:8080
       NODE_ENV: production
     ports:
-      - "3100:3100"
+      - "3100:1516"
 
 volumes:
   hub-audit-data:

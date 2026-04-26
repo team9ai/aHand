@@ -40,7 +40,7 @@ fn encoded_read_text(path: &str, request_id: &str) -> Vec<u8> {
 
 async fn dashboard_token(server: &TestServer) -> String {
     server
-        .state_ref()
+        .state()
         .auth
         .issue_dashboard_jwt("operator-1")
         .unwrap()
@@ -230,7 +230,7 @@ async fn file_response_from_wrong_device_does_not_resolve_other_waiter() {
         .to_bytes()
         .to_vec();
     server
-        .state_ref()
+        .state()
         .devices
         .insert(NewDevice {
             id: "device-3".into(),
@@ -240,11 +240,12 @@ async fn file_response_from_wrong_device_does_not_resolve_other_waiter() {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
     server
-        .state_ref()
+        .state()
         .devices
         .mark_offline("device-3")
         .await
@@ -350,7 +351,7 @@ async fn file_operation_releases_slot_on_client_cancellation() {
     let received = device.recv_file_request().await;
     assert_eq!(received.request_id, "req-cancel");
     assert_eq!(
-        server.state_ref().pending_file_requests.in_flight(),
+        server.state().pending_file_requests.in_flight(),
         1,
         "slot must be reserved while the request is in flight"
     );
@@ -366,17 +367,17 @@ async fn file_operation_releases_slot_on_client_cancellation() {
     let mut waited = Duration::ZERO;
     let limit = Duration::from_secs(2);
     let step = Duration::from_millis(25);
-    while server.state_ref().pending_file_requests.in_flight() > 0 {
+    while server.state().pending_file_requests.in_flight() > 0 {
         if waited >= limit {
             panic!(
                 "slot was not released after client cancellation; in_flight = {}",
-                server.state_ref().pending_file_requests.in_flight()
+                server.state().pending_file_requests.in_flight()
             );
         }
         tokio::time::sleep(step).await;
         waited += step;
     }
-    assert_eq!(server.state_ref().pending_file_requests.in_flight(), 0);
+    assert_eq!(server.state().pending_file_requests.in_flight(), 0);
 
     server.shutdown().await;
 }

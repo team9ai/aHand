@@ -8,6 +8,11 @@ pub enum HubError {
     DeviceNotFound(String),
     #[error("device already exists: {0}")]
     DeviceAlreadyExists(String),
+    #[error("device {device_id} is owned by external user {existing_external_user_id}")]
+    DeviceOwnedByDifferentUser {
+        device_id: String,
+        existing_external_user_id: String,
+    },
     #[error("device offline: {0}")]
     DeviceOffline(String),
     #[error("job not found: {0}")]

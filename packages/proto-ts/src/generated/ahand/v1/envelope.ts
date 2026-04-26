@@ -6,8 +6,7 @@
 
 /* eslint-disable */
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
-import { BrowserRequest, BrowserResponse } from "./browser";
-import { FileRequest, FileResponse } from "./file_ops";
+import { BrowserRequest, BrowserResponse } from "./browser.js";
 
 export const protobufPackage = "ahand.v1";
 
@@ -171,8 +170,17 @@ export interface Envelope {
   updateStatus?: UpdateStatus | undefined;
   stdinChunk?: StdinChunk | undefined;
   terminalResize?: TerminalResize | undefined;
-  fileRequest?: FileRequest | undefined;
-  fileResponse?: FileResponse | undefined;
+  heartbeat?: Heartbeat | undefined;
+}
+
+/**
+ * Heartbeat — periodic keep-alive sent from daemon to hub over the existing
+ * WebSocket. The hub forwards each heartbeat as a `device.heartbeat` webhook
+ * event and uses its arrival to refresh TTL-based presence state.
+ */
+export interface Heartbeat {
+  sentAtMs: number;
+  daemonVersion: string;
 }
 
 /** HelloChallenge - server nonce that must be signed in the initial Hello response. */
@@ -422,8 +430,7 @@ function createBaseEnvelope(): Envelope {
     updateStatus: undefined,
     stdinChunk: undefined,
     terminalResize: undefined,
-    fileRequest: undefined,
-    fileResponse: undefined,
+    heartbeat: undefined,
   };
 }
 
@@ -513,11 +520,8 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.terminalResize !== undefined) {
       TerminalResize.encode(message.terminalResize, writer.uint32(242).fork()).join();
     }
-    if (message.fileRequest !== undefined) {
-      FileRequest.encode(message.fileRequest, writer.uint32(250).fork()).join();
-    }
-    if (message.fileResponse !== undefined) {
-      FileResponse.encode(message.fileResponse, writer.uint32(258).fork()).join();
+    if (message.heartbeat !== undefined) {
+      Heartbeat.encode(message.heartbeat, writer.uint32(250).fork()).join();
     }
     return writer;
   },
@@ -758,15 +762,7 @@ export const Envelope: MessageFns<Envelope> = {
             break;
           }
 
-          message.fileRequest = FileRequest.decode(reader, reader.uint32());
-          continue;
-        }
-        case 32: {
-          if (tag !== 258) {
-            break;
-          }
-
-          message.fileResponse = FileResponse.decode(reader, reader.uint32());
+          message.heartbeat = Heartbeat.decode(reader, reader.uint32());
           continue;
         }
       }
@@ -908,16 +904,7 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.terminal_resize)
         ? TerminalResize.fromJSON(object.terminal_resize)
         : undefined,
-      fileRequest: isSet(object.fileRequest)
-        ? FileRequest.fromJSON(object.fileRequest)
-        : isSet(object.file_request)
-        ? FileRequest.fromJSON(object.file_request)
-        : undefined,
-      fileResponse: isSet(object.fileResponse)
-        ? FileResponse.fromJSON(object.fileResponse)
-        : isSet(object.file_response)
-        ? FileResponse.fromJSON(object.file_response)
-        : undefined,
+      heartbeat: isSet(object.heartbeat) ? Heartbeat.fromJSON(object.heartbeat) : undefined,
     };
   },
 
@@ -1007,11 +994,8 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.terminalResize !== undefined) {
       obj.terminalResize = TerminalResize.toJSON(message.terminalResize);
     }
-    if (message.fileRequest !== undefined) {
-      obj.fileRequest = FileRequest.toJSON(message.fileRequest);
-    }
-    if (message.fileResponse !== undefined) {
-      obj.fileResponse = FileResponse.toJSON(message.fileResponse);
+    if (message.heartbeat !== undefined) {
+      obj.heartbeat = Heartbeat.toJSON(message.heartbeat);
     }
     return obj;
   },
@@ -1091,12 +1075,93 @@ export const Envelope: MessageFns<Envelope> = {
     message.terminalResize = (object.terminalResize !== undefined && object.terminalResize !== null)
       ? TerminalResize.fromPartial(object.terminalResize)
       : undefined;
-    message.fileRequest = (object.fileRequest !== undefined && object.fileRequest !== null)
-      ? FileRequest.fromPartial(object.fileRequest)
+    message.heartbeat = (object.heartbeat !== undefined && object.heartbeat !== null)
+      ? Heartbeat.fromPartial(object.heartbeat)
       : undefined;
-    message.fileResponse = (object.fileResponse !== undefined && object.fileResponse !== null)
-      ? FileResponse.fromPartial(object.fileResponse)
-      : undefined;
+    return message;
+  },
+};
+
+function createBaseHeartbeat(): Heartbeat {
+  return { sentAtMs: 0, daemonVersion: "" };
+}
+
+export const Heartbeat: MessageFns<Heartbeat> = {
+  encode(message: Heartbeat, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sentAtMs !== 0) {
+      writer.uint32(8).uint64(message.sentAtMs);
+    }
+    if (message.daemonVersion !== "") {
+      writer.uint32(18).string(message.daemonVersion);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Heartbeat {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseHeartbeat();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.sentAtMs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.daemonVersion = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): Heartbeat {
+    return {
+      sentAtMs: isSet(object.sentAtMs)
+        ? globalThis.Number(object.sentAtMs)
+        : isSet(object.sent_at_ms)
+        ? globalThis.Number(object.sent_at_ms)
+        : 0,
+      daemonVersion: isSet(object.daemonVersion)
+        ? globalThis.String(object.daemonVersion)
+        : isSet(object.daemon_version)
+        ? globalThis.String(object.daemon_version)
+        : "",
+    };
+  },
+
+  toJSON(message: Heartbeat): unknown {
+    const obj: any = {};
+    if (message.sentAtMs !== 0) {
+      obj.sentAtMs = Math.round(message.sentAtMs);
+    }
+    if (message.daemonVersion !== "") {
+      obj.daemonVersion = message.daemonVersion;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<Heartbeat>): Heartbeat {
+    return Heartbeat.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<Heartbeat>): Heartbeat {
+    const message = createBaseHeartbeat();
+    message.sentAtMs = object.sentAtMs ?? 0;
+    message.daemonVersion = object.daemonVersion ?? "";
     return message;
   },
 };

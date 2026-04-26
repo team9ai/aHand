@@ -39,7 +39,16 @@ message Envelope {
     TerminalResize   terminal_resize   = 30;
     FileRequest      file_request      = 31;
     FileResponse     file_response     = 32;
+    Heartbeat        heartbeat         = 33;
   }
+}
+
+// Heartbeat — periodic keep-alive sent from daemon to hub over the existing
+// WebSocket. The hub forwards each heartbeat as a `device.heartbeat` webhook
+// event and uses its arrival to refresh TTL-based presence state.
+message Heartbeat {
+  uint64 sent_at_ms    = 1;
+  string daemon_version = 2;
 }
 
 // HelloChallenge - server nonce that must be signed in the initial Hello response.

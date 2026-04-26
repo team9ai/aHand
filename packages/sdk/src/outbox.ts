@@ -1,4 +1,4 @@
-import type { Envelope as EnvelopeMsg } from "@ahand/proto";
+import type { Envelope as EnvelopeMsg } from "@ahandai/proto";
 import { encodeEnvelope } from "./codec.ts";
 
 /**

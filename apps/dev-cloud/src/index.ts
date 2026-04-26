@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
 import type WebSocket from "ws";
-import { AHandServer } from "@ahand/sdk";
+import { AHandServer } from "@ahandai/sdk";
 import { DashboardState } from "./dashboard/state.ts";
 import { DashboardBroadcaster } from "./dashboard/broadcaster.ts";
 import { createDashboardRoutes } from "./dashboard/routes.ts";

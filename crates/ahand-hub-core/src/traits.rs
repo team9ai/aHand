@@ -14,6 +14,40 @@ pub trait DeviceStore: Send + Sync {
     async fn delete(&self, device_id: &str) -> Result<()>;
 }
 
+/// Admin-plane operations on a device store. Implemented by the same
+/// backends that implement [`DeviceStore`], but split out into its own
+/// trait so callers that only need read/write ops (e.g. the dispatcher)
+/// don't need to know about the admin surface. The trait is intentionally
+/// additive — existing [`DeviceStore`] consumers are untouched.
+#[async_trait]
+pub trait DeviceAdminStore: Send + Sync {
+    /// Idempotent pre-register:
+    /// - if no row exists, insert `(device_id, public_key, external_user_id)`
+    /// - if a row exists with matching `external_user_id` AND matching
+    ///   `public_key`, return the existing row unchanged
+    /// - if a row exists with a different `external_user_id`, return
+    ///   [`crate::HubError::DeviceOwnedByDifferentUser`]
+    ///
+    /// Returns `(Device, registered_at)` where `registered_at` is the stable
+    /// timestamp from the DB row (i.e. the first time the device was inserted,
+    /// not `Utc::now()` on each call).
+    async fn pre_register(
+        &self,
+        device_id: &str,
+        public_key: &[u8],
+        external_user_id: &str,
+    ) -> Result<(Device, DateTime<Utc>)>;
+
+    async fn find_by_id(&self, device_id: &str) -> Result<Option<Device>>;
+
+    /// Delete returns true if a row was removed, false if it didn't
+    /// exist. Distinguishes "idempotent no-op" from "something changed"
+    /// for the admin API's 404 path.
+    async fn delete_device(&self, device_id: &str) -> Result<bool>;
+
+    async fn list_by_external_user(&self, external_user_id: &str) -> Result<Vec<Device>>;
+}
+
 #[async_trait]
 pub trait JobStore: Send + Sync {
     async fn insert(&self, job: NewJob) -> Result<Job>;

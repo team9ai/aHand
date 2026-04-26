@@ -114,16 +114,23 @@ jobs:
           docker run -d --rm \
             --network hub-release-smoke \
             --name hub-release-dashboard \
-            -p 13100:3100 \
+            -p 13100:1516 \
             -e AHAND_HUB_BASE_URL \
             ahand-hub-dashboard:release-smoke
 
+          dashboard_ready=0
           for attempt in $(seq 1 30); do
             if curl -fsS http://127.0.0.1:13100/login >/dev/null; then
+              dashboard_ready=1
               break
             fi
             sleep 1
           done
+          if [ "$dashboard_ready" -ne 1 ]; then
+            echo "dashboard never became ready on http://127.0.0.1:13100/login after 30s" >&2
+            docker logs hub-release-dashboard >&2 || true
+            exit 1
+          fi
 
           dashboard_login=$(
             curl -fsS \

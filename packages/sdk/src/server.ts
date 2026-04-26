@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import type WebSocket from "ws";
-import type { Envelope as EnvelopeMsg } from "@ahand/proto";
+import type { Envelope as EnvelopeMsg } from "@ahandai/proto";
 import { decodeEnvelope } from "./codec.ts";
 import { DeviceConnection } from "./connection.ts";
 import { Outbox } from "./outbox.ts";

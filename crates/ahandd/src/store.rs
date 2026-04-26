@@ -156,6 +156,7 @@ fn describe_payload(envelope: &Envelope) -> &'static str {
         Some(Payload::TerminalResize(_)) => "TerminalResize",
         Some(Payload::FileRequest(_)) => "FileRequest",
         Some(Payload::FileResponse(_)) => "FileResponse",
+        Some(Payload::Heartbeat(_)) => "Heartbeat",
         None => "none",
     }
 }

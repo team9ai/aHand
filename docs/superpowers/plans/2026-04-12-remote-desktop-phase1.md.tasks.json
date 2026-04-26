@@ -1,0 +1,89 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-12-remote-desktop-phase1.md",
+  "lastUpdated": "2026-04-12",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Protocol — protobuf additions",
+      "status": "pending",
+      "description": "**Goal:** Add DesktopCaptureConfig, DesktopFrame, DesktopCaptureAllowUpdate messages; extend JobRequest, Envelope, PolicyState, PolicyUpdate with new fields.\n\n**Files:**\n- Modify: proto/ahand/v1/envelope.proto\n\n**Verify:** `cargo build -p ahand-protocol && cargo test -p ahand-protocol`\n\nSee plan Task 0 for full steps.\n\n```json:metadata\n{\"files\":[\"proto/ahand/v1/envelope.proto\"],\"verifyCommand\":\"cargo build -p ahand-protocol && cargo test -p ahand-protocol\",\"acceptanceCriteria\":[\"DesktopCaptureConfig/DesktopFrame/DesktopCaptureAllowUpdate messages present\",\"JobRequest.desktop_capture at tag 8\",\"Envelope.desktop_frame at tag 31\",\"PolicyState.allow_desktop_capture at tag 6\",\"PolicyUpdate.set_allow_desktop_capture at tag 10\",\"cargo build -p ahand-protocol passes\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Daemon — desktop.rs capture module",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Implement run_desktop_capture standalone with xcap + image JPEG encode, pluggable CaptureBackend for testing, unit tests with FakeBackend.\n\n**Files:**\n- Create: crates/ahandd/src/desktop.rs\n- Modify: crates/ahandd/src/lib.rs (declare module)\n- Modify: crates/ahandd/Cargo.toml (xcap, image deps)\n\n**Verify:** `cargo test -p ahandd desktop::`\n\nSee plan Task 1 for full steps.\n\n```json:metadata\n{\"files\":[\"crates/ahandd/src/desktop.rs\",\"crates/ahandd/src/lib.rs\",\"crates/ahandd/Cargo.toml\"],\"verifyCommand\":\"cargo test -p ahandd desktop::\",\"acceptanceCriteria\":[\"run_desktop_capture exists with documented signature\",\"Cancel signal exits within 100ms\",\"Defaults applied when fps=0/quality=0\",\"Three consecutive errors terminate the loop\",\"JPEG encoding runs in spawn_blocking\",\"All unit tests pass\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Daemon — wire spawn_job + policy gate",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Route JobRequest.desktop_capture through new spawn_job branch. Enforce allow_desktop_capture policy (default false). Integration test covering both paths.\n\n**Files:**\n- Modify: crates/ahandd/src/ahand_client.rs\n- Modify: crates/ahandd/src/config.rs\n- Modify: crates/ahandd/src/policy.rs\n- Create: crates/ahandd/tests/desktop_capture.rs\n\n**Verify:** `cargo test -p ahandd --test desktop_capture --features test-support`\n\nSee plan Task 2 for full steps.\n\n```json:metadata\n{\"files\":[\"crates/ahandd/src/ahand_client.rs\",\"crates/ahandd/src/config.rs\",\"crates/ahandd/src/policy.rs\",\"crates/ahandd/tests/desktop_capture.rs\",\"crates/ahandd/Cargo.toml\"],\"verifyCommand\":\"cargo test -p ahandd --test desktop_capture --features test-support\",\"acceptanceCriteria\":[\"PolicyConfig.allow_desktop_capture defaults false\",\"spawn_job branches on desktop_capture BEFORE interactive check\",\"Policy disabled → JobRejected with clear reason\",\"Policy enabled → frames stream, cancel works, JobFinished emitted\",\"Integration test exercises both paths\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Hub — DesktopFrameBus module",
+      "status": "pending",
+      "blockedBy": [0],
+      "description": "**Goal:** Per-session live-only broadcast channel registry. Capacity 4 (slow subscribers drop), Arc<DesktopFrame> to share payloads. 6 unit tests covering pub/sub/close/lag/idempotency.\n\n**Files:**\n- Create: crates/ahand-hub/src/desktop_bus.rs\n- Modify: crates/ahand-hub/src/lib.rs\n\n**Verify:** `cargo test -p ahand-hub desktop_bus::`\n\nSee plan Task 3 for full steps.\n\n```json:metadata\n{\"files\":[\"crates/ahand-hub/src/desktop_bus.rs\",\"crates/ahand-hub/src/lib.rs\",\"crates/ahand-hub/Cargo.toml\"],\"verifyCommand\":\"cargo test -p ahand-hub desktop_bus::\",\"acceptanceCriteria\":[\"publish/subscribe/close API implemented\",\"Channel capacity 4\",\"Subscribe-before-first-publish works\",\"Slow subscriber gets Lagged, fast unaffected\",\"close is idempotent\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: Hub — JobRecord.desktop_capture_config field + handle_device_frame routing",
+      "status": "pending",
+      "blockedBy": [3],
+      "description": "**Goal:** Add DesktopCaptureConfigJson type and JobRecord.desktop_capture_config field (struct only, no DB yet). Wire DesktopFrameBus into handle_device_frame routing for DesktopFrame + JobFinished close.\n\n**Files:**\n- Modify: crates/ahand-hub-store/src/job_store.rs\n- Modify: crates/ahand-hub-store/src/lib.rs\n- Modify: crates/ahand-hub/src/http/jobs.rs\n- Modify: crates/ahand-hub/src/http/mod.rs\n\n**Verify:** `cargo test -p ahand-hub http::jobs:: -- handle_device_frame && cargo check --workspace`\n\nSee plan Task 4 for full steps.\n\n```json:metadata\n{\"files\":[\"crates/ahand-hub-store/src/job_store.rs\",\"crates/ahand-hub-store/src/lib.rs\",\"crates/ahand-hub/src/http/jobs.rs\",\"crates/ahand-hub/src/http/mod.rs\"],\"verifyCommand\":\"cargo test -p ahand-hub http::jobs:: -- handle_device_frame && cargo check --workspace\",\"acceptanceCriteria\":[\"DesktopCaptureConfigJson serde type exists with From impls\",\"JobRecord.desktop_capture_config field added\",\"is_desktop_capture() helper\",\"JobsState owns Arc<DesktopFrameBus>\",\"handle_device_frame routes DesktopFrame to bus\",\"JobFinished closes bus session for desktop jobs\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Hub Store — DB migration + Postgres persistence",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "**Goal:** Add 0002_add_desktop_capture_config.sql migration, wire Postgres insert/select, round-trip tests.\n\n**Files:**\n- Create: crates/ahand-hub-store/migrations/0002_add_desktop_capture_config.sql\n- Modify: crates/ahand-hub-store/src/postgres.rs\n- Modify: crates/ahand-hub-store/tests/store_roundtrip.rs\n\n**Verify:** `cargo test -p ahand-hub-store`\n\nSee plan Task 5 for full steps.\n\n```json:metadata\n{\"files\":[\"crates/ahand-hub-store/migrations/0002_add_desktop_capture_config.sql\",\"crates/ahand-hub-store/src/postgres.rs\",\"crates/ahand-hub-store/tests/store_roundtrip.rs\"],\"verifyCommand\":\"cargo test -p ahand-hub-store\",\"acceptanceCriteria\":[\"Migration adds nullable desktop_capture_config JSONB\",\"Existing tests still pass\",\"Round-trip test covers memory and Postgres\",\"Non-desktop jobs round-trip with None\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "Task 6: Hub — POST /api/jobs desktop branch + audit + 409 concurrency",
+      "status": "pending",
+      "blockedBy": [4, 5],
+      "description": "**Goal:** Accept desktop_capture in create_job, enforce one-session-per-device (409), emit desktop.capture.start/rejected/end audit events, add take_stats() to DesktopFrameBus.\n\n**Files:**\n- Modify: crates/ahand-hub/src/http/jobs.rs\n- Modify: crates/ahand-hub-store/src/audit_store.rs\n- Modify: crates/ahand-hub/src/desktop_bus.rs (stats tracking)\n- Modify: crates/ahand-hub/tests/job_flow.rs or new desktop_flow.rs\n\n**Verify:** `cargo test -p ahand-hub --test job_flow desktop`\n\nSee plan Task 6 for full steps.\n\n```json:metadata\n{\"files\":[\"crates/ahand-hub/src/http/jobs.rs\",\"crates/ahand-hub-store/src/audit_store.rs\",\"crates/ahand-hub/src/desktop_bus.rs\",\"crates/ahand-hub/tests/job_flow.rs\"],\"verifyCommand\":\"cargo test -p ahand-hub --test job_flow desktop\",\"acceptanceCriteria\":[\"CreateJobRequest accepts desktop_capture Option\",\"409 Conflict on concurrent same-device\",\"desktop.capture.start audit written\",\"desktop.capture.rejected audit written on 409\",\"desktop.capture.end audit includes frame_count + total_bytes + duration_ms\",\"Integration tests cover all three event types\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "Task 7: Hub — /api/desktop/token + /ws/desktop endpoints",
+      "status": "pending",
+      "blockedBy": [4, 6],
+      "description": "**Goal:** One-time token (60s TTL, single-use). WebSocket gateway streams paired text-metadata + binary-JPEG frames. Sends {type:ended} on JobFinished.\n\n**Files:**\n- Create: crates/ahand-hub/src/http/desktop.rs\n- Modify: crates/ahand-hub/src/http/mod.rs\n- Modify: crates/ahand-hub/src/lib.rs (AppState)\n- Create/Modify: crates/ahand-hub/tests/desktop_flow.rs\n\n**Verify:** `cargo test -p ahand-hub desktop_flow`\n\nSee plan Task 7 for full steps.\n\n```json:metadata\n{\"files\":[\"crates/ahand-hub/src/http/desktop.rs\",\"crates/ahand-hub/src/http/mod.rs\",\"crates/ahand-hub/src/lib.rs\",\"crates/ahand-hub/tests/desktop_flow.rs\"],\"verifyCommand\":\"cargo test -p ahand-hub desktop_flow\",\"acceptanceCriteria\":[\"POST /api/desktop/token returns {token, expires_in}\",\"Token is 60s single-use\",\"/ws/desktop streams text metadata + binary JPEG pairs\",\"{type:ended} emitted on session close\",\"Second use of token rejected\",\"Integration tests cover all paths\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "Task 8: Dashboard — use-desktop-stream hook",
+      "status": "pending",
+      "blockedBy": [7],
+      "description": "**Goal:** React hook managing desktop session lifecycle. State machine: idle → requesting-token → connecting → streaming → ended/error. Frame parsing, EMA stats. Vitest unit tests with fake WebSocket and fetch.\n\n**Files:**\n- Create: apps/hub-dashboard/src/hooks/use-desktop-stream.ts\n- Create: apps/hub-dashboard/tests/desktop-stream.test.ts\n\n**Verify:** `pnpm --filter hub-dashboard test desktop-stream`\n\nSee plan Task 8 for full steps.\n\n```json:metadata\n{\"files\":[\"apps/hub-dashboard/src/hooks/use-desktop-stream.ts\",\"apps/hub-dashboard/tests/desktop-stream.test.ts\"],\"verifyCommand\":\"pnpm --filter hub-dashboard test desktop-stream\",\"acceptanceCriteria\":[\"Hook exports useDesktopStream(deviceId) with documented return shape\",\"State machine covers all transitions\",\"Binary frame without preceding meta warns but does not crash\",\"onFrame hands bitmap to consumer (who calls close)\",\"stop() cancels job and cleans up\",\"Unit tests pass\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "Task 9: Dashboard — canvas + debug panel components",
+      "status": "pending",
+      "blockedBy": [8],
+      "description": "**Goal:** DeviceDesktopCanvas (forwardRef canvas with placeholder states) and DeviceDesktopDebug (one-row stats + expandable details).\n\n**Files:**\n- Create: apps/hub-dashboard/src/components/device-desktop-canvas.tsx\n- Create: apps/hub-dashboard/src/components/device-desktop-debug.tsx\n- Modify: apps/hub-dashboard/src/app/globals.css\n\n**Verify:** `pnpm --filter hub-dashboard build`\n\nSee plan Task 9 for full steps.\n\n```json:metadata\n{\"files\":[\"apps/hub-dashboard/src/components/device-desktop-canvas.tsx\",\"apps/hub-dashboard/src/components/device-desktop-debug.tsx\",\"apps/hub-dashboard/src/app/globals.css\"],\"verifyCommand\":\"pnpm --filter hub-dashboard build\",\"acceptanceCriteria\":[\"Canvas component accepts forwardRef\",\"Placeholder messages for each non-streaming state\",\"Debug panel renders all required stats\",\"Badge colors per state\",\"Expandable details panel\",\"TypeScript compiles clean\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "Task 10: Dashboard — DeviceDesktop + tabs integration + E2E smoke",
+      "status": "pending",
+      "blockedBy": [8, 9],
+      "description": "**Goal:** Wire hook + canvas + debug into DeviceDesktop top-level. Add Desktop tab to device-tabs.tsx. Manual E2E verification on macOS including 10-minute memory leak check.\n\n**Files:**\n- Create: apps/hub-dashboard/src/components/device-desktop.tsx\n- Modify: apps/hub-dashboard/src/components/device-tabs.tsx\n\n**Verify:** `pnpm --filter hub-dashboard build && pnpm --filter hub-dashboard test` + manual E2E\n\nSee plan Task 10 for full steps.\n\n```json:metadata\n{\"files\":[\"apps/hub-dashboard/src/components/device-desktop.tsx\",\"apps/hub-dashboard/src/components/device-tabs.tsx\"],\"verifyCommand\":\"pnpm --filter hub-dashboard build && pnpm --filter hub-dashboard test\",\"acceptanceCriteria\":[\"DeviceDesktop wires hook + canvas + debug correctly\",\"bitmap.close() called after drawImage\",\"Cleanup useEffect stops session on unmount\",\"Desktop tab appears for online devices\",\"Manual E2E: Start sees screen, Stop works, permission denial shows error\",\"10-minute leak check passes\"]}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 11: Docs — macOS permission, spec status, roadmap ticks",
+      "status": "pending",
+      "blockedBy": [10],
+      "description": "**Goal:** Write daemon README macOS permission section. Flip spec status to \"Phase 1 implemented\". Tick all Phase 1 checkboxes in roadmap.\n\n**Files:**\n- Modify: crates/ahandd/README.md\n- Modify: docs/superpowers/specs/2026-04-12-remote-desktop-research.md\n- Modify: docs/remote-control-roadmap.md\n\n**Verify:** Visual inspection + grep for checkboxes.\n\nSee plan Task 11 for full steps.\n\n```json:metadata\n{\"files\":[\"crates/ahandd/README.md\",\"docs/superpowers/specs/2026-04-12-remote-desktop-research.md\",\"docs/remote-control-roadmap.md\"],\"verifyCommand\":\"grep -c '\\\\[x\\\\]' docs/remote-control-roadmap.md\",\"acceptanceCriteria\":[\"Daemon README has macOS Screen Recording Permission section\",\"Spec status updated to Phase 1 implemented\",\"All Phase 1 roadmap checkboxes ticked\"]}\n```"
+    }
+  ]
+}
