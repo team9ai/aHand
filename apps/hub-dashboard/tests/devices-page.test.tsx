@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import DevicesPage from "@/app/(dashboard)/devices/page";
 import DeviceDetailPage from "@/app/(dashboard)/devices/[id]/page";
 import { Sidebar } from "@/components/sidebar";
-import { getDevice, getDevices, getJobs } from "@/lib/api";
+import { getDevice, getDevices } from "@/lib/api";
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -11,7 +11,6 @@ vi.mock("@/lib/api", async (importOriginal) => {
     ...actual,
     getDevices: vi.fn(),
     getDevice: vi.fn(),
-    getJobs: vi.fn(),
     withDashboardSession: actual.withDashboardSession,
   };
 });
@@ -76,7 +75,11 @@ describe("devices surfaces", () => {
     expect(screen.getByText(/no devices match the current filters/i)).toBeInTheDocument();
   });
 
-  it("renders device detail metadata, fingerprint, and recent jobs", async () => {
+  it("renders device detail metadata, fingerprint, and capabilities", async () => {
+    // The jobs panel is no longer rendered server-side — DeviceJobsPanel
+    // (a client component) fetches its own jobs via `fetch`. Job-list
+    // assertions live in `device-jobs-panel.test.tsx` to avoid coupling
+    // this server-render test to the client tab's data flow.
     vi.mocked(getDevice).mockResolvedValue({
       id: "device-1",
       hostname: "render-node",
@@ -87,17 +90,6 @@ describe("devices surfaces", () => {
       auth_method: "ed25519",
       online: true,
     });
-    vi.mocked(getJobs).mockResolvedValue([
-      {
-        id: "job-1",
-        device_id: "device-1",
-        tool: "render",
-        args: ["scene.blend"],
-        cwd: "/srv/work",
-        timeout_ms: 30_000,
-        status: "running",
-      },
-    ]);
 
     render(
       await DeviceDetailPage({
@@ -108,7 +100,6 @@ describe("devices surfaces", () => {
     expect(screen.getByRole("heading", { name: /render-node/i })).toBeInTheDocument();
     expect(screen.getByText(/00010203/i)).toBeInTheDocument();
     expect(screen.getByText("gpu")).toBeInTheDocument();
-    expect(screen.getByText("render")).toBeInTheDocument();
   });
 
   it("highlights the active sidebar destination", () => {
@@ -119,7 +110,6 @@ describe("devices surfaces", () => {
 
   it("renders device not found when the device does not exist", async () => {
     vi.mocked(getDevice).mockResolvedValue(null);
-    vi.mocked(getJobs).mockResolvedValue([]);
 
     render(
       await DeviceDetailPage({

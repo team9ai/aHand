@@ -77,7 +77,16 @@ export function DeviceJobsPanel({ deviceId }: { deviceId: string }) {
   );
 
   if (jobs === null) {
-    return <p className="empty-state">Loading jobs…</p>;
+    // Still in the initial fetch (or every fetch so far has failed).
+    // Render the error banner alongside the loading hint so a 500/network
+    // failure on the very first request is visible — the early-return
+    // version would show "Loading jobs…" indefinitely with no signal.
+    return (
+      <div className="device-jobs-panel">
+        {error && <p className="inline-error">{error}</p>}
+        <p className="empty-state">Loading jobs…</p>
+      </div>
+    );
   }
 
   const active = jobs
