@@ -3273,3 +3273,397 @@ async fn check_request_approval_glob_fails_closed_when_scan_cap_hit() {
         ahandd::file_manager::EscalationKind::GlobScanCapHit
     );
 }
+
+#[tokio::test]
+async fn check_request_approval_glob_escalates_when_match_is_in_dangerous_paths() {
+    // The sister branch of the glob fail-closed (C3) approval flow:
+    // if the pre-flight scan finds a glob expansion that matches a
+    // path listed in `dangerous_paths`, escalation kind must be
+    // `DangerousGlobMatch` (not `GlobScanCapHit`, not bypassed).
+    // Without this test, a regression that conflated the two branches
+    // — or that silently failed the dangerous check while reporting
+    // CapHit — would slip through.
+    use ahand_protocol::FileGlob;
+
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = manager_with_dangerous(&dir, &["secrets/**"]);
+    let secrets = root.join("secrets");
+    std::fs::create_dir(&secrets).unwrap();
+    std::fs::write(secrets.join("api_key.txt"), "shh").unwrap();
+    std::fs::write(root.join("normal.txt"), "x").unwrap();
+
+    // Pattern intentionally matches both the dangerous path and the
+    // normal one — the scan must surface the dangerous match.
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Glob(FileGlob {
+            base_path: Some(root.to_string_lossy().into_owned()),
+            pattern: "**/*.txt".into(),
+            max_results: None,
+        })),
+    };
+    let escalation = mgr
+        .check_request_approval(&req)
+        .await
+        .expect("dangerous glob must not be denied — it must be escalated")
+        .expect("a glob matching dangerous_paths must require approval");
+    assert_eq!(
+        escalation.kind,
+        ahandd::file_manager::EscalationKind::DangerousGlobMatch
+    );
+    // The escalation message should name the specific dangerous match
+    // so the operator's approval prompt can show what tripped the gate.
+    assert_eq!(
+        escalation.path.as_deref(),
+        Some(secrets.join("api_key.txt").to_string_lossy().as_ref())
+    );
+}
+
+// ── Bad-case coverage gaps surfaced by test-completeness audit ──────────────
+//
+// Each test below pins one error path that the audit found uncovered.
+// Failure mode is documented inline. None of these required production
+// code changes — they only surface paths that already exist.
+
+#[tokio::test]
+async fn read_text_on_directory_returns_is_a_directory() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadText(FileReadText {
+            path: root.to_string_lossy().into_owned(),
+            start: None,
+            max_lines: None,
+            max_bytes: None,
+            target_end: None,
+            max_line_width: None,
+            encoding: None,
+            line_numbers: false,
+            no_follow_symlink: false,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::IsADirectory as i32);
+}
+
+#[tokio::test]
+async fn read_text_exceeding_max_read_bytes_returns_too_large() {
+    // ReadText must check file_size against max_read_bytes BEFORE
+    // slurping. A file that exceeds the policy budget should return
+    // TooLarge, never load into memory.
+    let dir = TempDir::new().unwrap();
+    let tmp_root = dir.path().canonicalize().unwrap();
+    let root_str = tmp_root.to_string_lossy().into_owned();
+    let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec![format!("{}/**", root_str), root_str.clone()],
+        path_denylist: vec![],
+        max_read_bytes: 50,
+        max_write_bytes: 100_000_000,
+        dangerous_paths: vec![],
+    });
+    let big = tmp_root.join("big.txt");
+    fs::write(&big, vec![b'a'; 200]).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadText(FileReadText {
+            path: big.to_string_lossy().into_owned(),
+            start: None,
+            max_lines: None,
+            max_bytes: None,
+            target_end: None,
+            max_line_width: None,
+            encoding: None,
+            line_numbers: false,
+            no_follow_symlink: false,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+}
+
+#[tokio::test]
+async fn read_binary_on_missing_file_returns_not_found() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let missing = root.join("nope.bin");
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadBinary(FileReadBinary {
+            path: missing.to_string_lossy().into_owned(),
+            byte_offset: 0,
+            byte_length: 0,
+            max_bytes: None,
+            no_follow_symlink: false,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::NotFound as i32);
+}
+
+#[tokio::test]
+async fn read_binary_on_directory_returns_is_a_directory() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadBinary(FileReadBinary {
+            path: root.to_string_lossy().into_owned(),
+            byte_offset: 0,
+            byte_length: 0,
+            max_bytes: None,
+            no_follow_symlink: false,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::IsADirectory as i32);
+}
+
+#[tokio::test]
+async fn read_image_on_directory_returns_is_a_directory() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::ReadImage(FileReadImage {
+            path: root.to_string_lossy().into_owned(),
+            max_width: None,
+            max_height: None,
+            max_bytes: None,
+            quality: None,
+            output_format: None,
+            no_follow_symlink: false,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::IsADirectory as i32);
+}
+
+#[tokio::test]
+async fn glob_with_invalid_pattern_returns_invalid_path() {
+    // The dispatcher rejects absolute / `..` patterns up front. A
+    // syntactically invalid pattern like an unclosed character class
+    // gets through to `glob::glob()` and must be reported as
+    // `InvalidPath` rather than panicking or returning empty results.
+    use ahand_protocol::FileGlob;
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Glob(FileGlob {
+            base_path: Some(root.to_string_lossy().into_owned()),
+            pattern: "[unclosed".into(),
+            max_results: None,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+}
+
+#[tokio::test]
+async fn copy_directory_without_recursive_returns_is_a_directory() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let src = root.join("src_dir");
+    fs::create_dir(&src).unwrap();
+    let dst = root.join("dst");
+    let req = copy_req(&src, &dst, false, false);
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::IsADirectory as i32);
+}
+
+#[tokio::test]
+async fn move_to_existing_destination_without_overwrite_returns_already_exists() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let src = root.join("src.txt");
+    let dst = root.join("dst.txt");
+    fs::write(&src, "from").unwrap();
+    fs::write(&dst, "stay").unwrap();
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Move(FileMove {
+            source: src.to_string_lossy().into_owned(),
+            destination: dst.to_string_lossy().into_owned(),
+            overwrite: false,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::AlreadyExists as i32);
+    // Source untouched because the guard fires before rename.
+    assert_eq!(fs::read_to_string(&src).unwrap(), "from");
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "stay");
+}
+
+#[tokio::test]
+async fn write_with_no_method_returns_unspecified_error() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let path = root.join("placeholder.txt");
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: path.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: None,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+}
+
+#[tokio::test]
+async fn edit_with_no_method_returns_unspecified_error() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let path = root.join("placeholder.txt");
+    fs::write(&path, "x").unwrap();
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: path.to_string_lossy().into_owned(),
+            encoding: None,
+            no_follow_symlink: false,
+            method: None,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+}
+
+#[tokio::test]
+async fn full_write_with_no_source_returns_unspecified_error() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let path = root.join("nosource.txt");
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: path.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::FullWrite(FullWrite { source: None })),
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+}
+
+#[tokio::test]
+async fn full_write_with_s3_object_key_source_returns_unspecified_error() {
+    // The hub-side S3 transfer flow is intentionally deferred (per the
+    // PR description). Until it ships, the daemon must reject S3-keyed
+    // writes loudly so the operator gets a clear error rather than a
+    // mysterious "no content" outcome.
+    use ahand_protocol::full_write;
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let path = root.join("s3.bin");
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: path.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::S3ObjectKey("upload-key-123".into())),
+            })),
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+    assert!(
+        err.message.to_lowercase().contains("s3"),
+        "error must name the unsupported S3 source, got: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn append_exceeding_total_size_limit_returns_too_large() {
+    // The size-limit check for Append must combine existing file size
+    // and new content. An existing file at the limit + any non-empty
+    // append must fail with TooLarge before any write happens.
+    let dir = TempDir::new().unwrap();
+    let tmp_root = dir.path().canonicalize().unwrap();
+    let root_str = tmp_root.to_string_lossy().into_owned();
+    let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec![format!("{}/**", root_str), root_str.clone()],
+        path_denylist: vec![],
+        max_read_bytes: 100_000_000,
+        max_write_bytes: 50,
+        dangerous_paths: vec![],
+    });
+    let path = tmp_root.join("at_limit.txt");
+    fs::write(&path, vec![b'a'; 50]).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: path.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: false,
+            method: Some(file_write::Method::Append(FileAppend {
+                content: b"!".to_vec(),
+            })),
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+    // File on disk untouched.
+    assert_eq!(fs::read(&path).unwrap().len(), 50);
+}
+
+#[tokio::test]
+async fn chmod_with_no_permission_returns_unspecified_error() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("p.txt");
+    fs::write(&file, "x").unwrap();
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: file.to_string_lossy().into_owned(),
+            recursive: false,
+            no_follow_symlink: false,
+            permission: None,
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_with_unix_permission_but_no_mode_or_owner_returns_unspecified_error() {
+    // The Unix branch requires AT LEAST one of mode / owner / group to
+    // be Some. All three None must surface as a clear "nothing to do"
+    // error rather than silently no-op.
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("p.txt");
+    fs::write(&file, "x").unwrap();
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: file.to_string_lossy().into_owned(),
+            recursive: false,
+            no_follow_symlink: false,
+            permission: Some(file_chmod::Permission::Unix(UnixPermission {
+                mode: None,
+                owner: None,
+                group: None,
+            })),
+        })),
+    };
+    let err = expect_error(mgr.handle(&req).await);
+    assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+}

@@ -300,3 +300,75 @@ async fn watchdog_disabled_still_recovers_via_tcp_keepalive() {
 
     handle.shutdown().await.expect("shutdown clean");
 }
+
+#[tokio::test]
+async fn daemon_responds_to_file_request_through_ahand_client_glue() {
+    // End-to-end test for the daemon's `handle_file_request` path:
+    // the mock hub injects a FileRequest after the Hello handshake,
+    // and we assert the daemon responds with a FileResponse envelope
+    // (via `ahand_client.rs::handle_file_request → file_mgr.handle →
+    // BufferedEnvelopeSender → WebSocket → mock`).
+    //
+    // `public_api::spawn` constructs the FileManager from the inner
+    // config's `file_policy: None`, which produces a *disabled*
+    // FileManager. That's the right shape for this test: the
+    // disabled-manager path is the early-return at handle_file_request
+    // line 1218-1226 — we don't need an enabled policy to validate
+    // that envelope decode → dispatch → response encode is wired up.
+    // The reply will be a `PolicyDenied` error envelope, which is
+    // exactly what the disabled-manager contract promises.
+    use ahand_protocol::{FileRequest, FileStat, file_request};
+
+    let stat_req = FileRequest {
+        request_id: "glue-test-1".into(),
+        operation: Some(file_request::Operation::Stat(FileStat {
+            path: "/tmp/dummy".into(),
+            no_follow_symlink: false,
+        })),
+    };
+    let mock = mock_hub::start_with_file_request(stat_req).await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
+        .heartbeat_interval(Duration::from_secs(1))
+        .build();
+
+    let handle = spawn(config).await.expect("spawn ok");
+
+    // Wait for the daemon to send back a FileResponse. The whole
+    // round-trip should complete in well under a second; budget 5s
+    // for slow CI.
+    let got_response = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let captured = mock.captured_file_responses();
+            if let Some(resp) = captured.first().cloned() {
+                break resp;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("daemon should reply to FileRequest within 5s");
+
+    assert_eq!(got_response.request_id, "glue-test-1");
+    // Disabled manager → PolicyDenied error envelope. The point of
+    // this test is the wiring (envelope decode + dispatch + response
+    // encode), not the manager's policy decision — so any structured
+    // FileError suffices to prove the glue works end-to-end.
+    use ahand_protocol::file_response;
+    match got_response.result {
+        Some(file_response::Result::Error(err)) => {
+            assert_eq!(
+                err.code,
+                ahand_protocol::FileErrorCode::PolicyDenied as i32,
+                "expected PolicyDenied from a disabled FileManager, got: {:?}",
+                err
+            );
+        }
+        other => panic!(
+            "expected FileResponse::Error from disabled FileManager, got: {:?}",
+            other
+        ),
+    }
+
+    handle.shutdown().await.expect("shutdown clean");
+}

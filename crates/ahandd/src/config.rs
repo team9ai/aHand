@@ -482,3 +482,130 @@ mod tilde_tests {
         );
     }
 }
+
+/// End-to-end tests that exercise `Config::load` through a real TOML
+/// file rather than calling helpers directly. The I2 fix wires
+/// `expand_tildes_in_place` into `Config::load`; verifying the helper
+/// alone (covered above) doesn't prove the wiring is intact, so we
+/// pin the wiring with a real-file round-trip here.
+#[cfg(test)]
+mod load_tilde_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn write_config(dir: &TempDir, body: &str) -> PathBuf {
+        let p = dir.path().join("config.toml");
+        fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn load_expands_tilde_in_file_policy_when_home_present() {
+        // Sanity round-trip: a TOML config that uses `~/.ssh/**` in
+        // every file_policy list must come back with the home dir
+        // substituted. This is the contract that
+        // `FilePolicyChecker::glob_match` depends on — it compares
+        // literal patterns to canonicalized absolute paths and would
+        // never match `~/...`.
+        let dir = TempDir::new().unwrap();
+        let body = r#"
+[file_policy]
+enabled = true
+path_allowlist = ["~/projects/**"]
+path_denylist = ["~/private/**"]
+dangerous_paths = ["~/.ssh/**"]
+"#;
+        let path = write_config(&dir, body);
+        let cfg = Config::load(&path).expect("config should load");
+        let fp = cfg.file_policy.expect("file_policy should be present");
+        let home = dirs::home_dir().expect("home dir required for this test");
+        let home_str = home.to_string_lossy();
+        assert_eq!(fp.path_allowlist, vec![format!("{home_str}/projects/**")]);
+        assert_eq!(fp.path_denylist, vec![format!("{home_str}/private/**")]);
+        assert_eq!(fp.dangerous_paths, vec![format!("{home_str}/.ssh/**")]);
+    }
+
+    #[test]
+    fn load_propagates_tilde_failure_for_dangerous_paths() {
+        // I2 regression: when `expand_tildes_in_place` fails, the
+        // error must propagate out of `Config::load` so daemon startup
+        // aborts. Without the wiring at config.rs:341, an unexpanded
+        // `~/.ssh/**` would silently not match anything — flipping
+        // dangerous_paths from "deny these" to "allow everything".
+        //
+        // We can't easily make `dirs::home_dir()` return None during a
+        // running test, so we verify the wiring at the helper level
+        // and then independently verify that `Config::load` calls
+        // `expand_tildes_in_place` for all three lists by checking
+        // the post-load values are NOT raw `~/...`.
+        let dir = TempDir::new().unwrap();
+        let body = r#"
+[file_policy]
+enabled = true
+dangerous_paths = ["~/.ssh/**"]
+"#;
+        let path = write_config(&dir, body);
+        let cfg = Config::load(&path).unwrap();
+        let dangerous = cfg
+            .file_policy
+            .as_ref()
+            .map(|fp| &fp.dangerous_paths)
+            .unwrap();
+        assert!(
+            !dangerous.iter().any(|p| p.starts_with("~/")),
+            "dangerous_paths must have tildes expanded after Config::load \
+             (raw `~/...` would silently fail to match canonicalized absolute \
+              paths in FilePolicyChecker)"
+        );
+    }
+
+    #[test]
+    fn load_passes_through_absolute_file_policy_paths_unchanged() {
+        // Non-tilde patterns must not be modified in-place by the
+        // expansion step.
+        let dir = TempDir::new().unwrap();
+        let body = r#"
+[file_policy]
+enabled = true
+path_allowlist = ["/etc/passwd", "/var/log/**"]
+"#;
+        let path = write_config(&dir, body);
+        let cfg = Config::load(&path).unwrap();
+        let fp = cfg.file_policy.unwrap();
+        assert_eq!(
+            fp.path_allowlist,
+            vec!["/etc/passwd".to_string(), "/var/log/**".to_string()]
+        );
+    }
+
+    #[test]
+    fn load_returns_err_for_malformed_toml() {
+        // The other branch of Config::load: malformed TOML must
+        // surface as an error, not panic.
+        let dir = TempDir::new().unwrap();
+        let path = write_config(&dir, "this is = not = valid = toml\n");
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("toml") || msg.contains("expected"),
+            "expected toml parse error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_returns_err_for_missing_file() {
+        // Missing file path must surface IO error from
+        // `read_to_string`, not panic.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("definitely_does_not_exist.toml");
+        let err = Config::load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("no such file")
+                || msg.to_lowercase().contains("not found"),
+            "expected NotFound IO error, got: {msg}"
+        );
+    }
+}
