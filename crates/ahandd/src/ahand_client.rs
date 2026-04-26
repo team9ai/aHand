@@ -29,7 +29,7 @@ pub enum HelloAuthMode {
 
 #[derive(Clone)]
 struct BufferedEnvelopeSender {
-    tx: mpsc::UnboundedSender<QueuedEnvelope>,
+    tx: mpsc::UnboundedSender<OutboundFrame>,
     outbox: Arc<Mutex<Outbox>>,
 }
 
@@ -38,9 +38,27 @@ struct QueuedEnvelope {
     envelope: Envelope,
 }
 
+/// Multiplexed sink output. App-level Envelope frames go through the
+/// outbox-stamping pipeline; WebSocket-level Ping frames bypass the
+/// outbox and only exist to keep the connection liveness-checked from
+/// the daemon side. Pings are sent so the read loop sees a Pong (auto-
+/// replied by tungstenite per RFC 6455) before its watchdog timeout
+/// fires — that's how we detect zombie TCP connections that survived
+/// macOS sleep/wake or NAT timeout without any visible socket error.
+enum OutboundFrame {
+    Envelope(QueuedEnvelope),
+    WsPing(Vec<u8>),
+}
+
 impl BufferedEnvelopeSender {
-    fn new(tx: mpsc::UnboundedSender<QueuedEnvelope>, outbox: Arc<Mutex<Outbox>>) -> Self {
+    fn new(tx: mpsc::UnboundedSender<OutboundFrame>, outbox: Arc<Mutex<Outbox>>) -> Self {
         Self { tx, outbox }
+    }
+
+    /// Send a raw WebSocket Ping. Returns Err only if the receiver task has
+    /// already exited (session tearing down).
+    fn send_ping(&self, payload: Vec<u8>) -> Result<(), ()> {
+        self.tx.send(OutboundFrame::WsPing(payload)).map_err(|_| ())
     }
 }
 
@@ -51,7 +69,7 @@ impl crate::executor::EnvelopeSink for BufferedEnvelopeSender {
             prepare_outbound(&mut outbox, &mut envelope)
         };
         self.tx
-            .send(QueuedEnvelope { frame, envelope })
+            .send(OutboundFrame::Envelope(QueuedEnvelope { frame, envelope }))
             .map_err(|_| ())
     }
 }
@@ -310,7 +328,9 @@ async fn connect_with_auth(
     }
 
     // Channel: executor sends Envelope objects, send task stamps + encodes + sends.
-    let (raw_tx, mut rx) = mpsc::unbounded_channel::<QueuedEnvelope>();
+    // Multiplexed with WS-level Ping frames so the same task is the sole writer
+    // to `sink` (avoids needing a Mutex around the sink).
+    let (raw_tx, mut rx) = mpsc::unbounded_channel::<OutboundFrame>();
     let tx = BufferedEnvelopeSender::new(raw_tx, Arc::clone(outbox));
     let store_send = store.clone();
 
@@ -321,18 +341,21 @@ async fn connect_with_auth(
         crate::updater::spawn_update(params, device_id.to_string(), tx.clone());
     }
 
-    // Task: receive Envelope from executors, stamp with outbox, encode, send over WS.
+    // Task: receive OutboundFrame from executors + ws-ping task, stamp + encode
+    // + send over WS. Multiplexed so the sink stays single-owner.
     let send_handle = tokio::spawn(async move {
-        while let Some(queued) = rx.recv().await {
-            // Log outbound envelopes to trace.
-            if let Some(s) = &store_send {
-                s.log_envelope(&queued.envelope, Direction::Outbound).await;
-            }
-            if sink
-                .send(tungstenite::Message::Binary(queued.frame))
-                .await
-                .is_err()
-            {
+        while let Some(frame) = rx.recv().await {
+            let msg = match frame {
+                OutboundFrame::Envelope(queued) => {
+                    // Log outbound envelopes to trace.
+                    if let Some(s) = &store_send {
+                        s.log_envelope(&queued.envelope, Direction::Outbound).await;
+                    }
+                    tungstenite::Message::Binary(queued.frame)
+                }
+                OutboundFrame::WsPing(payload) => tungstenite::Message::Ping(payload),
+            };
+            if sink.send(msg).await.is_err() {
                 break;
             }
         }
@@ -352,13 +375,55 @@ async fn connect_with_auth(
         heartbeat_interval,
     );
 
+    // Task: WS-level Ping every `heartbeat_interval`. Tungstenite-spec-compliant
+    // peers (including our hub) auto-reply with Pong, so the read loop's
+    // watchdog timeout (2× heartbeat_interval) is reset on every successful
+    // ping. The reason this exists alongside the app-level heartbeat: the
+    // app-level heartbeat is a fire-and-forget Binary frame, so a zombie
+    // TCP connection (Mac sleep/wake, NAT timeout) accepts the write into
+    // the OS send buffer without ever delivering the bytes — daemon never
+    // notices, hub eventually marks device offline, UI stays "Online" until
+    // the OS gives up on the dead socket (~hours). WS Ping/Pong forces a
+    // round-trip — no Pong → no inbound message → watchdog fires → reconnect.
+    let ws_ping_tx = tx.clone();
+    let ws_ping_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(heartbeat_interval);
+        // Skip first tick so it doesn't race with the Hello handshake.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if ws_ping_tx
+                .send_ping(now_ms().to_be_bytes().to_vec())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
     let caller_uid = "cloud";
 
     // Register the cloud caller so session queries return it.
     session_mgr.register_caller(caller_uid).await;
 
+    // Watchdog: if no inbound activity (Pong, app message, anything) for
+    // 2× heartbeat_interval, we're talking to a zombie connection. Break
+    // out so the outer reconnect loop can dial a fresh socket.
+    let read_timeout = heartbeat_interval.saturating_mul(2);
+
     // Process incoming messages.
-    while let Some(msg) = stream.next().await {
+    loop {
+        let msg = match tokio::time::timeout(read_timeout, stream.next()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => break, // stream ended
+            Err(_) => {
+                warn!(
+                    timeout_secs = read_timeout.as_secs(),
+                    "no inbound activity (no Pong, no message) — closing zombie connection",
+                );
+                break;
+            }
+        };
         let msg = match msg {
             Ok(m) => m,
             Err(e) => {
@@ -490,9 +555,11 @@ async fn connect_with_auth(
     // indefinitely — `send_handle.await` would hang until the WS broke
     // naturally. Aborting the heartbeat task drops its sender clone, so
     // dropping `tx` here leaves zero senders and `rx.recv()` resolves to
-    // `None`.
+    // `None`. Same logic for `ws_ping_task`.
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
+    ws_ping_task.abort();
+    let _ = ws_ping_task.await;
     drop(tx);
     let _ = send_handle.await;
 
@@ -1089,7 +1156,8 @@ mod tests {
     use crate::outbox::Outbox;
 
     use super::{
-        BufferedEnvelopeSender, ConnectError, QueuedEnvelope, classify_hello_accepted_message,
+        BufferedEnvelopeSender, ConnectError, OutboundFrame, QueuedEnvelope,
+        classify_hello_accepted_message,
     };
 
     #[test]
@@ -1192,7 +1260,7 @@ mod tests {
     #[test]
     fn buffered_envelope_sender_stores_frames_before_transport_send() {
         let outbox = Arc::new(Mutex::new(Outbox::new(16)));
-        let (tx, rx) = mpsc::unbounded_channel::<QueuedEnvelope>();
+        let (tx, rx) = mpsc::unbounded_channel::<OutboundFrame>();
         let sender = BufferedEnvelopeSender::new(tx, outbox.clone());
 
         sender
