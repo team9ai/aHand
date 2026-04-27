@@ -509,6 +509,16 @@ mod load_tilde_tests {
         // `FilePolicyChecker::glob_match` depends on — it compares
         // literal patterns to canonicalized absolute paths and would
         // never match `~/...`.
+        //
+        // Skip on environments where `dirs::home_dir()` returns None
+        // (sandboxed CI runners with HOME cleared, chroots) — the
+        // assertion below relies on having a home dir, but the test
+        // is about the round-trip of an existing home, not about the
+        // fail-loud path (covered separately).
+        let Some(home) = dirs::home_dir() else {
+            eprintln!("skipping load_expands_tilde — dirs::home_dir() is None");
+            return;
+        };
         let dir = TempDir::new().unwrap();
         let body = r#"
 [file_policy]
@@ -520,7 +530,6 @@ dangerous_paths = ["~/.ssh/**"]
         let path = write_config(&dir, body);
         let cfg = Config::load(&path).expect("config should load");
         let fp = cfg.file_policy.expect("file_policy should be present");
-        let home = dirs::home_dir().expect("home dir required for this test");
         let home_str = home.to_string_lossy();
         assert_eq!(fp.path_allowlist, vec![format!("{home_str}/projects/**")]);
         assert_eq!(fp.path_denylist, vec![format!("{home_str}/private/**")]);
@@ -528,18 +537,20 @@ dangerous_paths = ["~/.ssh/**"]
     }
 
     #[test]
-    fn load_propagates_tilde_failure_for_dangerous_paths() {
-        // I2 regression: when `expand_tildes_in_place` fails, the
-        // error must propagate out of `Config::load` so daemon startup
-        // aborts. Without the wiring at config.rs:341, an unexpanded
-        // `~/.ssh/**` would silently not match anything — flipping
-        // dangerous_paths from "deny these" to "allow everything".
+    fn load_pins_tilde_expansion_wiring_for_dangerous_paths() {
+        // I2 wiring pin: `Config::load` must run `expand_tildes_in_place`
+        // for `dangerous_paths`. If a future refactor drops the call (or
+        // its `?` propagation), an unexpanded `~/.ssh/**` would silently
+        // not match anything — flipping dangerous_paths from "deny these"
+        // to "allow everything", a hard-to-spot security regression.
         //
-        // We can't easily make `dirs::home_dir()` return None during a
-        // running test, so we verify the wiring at the helper level
-        // and then independently verify that `Config::load` calls
-        // `expand_tildes_in_place` for all three lists by checking
-        // the post-load values are NOT raw `~/...`.
+        // This test pins the wiring (post-load values don't start with
+        // `~`); the fail-loud propagation itself is covered by the unit
+        // test on `expand_tilde_with(_, None)` returning Err.
+        let Some(_) = dirs::home_dir() else {
+            eprintln!("skipping load_pins_tilde — dirs::home_dir() is None");
+            return;
+        };
         let dir = TempDir::new().unwrap();
         let body = r#"
 [file_policy]

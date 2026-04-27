@@ -30,8 +30,24 @@ use policy::FilePolicyChecker;
 static GLOB_APPROVAL_SCAN_CAP: AtomicUsize = AtomicUsize::new(10_000);
 
 /// Override the glob approval scan cap. Returns the previous value so the
-/// caller can restore it. Intended for tests; production code does not call
-/// this.
+/// caller can restore it.
+///
+/// **Test-only.** This function exists so integration tests can lower the
+/// cap to a small number (e.g. 8) and exercise the `CapHit` branch
+/// without materializing 10k+ files on disk. It has no production use
+/// case — calling it from production code would degrade the C3
+/// fail-closed safety guarantee by either raising the cap (more files
+/// scanned, more time to abort) or lowering it (every glob escalates,
+/// surfacing as approval-storm UX bugs).
+///
+/// We considered gating this behind `cfg(any(test, feature = "test-utils"))`
+/// but Cargo's integration-test build doesn't see the lib's `cfg(test)`
+/// and `required-features` on `[[test]]` targets makes plain `cargo test`
+/// silently skip those targets, which breaks CI ergonomics. The doc-hidden
+/// + naming-by-shame approach is what we have today; the function is
+/// `#[doc(hidden)]` so it doesn't surface in rustdoc and the body of the
+/// docstring tells anyone reaching for it to stop.
+#[doc(hidden)]
 pub fn set_glob_approval_scan_cap(cap: usize) -> usize {
     GLOB_APPROVAL_SCAN_CAP.swap(cap, Ordering::Relaxed)
 }
@@ -616,6 +632,32 @@ async fn verify_post_create(policy: &FilePolicyChecker, resolved: &Path) -> Resu
             // If the created resource can't be removed, leave it in place
             // and still return the error so the caller knows the op was
             // rejected.
+            //
+            // KNOWN LIMITATIONS — see also the round-4 follow-up issue:
+            //
+            // 1. **Move can lose data.** Caller arms: `handle_move`
+            //    `rename`s the source to `resolved` *before* this
+            //    function runs. If `policy.check_path` then rejects
+            //    `resolved` (TOCTOU swap on a parent component slipped
+            //    a symlink past the pre-check), the cleanup deletes
+            //    `resolved` — and the original source is already gone.
+            //    The caller observes `PolicyDenied` with no recovery
+            //    path. Full fix needs `openat2(RESOLVE_NO_SYMLINKS)`
+            //    or equivalent so the rename target can't be diverted.
+            //
+            // 2. **Copy of a directory tree leaves a partial copy.**
+            //    `remove_dir` (below) does NOT recurse, so a
+            //    recursive copy that hits a post-op canonical
+            //    rejection leaves the partial tree in the rejected
+            //    location. The source is intact, so this is a leak
+            //    rather than data loss; using `remove_dir_all` would
+            //    fully clean up but also runs against the same
+            //    TOCTOU surface (an attacker who can swap a parent
+            //    can reroute the recursive remove).
+            //
+            // Both issues are already implicit in the "best-effort"
+            // wording, but we name them here so future readers don't
+            // have to re-derive the failure modes.
             if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await {
                 if metadata.is_dir() {
                     let _ = tokio::fs::remove_dir(resolved).await;

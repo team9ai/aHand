@@ -1215,11 +1215,20 @@ async fn handle_file_request<T>(
         let _ = tx.send(env);
     };
 
+    // Derive a single string identifying the path(s) this request
+    // touches, for inclusion in any synthetic FileError.path we build
+    // at this layer. file_mgr.request_paths(&req) returns one entry
+    // per operand (Move/Copy/CreateSymlink → two, single-path ops →
+    // one); join with comma so the operator can see exactly which
+    // file the daemon refused to act on, instead of a blank `path`
+    // field hiding behind a generic "PolicyDenied" message.
+    let req_paths_joined = file_mgr.request_paths(&req).join(", ");
+
     if !file_mgr.is_enabled() {
         send_file_response(crate::file_manager::error_response(
             req.request_id.clone(),
             ahand_protocol::FileErrorCode::PolicyDenied,
-            "",
+            &req_paths_joined,
             "file operations are not enabled on this daemon",
         ));
         return;
@@ -1282,7 +1291,7 @@ async fn handle_file_request<T>(
             send_file_response(crate::file_manager::error_response(
                 req.request_id.clone(),
                 ahand_protocol::FileErrorCode::PolicyDenied,
-                "",
+                &req_paths_joined,
                 &reason,
             ));
             return;
@@ -1356,6 +1365,12 @@ async fn handle_file_request<T>(
     let response_request_id = req.request_id.clone();
     let approval_key = approval_job_id;
     let mut close_rx_clone = close_rx.clone();
+    // Clone the joined paths so the spawned task can populate
+    // FileError.path on the Denied / TimedOut branches — without it
+    // the operator only sees a generic "approval denied" / "approval
+    // timed out" with no indication of *which* file. Same observability
+    // pattern Copilot caught one layer down in text/binary readers.
+    let req_paths_joined_for_task = req_paths_joined.clone();
 
     tokio::spawn(async move {
         let reply = |resp: ahand_protocol::FileResponse| {
@@ -1413,7 +1428,7 @@ async fn handle_file_request<T>(
                 reply(crate::file_manager::error_response(
                     response_request_id.clone(),
                     ahand_protocol::FileErrorCode::PolicyDenied,
-                    "",
+                    &req_paths_joined_for_task,
                     &reason,
                 ));
             }
@@ -1423,7 +1438,7 @@ async fn handle_file_request<T>(
                 reply(crate::file_manager::error_response(
                     response_request_id.clone(),
                     ahand_protocol::FileErrorCode::PolicyDenied,
-                    "",
+                    &req_paths_joined_for_task,
                     "approval timed out",
                 ));
             }
