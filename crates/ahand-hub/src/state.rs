@@ -149,7 +149,13 @@ impl AppState {
             Some(store) => crate::output_stream::OutputStream::persistent(store),
             None => crate::output_stream::OutputStream::new(finished_retention, 256),
         });
-        let connections = Arc::new(crate::ws::device_gateway::ConnectionRegistry::default());
+        // Task 5 wires the registry to an in-memory OutboxStore so the
+        // refactored fencing/replay/lock paths exercise the trait. Task 6
+        // will branch on `StoreConfig::Persistent` to plug in
+        // `RedisOutboxStore` instead.
+        let outbox: Arc<dyn ahand_hub_core::traits::OutboxStore> =
+            Arc::new(crate::ws::in_memory_outbox::InMemoryOutboxStore::new());
+        let connections = Arc::new(crate::ws::device_gateway::ConnectionRegistry::new(outbox));
         let events = Arc::new(match persistent_fanout {
             Some(fanout) => crate::events::EventBus::new_with_fanout(audit_store.clone(), fanout),
             None => crate::events::EventBus::new(audit_store.clone()),
