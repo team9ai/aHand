@@ -8,11 +8,11 @@
   The name `BrowserResult` is now reused for the new HTTP-side return type of
   `CloudClient.browser()` (cloud-client.ts), with a different shape:
 
-  | Before (WS / `connection.ts`) | After (HTTP / `cloud-client.ts`)             |
-  |--------------------------------|-----------------------------------------------|
-  | `binaryData: Uint8Array \| null` | `binary?: { data: Uint8Array; mime: string }` |
-  | `binaryMime: string \| null`     | (subsumed into `binary.mime`)                 |
-  | (no duration)                  | `durationMs: number`                          |
+  | Before (WS / `connection.ts`)        | After (HTTP / `cloud-client.ts`)              |
+  |---------------------------------------|------------------------------------------------|
+  | `binaryData?: Buffer`                 | `binary?: { data: Uint8Array; mime: string }` |
+  | `binaryMime?: string`                 | (subsumed into `binary.mime`)                  |
+  | (no duration)                         | `durationMs: number`                           |
 
   External consumers importing `BrowserResult` from `@ahandai/sdk` get the
   new HTTP-side shape and must update field accesses accordingly. Within the
@@ -40,6 +40,8 @@
 
 - `correlation_id` on `browser()` requests is accepted by the hub's wire
   schema but is **not currently deduplicated** at the hub layer. Workers
-  should still set it (the field reserves the dedupe contract for a
-  future minor release), but should not assume two calls with the same
-  id are guaranteed to be deduped today. See the spec follow-up.
+  may set the field today as forward-compat (it is reserved on the wire
+  for a future minor release that lands dedupe), but must not assume two
+  calls with the same id are guaranteed to be deduped today. Tracked as
+  follow-up #3 in the cross-repo browser-tool spec
+  (`team9-agent-pi/docs/superpowers/specs/2026-04-26-claw-hive-ahand-browser-tool-design.md`).

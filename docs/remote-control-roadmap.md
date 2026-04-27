@@ -51,7 +51,9 @@ Remote control of a browser instance on the device via Playwright.
 - [x] BrowserRequest / BrowserResponse protocol messages
 - [x] Daemon browser manager (Playwright integration)
 - [x] Domain allowlist enforcement
-- [x] Hub `POST /api/browser` endpoint with base64 binary response
+- [x] Hub `POST /api/browser` endpoint with base64 binary response (dashboard-facing)
+- [x] Hub `POST /api/control/browser` endpoint (worker-facing, control-plane JWT + ownership/scope/allowlist/rate-limit checks); shares `browser_service::execute()` with the dashboard endpoint
+- [x] `@ahandai/sdk` `CloudClient.browser()` — agent-side browser command method (paired with the new control-plane endpoint)
 - [x] Dashboard Browser tab with command-based controls (open, click, fill, snapshot, screenshot, PDF, download, close, custom) and response log with image preview
 - [ ] TODO: Live browser view with low-latency interactive control (~100ms).
   - **Goal:** user can watch current browser state in real time and take over for manual login / form filling / debugging. Command-based UI has ~1–2s polling latency which is too slow for typing.

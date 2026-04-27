@@ -113,8 +113,9 @@ pub async fn execute(
     // NOTE(idempotency): `input.correlation_id` is intentionally unused.
     // Hub-layer dedupe for /api/control/browser is deferred — see the
     // module doc-comment in `crates/ahand-hub/src/http/control_plane.rs:20-32`
-    // and the spec follow-up #2 ("Tool-args redaction" / hub-side idempotency)
-    // at docs/superpowers/specs/2026-04-26-claw-hive-ahand-browser-tool-design.md.
+    // and the cross-repo spec's follow-up #3 ("Hub-side idempotency for
+    // POST /api/control/browser") in
+    // team9-agent-pi/docs/superpowers/specs/2026-04-26-claw-hive-ahand-browser-tool-design.md.
     // The field is kept on `BrowserCommandInput` so the wire schema stays
     // stable when dedupe lands.
 
