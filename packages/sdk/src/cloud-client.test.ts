@@ -1079,6 +1079,31 @@ describe("CloudClient.browser", () => {
       }),
     ).rejects.toMatchObject({ code: "server_error" });
   });
+
+  it("rejects malformed root: response is a JSON array", async () => {
+    // `JSON.parse("[]")` returns an array — `typeof [] === "object"` so
+    // it slips past the `typeof !== "object"` check, but reading
+    // `.success` returns `undefined`, which fails the boolean check.
+    // Pin this so a future refactor that loosens the boolean check
+    // (e.g. coerces with `Boolean(json.success)`) does not silently
+    // start accepting array roots.
+    const fakeFetch = async () =>
+      new Response("[]", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
 });
 
 describe("CloudClientError", () => {

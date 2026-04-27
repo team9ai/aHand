@@ -1133,3 +1133,266 @@ async fn control_browser_500_when_device_store_errors() {
     // 5. Verify tracing::error! captured the raw HubError.
     panic!("Stub — see #[ignore] reason");
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Test-completeness audit follow-ups (T1, T2, T3, T4, T5).
+// ──────────────────────────────────────────────────────────────────────
+
+/// T1 (Issue 3): `timeout_ms.max(1000)` floor regression test.
+///
+/// `browser_service::execute` floors any caller-supplied `timeout_ms` to
+/// 1000ms (`Duration::from_millis(input.timeout_ms.max(1000))`). A
+/// regression that drops the floor would surface as flaky 504s well
+/// under one second — which is hard to bisect from the symptom alone.
+/// This test pins the floor by sending `timeout_ms: 0` against a
+/// daemon that never responds and asserts both:
+///   - the response is 504 TIMEOUT (the floor still triggers a
+///     normal timeout outcome), and
+///   - the wall-clock elapsed is >= ~1s (the floor was honored — an
+///     unfloored `0` would fire well under 100ms).
+#[tokio::test]
+async fn control_browser_timeout_ms_zero_floors_to_1000ms() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    // Owned, browser-capable daemon that will receive the BrowserRequest
+    // but never respond — forcing the hub-side timeout (with the 1s
+    // floor) to fire.
+    let _device = attach_owned_browser_device(&server, "cb-floor", "user-floor").await;
+    let token = mint_cp_jwt("user-floor");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let response = client
+        .post(format!("{}/api/control/browser", server.http_base_url()))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "device_id": "cb-floor",
+            "session_id": "x",
+            "action": "snapshot",
+            // The whole point: a caller-supplied 0 must NOT collapse to
+            // an instant timeout — the floor inside `browser_service`
+            // must clamp it to 1000ms.
+            "timeout_ms": 0,
+        }))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(response.status(), reqwest::StatusCode::GATEWAY_TIMEOUT);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "TIMEOUT");
+    // Allow a small sub-1s shave to keep CI stable; an unfloored `0`
+    // would fire in well under 100ms, so 950ms is still a strong signal.
+    assert!(
+        elapsed.as_millis() >= 950,
+        "timeout_ms=0 should still wait >=1000ms (floor); actual elapsed: {elapsed:?}"
+    );
+
+    drop(_device);
+    server.shutdown().await;
+}
+
+/// T2 (Issue 7): dashboard `/api/browser` JsonRejection 400 — malformed body.
+///
+/// The handler at `crates/ahand-hub/src/http/browser.rs` declares
+/// `body: Result<Json<BrowserCommandRequest>, JsonRejection>` and maps
+/// failure via `ApiError::from_json_rejection`, which surfaces as 400
+/// VALIDATION_ERROR. No prior test exercised malformed bodies on this
+/// route — pin it.
+#[tokio::test]
+async fn browser_command_returns_400_for_malformed_json_body() {
+    let state = support::test_state_with_browser_device().await;
+    let server = spawn_server_with_state(state).await;
+    let token = login_token(&server).await;
+
+    // Authenticated request with a Content-Type advertising JSON but a
+    // body that is not valid JSON. Axum's `Json` extractor surfaces a
+    // `JsonRejection` which `ApiError::from_json_rejection` maps to
+    // 400 VALIDATION_ERROR.
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/browser", server.http_base_url()))
+        .bearer_auth(&token)
+        .header("Content-Type", "application/json")
+        .body("not-json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+}
+
+/// T2 (Issue 7) cont.: dashboard `/api/browser` 400 when required
+/// fields are missing. `BrowserCommandRequest` has `device_id`,
+/// `session_id`, and `action` declared without `#[serde(default)]`, so
+/// an empty object `{}` must trip the JsonRejection path.
+#[tokio::test]
+async fn browser_command_returns_400_for_missing_required_field() {
+    let state = support::test_state_with_browser_device().await;
+    let server = spawn_server_with_state(state).await;
+    let token = login_token(&server).await;
+
+    let response = server
+        .post("/api/browser", &token, serde_json::json!({}))
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+}
+
+/// T3 (Issue 14): control-plane `/api/control/browser` JsonRejection 400 —
+/// malformed body. Same gap on the worker-side endpoint.
+#[tokio::test]
+async fn control_browser_returns_400_for_malformed_json_body() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    // Mint a valid JWT so the request gets past the auth layer and
+    // reaches the JSON extractor. The body itself is the failure point.
+    let token = mint_cp_jwt("user-cb-malformed");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/control/browser", server.http_base_url()))
+        .bearer_auth(&token)
+        .header("Content-Type", "application/json")
+        .body("not-json")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+    server.shutdown().await;
+}
+
+/// T3 (Issue 14) cont.: control-plane `/api/control/browser` 400 when
+/// required fields are missing.
+#[tokio::test]
+async fn control_browser_returns_400_for_missing_required_field() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let token = mint_cp_jwt("user-cb-missing");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/control/browser", server.http_base_url()))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+    server.shutdown().await;
+}
+
+/// T4 (Issue 11): camelCase rejection on `ControlBrowserRequest`.
+///
+/// `ControlBrowserRequest` is intentionally snake_case (no
+/// `#[serde(rename_all = "camelCase")]`). Pin this wire contract: a
+/// caller that POSTs camelCase keys must get 400 because the snake_case
+/// fields are missing → JsonRejection. A future commit that flips the
+/// struct to camelCase would silently change the wire contract; this
+/// test catches it.
+#[tokio::test]
+async fn control_browser_400_when_request_uses_camelcase_keys() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    // Pre-register an owned browser-capable device so the only failure
+    // point is the JSON shape — proves the 400 we observe is the
+    // JsonRejection path, not a downstream "unknown device" 404.
+    let _device = attach_owned_browser_device(&server, "cb-camel", "user-camel").await;
+    let token = mint_cp_jwt("user-camel");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/control/browser", server.http_base_url()))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "deviceId": "cb-camel",
+            "sessionId": "s",
+            "action": "snapshot",
+            "timeoutMs": 1_000,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+    drop(_device);
+    server.shutdown().await;
+}
+
+/// T5 (Issue 12): control-plane daemon `success: false + error` wire fidelity.
+///
+/// Existing tests assert `success: true`. This pins the inverse contract:
+/// when the daemon reports `success: false` with a non-empty `error`,
+/// the hub returns HTTP 200 (NOT promoted to a 4xx/5xx) with the
+/// `success: false` and `error` echoed verbatim, plus a `duration_ms`
+/// field. SDK consumers branch on `body.success` — promoting failure to
+/// HTTP 5xx would silently break that contract.
+#[tokio::test]
+async fn control_browser_daemon_failure_returned_as_200_with_error_echoed() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let mut device = attach_owned_browser_device(&server, "cb-fail", "user-fail").await;
+    let token = mint_cp_jwt("user-fail");
+
+    let api_task = {
+        let base_url = server.http_base_url().to_string();
+        let token = token.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/control/browser"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "device_id": "cb-fail",
+                    "session_id": "sess-fail",
+                    "action": "snapshot",
+                    "timeout_ms": 10_000,
+                }))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+
+    let req = device.recv_browser_request().await;
+    device
+        .send_browser_response(BrowserResponse {
+            request_id: req.request_id.clone(),
+            session_id: "sess-fail".into(),
+            success: false,
+            result_json: String::new(),
+            error: "navigation denied".into(),
+            binary_data: Vec::new(),
+            binary_mime: String::new(),
+        })
+        .await;
+
+    let response = api_task.await.unwrap();
+    // Daemon-reported failure is NOT promoted to an HTTP error — the
+    // handler returns 200 with `success: false` so the SDK can branch
+    // on the body. A regression that flips the status code (e.g. 500)
+    // would silently break SDK consumers.
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert_eq!(body["error"], "navigation denied");
+    // duration_ms must be present and a non-negative integer (u64 in
+    // the wire schema; a fast in-process round trip can land at 0).
+    assert!(
+        body.get("duration_ms").and_then(|v| v.as_u64()).is_some(),
+        "duration_ms missing or wrong type: {body}"
+    );
+
+    drop(device);
+    server.shutdown().await;
+}
