@@ -575,6 +575,34 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                 );
             }
         }
+        let device_id = envelope.device_id.clone();
+        let hostname = hello.hostname.clone();
+        // Register BEFORE sending HelloAccepted so the in-process
+        // DashMap entry is observable by the time the client sees the
+        // accepted frame and starts dispatching jobs. With the
+        // OutboxStore-backed registry, register involves Redis I/O —
+        // sending HelloAccepted first would let a fast client race the
+        // register completion and see is_online=false on its first
+        // request.
+        let (connection_id, mut outbound_rx, close_rx) = match state
+            .connections
+            .register(device_id.clone(), hello.last_ack)
+            .await
+        {
+            Ok(tuple) => tuple,
+            Err(HubError::OutboxLockContention(_)) => {
+                let _ = send_handshake_close(
+                    &mut sender,
+                    axum::extract::ws::close_code::AGAIN,
+                    "outbox-lock-contention",
+                )
+                .await;
+                return Err(anyhow::Error::from(HubError::OutboxLockContention(
+                    device_id.clone(),
+                )));
+            }
+            Err(err) => return Err(anyhow::Error::from(err)),
+        };
         sender
             .send(WsMessage::Binary(
                 ahand_protocol::Envelope {
@@ -596,27 +624,6 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                 .into(),
             ))
             .await?;
-        let device_id = envelope.device_id.clone();
-        let hostname = hello.hostname.clone();
-        let (connection_id, mut outbound_rx, close_rx) = match state
-            .connections
-            .register(device_id.clone(), hello.last_ack)
-            .await
-        {
-            Ok(tuple) => tuple,
-            Err(HubError::OutboxLockContention(_)) => {
-                let _ = send_handshake_close(
-                    &mut sender,
-                    axum::extract::ws::close_code::AGAIN,
-                    "outbox-lock-contention",
-                )
-                .await;
-                return Err(anyhow::Error::from(HubError::OutboxLockContention(
-                    device_id.clone(),
-                )));
-            }
-            Err(err) => return Err(anyhow::Error::from(err)),
-        };
         let (control_tx, mut control_rx) = mpsc::unbounded_channel::<WsMessage>();
         let last_inbound_at = Arc::new(AsyncMutex::new(tokio::time::Instant::now()));
         active_connection = Some((device_id.clone(), connection_id));
