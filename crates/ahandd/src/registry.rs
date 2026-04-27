@@ -4,6 +4,8 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{info, warn};
 
+use crate::executor::{StdinInput, StdinSender};
+
 /// Handle kept per running job, used to send a cancel signal.
 struct JobHandle {
     cancel_tx: mpsc::Sender<()>,
@@ -30,6 +32,7 @@ pub enum IsKnown {
 /// job results for idempotency.
 pub struct JobRegistry {
     jobs: Mutex<HashMap<String, JobHandle>>,
+    stdin_senders: Mutex<HashMap<String, StdinSender>>,
     semaphore: Arc<Semaphore>,
     completed: Mutex<VecDeque<(String, CompletedJob)>>,
     max_completed: usize,
@@ -39,6 +42,7 @@ impl JobRegistry {
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
+            stdin_senders: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(max_concurrent)),
             completed: Mutex::new(VecDeque::new()),
             max_completed: 1000,
@@ -60,6 +64,32 @@ impl JobRegistry {
         jobs.insert(job_id, JobHandle { cancel_tx });
     }
 
+    /// Register an interactive job with both cancel and stdin senders.
+    pub async fn register_interactive(
+        &self,
+        job_id: String,
+        cancel_tx: mpsc::Sender<()>,
+        stdin_tx: StdinSender,
+    ) {
+        let mut jobs = self.jobs.lock().await;
+        jobs.insert(job_id.clone(), JobHandle { cancel_tx });
+        drop(jobs);
+        let mut senders = self.stdin_senders.lock().await;
+        senders.insert(job_id, stdin_tx);
+    }
+
+    /// Send stdin input to an interactive job. Returns `true` if the message
+    /// was delivered, `false` if the job has no stdin channel or the channel
+    /// is closed.
+    pub async fn send_stdin(&self, job_id: &str, input: StdinInput) -> bool {
+        let senders = self.stdin_senders.lock().await;
+        if let Some(tx) = senders.get(job_id) {
+            tx.send(input).is_ok()
+        } else {
+            false
+        }
+    }
+
     /// Send a cancel signal to a running job.
     pub async fn cancel(&self, job_id: &str) {
         let jobs = self.jobs.lock().await;
@@ -78,6 +108,9 @@ impl JobRegistry {
     pub async fn remove(&self, job_id: &str) {
         let mut jobs = self.jobs.lock().await;
         jobs.remove(job_id);
+        drop(jobs);
+        let mut senders = self.stdin_senders.lock().await;
+        senders.remove(job_id);
     }
 
     /// Check if a job_id is already known (running or completed).

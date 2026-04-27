@@ -62,7 +62,23 @@ fn is_process_running(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{}", pid)).exists()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn is_process_running(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        .output()
+        .map(|output| {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // Check if the PID appears as a word in the output (locale-independent)
+            output.status.success()
+                && stdout
+                    .split_whitespace()
+                    .any(|w| w == pid.to_string().as_str())
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn is_process_running(pid: u32) -> bool {
     std::process::Command::new("ps")
         .args(["-p", &pid.to_string()])

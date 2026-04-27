@@ -9,7 +9,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
-const IDENTITY_FILE: &str = "hub-device-identity.json";
+pub(crate) const IDENTITY_FILE: &str = "hub-device-identity.json";
 
 #[derive(Debug, Clone)]
 pub struct DeviceIdentity {
@@ -32,7 +32,10 @@ impl DeviceIdentity {
         }
     }
 
-    #[allow(dead_code)]
+    /// Deterministic identity used by integration tests (golden signature
+    /// fixtures, handshake roundtrips). Seed is fixed `[7u8; 32]`; do not
+    /// call from production code paths — anything signed by this key has
+    /// no real authentication value.
     pub fn generate_for_tests() -> Self {
         Self {
             signing_key: SigningKey::from_bytes(&[7u8; 32]),
@@ -70,6 +73,18 @@ impl DeviceIdentity {
 
     pub fn public_key_bytes(&self) -> Vec<u8> {
         self.signing_key.verifying_key().to_bytes().to_vec()
+    }
+
+    /// Returns the device ID as `SHA256(pubkey)` hex, per spec § 2.1.
+    pub fn device_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.public_key_bytes());
+        hex::encode(digest)
+    }
+
+    /// Returns the Ed25519 public key encoded as standard base64.
+    pub fn public_key_b64(&self) -> String {
+        STANDARD.encode(self.public_key_bytes())
     }
 
     pub fn sign_hello(

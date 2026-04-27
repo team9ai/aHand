@@ -493,36 +493,10 @@ impl BrowserManager {
         envs
     }
 
-    /// Resolve browser executable: config > system Chrome auto-detect.
+    /// Resolve browser executable: config > system Chrome/Edge auto-detect.
     fn resolve_executable_path(&self) -> Option<String> {
-        if let Some(path) = &self.config.executable_path {
-            return Some(path.clone());
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            for candidate in &[
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "/Applications/Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev",
-                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-                "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            ] {
-                if std::path::Path::new(candidate).exists() {
-                    return Some(candidate.to_string());
-                }
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            for candidate in &["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"] {
-                if std::path::Path::new(candidate).exists() {
-                    return Some(candidate.to_string());
-                }
-            }
-        }
-
-        None
+        crate::browser_setup::detect_browser(self.config.executable_path.as_deref())
+            .map(|b| b.path.to_string_lossy().into_owned())
     }
 
     async fn parse_output(

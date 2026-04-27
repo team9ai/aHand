@@ -60,6 +60,10 @@ impl ApiError {
         Self::validation("Invalid query parameters")
     }
 
+    pub fn gone(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::GONE, "JOB_FINISHED", message)
+    }
+
     pub fn from_json_rejection(_value: JsonRejection) -> Self {
         Self::validation("Invalid JSON request body")
     }
@@ -113,6 +117,14 @@ impl From<HubError> for ApiError {
                 StatusCode::CONFLICT,
                 "VALIDATION_ERROR",
                 format!("Device {device_id} already exists"),
+            ),
+            HubError::DeviceOwnedByDifferentUser {
+                device_id,
+                existing_external_user_id,
+            } => Self::new(
+                StatusCode::CONFLICT,
+                "DEVICE_OWNED_BY_DIFFERENT_USER",
+                format!("Device {device_id} is owned by external user {existing_external_user_id}"),
             ),
             HubError::JobNotFound(job_id) => Self::new(
                 StatusCode::NOT_FOUND,

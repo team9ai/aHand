@@ -9,3 +9,4 @@ plugins:
       - outputServices=false
       - env=node
       - useExactTypes=false
+      - importSuffix=.js

@@ -24,8 +24,9 @@ fn persistent_config(stack: &TestStack) -> Config {
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,
-        device_heartbeat_interval_ms: 30_000,
-        device_heartbeat_timeout_ms: 90_000,
+        device_staleness_probe_interval_ms: 30_000,
+        device_staleness_timeout_ms: 180_000,
+        device_expected_heartbeat_secs: 60,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
         job_timeout_grace_ms: 50,
@@ -35,6 +36,11 @@ fn persistent_config(stack: &TestStack) -> Config {
         audit_fallback_path: std::env::temp_dir()
             .join("ahand-hub-persistent-store-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
+        webhook_url: None,
+        webhook_secret: None,
+        webhook_max_retries: 8,
+        webhook_max_concurrency: 50,
+        webhook_timeout_ms: 5_000,
         store: StoreConfig::Persistent {
             database_url: stack.database_url().into(),
             redis_url: stack.redis_url().into(),

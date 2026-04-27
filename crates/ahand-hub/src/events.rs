@@ -98,6 +98,24 @@ impl EventBus {
         Ok(())
     }
 
+    /// Emit a `device.revoked` event. The admin API calls this after
+    /// deleting a pre-registered device; Task 1.5's webhook sender will
+    /// consume it. The detail carries `externalUserId` when available so
+    /// consumers can attribute the revocation to the owning tenant.
+    pub async fn emit_device_revoked(
+        &self,
+        device_id: &str,
+        external_user_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let detail = match external_user_id {
+            Some(user) => serde_json::json!({ "externalUserId": user }),
+            None => serde_json::json!({}),
+        };
+        self.record_and_publish("device.revoked", "device", device_id, "service", detail)
+            .await?;
+        Ok(())
+    }
+
     pub async fn emit_device_offline(&self, device_id: &str) -> anyhow::Result<()> {
         self.record_and_publish(
             "device.offline",
@@ -108,6 +126,32 @@ impl EventBus {
         )
         .await?;
         Ok(())
+    }
+
+    /// Emit a `device.heartbeat` event carrying the daemon-provided
+    /// `sent_at_ms` plus a `presenceTtlSeconds` hint (three times the
+    /// hub's expected heartbeat interval) for downstream webhook
+    /// consumers that want TTL-based presence. This does NOT update the
+    /// audit log — heartbeats are high-frequency and would balloon it —
+    /// it only fans out to live subscribers and the Redis fanout (if any).
+    pub async fn emit_device_heartbeat(
+        &self,
+        device_id: &str,
+        sent_at_ms: u64,
+        presence_ttl_seconds: u64,
+    ) -> anyhow::Result<()> {
+        self.publish(DashboardEvent {
+            event: "device.heartbeat".into(),
+            resource_type: "device".into(),
+            resource_id: device_id.into(),
+            actor: "device".into(),
+            detail: serde_json::json!({
+                "sentAtMs": sent_at_ms,
+                "presenceTtlSeconds": presence_ttl_seconds,
+            }),
+            timestamp: Utc::now(),
+        })
+        .await
     }
 
     pub async fn emit_job_status(&self, job: &Job, actor: &str) -> anyhow::Result<()> {
@@ -307,6 +351,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emit_device_heartbeat_publishes_event_with_ttl_and_sent_at() {
+        let bus = EventBus::new(Arc::new(NoopAuditStore));
+        let mut rx = bus.subscribe();
+
+        bus.emit_device_heartbeat("device-1", 1_745_318_400_000, 180)
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("subscriber should receive heartbeat event")
+            .expect("event bus should stay open");
+        assert_eq!(event.event, "device.heartbeat");
+        assert_eq!(event.resource_type, "device");
+        assert_eq!(event.resource_id, "device-1");
+        assert_eq!(event.actor, "device");
+        assert_eq!(event.detail["sentAtMs"], 1_745_318_400_000_u64);
+        assert_eq!(event.detail["presenceTtlSeconds"], 180_u64);
+    }
+
+    #[tokio::test]
     async fn publish_job_created_ignores_fanout_failures() {
         let publisher = Arc::new(FailingPublisher::default());
         let bus =
@@ -320,6 +385,7 @@ mod tests {
             cwd: None,
             env: Default::default(),
             timeout_ms: 30_000,
+            interactive: false,
             status: JobStatus::Pending,
             exit_code: None,
             error: None,

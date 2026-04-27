@@ -1,0 +1,39 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-12-hub-browser-tab.md",
+  "tasks": [
+    {
+      "id": 1,
+      "subject": "Task 1: Add BrowserPendingMap to AppState and route BrowserResponse in device gateway",
+      "status": "pending",
+      "description": "**Goal:** Enable the hub to track pending browser requests and match inbound BrowserResponse envelopes to waiting HTTP handlers.\n\n**Files:**\n- Modify: crates/ahand-hub/src/state.rs\n- Modify: crates/ahand-hub/src/ws/device_gateway.rs\n\n**Verify:** cargo test -p ahand-hub\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/state.rs\", \"crates/ahand-hub/src/ws/device_gateway.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub\", \"acceptanceCriteria\": [\"AppState has browser_pending DashMap field\", \"Inbound BrowserResponse matched by request_id via oneshot\", \"Unmatched BrowserResponse logged and discarded\", \"Existing job handling unaffected\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: Add POST /api/browser HTTP handler",
+      "status": "pending",
+      "blockedBy": [1],
+      "description": "**Goal:** Create the browser HTTP endpoint that receives browser commands, sends them to devices via WebSocket, and awaits responses.\n\n**Files:**\n- Create: crates/ahand-hub/src/http/browser.rs\n- Modify: crates/ahand-hub/src/http/mod.rs\n- Modify: crates/ahand-hub/Cargo.toml\n\n**Verify:** cargo test -p ahand-hub\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/browser.rs\", \"crates/ahand-hub/src/http/mod.rs\", \"crates/ahand-hub/Cargo.toml\"], \"verifyCommand\": \"cargo test -p ahand-hub\", \"acceptanceCriteria\": [\"POST /api/browser accepts request with dashboard auth\", \"Builds BrowserRequest protobuf and sends via ConnectionRegistry\", \"Returns JSON with base64-encoded binary data\", \"404 if device offline, 400 if no browser capability, 504 on timeout\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: Integration tests for browser API",
+      "status": "pending",
+      "blockedBy": [2],
+      "description": "**Goal:** Test the full browser request-response flow through hub, including error cases.\n\n**Files:**\n- Modify: crates/ahand-hub/tests/support/mod.rs\n- Create: crates/ahand-hub/tests/browser_api.rs\n\n**Verify:** cargo test -p ahand-hub browser\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/tests/support/mod.rs\", \"crates/ahand-hub/tests/browser_api.rs\", \"crates/ahand-hub/Cargo.toml\"], \"verifyCommand\": \"cargo test -p ahand-hub browser\", \"acceptanceCriteria\": [\"Roundtrip test passes\", \"Binary data test passes\", \"Offline device returns 404\", \"No capability returns 400\", \"Timeout returns 504\", \"Unauthenticated returns 401\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: DeviceBrowser React component",
+      "status": "pending",
+      "description": "**Goal:** Create the DeviceBrowser component by porting the old SolidJS BrowserPanel to React.\n\n**Files:**\n- Create: apps/hub-dashboard/src/components/device-browser.tsx\n\n**Verify:** cd apps/hub-dashboard && npx next build\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/src/components/device-browser.tsx\"], \"verifyCommand\": \"cd apps/hub-dashboard && npx next build\", \"acceptanceCriteria\": [\"Session config with session ID input\", \"Actions: URL+Open, Selector, Value+Fill, Snapshot/Click/Fill/Screenshot/Download/PDF/Close\", \"Collapsible Custom Command section\", \"Response log with image preview and download links\", \"Loading state and Clear button\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Integrate Browser tab into DeviceTabs and add styles",
+      "status": "pending",
+      "blockedBy": [4],
+      "description": "**Goal:** Wire the Browser tab into the device detail page with capability gate and CSS styles.\n\n**Files:**\n- Modify: apps/hub-dashboard/src/app/(dashboard)/devices/[id]/page.tsx\n- Modify: apps/hub-dashboard/src/components/device-tabs.tsx\n- Modify: apps/hub-dashboard/src/app/globals.css\n\n**Verify:** cd apps/hub-dashboard && npx next build\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/src/app/(dashboard)/devices/[id]/page.tsx\", \"apps/hub-dashboard/src/components/device-tabs.tsx\", \"apps/hub-dashboard/src/app/globals.css\"], \"verifyCommand\": \"cd apps/hub-dashboard && npx next build\", \"acceptanceCriteria\": [\"Browser tab only visible when online + browser capability\", \"capabilities passed from device detail page\", \"Default tab selection logic correct\", \"Browser panel styles match dark theme\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-12T00:00:00Z"
+}

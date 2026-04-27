@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type WebSocket from "ws";
-import type { AHandServer } from "@ahand/sdk";
+import type { AHandServer } from "@ahandai/sdk";
 import type { DashboardBroadcaster } from "./broadcaster.ts";
 import type { DashboardState } from "./state.ts";
 

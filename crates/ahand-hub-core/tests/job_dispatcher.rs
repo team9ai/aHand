@@ -34,6 +34,7 @@ impl OnlineDeviceStore {
                 version: Some("0.1.2".into()),
                 auth_method: "ed25519".into(),
                 online: true,
+                external_user_id: None,
             },
         }
     }
@@ -76,6 +77,7 @@ impl DeviceStore for OfflineDeviceStore {
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
             online: false,
+            external_user_id: None,
         }))
     }
 
@@ -89,6 +91,7 @@ impl DeviceStore for OfflineDeviceStore {
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
             online: false,
+            external_user_id: None,
         }])
     }
 
@@ -354,6 +357,7 @@ async fn create_job_requires_online_device() {
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap_err();
@@ -377,6 +381,7 @@ async fn create_job_returns_not_found_for_unknown_device() {
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap_err();
@@ -399,6 +404,7 @@ async fn create_job_propagates_device_store_errors() {
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap_err();
@@ -421,6 +427,7 @@ async fn create_job_propagates_job_insert_errors() {
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap_err();
@@ -444,6 +451,7 @@ async fn create_job_writes_audit_entry_for_online_device() {
             env: HashMap::from([("RUST_LOG".into(), "info".into())]),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -485,6 +493,7 @@ async fn create_job_does_not_fail_after_job_is_persisted_if_audit_write_fails() 
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -512,6 +521,7 @@ async fn transition_returns_error_for_terminal_job_regressions() {
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -554,6 +564,7 @@ async fn transition_returns_none_when_status_is_unchanged() {
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -586,6 +597,7 @@ async fn transition_returns_explicit_error_for_illegal_job_transitions() {
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -639,6 +651,7 @@ async fn transition_propagates_job_store_update_errors() {
         cwd: None,
         env: HashMap::new(),
         timeout_ms: 30_000,
+        interactive: false,
         status: JobStatus::Pending,
         exit_code: None,
         error: None,
@@ -676,6 +689,7 @@ async fn fake_job_store_persists_and_filters_jobs() {
             env: HashMap::from([("RUST_LOG".into(), "debug".into())]),
             timeout_ms: 30_000,
             requested_by: "service:test".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -689,6 +703,7 @@ async fn fake_job_store_persists_and_filters_jobs() {
             env: HashMap::new(),
             timeout_ms: 5_000,
             requested_by: "service:other".into(),
+            interactive: false,
         })
         .await
         .unwrap();
@@ -803,6 +818,7 @@ fn job_helpers_roundtrip_inside_dispatcher_target() {
             env: HashMap::new(),
             timeout_ms: 30_000,
             requested_by: "service".into(),
+            interactive: false,
         },
         created_at,
     );

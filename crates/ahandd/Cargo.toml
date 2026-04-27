@@ -15,6 +15,19 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+# `feature = "all"` is required to expose `TcpKeepalive::with_retries`
+# (TCP_KEEPCNT) on Linux. Without it the cfg-gated branch in
+# `apply_tcp_keepalive` (Linux/non-macOS path) fails to compile in CI
+# even though local macOS builds succeed. macOS still falls back to
+# raw setsockopt below — `with_retries` is not exposed for macOS in
+# socket2 even with "all".
+socket2 = { version = "0.6", features = ["all"] }
+# Used on macOS, where socket2 doesn't expose TCP_KEEPCNT via
+# `TcpKeepalive::with_retries` — we set it through raw setsockopt to keep
+# the keepalive budget at ~60s (30s idle + 3×10s probes) instead of the
+# kernel default of 8 probes (~110s). See `apply_tcp_keepalive` in
+# `ahand_client.rs`.
+libc = "0.2"
 toml = "0.8"
 futures-util = "0.3"
 gethostname = "1"
@@ -31,3 +44,19 @@ tar = "0.4"
 flate2 = "1"
 xz2 = { version = "0.1", features = ["static"] }
 tokio-util = { version = "0.7", features = ["io"] }
+semver = "1"
+hex = "0.4"
+portable-pty = "0.9.0"
+
+[features]
+# Dev-only escape hatch for the manual TCP-keepalive smoke test in
+# tests/lib_spawn.rs::watchdog_disabled_still_recovers_via_tcp_keepalive.
+# Disables the WS-level Ping task in connect_with_auth so the only
+# liveness signal left is OS-level TCP keepalive — useful when an
+# operator wants to verify the kernel-level fallback fires by manually
+# dropping traffic to the peer (e.g. via pfctl/iptables). Never enable
+# in production.
+disable-ws-ping = []
+
+[dev-dependencies]
+tempfile = "3"

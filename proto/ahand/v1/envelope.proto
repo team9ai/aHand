@@ -32,7 +32,20 @@ message Envelope {
     BrowserRequest   browser_request   = 24;
     BrowserResponse  browser_response  = 25;
     HelloAccepted    hello_accepted    = 26;
+    UpdateCommand    update_command    = 27;
+    UpdateStatus     update_status     = 28;
+    StdinChunk       stdin_chunk       = 29;
+    TerminalResize   terminal_resize   = 30;
+    Heartbeat        heartbeat         = 31;
   }
+}
+
+// Heartbeat — periodic keep-alive sent from daemon to hub over the existing
+// WebSocket. The hub forwards each heartbeat as a `device.heartbeat` webhook
+// event and uses its arrival to refresh TTL-based presence state.
+message Heartbeat {
+  uint64 sent_at_ms    = 1;
+  string daemon_version = 2;
 }
 
 // HelloChallenge - server nonce that must be signed in the initial Hello response.
@@ -43,7 +56,8 @@ message HelloChallenge {
 
 // Hello - initial handshake after WS connection.
 message HelloAccepted {
-  string auth_method = 1;
+  string            auth_method        = 1;
+  UpdateSuggestion  update_suggestion  = 2;  // optional — server may suggest an update
 }
 
 // Hello - initial handshake after WS connection.
@@ -83,6 +97,7 @@ message JobRequest {
   string cwd    = 4;
   map<string, string> env = 5;
   uint64 timeout_ms = 6;
+  bool   interactive = 7;  // request a PTY / interactive session
 }
 
 // JobEvent - streaming output from a running job.
@@ -196,4 +211,62 @@ message RefusalContext {
   string tool          = 1;
   string reason        = 2;
   uint64 refused_at_ms = 3;
+}
+
+// ── Auto-Update System ──────────────────────────────────────────
+
+// UpdateState — lifecycle state of an in-progress or completed update.
+enum UpdateState {
+  UPDATE_STATE_PENDING     = 0;  // update queued, not yet started
+  UPDATE_STATE_DOWNLOADING = 1;  // binary is being fetched
+  UPDATE_STATE_VERIFYING   = 2;  // checksum / signature check
+  UPDATE_STATE_INSTALLING  = 3;  // installing new binary
+  UPDATE_STATE_RESTARTING  = 4;  // process replacing itself
+  UPDATE_STATE_COMPLETED   = 5;  // update complete, new version running
+  UPDATE_STATE_FAILED      = 6;  // update failed — see error field
+}
+
+// UpdateSuggestion — server hints that a newer version is available (hub → daemon).
+message UpdateSuggestion {
+  string update_id        = 1;
+  string target_version   = 2;
+  string download_url     = 3;
+  string checksum_sha256  = 4;
+  bytes  signature        = 5;
+  string release_notes    = 6;
+}
+
+// UpdateCommand — server instructs daemon to apply an update (hub → daemon).
+message UpdateCommand {
+  string update_id        = 1;
+  string target_version   = 2;
+  string download_url     = 3;
+  string checksum_sha256  = 4;
+  bytes  signature        = 5;
+  uint32 max_retries      = 6;
+}
+
+// UpdateStatus — daemon reports update progress back to hub (daemon → hub).
+message UpdateStatus {
+  string      update_id       = 1;
+  UpdateState state           = 2;
+  string      current_version = 3;
+  string      target_version  = 4;
+  uint32      progress        = 5;  // 0-100
+  string      error           = 6;  // non-empty on FAILED
+}
+
+// ── Interactive / PTY Support ───────────────────────────────────
+
+// StdinChunk — sends a chunk of stdin data to a running interactive job.
+message StdinChunk {
+  string job_id = 1;
+  bytes  data   = 2;
+}
+
+// TerminalResize — notifies the daemon of a terminal size change for a PTY job.
+message TerminalResize {
+  string job_id = 1;
+  uint32 cols   = 2;
+  uint32 rows   = 3;
 }

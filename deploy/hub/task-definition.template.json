@@ -1,0 +1,96 @@
+{
+  "family": "ahand-hub-${ENV}",
+  "requiresCompatibilities": ["FARGATE"],
+  "networkMode": "awsvpc",
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+  "taskRoleArn": "${TASK_ROLE_ARN}",
+  "containerDefinitions": [
+    {
+      "name": "ahand-hub",
+      "image": "${ECR_IMAGE}",
+      "essential": true,
+      "portMappings": [{ "containerPort": 1515, "protocol": "tcp" }],
+      "environment": [
+        { "name": "AHAND_HUB_BIND_ADDR", "value": "0.0.0.0:1515" },
+        { "name": "AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS", "value": "" },
+        { "name": "AHAND_HUB_LOG_FORMAT", "value": "json" },
+        { "name": "AHAND_HUB_LOG_LEVEL", "value": "info" },
+        {
+          "name": "AHAND_HUB_AUDIT_FALLBACK_PATH",
+          "value": "/tmp/audit-fallback.jsonl"
+        },
+        { "name": "AHAND_HUB_WEBHOOK_MAX_RETRIES", "value": "8" },
+        { "name": "AHAND_HUB_WEBHOOK_TIMEOUT_MS", "value": "5000" },
+        { "name": "GIT_SHA", "value": "${GIT_SHA}" },
+        { "name": "SENTRY_ENVIRONMENT", "value": "${ENV}" }
+      ],
+      "secrets": [
+        {
+          "name": "AHAND_HUB_JWT_SECRET",
+          "valueFrom": "${SSM_PREFIX}/JWT_SECRET"
+        },
+        {
+          "name": "AHAND_HUB_SERVICE_TOKEN",
+          "valueFrom": "${SSM_PREFIX}/SERVICE_TOKEN"
+        },
+        {
+          "name": "AHAND_HUB_WEBHOOK_URL",
+          "valueFrom": "${SSM_PREFIX}/WEBHOOK_URL"
+        },
+        {
+          "name": "AHAND_HUB_WEBHOOK_SECRET",
+          "valueFrom": "${SSM_PREFIX}/WEBHOOK_SECRET"
+        },
+        {
+          "name": "AHAND_HUB_DATABASE_URL",
+          "valueFrom": "${SSM_PREFIX}/DATABASE_URL"
+        },
+        {
+          "name": "AHAND_HUB_REDIS_URL",
+          "valueFrom": "${SSM_PREFIX}/REDIS_URL"
+        },
+        {
+          "name": "AHAND_HUB_DASHBOARD_PASSWORD",
+          "valueFrom": "${SSM_PREFIX}/DASHBOARD_PASSWORD"
+        },
+        {
+          "name": "AHAND_HUB_DEVICE_BOOTSTRAP_TOKEN",
+          "valueFrom": "${SSM_PREFIX}/DEVICE_BOOTSTRAP_TOKEN"
+        },
+        {
+          "name": "AHAND_HUB_DEVICE_BOOTSTRAP_DEVICE_ID",
+          "valueFrom": "${SSM_PREFIX}/DEVICE_BOOTSTRAP_DEVICE_ID"
+        },
+        { "name": "SENTRY_DSN", "valueFrom": "${SSM_PREFIX}/SENTRY_DSN" }
+      ],
+      "dockerLabels": {
+        "traefik.enable": "true",
+        "traefik.http.routers.ahand-hub-${ENV}.rule": "Host(`${API_DOMAIN}`)",
+        "traefik.http.routers.ahand-hub-${ENV}.entrypoints": "websecure",
+        "traefik.http.routers.ahand-hub-${ENV}.tls": "true",
+        "traefik.http.routers.ahand-hub-${ENV}.tls.certresolver": "letsencrypt",
+        "traefik.http.services.ahand-hub-${ENV}.loadbalancer.server.port": "1515"
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/ahand-hub",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "ahand-hub-${ENV}"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:1515/api/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}

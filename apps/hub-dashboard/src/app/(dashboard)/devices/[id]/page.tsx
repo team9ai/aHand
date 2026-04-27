@@ -1,6 +1,6 @@
-import Link from "next/link";
 import { DeviceStatusBadge } from "@/components/device-status-badge";
-import { getDevice, getJobs, withDashboardSession } from "@/lib/api";
+import { DeviceTabs } from "@/components/device-tabs";
+import { getDevice, withDashboardSession } from "@/lib/api";
 
 type DeviceDetailPageProps = {
   params: Promise<{ id: string }>;
@@ -8,9 +8,7 @@ type DeviceDetailPageProps = {
 
 export default async function DeviceDetailPage({ params }: DeviceDetailPageProps) {
   const { id } = await params;
-  const [device, jobs] = await withDashboardSession(() =>
-    Promise.all([getDevice(id), getJobs({ deviceId: id })]),
-  );
+  const device = await withDashboardSession(() => getDevice(id));
 
   if (!device) {
     return (
@@ -70,28 +68,7 @@ export default async function DeviceDetailPage({ params }: DeviceDetailPageProps
         </article>
       </div>
 
-      <section className="surface-panel">
-        <div className="panel-header">
-          <h2 className="panel-title">Recent Jobs</h2>
-        </div>
-        {jobs.length > 0 ? (
-          <ul className="activity-list">
-            {jobs.slice(0, 6).map((job) => (
-              <li className="activity-row" key={job.id}>
-                <div>
-                  <Link className="table-link" href={`/jobs/${job.id}`}>
-                    {job.tool}
-                  </Link>
-                  <p className="dashboard-copy">{job.args.join(" ")}</p>
-                </div>
-                <span className="table-subtle">{job.status.toLowerCase()}</span>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="empty-state">No jobs have been recorded for this device yet.</p>
-        )}
-      </section>
+      <DeviceTabs deviceId={device.id} online={device.online} capabilities={device.capabilities} />
     </section>
   );
 }
@@ -101,8 +78,10 @@ function formatFingerprint(publicKey: number[] | null) {
     return "Unavailable";
   }
 
-  return publicKey
+  const hex = publicKey
     .map((value) => value.toString(16).padStart(2, "0"))
     .join("")
     .toUpperCase();
+
+  return hex.replace(/.{8}/g, "$& ").trim();
 }

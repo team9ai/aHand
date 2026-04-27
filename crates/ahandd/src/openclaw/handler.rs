@@ -877,7 +877,11 @@ fn approval_disposition(params: &SystemRunParams) -> ApprovalDisposition {
     }
 }
 
-fn build_job_request(invoke: &NodeInvokeRequest, params: &SystemRunParams, run_id: &str) -> JobRequest {
+fn build_job_request(
+    invoke: &NodeInvokeRequest,
+    params: &SystemRunParams,
+    run_id: &str,
+) -> JobRequest {
     let tool = params
         .command
         .first()
@@ -898,6 +902,7 @@ fn build_job_request(invoke: &NodeInvokeRequest, params: &SystemRunParams, run_i
         cwd: params.cwd.clone().unwrap_or_default(),
         env: params.env.clone().unwrap_or_default(),
         timeout_ms: params.timeout_ms.or(invoke.timeout_ms).unwrap_or(120_000),
+        interactive: false,
     }
 }
 
@@ -920,7 +925,11 @@ fn approval_denied_reason(resp: &ApprovalResponse) -> String {
     }
 }
 
-fn invoke_result_from_run(invoke: &NodeInvokeRequest, node_id: &str, result: &RunResult) -> NodeInvokeResult {
+fn invoke_result_from_run(
+    invoke: &NodeInvokeRequest,
+    node_id: &str,
+    result: &RunResult,
+) -> NodeInvokeResult {
     NodeInvokeResult {
         id: invoke.id.clone(),
         node_id: node_id.to_string(),
@@ -1394,10 +1403,7 @@ mod tests {
     }
 
     fn unique_output_path() -> PathBuf {
-        PathBuf::from(format!(
-            "/tmp/ahand-openclaw-{}",
-            uuid::Uuid::new_v4()
-        ))
+        PathBuf::from(format!("/tmp/ahand-openclaw-{}", uuid::Uuid::new_v4()))
     }
 
     fn system_run_invoke(
@@ -1449,7 +1455,10 @@ mod tests {
 
         let event = event.unwrap();
         assert_eq!(event.kind, ExecEventKind::Denied);
-        assert_eq!(event.payload.reason.as_deref(), Some("session not activated"));
+        assert_eq!(
+            event.payload.reason.as_deref(),
+            Some("session not activated")
+        );
 
         let _ = std::fs::remove_file(output_path);
     }
@@ -1474,9 +1483,11 @@ mod tests {
 
         let event = event.unwrap();
         assert_eq!(event.kind, ExecEventKind::Finished);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), approval_rx.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), approval_rx.recv())
+                .await
+                .is_err()
+        );
 
         let _ = std::fs::remove_file(output_path);
     }

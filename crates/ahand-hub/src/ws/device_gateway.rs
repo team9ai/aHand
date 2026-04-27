@@ -6,6 +6,7 @@ use prost::Message;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
 
 use ahand_hub_core::HubError;
+use ahand_hub_core::traits::DeviceStore;
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -143,6 +144,25 @@ impl ConnectionRegistry {
         }
     }
 
+    /// Forcibly close an active device WS. Returns true if there was an
+    /// active connection to close, false otherwise. Idempotent: calling
+    /// it on a device with no WS is a no-op. The main loop in
+    /// `run_device_socket` picks up the `close_tx` signal, unregisters,
+    /// and runs the normal teardown path.
+    pub async fn kick_device(&self, device_id: &str) -> bool {
+        let active = {
+            let Some(entry) = self.senders.get(device_id) else {
+                return false;
+            };
+            entry.active.clone()
+        };
+        let Some(active) = active else {
+            return false;
+        };
+        let _ = active.close_tx.send(true);
+        true
+    }
+
     pub(crate) fn is_current(&self, device_id: &str, connection_id: uuid::Uuid) -> bool {
         self.senders
             .get(device_id)
@@ -158,6 +178,28 @@ impl ConnectionRegistry {
 
     pub(crate) fn is_connected(&self, device_id: &str) -> bool {
         self.has_active(device_id)
+    }
+
+    /// Public wrapper around [`Self::is_connected`] so the
+    /// control-plane HTTP handlers (which live outside the `ws`
+    /// module) can gate job dispatch on a live WS without reaching
+    /// into private state.
+    pub fn is_online(&self, device_id: &str) -> bool {
+        self.has_active(device_id)
+    }
+
+    /// Public wrapper around [`Self::send`] so the control-plane HTTP
+    /// handlers can dispatch envelopes to a device. The underlying
+    /// path is the same as the dashboard job flow; we expose it here
+    /// to keep the module boundary tight rather than promoting
+    /// `send` itself to public (which would also expose the retry
+    /// loop semantics to more call sites).
+    pub async fn send_envelope(
+        &self,
+        device_id: &str,
+        envelope: ahand_protocol::Envelope,
+    ) -> anyhow::Result<()> {
+        self.send(device_id, envelope).await
     }
 
     pub(crate) fn has_seen_inbound(&self, device_id: &str, seq: u64) -> bool {
@@ -298,7 +340,11 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     let mut bootstrap_reservation: Option<crate::bootstrap::BootstrapReservation> = None;
     let mut send_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut presence_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut heartbeat_task: Option<tokio::task::JoinHandle<()>> = None;
+    // Staleness monitor: closes the WS if no inbound frame (including the
+    // daemon's Heartbeat envelopes) has arrived within
+    // `device_staleness_timeout_ms`. Replaces the old hub-initiated ping
+    // timer — direction is now daemon → hub.
+    let mut staleness_monitor_task: Option<tokio::task::JoinHandle<()>> = None;
     let (local_close_tx, local_close_rx) = watch::channel(false);
 
     let run_result: anyhow::Result<()> = async {
@@ -388,6 +434,25 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     }),
                 )
                 .await;
+            // Best-effort webhook — the admin pre-register path sets
+            // `external_user_id` before the daemon hellos, so we
+            // look it up here. A failure to enqueue only surfaces as
+            // a log warning; the handshake is already committed.
+            let external_user_id = match state.devices.get(&envelope.device_id).await {
+                Ok(Some(device)) => device.external_user_id,
+                _ => None,
+            };
+            if let Err(err) = state
+                .webhook
+                .enqueue_registered(&envelope.device_id, external_user_id.as_deref())
+                .await
+            {
+                tracing::warn!(
+                    device_id = %envelope.device_id,
+                    error = %err,
+                    "failed to enqueue device.registered webhook",
+                );
+            }
         }
         sender
             .send(WsMessage::Binary(
@@ -401,6 +466,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     payload: Some(ahand_protocol::envelope::Payload::HelloAccepted(
                         ahand_protocol::HelloAccepted {
                             auth_method: verified.auth_method.into(),
+                            update_suggestion: None,
                         },
                     )),
                     ..Default::default()
@@ -421,6 +487,25 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         state.jobs.handle_device_connected(&device_id).await?;
         if let Err(err) = state.events.emit_device_online(&device_id, &hostname).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.online audit");
+        }
+        // The external_user_id on the device row may have been set by an
+        // earlier admin pre-register or during this hello's accept path.
+        // Either way, fetch it fresh so webhooks always carry the most
+        // recent attribution.
+        let online_external_user_id = match state.devices.get(&device_id).await {
+            Ok(Some(device)) => device.external_user_id,
+            _ => None,
+        };
+        if let Err(err) = state
+            .webhook
+            .enqueue_online(&device_id, online_external_user_id.as_deref())
+            .await
+        {
+            tracing::warn!(
+                device_id = %device_id,
+                error = %err,
+                "failed to enqueue device.online webhook",
+            );
         }
 
         if state.device_presence_refresh_ms > 0 {
@@ -486,31 +571,32 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             }
         }));
 
-        if state.device_heartbeat_interval_ms > 0 && state.device_heartbeat_timeout_ms > 0 {
-            let heartbeat_interval = state.device_heartbeat_interval_ms;
-            let heartbeat_timeout = std::time::Duration::from_millis(state.device_heartbeat_timeout_ms);
-            let mut heartbeat_close_rx = close_rx.clone();
-            let mut heartbeat_local_close_rx = local_close_rx.clone();
-            let heartbeat_last_inbound_at = last_inbound_at.clone();
-            let heartbeat_control_tx = control_tx.clone();
-            let heartbeat_local_close_tx = local_close_tx.clone();
-            heartbeat_task = Some(tokio::spawn(async move {
+        if state.device_staleness_probe_interval_ms > 0 && state.device_staleness_timeout_ms > 0 {
+            let probe_interval = state.device_staleness_probe_interval_ms;
+            let staleness_timeout =
+                std::time::Duration::from_millis(state.device_staleness_timeout_ms);
+            let mut staleness_close_rx = close_rx.clone();
+            let mut staleness_local_close_rx = local_close_rx.clone();
+            let staleness_last_inbound_at = last_inbound_at.clone();
+            let staleness_local_close_tx = local_close_tx.clone();
+            staleness_monitor_task = Some(tokio::spawn(async move {
+                // Periodically check how long it has been since the last
+                // inbound frame. When the daemon's heartbeats stop arriving
+                // (because the process or network died without closing the
+                // WS cleanly), we trip the local close signal so the main
+                // loop exits and the connection is reaped.
+                //
+                // No outbound probes are sent — direction is now daemon →
+                // hub only.
                 loop {
                     tokio::select! {
                         biased;
-                        _ = heartbeat_close_rx.changed() => break,
-                        _ = heartbeat_local_close_rx.changed() => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(heartbeat_interval)) => {
-                            let elapsed = heartbeat_last_inbound_at.lock().await.elapsed();
-                            if elapsed >= heartbeat_timeout {
-                                let _ = heartbeat_local_close_tx.send(true);
-                                break;
-                            }
-                            if heartbeat_control_tx
-                                .send(WsMessage::Ping(Vec::new().into()))
-                                .is_err()
-                            {
-                                let _ = heartbeat_local_close_tx.send(true);
+                        _ = staleness_close_rx.changed() => break,
+                        _ = staleness_local_close_rx.changed() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(probe_interval)) => {
+                            let elapsed = staleness_last_inbound_at.lock().await.elapsed();
+                            if elapsed >= staleness_timeout {
+                                let _ = staleness_local_close_tx.send(true);
                                 break;
                             }
                         }
@@ -539,7 +625,84 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             match message {
                 WsMessage::Binary(frame) => {
                     *last_inbound_at.lock().await = tokio::time::Instant::now();
-                    state.jobs.handle_device_frame(&device_id, &frame).await?;
+                    let envelope = ahand_protocol::Envelope::decode(frame.as_ref())?;
+                    if state.connections.has_seen_inbound(&device_id, envelope.seq) {
+                        state.connections.observe_ack(&device_id, envelope.ack)?;
+                    } else if let Some(ahand_protocol::envelope::Payload::Heartbeat(ref hb)) =
+                        envelope.payload
+                    {
+                        // Heartbeat is observed (for ack bookkeeping and
+                        // staleness refresh above) and then fanned out so
+                        // downstream webhook senders / dashboards can mirror
+                        // device presence without polling.
+                        state
+                            .connections
+                            .observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                        let ttl = state
+                            .device_expected_heartbeat_secs
+                            .saturating_mul(3);
+                        if let Err(err) = state
+                            .events
+                            .emit_device_heartbeat(&device_id, hb.sent_at_ms, ttl)
+                            .await
+                        {
+                            tracing::warn!(
+                                device_id = %device_id,
+                                error = %err,
+                                "failed to emit device.heartbeat event",
+                            );
+                        }
+                        // Heartbeats are also posted to the external webhook
+                        // gateway so team9's presence tracker can stay
+                        // synced. Use the `online_external_user_id` cached
+                        // at Hello-accept time instead of re-fetching the
+                        // device row on every heartbeat — at fleet scale
+                        // (~1000 devices @ 60s cadence) a per-heartbeat
+                        // SELECT is ~17 Pg QPS of pure attribution
+                        // lookups. The owner of a device effectively never
+                        // changes mid-session, and if an admin revokes a
+                        // device via DELETE /api/admin/devices/{id} the
+                        // WS is torn down via `kick_device`, so staleness
+                        // is bounded to the handshake-to-close window.
+                        if state.webhook.is_enabled()
+                            && let Err(err) = state
+                                .webhook
+                                .enqueue_heartbeat(
+                                    &device_id,
+                                    online_external_user_id.as_deref(),
+                                    hb.sent_at_ms,
+                                    ttl,
+                                )
+                                .await
+                        {
+                            tracing::warn!(
+                                device_id = %device_id,
+                                error = %err,
+                                "failed to enqueue device.heartbeat webhook",
+                            );
+                        }
+                    } else if let Some(ahand_protocol::envelope::Payload::BrowserResponse(ref browser_resp)) = envelope.payload {
+                        if let Some((_, sender)) = state.browser_pending.remove(&browser_resp.request_id) {
+                            let _ = sender.send(browser_resp.clone());
+                        } else {
+                            tracing::warn!(
+                                request_id = %browser_resp.request_id,
+                                "received BrowserResponse with no pending request"
+                            );
+                        }
+                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                    } else if dispatch_control_plane_event(&state, &envelope) {
+                        // The envelope's job_id was registered in the
+                        // control-plane tracker — the tee has already
+                        // published the event to SSE subscribers.
+                        // Skip JobRuntime (which would bail on an
+                        // unknown job id) and just advance seq/ack.
+                        state
+                            .connections
+                            .observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                    } else {
+                        state.jobs.handle_device_frame(&device_id, &frame).await?;
+                    }
                 }
                 WsMessage::Ping(payload) => {
                     *last_inbound_at.lock().await = tokio::time::Instant::now();
@@ -566,17 +729,17 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     if let Some(task) = presence_task.take() {
         task.abort();
     }
-    if let Some(task) = heartbeat_task.take() {
+    if let Some(task) = staleness_monitor_task.take() {
         task.abort();
     }
-    if let Some(reservation) = bootstrap_reservation.take() {
-        if let Err(err) = state.bootstrap_tokens.release(&reservation).await {
-            tracing::warn!(
-                device_id = %reservation.device_id,
-                error = %err,
-                "failed to release bootstrap reservation"
-            );
-        }
+    if let Some(reservation) = bootstrap_reservation.take()
+        && let Err(err) = state.bootstrap_tokens.release(&reservation).await
+    {
+        tracing::warn!(
+            device_id = %reservation.device_id,
+            error = %err,
+            "failed to release bootstrap reservation"
+        );
     }
     if let Some((device_id, connection_id)) = active_connection.take()
         && state
@@ -584,14 +747,125 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             .unregister(&device_id, connection_id)
             .await?
     {
+        let offline_external_user_id = match state.devices.get(&device_id).await {
+            Ok(Some(device)) => device.external_user_id,
+            _ => None,
+        };
         state.devices.mark_offline(&device_id).await?;
         state.jobs.handle_device_disconnected(&device_id).await?;
         if let Err(err) = state.events.emit_device_offline(&device_id).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.offline audit");
         }
+        if let Err(err) = state
+            .webhook
+            .enqueue_offline(&device_id, offline_external_user_id.as_deref())
+            .await
+        {
+            tracing::warn!(
+                device_id = %device_id,
+                error = %err,
+                "failed to enqueue device.offline webhook",
+            );
+        }
     }
 
     run_result
+}
+
+/// Publish any job-related envelope received from a daemon to the
+/// control-plane tracker, if the `job_id` is known to it.
+///
+/// Returns `true` if the envelope targeted a control-plane job (and
+/// was therefore handled here) — the caller should then skip
+/// [`crate::http::jobs::JobRuntime::handle_device_frame`] to avoid
+/// the "job not found" bail-out that would kill the WS. Returns
+/// `false` otherwise (not job-related, or a dashboard / JobRuntime
+/// job id the caller still needs to process).
+fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Envelope) -> bool {
+    let Some(payload) = envelope.payload.as_ref() else {
+        return false;
+    };
+    match payload {
+        ahand_protocol::envelope::Payload::JobEvent(event) => {
+            if state.control_jobs.get(&event.job_id).is_none() {
+                return false;
+            }
+            let Some(kind) = event.event.as_ref() else {
+                return true;
+            };
+            let control_event = match kind {
+                ahand_protocol::job_event::Event::StdoutChunk(chunk) => {
+                    crate::control_jobs::ControlJobEvent::Stdout {
+                        chunk: String::from_utf8_lossy(chunk).into_owned(),
+                    }
+                }
+                ahand_protocol::job_event::Event::StderrChunk(chunk) => {
+                    crate::control_jobs::ControlJobEvent::Stderr {
+                        chunk: String::from_utf8_lossy(chunk).into_owned(),
+                    }
+                }
+                ahand_protocol::job_event::Event::Progress(percent) => {
+                    crate::control_jobs::ControlJobEvent::Progress {
+                        // Percent is a u32 on the wire but the SDK
+                        // surface is 0..=100; clamp defensively.
+                        percent: (*percent).min(100) as u8,
+                        message: None,
+                    }
+                }
+            };
+            state.control_jobs.publish(&event.job_id, control_event);
+            true
+        }
+        ahand_protocol::envelope::Payload::JobFinished(finished) => {
+            let Some(channels) = state.control_jobs.get(&finished.job_id) else {
+                return false;
+            };
+            let duration_ms = channels
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            // `error == "cancelled"` and non-zero exit_code are the
+            // two ways a job can fail. We report them as an `error`
+            // event so the SDK can distinguish graceful completion
+            // from failure without peeking at the exit code.
+            let event = if finished.exit_code == 0 && finished.error.is_empty() {
+                crate::control_jobs::ControlJobEvent::Finished {
+                    exit_code: finished.exit_code,
+                    duration_ms,
+                }
+            } else {
+                crate::control_jobs::ControlJobEvent::Error {
+                    code: if finished.error == "cancelled" {
+                        "cancelled".into()
+                    } else {
+                        "exec_failed".into()
+                    },
+                    message: if finished.error.is_empty() {
+                        format!("exit code {}", finished.exit_code)
+                    } else {
+                        finished.error.clone()
+                    },
+                }
+            };
+            state.control_jobs.finalize(&finished.job_id, event);
+            true
+        }
+        ahand_protocol::envelope::Payload::JobRejected(rejected) => {
+            if state.control_jobs.get(&rejected.job_id).is_none() {
+                return false;
+            }
+            state.control_jobs.finalize(
+                &rejected.job_id,
+                crate::control_jobs::ControlJobEvent::Error {
+                    code: "rejected".into(),
+                    message: rejected.reason.clone(),
+                },
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 fn issue_hello_challenge() -> ahand_protocol::HelloChallenge {
@@ -650,6 +924,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()
@@ -671,6 +946,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()
@@ -724,6 +1000,7 @@ mod tests {
                             cwd: String::new(),
                             env: Default::default(),
                             timeout_ms: 30_000,
+                            interactive: false,
                         },
                     )),
                     ..Default::default()

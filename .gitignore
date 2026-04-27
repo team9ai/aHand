@@ -41,3 +41,7 @@ plan.md
 
 .claude/
 .worktrees/
+
+# Terraform (added by Stream C)
+.terraform/
+*.tfplan

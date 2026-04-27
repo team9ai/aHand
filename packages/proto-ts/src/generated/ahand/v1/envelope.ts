@@ -6,7 +6,7 @@
 
 /* eslint-disable */
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
-import { BrowserRequest, BrowserResponse } from "./browser";
+import { BrowserRequest, BrowserResponse } from "./browser.js";
 
 export const protobufPackage = "ahand.v1";
 
@@ -60,6 +60,77 @@ export function sessionModeToJSON(object: SessionMode): string {
   }
 }
 
+/** UpdateState — lifecycle state of an in-progress or completed update. */
+export enum UpdateState {
+  /** UPDATE_STATE_PENDING - update queued, not yet started */
+  UPDATE_STATE_PENDING = 0,
+  /** UPDATE_STATE_DOWNLOADING - binary is being fetched */
+  UPDATE_STATE_DOWNLOADING = 1,
+  /** UPDATE_STATE_VERIFYING - checksum / signature check */
+  UPDATE_STATE_VERIFYING = 2,
+  /** UPDATE_STATE_INSTALLING - installing new binary */
+  UPDATE_STATE_INSTALLING = 3,
+  /** UPDATE_STATE_RESTARTING - process replacing itself */
+  UPDATE_STATE_RESTARTING = 4,
+  /** UPDATE_STATE_COMPLETED - update complete, new version running */
+  UPDATE_STATE_COMPLETED = 5,
+  /** UPDATE_STATE_FAILED - update failed — see error field */
+  UPDATE_STATE_FAILED = 6,
+  UNRECOGNIZED = -1,
+}
+
+export function updateStateFromJSON(object: any): UpdateState {
+  switch (object) {
+    case 0:
+    case "UPDATE_STATE_PENDING":
+      return UpdateState.UPDATE_STATE_PENDING;
+    case 1:
+    case "UPDATE_STATE_DOWNLOADING":
+      return UpdateState.UPDATE_STATE_DOWNLOADING;
+    case 2:
+    case "UPDATE_STATE_VERIFYING":
+      return UpdateState.UPDATE_STATE_VERIFYING;
+    case 3:
+    case "UPDATE_STATE_INSTALLING":
+      return UpdateState.UPDATE_STATE_INSTALLING;
+    case 4:
+    case "UPDATE_STATE_RESTARTING":
+      return UpdateState.UPDATE_STATE_RESTARTING;
+    case 5:
+    case "UPDATE_STATE_COMPLETED":
+      return UpdateState.UPDATE_STATE_COMPLETED;
+    case 6:
+    case "UPDATE_STATE_FAILED":
+      return UpdateState.UPDATE_STATE_FAILED;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return UpdateState.UNRECOGNIZED;
+  }
+}
+
+export function updateStateToJSON(object: UpdateState): string {
+  switch (object) {
+    case UpdateState.UPDATE_STATE_PENDING:
+      return "UPDATE_STATE_PENDING";
+    case UpdateState.UPDATE_STATE_DOWNLOADING:
+      return "UPDATE_STATE_DOWNLOADING";
+    case UpdateState.UPDATE_STATE_VERIFYING:
+      return "UPDATE_STATE_VERIFYING";
+    case UpdateState.UPDATE_STATE_INSTALLING:
+      return "UPDATE_STATE_INSTALLING";
+    case UpdateState.UPDATE_STATE_RESTARTING:
+      return "UPDATE_STATE_RESTARTING";
+    case UpdateState.UPDATE_STATE_COMPLETED:
+      return "UPDATE_STATE_COMPLETED";
+    case UpdateState.UPDATE_STATE_FAILED:
+      return "UPDATE_STATE_FAILED";
+    case UpdateState.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Envelope wraps all messages on the wire (WS and IPC). */
 export interface Envelope {
   deviceId: string;
@@ -95,6 +166,21 @@ export interface Envelope {
   browserRequest?: BrowserRequest | undefined;
   browserResponse?: BrowserResponse | undefined;
   helloAccepted?: HelloAccepted | undefined;
+  updateCommand?: UpdateCommand | undefined;
+  updateStatus?: UpdateStatus | undefined;
+  stdinChunk?: StdinChunk | undefined;
+  terminalResize?: TerminalResize | undefined;
+  heartbeat?: Heartbeat | undefined;
+}
+
+/**
+ * Heartbeat — periodic keep-alive sent from daemon to hub over the existing
+ * WebSocket. The hub forwards each heartbeat as a `device.heartbeat` webhook
+ * event and uses its arrival to refresh TTL-based presence state.
+ */
+export interface Heartbeat {
+  sentAtMs: number;
+  daemonVersion: string;
 }
 
 /** HelloChallenge - server nonce that must be signed in the initial Hello response. */
@@ -106,6 +192,8 @@ export interface HelloChallenge {
 /** Hello - initial handshake after WS connection. */
 export interface HelloAccepted {
   authMethod: string;
+  /** optional — server may suggest an update */
+  updateSuggestion: UpdateSuggestion | undefined;
 }
 
 /** Hello - initial handshake after WS connection. */
@@ -142,6 +230,8 @@ export interface JobRequest {
   cwd: string;
   env: { [key: string]: string };
   timeoutMs: number;
+  /** request a PTY / interactive session */
+  interactive: boolean;
 }
 
 export interface JobRequest_EnvEntry {
@@ -265,6 +355,51 @@ export interface RefusalContext {
   refusedAtMs: number;
 }
 
+/** UpdateSuggestion — server hints that a newer version is available (hub → daemon). */
+export interface UpdateSuggestion {
+  updateId: string;
+  targetVersion: string;
+  downloadUrl: string;
+  checksumSha256: string;
+  signature: Buffer;
+  releaseNotes: string;
+}
+
+/** UpdateCommand — server instructs daemon to apply an update (hub → daemon). */
+export interface UpdateCommand {
+  updateId: string;
+  targetVersion: string;
+  downloadUrl: string;
+  checksumSha256: string;
+  signature: Buffer;
+  maxRetries: number;
+}
+
+/** UpdateStatus — daemon reports update progress back to hub (daemon → hub). */
+export interface UpdateStatus {
+  updateId: string;
+  state: UpdateState;
+  currentVersion: string;
+  targetVersion: string;
+  /** 0-100 */
+  progress: number;
+  /** non-empty on FAILED */
+  error: string;
+}
+
+/** StdinChunk — sends a chunk of stdin data to a running interactive job. */
+export interface StdinChunk {
+  jobId: string;
+  data: Buffer;
+}
+
+/** TerminalResize — notifies the daemon of a terminal size change for a PTY job. */
+export interface TerminalResize {
+  jobId: string;
+  cols: number;
+  rows: number;
+}
+
 function createBaseEnvelope(): Envelope {
   return {
     deviceId: "",
@@ -291,6 +426,11 @@ function createBaseEnvelope(): Envelope {
     browserRequest: undefined,
     browserResponse: undefined,
     helloAccepted: undefined,
+    updateCommand: undefined,
+    updateStatus: undefined,
+    stdinChunk: undefined,
+    terminalResize: undefined,
+    heartbeat: undefined,
   };
 }
 
@@ -367,6 +507,21 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.helloAccepted !== undefined) {
       HelloAccepted.encode(message.helloAccepted, writer.uint32(210).fork()).join();
+    }
+    if (message.updateCommand !== undefined) {
+      UpdateCommand.encode(message.updateCommand, writer.uint32(218).fork()).join();
+    }
+    if (message.updateStatus !== undefined) {
+      UpdateStatus.encode(message.updateStatus, writer.uint32(226).fork()).join();
+    }
+    if (message.stdinChunk !== undefined) {
+      StdinChunk.encode(message.stdinChunk, writer.uint32(234).fork()).join();
+    }
+    if (message.terminalResize !== undefined) {
+      TerminalResize.encode(message.terminalResize, writer.uint32(242).fork()).join();
+    }
+    if (message.heartbeat !== undefined) {
+      Heartbeat.encode(message.heartbeat, writer.uint32(250).fork()).join();
     }
     return writer;
   },
@@ -570,6 +725,46 @@ export const Envelope: MessageFns<Envelope> = {
           message.helloAccepted = HelloAccepted.decode(reader, reader.uint32());
           continue;
         }
+        case 27: {
+          if (tag !== 218) {
+            break;
+          }
+
+          message.updateCommand = UpdateCommand.decode(reader, reader.uint32());
+          continue;
+        }
+        case 28: {
+          if (tag !== 226) {
+            break;
+          }
+
+          message.updateStatus = UpdateStatus.decode(reader, reader.uint32());
+          continue;
+        }
+        case 29: {
+          if (tag !== 234) {
+            break;
+          }
+
+          message.stdinChunk = StdinChunk.decode(reader, reader.uint32());
+          continue;
+        }
+        case 30: {
+          if (tag !== 242) {
+            break;
+          }
+
+          message.terminalResize = TerminalResize.decode(reader, reader.uint32());
+          continue;
+        }
+        case 31: {
+          if (tag !== 250) {
+            break;
+          }
+
+          message.heartbeat = Heartbeat.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -689,6 +884,27 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.hello_accepted)
         ? HelloAccepted.fromJSON(object.hello_accepted)
         : undefined,
+      updateCommand: isSet(object.updateCommand)
+        ? UpdateCommand.fromJSON(object.updateCommand)
+        : isSet(object.update_command)
+        ? UpdateCommand.fromJSON(object.update_command)
+        : undefined,
+      updateStatus: isSet(object.updateStatus)
+        ? UpdateStatus.fromJSON(object.updateStatus)
+        : isSet(object.update_status)
+        ? UpdateStatus.fromJSON(object.update_status)
+        : undefined,
+      stdinChunk: isSet(object.stdinChunk)
+        ? StdinChunk.fromJSON(object.stdinChunk)
+        : isSet(object.stdin_chunk)
+        ? StdinChunk.fromJSON(object.stdin_chunk)
+        : undefined,
+      terminalResize: isSet(object.terminalResize)
+        ? TerminalResize.fromJSON(object.terminalResize)
+        : isSet(object.terminal_resize)
+        ? TerminalResize.fromJSON(object.terminal_resize)
+        : undefined,
+      heartbeat: isSet(object.heartbeat) ? Heartbeat.fromJSON(object.heartbeat) : undefined,
     };
   },
 
@@ -766,6 +982,21 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.helloAccepted !== undefined) {
       obj.helloAccepted = HelloAccepted.toJSON(message.helloAccepted);
     }
+    if (message.updateCommand !== undefined) {
+      obj.updateCommand = UpdateCommand.toJSON(message.updateCommand);
+    }
+    if (message.updateStatus !== undefined) {
+      obj.updateStatus = UpdateStatus.toJSON(message.updateStatus);
+    }
+    if (message.stdinChunk !== undefined) {
+      obj.stdinChunk = StdinChunk.toJSON(message.stdinChunk);
+    }
+    if (message.terminalResize !== undefined) {
+      obj.terminalResize = TerminalResize.toJSON(message.terminalResize);
+    }
+    if (message.heartbeat !== undefined) {
+      obj.heartbeat = Heartbeat.toJSON(message.heartbeat);
+    }
     return obj;
   },
 
@@ -832,6 +1063,105 @@ export const Envelope: MessageFns<Envelope> = {
     message.helloAccepted = (object.helloAccepted !== undefined && object.helloAccepted !== null)
       ? HelloAccepted.fromPartial(object.helloAccepted)
       : undefined;
+    message.updateCommand = (object.updateCommand !== undefined && object.updateCommand !== null)
+      ? UpdateCommand.fromPartial(object.updateCommand)
+      : undefined;
+    message.updateStatus = (object.updateStatus !== undefined && object.updateStatus !== null)
+      ? UpdateStatus.fromPartial(object.updateStatus)
+      : undefined;
+    message.stdinChunk = (object.stdinChunk !== undefined && object.stdinChunk !== null)
+      ? StdinChunk.fromPartial(object.stdinChunk)
+      : undefined;
+    message.terminalResize = (object.terminalResize !== undefined && object.terminalResize !== null)
+      ? TerminalResize.fromPartial(object.terminalResize)
+      : undefined;
+    message.heartbeat = (object.heartbeat !== undefined && object.heartbeat !== null)
+      ? Heartbeat.fromPartial(object.heartbeat)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseHeartbeat(): Heartbeat {
+  return { sentAtMs: 0, daemonVersion: "" };
+}
+
+export const Heartbeat: MessageFns<Heartbeat> = {
+  encode(message: Heartbeat, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.sentAtMs !== 0) {
+      writer.uint32(8).uint64(message.sentAtMs);
+    }
+    if (message.daemonVersion !== "") {
+      writer.uint32(18).string(message.daemonVersion);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): Heartbeat {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseHeartbeat();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.sentAtMs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.daemonVersion = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): Heartbeat {
+    return {
+      sentAtMs: isSet(object.sentAtMs)
+        ? globalThis.Number(object.sentAtMs)
+        : isSet(object.sent_at_ms)
+        ? globalThis.Number(object.sent_at_ms)
+        : 0,
+      daemonVersion: isSet(object.daemonVersion)
+        ? globalThis.String(object.daemonVersion)
+        : isSet(object.daemon_version)
+        ? globalThis.String(object.daemon_version)
+        : "",
+    };
+  },
+
+  toJSON(message: Heartbeat): unknown {
+    const obj: any = {};
+    if (message.sentAtMs !== 0) {
+      obj.sentAtMs = Math.round(message.sentAtMs);
+    }
+    if (message.daemonVersion !== "") {
+      obj.daemonVersion = message.daemonVersion;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<Heartbeat>): Heartbeat {
+    return Heartbeat.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<Heartbeat>): Heartbeat {
+    const message = createBaseHeartbeat();
+    message.sentAtMs = object.sentAtMs ?? 0;
+    message.daemonVersion = object.daemonVersion ?? "";
     return message;
   },
 };
@@ -917,13 +1247,16 @@ export const HelloChallenge: MessageFns<HelloChallenge> = {
 };
 
 function createBaseHelloAccepted(): HelloAccepted {
-  return { authMethod: "" };
+  return { authMethod: "", updateSuggestion: undefined };
 }
 
 export const HelloAccepted: MessageFns<HelloAccepted> = {
   encode(message: HelloAccepted, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.authMethod !== "") {
       writer.uint32(10).string(message.authMethod);
+    }
+    if (message.updateSuggestion !== undefined) {
+      UpdateSuggestion.encode(message.updateSuggestion, writer.uint32(18).fork()).join();
     }
     return writer;
   },
@@ -943,6 +1276,14 @@ export const HelloAccepted: MessageFns<HelloAccepted> = {
           message.authMethod = reader.string();
           continue;
         }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.updateSuggestion = UpdateSuggestion.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -959,6 +1300,11 @@ export const HelloAccepted: MessageFns<HelloAccepted> = {
         : isSet(object.auth_method)
         ? globalThis.String(object.auth_method)
         : "",
+      updateSuggestion: isSet(object.updateSuggestion)
+        ? UpdateSuggestion.fromJSON(object.updateSuggestion)
+        : isSet(object.update_suggestion)
+        ? UpdateSuggestion.fromJSON(object.update_suggestion)
+        : undefined,
     };
   },
 
@@ -966,6 +1312,9 @@ export const HelloAccepted: MessageFns<HelloAccepted> = {
     const obj: any = {};
     if (message.authMethod !== "") {
       obj.authMethod = message.authMethod;
+    }
+    if (message.updateSuggestion !== undefined) {
+      obj.updateSuggestion = UpdateSuggestion.toJSON(message.updateSuggestion);
     }
     return obj;
   },
@@ -976,6 +1325,9 @@ export const HelloAccepted: MessageFns<HelloAccepted> = {
   fromPartial(object: DeepPartial<HelloAccepted>): HelloAccepted {
     const message = createBaseHelloAccepted();
     message.authMethod = object.authMethod ?? "";
+    message.updateSuggestion = (object.updateSuggestion !== undefined && object.updateSuggestion !== null)
+      ? UpdateSuggestion.fromPartial(object.updateSuggestion)
+      : undefined;
     return message;
   },
 };
@@ -1367,7 +1719,7 @@ export const BootstrapAuth: MessageFns<BootstrapAuth> = {
 };
 
 function createBaseJobRequest(): JobRequest {
-  return { jobId: "", tool: "", args: [], cwd: "", env: {}, timeoutMs: 0 };
+  return { jobId: "", tool: "", args: [], cwd: "", env: {}, timeoutMs: 0, interactive: false };
 }
 
 export const JobRequest: MessageFns<JobRequest> = {
@@ -1389,6 +1741,9 @@ export const JobRequest: MessageFns<JobRequest> = {
     });
     if (message.timeoutMs !== 0) {
       writer.uint32(48).uint64(message.timeoutMs);
+    }
+    if (message.interactive !== false) {
+      writer.uint32(56).bool(message.interactive);
     }
     return writer;
   },
@@ -1451,6 +1806,14 @@ export const JobRequest: MessageFns<JobRequest> = {
           message.timeoutMs = longToNumber(reader.uint64());
           continue;
         }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.interactive = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1484,6 +1847,7 @@ export const JobRequest: MessageFns<JobRequest> = {
         : isSet(object.timeout_ms)
         ? globalThis.Number(object.timeout_ms)
         : 0,
+      interactive: isSet(object.interactive) ? globalThis.Boolean(object.interactive) : false,
     };
   },
 
@@ -1513,6 +1877,9 @@ export const JobRequest: MessageFns<JobRequest> = {
     if (message.timeoutMs !== 0) {
       obj.timeoutMs = Math.round(message.timeoutMs);
     }
+    if (message.interactive !== false) {
+      obj.interactive = message.interactive;
+    }
     return obj;
   },
 
@@ -1535,6 +1902,7 @@ export const JobRequest: MessageFns<JobRequest> = {
       {},
     );
     message.timeoutMs = object.timeoutMs ?? 0;
+    message.interactive = object.interactive ?? false;
     return message;
   },
 };
@@ -3106,6 +3474,668 @@ export const RefusalContext: MessageFns<RefusalContext> = {
     message.tool = object.tool ?? "";
     message.reason = object.reason ?? "";
     message.refusedAtMs = object.refusedAtMs ?? 0;
+    return message;
+  },
+};
+
+function createBaseUpdateSuggestion(): UpdateSuggestion {
+  return {
+    updateId: "",
+    targetVersion: "",
+    downloadUrl: "",
+    checksumSha256: "",
+    signature: Buffer.alloc(0),
+    releaseNotes: "",
+  };
+}
+
+export const UpdateSuggestion: MessageFns<UpdateSuggestion> = {
+  encode(message: UpdateSuggestion, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.updateId !== "") {
+      writer.uint32(10).string(message.updateId);
+    }
+    if (message.targetVersion !== "") {
+      writer.uint32(18).string(message.targetVersion);
+    }
+    if (message.downloadUrl !== "") {
+      writer.uint32(26).string(message.downloadUrl);
+    }
+    if (message.checksumSha256 !== "") {
+      writer.uint32(34).string(message.checksumSha256);
+    }
+    if (message.signature.length !== 0) {
+      writer.uint32(42).bytes(message.signature);
+    }
+    if (message.releaseNotes !== "") {
+      writer.uint32(50).string(message.releaseNotes);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): UpdateSuggestion {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseUpdateSuggestion();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.updateId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.targetVersion = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.downloadUrl = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.checksumSha256 = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.signature = Buffer.from(reader.bytes());
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.releaseNotes = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): UpdateSuggestion {
+    return {
+      updateId: isSet(object.updateId)
+        ? globalThis.String(object.updateId)
+        : isSet(object.update_id)
+        ? globalThis.String(object.update_id)
+        : "",
+      targetVersion: isSet(object.targetVersion)
+        ? globalThis.String(object.targetVersion)
+        : isSet(object.target_version)
+        ? globalThis.String(object.target_version)
+        : "",
+      downloadUrl: isSet(object.downloadUrl)
+        ? globalThis.String(object.downloadUrl)
+        : isSet(object.download_url)
+        ? globalThis.String(object.download_url)
+        : "",
+      checksumSha256: isSet(object.checksumSha256)
+        ? globalThis.String(object.checksumSha256)
+        : isSet(object.checksum_sha256)
+        ? globalThis.String(object.checksum_sha256)
+        : "",
+      signature: isSet(object.signature) ? Buffer.from(bytesFromBase64(object.signature)) : Buffer.alloc(0),
+      releaseNotes: isSet(object.releaseNotes)
+        ? globalThis.String(object.releaseNotes)
+        : isSet(object.release_notes)
+        ? globalThis.String(object.release_notes)
+        : "",
+    };
+  },
+
+  toJSON(message: UpdateSuggestion): unknown {
+    const obj: any = {};
+    if (message.updateId !== "") {
+      obj.updateId = message.updateId;
+    }
+    if (message.targetVersion !== "") {
+      obj.targetVersion = message.targetVersion;
+    }
+    if (message.downloadUrl !== "") {
+      obj.downloadUrl = message.downloadUrl;
+    }
+    if (message.checksumSha256 !== "") {
+      obj.checksumSha256 = message.checksumSha256;
+    }
+    if (message.signature.length !== 0) {
+      obj.signature = base64FromBytes(message.signature);
+    }
+    if (message.releaseNotes !== "") {
+      obj.releaseNotes = message.releaseNotes;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<UpdateSuggestion>): UpdateSuggestion {
+    return UpdateSuggestion.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<UpdateSuggestion>): UpdateSuggestion {
+    const message = createBaseUpdateSuggestion();
+    message.updateId = object.updateId ?? "";
+    message.targetVersion = object.targetVersion ?? "";
+    message.downloadUrl = object.downloadUrl ?? "";
+    message.checksumSha256 = object.checksumSha256 ?? "";
+    message.signature = object.signature ?? Buffer.alloc(0);
+    message.releaseNotes = object.releaseNotes ?? "";
+    return message;
+  },
+};
+
+function createBaseUpdateCommand(): UpdateCommand {
+  return {
+    updateId: "",
+    targetVersion: "",
+    downloadUrl: "",
+    checksumSha256: "",
+    signature: Buffer.alloc(0),
+    maxRetries: 0,
+  };
+}
+
+export const UpdateCommand: MessageFns<UpdateCommand> = {
+  encode(message: UpdateCommand, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.updateId !== "") {
+      writer.uint32(10).string(message.updateId);
+    }
+    if (message.targetVersion !== "") {
+      writer.uint32(18).string(message.targetVersion);
+    }
+    if (message.downloadUrl !== "") {
+      writer.uint32(26).string(message.downloadUrl);
+    }
+    if (message.checksumSha256 !== "") {
+      writer.uint32(34).string(message.checksumSha256);
+    }
+    if (message.signature.length !== 0) {
+      writer.uint32(42).bytes(message.signature);
+    }
+    if (message.maxRetries !== 0) {
+      writer.uint32(48).uint32(message.maxRetries);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): UpdateCommand {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseUpdateCommand();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.updateId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.targetVersion = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.downloadUrl = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.checksumSha256 = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.signature = Buffer.from(reader.bytes());
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.maxRetries = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): UpdateCommand {
+    return {
+      updateId: isSet(object.updateId)
+        ? globalThis.String(object.updateId)
+        : isSet(object.update_id)
+        ? globalThis.String(object.update_id)
+        : "",
+      targetVersion: isSet(object.targetVersion)
+        ? globalThis.String(object.targetVersion)
+        : isSet(object.target_version)
+        ? globalThis.String(object.target_version)
+        : "",
+      downloadUrl: isSet(object.downloadUrl)
+        ? globalThis.String(object.downloadUrl)
+        : isSet(object.download_url)
+        ? globalThis.String(object.download_url)
+        : "",
+      checksumSha256: isSet(object.checksumSha256)
+        ? globalThis.String(object.checksumSha256)
+        : isSet(object.checksum_sha256)
+        ? globalThis.String(object.checksum_sha256)
+        : "",
+      signature: isSet(object.signature) ? Buffer.from(bytesFromBase64(object.signature)) : Buffer.alloc(0),
+      maxRetries: isSet(object.maxRetries)
+        ? globalThis.Number(object.maxRetries)
+        : isSet(object.max_retries)
+        ? globalThis.Number(object.max_retries)
+        : 0,
+    };
+  },
+
+  toJSON(message: UpdateCommand): unknown {
+    const obj: any = {};
+    if (message.updateId !== "") {
+      obj.updateId = message.updateId;
+    }
+    if (message.targetVersion !== "") {
+      obj.targetVersion = message.targetVersion;
+    }
+    if (message.downloadUrl !== "") {
+      obj.downloadUrl = message.downloadUrl;
+    }
+    if (message.checksumSha256 !== "") {
+      obj.checksumSha256 = message.checksumSha256;
+    }
+    if (message.signature.length !== 0) {
+      obj.signature = base64FromBytes(message.signature);
+    }
+    if (message.maxRetries !== 0) {
+      obj.maxRetries = Math.round(message.maxRetries);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<UpdateCommand>): UpdateCommand {
+    return UpdateCommand.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<UpdateCommand>): UpdateCommand {
+    const message = createBaseUpdateCommand();
+    message.updateId = object.updateId ?? "";
+    message.targetVersion = object.targetVersion ?? "";
+    message.downloadUrl = object.downloadUrl ?? "";
+    message.checksumSha256 = object.checksumSha256 ?? "";
+    message.signature = object.signature ?? Buffer.alloc(0);
+    message.maxRetries = object.maxRetries ?? 0;
+    return message;
+  },
+};
+
+function createBaseUpdateStatus(): UpdateStatus {
+  return { updateId: "", state: 0, currentVersion: "", targetVersion: "", progress: 0, error: "" };
+}
+
+export const UpdateStatus: MessageFns<UpdateStatus> = {
+  encode(message: UpdateStatus, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.updateId !== "") {
+      writer.uint32(10).string(message.updateId);
+    }
+    if (message.state !== 0) {
+      writer.uint32(16).int32(message.state);
+    }
+    if (message.currentVersion !== "") {
+      writer.uint32(26).string(message.currentVersion);
+    }
+    if (message.targetVersion !== "") {
+      writer.uint32(34).string(message.targetVersion);
+    }
+    if (message.progress !== 0) {
+      writer.uint32(40).uint32(message.progress);
+    }
+    if (message.error !== "") {
+      writer.uint32(50).string(message.error);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): UpdateStatus {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseUpdateStatus();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.updateId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.state = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.currentVersion = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.targetVersion = reader.string();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.progress = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.error = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): UpdateStatus {
+    return {
+      updateId: isSet(object.updateId)
+        ? globalThis.String(object.updateId)
+        : isSet(object.update_id)
+        ? globalThis.String(object.update_id)
+        : "",
+      state: isSet(object.state) ? updateStateFromJSON(object.state) : 0,
+      currentVersion: isSet(object.currentVersion)
+        ? globalThis.String(object.currentVersion)
+        : isSet(object.current_version)
+        ? globalThis.String(object.current_version)
+        : "",
+      targetVersion: isSet(object.targetVersion)
+        ? globalThis.String(object.targetVersion)
+        : isSet(object.target_version)
+        ? globalThis.String(object.target_version)
+        : "",
+      progress: isSet(object.progress) ? globalThis.Number(object.progress) : 0,
+      error: isSet(object.error) ? globalThis.String(object.error) : "",
+    };
+  },
+
+  toJSON(message: UpdateStatus): unknown {
+    const obj: any = {};
+    if (message.updateId !== "") {
+      obj.updateId = message.updateId;
+    }
+    if (message.state !== 0) {
+      obj.state = updateStateToJSON(message.state);
+    }
+    if (message.currentVersion !== "") {
+      obj.currentVersion = message.currentVersion;
+    }
+    if (message.targetVersion !== "") {
+      obj.targetVersion = message.targetVersion;
+    }
+    if (message.progress !== 0) {
+      obj.progress = Math.round(message.progress);
+    }
+    if (message.error !== "") {
+      obj.error = message.error;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<UpdateStatus>): UpdateStatus {
+    return UpdateStatus.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<UpdateStatus>): UpdateStatus {
+    const message = createBaseUpdateStatus();
+    message.updateId = object.updateId ?? "";
+    message.state = object.state ?? 0;
+    message.currentVersion = object.currentVersion ?? "";
+    message.targetVersion = object.targetVersion ?? "";
+    message.progress = object.progress ?? 0;
+    message.error = object.error ?? "";
+    return message;
+  },
+};
+
+function createBaseStdinChunk(): StdinChunk {
+  return { jobId: "", data: Buffer.alloc(0) };
+}
+
+export const StdinChunk: MessageFns<StdinChunk> = {
+  encode(message: StdinChunk, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.jobId !== "") {
+      writer.uint32(10).string(message.jobId);
+    }
+    if (message.data.length !== 0) {
+      writer.uint32(18).bytes(message.data);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): StdinChunk {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseStdinChunk();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.jobId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.data = Buffer.from(reader.bytes());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): StdinChunk {
+    return {
+      jobId: isSet(object.jobId)
+        ? globalThis.String(object.jobId)
+        : isSet(object.job_id)
+        ? globalThis.String(object.job_id)
+        : "",
+      data: isSet(object.data) ? Buffer.from(bytesFromBase64(object.data)) : Buffer.alloc(0),
+    };
+  },
+
+  toJSON(message: StdinChunk): unknown {
+    const obj: any = {};
+    if (message.jobId !== "") {
+      obj.jobId = message.jobId;
+    }
+    if (message.data.length !== 0) {
+      obj.data = base64FromBytes(message.data);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<StdinChunk>): StdinChunk {
+    return StdinChunk.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<StdinChunk>): StdinChunk {
+    const message = createBaseStdinChunk();
+    message.jobId = object.jobId ?? "";
+    message.data = object.data ?? Buffer.alloc(0);
+    return message;
+  },
+};
+
+function createBaseTerminalResize(): TerminalResize {
+  return { jobId: "", cols: 0, rows: 0 };
+}
+
+export const TerminalResize: MessageFns<TerminalResize> = {
+  encode(message: TerminalResize, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.jobId !== "") {
+      writer.uint32(10).string(message.jobId);
+    }
+    if (message.cols !== 0) {
+      writer.uint32(16).uint32(message.cols);
+    }
+    if (message.rows !== 0) {
+      writer.uint32(24).uint32(message.rows);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): TerminalResize {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTerminalResize();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.jobId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.cols = reader.uint32();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.rows = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): TerminalResize {
+    return {
+      jobId: isSet(object.jobId)
+        ? globalThis.String(object.jobId)
+        : isSet(object.job_id)
+        ? globalThis.String(object.job_id)
+        : "",
+      cols: isSet(object.cols) ? globalThis.Number(object.cols) : 0,
+      rows: isSet(object.rows) ? globalThis.Number(object.rows) : 0,
+    };
+  },
+
+  toJSON(message: TerminalResize): unknown {
+    const obj: any = {};
+    if (message.jobId !== "") {
+      obj.jobId = message.jobId;
+    }
+    if (message.cols !== 0) {
+      obj.cols = Math.round(message.cols);
+    }
+    if (message.rows !== 0) {
+      obj.rows = Math.round(message.rows);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<TerminalResize>): TerminalResize {
+    return TerminalResize.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<TerminalResize>): TerminalResize {
+    const message = createBaseTerminalResize();
+    message.jobId = object.jobId ?? "";
+    message.cols = object.cols ?? 0;
+    message.rows = object.rows ?? 0;
     return message;
   },
 };

@@ -19,8 +19,8 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use ahand_protocol::{
-    BootstrapAuth, CancelJob, Ed25519Auth, Envelope, Hello, HelloAccepted, HelloChallenge,
-    JobEvent, JobFinished, JobRequest, envelope, hello, job_event,
+    BootstrapAuth, BrowserRequest, BrowserResponse, CancelJob, Ed25519Auth, Envelope, Hello,
+    HelloAccepted, HelloChallenge, JobEvent, JobFinished, JobRequest, envelope, hello, job_event,
 };
 
 pub fn service_request(uri: &str) -> Request<Body> {
@@ -40,8 +40,9 @@ pub fn test_config() -> Config {
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,
-        device_heartbeat_interval_ms: 30_000,
-        device_heartbeat_timeout_ms: 90_000,
+        device_staleness_probe_interval_ms: 30_000,
+        device_staleness_timeout_ms: 180_000,
+        device_expected_heartbeat_secs: 60,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
         job_timeout_grace_ms: 50,
@@ -50,6 +51,11 @@ pub fn test_config() -> Config {
         audit_retention_days: 90,
         audit_fallback_path: std::env::temp_dir().join("ahand-hub-test-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
+        webhook_url: None,
+        webhook_secret: None,
+        webhook_max_retries: 8,
+        webhook_max_concurrency: 50,
+        webhook_timeout_ms: 5_000,
         store: StoreConfig::Memory,
     }
 }
@@ -63,8 +69,9 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
         device_bootstrap_token: "bootstrap-test-token".into(),
         device_bootstrap_device_id: "device-2".into(),
         device_hello_max_age_ms: 30_000,
-        device_heartbeat_interval_ms: 30_000,
-        device_heartbeat_timeout_ms: 90_000,
+        device_staleness_probe_interval_ms: 30_000,
+        device_staleness_timeout_ms: 180_000,
+        device_expected_heartbeat_secs: 60,
         device_presence_ttl_secs: 60,
         device_presence_refresh_ms: 20_000,
         job_timeout_grace_ms: 50,
@@ -74,6 +81,11 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
         audit_fallback_path: std::env::temp_dir()
             .join("ahand-hub-persistent-test-audit-fallback.jsonl"),
         output_retention_ms: 60_000,
+        webhook_url: None,
+        webhook_secret: None,
+        webhook_max_retries: 8,
+        webhook_max_concurrency: 50,
+        webhook_timeout_ms: 5_000,
         store: StoreConfig::Persistent {
             database_url: stack.database_url().into(),
             redis_url: stack.redis_url().into(),
@@ -100,6 +112,57 @@ pub async fn test_state() -> AppState {
             capabilities: vec!["exec".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
+            external_user_id: None,
+        })
+        .await
+        .unwrap();
+    state.devices.mark_offline("device-1").await.unwrap();
+    state
+}
+
+/// Build an `AppState` whose outbound webhook is configured against an
+/// unreachable URL. Every `enqueue_*` call still persists to the
+/// underlying `MemoryWebhookDeliveryStore`, which tests can inspect via
+/// `state.webhook.store()`. Deliveries will never succeed (the URL
+/// routes nowhere) but that's fine — we only care about verifying that
+/// admin / ws code paths enqueued the expected events.
+pub async fn test_state_with_webhook() -> AppState {
+    let mut config = test_config();
+    // Port 1 is reserved; a POST here fails fast on every platform so
+    // the worker doesn't build up wall-clock debt during tests.
+    config.webhook_url = Some("http://127.0.0.1:1/webhook".into());
+    config.webhook_secret = Some("test-webhook-secret".into());
+    // Keep attempts small so the worker doesn't spam the log if the
+    // test takes a while to assert.
+    config.webhook_max_retries = 1;
+    config.webhook_max_concurrency = 2;
+    let state = AppState::from_config(config)
+        .await
+        .expect("test state should build");
+    state.devices.mark_offline("device-2").await.ok();
+    state
+}
+
+pub async fn test_state_with_browser_device() -> AppState {
+    let state = AppState::from_config(test_config())
+        .await
+        .expect("test state should build");
+    state
+        .devices
+        .insert(NewDevice {
+            id: "device-1".into(),
+            public_key: Some(
+                SigningKey::from_bytes(&[7u8; 32])
+                    .verifying_key()
+                    .to_bytes()
+                    .to_vec(),
+            ),
+            hostname: "seeded-device".into(),
+            os: "linux".into(),
+            capabilities: vec!["exec".into(), "browser".into()],
+            version: Some("0.1.2".into()),
+            auth_method: "ed25519".into(),
+            external_user_id: None,
         })
         .await
         .unwrap();
@@ -122,6 +185,14 @@ pub struct TestServer {
 impl TestServer {
     pub fn http_base_url(&self) -> &str {
         &self.base_http_url
+    }
+
+    pub fn events(&self) -> std::sync::Arc<ahand_hub::events::EventBus> {
+        self.state.events.clone()
+    }
+
+    pub fn state(&self) -> &AppState {
+        &self.state
     }
 
     pub fn ws_url(&self, path: &str) -> String {
@@ -215,6 +286,26 @@ impl TestServer {
         socket
     }
 
+    pub async fn attach_browser_device(&self, device_id: &str) -> TestDevice {
+        let (mut socket, _) = tokio_tungstenite::connect_async(self.ws_url("/ws"))
+            .await
+            .unwrap();
+        let challenge = read_hello_challenge(&mut socket).await;
+        let hello = signed_hello_with_browser(device_id, &challenge.nonce);
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                hello.encode_to_vec().into(),
+            ))
+            .await
+            .unwrap();
+        let _ = read_hello_accepted(&mut socket).await;
+
+        TestDevice {
+            device_id: device_id.into(),
+            socket,
+        }
+    }
+
     pub async fn attach_bootstrap_device(&self, device_id: &str, token: &str) -> TestDevice {
         let (mut socket, _) = tokio_tungstenite::connect_async(self.ws_url("/ws"))
             .await
@@ -267,11 +358,7 @@ impl TestServer {
         let started_at = tokio::time::Instant::now();
         let mut body = String::new();
 
-        loop {
-            let Some(remaining) = duration.checked_sub(started_at.elapsed()) else {
-                break;
-            };
-
+        while let Some(remaining) = duration.checked_sub(started_at.elapsed()) {
             match tokio::time::timeout(remaining, stream.next()).await {
                 Ok(Some(Ok(chunk))) => body.push_str(&String::from_utf8_lossy(&chunk)),
                 Ok(Some(Err(err))) => panic!("failed reading SSE chunk: {err}"),
@@ -307,14 +394,11 @@ impl TestDevice {
     pub async fn recv_job_request(&mut self) -> JobRequest {
         while let Some(message) = self.socket.next().await {
             let message = message.unwrap();
-            match message {
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    let envelope = Envelope::decode(data.as_ref()).unwrap();
-                    if let Some(envelope::Payload::JobRequest(job)) = envelope.payload {
-                        return job;
-                    }
+            if let tokio_tungstenite::tungstenite::Message::Binary(data) = message {
+                let envelope = Envelope::decode(data.as_ref()).unwrap();
+                if let Some(envelope::Payload::JobRequest(job)) = envelope.payload {
+                    return job;
                 }
-                _ => {}
             }
         }
 
@@ -362,17 +446,43 @@ impl TestDevice {
             .unwrap();
     }
 
+    pub async fn recv_browser_request(&mut self) -> BrowserRequest {
+        while let Some(message) = self.socket.next().await {
+            let message = message.unwrap();
+            if let tokio_tungstenite::tungstenite::Message::Binary(data) = message {
+                let envelope = Envelope::decode(data.as_ref()).unwrap();
+                if let Some(envelope::Payload::BrowserRequest(req)) = envelope.payload {
+                    return req;
+                }
+            }
+        }
+        panic!("device socket closed before a browser request arrived");
+    }
+
+    pub async fn send_browser_response(&mut self, response: BrowserResponse) {
+        let envelope = Envelope {
+            device_id: self.device_id.clone(),
+            msg_id: format!("browser-resp-{}", response.request_id),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::BrowserResponse(response)),
+            ..Default::default()
+        };
+        self.socket
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                envelope.encode_to_vec().into(),
+            ))
+            .await
+            .unwrap();
+    }
+
     pub async fn recv_cancel_request(&mut self) -> CancelJob {
         while let Some(message) = self.socket.next().await {
             let message = message.unwrap();
-            match message {
-                tokio_tungstenite::tungstenite::Message::Binary(data) => {
-                    let envelope = Envelope::decode(data.as_ref()).unwrap();
-                    if let Some(envelope::Payload::CancelJob(cancel)) = envelope.payload {
-                        return cancel;
-                    }
+            if let tokio_tungstenite::tungstenite::Message::Binary(data) = message {
+                let envelope = Envelope::decode(data.as_ref()).unwrap();
+                if let Some(envelope::Payload::CancelJob(cancel)) = envelope.payload {
+                    return cancel;
                 }
-                _ => {}
             }
         }
 
@@ -506,6 +616,41 @@ pub fn signed_hello_with_key_at(
     Envelope {
         device_id: device_id.into(),
         msg_id: "hello-1".into(),
+        ts_ms: signed_at_ms,
+        payload: Some(envelope::Payload::Hello(hello)),
+        ..Default::default()
+    }
+}
+
+pub fn signed_hello_with_browser(device_id: &str, challenge_nonce: &[u8]) -> Envelope {
+    let signed_at_ms = next_test_signed_at_ms();
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let mut hello = Hello {
+        version: "0.1.2".into(),
+        hostname: "devbox".into(),
+        os: "linux".into(),
+        capabilities: vec!["exec".into(), "browser".into()],
+        last_ack: 0,
+        auth: None,
+    };
+    let signature = signing_key
+        .sign(&ahand_protocol::build_hello_auth_payload(
+            device_id,
+            &hello,
+            signed_at_ms,
+            challenge_nonce,
+        ))
+        .to_bytes()
+        .to_vec();
+    hello.auth = Some(hello::Auth::Ed25519(Ed25519Auth {
+        public_key: signing_key.verifying_key().to_bytes().to_vec(),
+        signature,
+        signed_at_ms,
+    }));
+
+    Envelope {
+        device_id: device_id.into(),
+        msg_id: "hello-browser-1".into(),
         ts_ms: signed_at_ms,
         payload: Some(envelope::Payload::Hello(hello)),
         ..Default::default()

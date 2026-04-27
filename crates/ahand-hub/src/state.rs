@@ -7,7 +7,7 @@ use ahand_hub_core::device::{Device, NewDevice};
 use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::device_manager::DeviceManager;
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
-use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
+use ahand_hub_core::traits::{AuditStore, DeviceAdminStore, DeviceStore, JobStore};
 use ahand_hub_core::{HubError, Result};
 use ahand_hub_store::audit_store::PgAuditStore;
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
@@ -16,8 +16,31 @@ use ahand_hub_store::event_fanout::RedisEventFanout;
 use ahand_hub_store::job_output_store::RedisJobOutputStore;
 use ahand_hub_store::job_store::PgJobStore;
 use ahand_hub_store::presence_store::RedisPresenceStore;
+use ahand_hub_store::webhook_delivery_store::{
+    MemoryWebhookDeliveryStore, PgWebhookDeliveryStore, WebhookDeliveryStore,
+};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use dashmap::{DashMap, mapref::entry::Entry};
+use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
+
+/// Control-plane rate limiter keyed by `external_user_id`.
+///
+/// Default policy: **10 requests per second sustained, 100-request burst**
+/// — matches the plan's § 8 guidance. Tuning hooks (env vars, per-scope
+/// caps) can be added later without changing the type alias.
+pub type ControlPlaneRateLimiter =
+    RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
+
+pub fn default_control_plane_rate_limiter() -> ControlPlaneRateLimiter {
+    // Burst = 100 means we allow up to 100 rapid requests before
+    // needing to wait for the 10-per-second replenishment to kick in.
+    // `Quota::per_second(10)` sets the sustained cap; `allow_burst(100)`
+    // widens the bucket.
+    let quota = Quota::per_second(std::num::NonZeroU32::new(10).expect("10 is non-zero"))
+        .allow_burst(std::num::NonZeroU32::new(100).expect("100 is non-zero"));
+    RateLimiter::keyed(quota)
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,19 +52,37 @@ pub struct AppState {
     pub audit_store: Arc<dyn AuditStore>,
     audit_writer: Arc<crate::audit_writer::BufferedAuditStore>,
     pub jobs: Arc<crate::http::jobs::JobRuntime>,
+    pub control_jobs: Arc<crate::control_jobs::ControlJobTracker>,
+    pub control_rate_limiter: Arc<ControlPlaneRateLimiter>,
     pub connections: Arc<crate::ws::device_gateway::ConnectionRegistry>,
+    pub browser_pending:
+        Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::BrowserResponse>>>,
     pub events: Arc<crate::events::EventBus>,
     pub output_stream: Arc<crate::output_stream::OutputStream>,
     pub bootstrap_tokens: Arc<crate::bootstrap::BootstrapCredentials>,
     pub device_bootstrap_token: Arc<String>,
     pub device_bootstrap_device_id: Arc<String>,
     pub device_hello_max_age_ms: u64,
-    pub device_heartbeat_interval_ms: u64,
-    pub device_heartbeat_timeout_ms: u64,
+    /// Cadence for the staleness-monitor probe loop. See
+    /// [`crate::config::Config::device_staleness_probe_interval_ms`].
+    pub device_staleness_probe_interval_ms: u64,
+    /// Timeout after which an idle device WS is closed. See
+    /// [`crate::config::Config::device_staleness_timeout_ms`].
+    pub device_staleness_timeout_ms: u64,
+    /// Expected daemon heartbeat cadence in seconds. Advertised to
+    /// downstream webhook consumers via `presenceTtlSeconds` hints
+    /// (`secs × 3`).
+    pub device_expected_heartbeat_secs: u64,
     pub device_presence_refresh_ms: u64,
     pub service_token: Arc<String>,
     pub dashboard_shared_password: Arc<String>,
     pub dashboard_allowed_origins: Arc<Vec<String>>,
+    pub terminal_tokens: Arc<DashMap<String, crate::http::terminal::TerminalToken>>,
+    /// Outbound webhook dispatcher. Always present; when
+    /// `config.webhook_url` is `None`, this is a no-op (`Webhook::disabled()`)
+    /// so call sites can always invoke `state.webhook.enqueue_*` without
+    /// branching.
+    pub webhook: Arc<crate::webhook::Webhook>,
 }
 
 impl AppState {
@@ -58,6 +99,7 @@ impl AppState {
             persistent_output,
             persistent_fanout,
             bootstrap_tokens,
+            webhook_delivery_store,
         ) = match &config.store {
             crate::config::StoreConfig::Memory => (
                 Arc::new(MemoryDeviceStore::default()),
@@ -66,6 +108,7 @@ impl AppState {
                 None,
                 None,
                 crate::bootstrap::BootstrapCredentials::memory(),
+                Arc::new(MemoryWebhookDeliveryStore::new()) as Arc<dyn WebhookDeliveryStore>,
             ),
             crate::config::StoreConfig::Persistent {
                 database_url,
@@ -83,13 +126,14 @@ impl AppState {
                         PgDeviceStore::with_presence(pool.clone(), presence),
                     )),
                     Arc::new(PgJobStore::new(pool.clone())) as Arc<dyn JobStore>,
-                    Arc::new(PgAuditStore::new(pool)) as Arc<dyn AuditStore>,
+                    Arc::new(PgAuditStore::new(pool.clone())) as Arc<dyn AuditStore>,
                     Some(RedisJobOutputStore::new(redis_url, finished_retention).await?),
                     Some(RedisEventFanout::new(redis_url).await?),
                     crate::bootstrap::BootstrapCredentials::redis(RedisBootstrapStore::new(
                         bootstrap_redis,
                         bootstrap_reservation_ttl,
                     )),
+                    Arc::new(PgWebhookDeliveryStore::new(pool)) as Arc<dyn WebhookDeliveryStore>,
                 )
             }
         };
@@ -126,6 +170,34 @@ impl AppState {
             config.device_disconnect_grace_ms,
         ));
 
+        let browser_pending = Arc::new(DashMap::new());
+        let control_jobs = Arc::new(crate::control_jobs::ControlJobTracker::new());
+        let control_rate_limiter = Arc::new(default_control_plane_rate_limiter());
+
+        // Webhook dispatcher — always present. When the URL/secret are
+        // unconfigured we build a no-op so downstream call sites don't
+        // have to branch on Option. When configured we spin up the
+        // background worker that drains the delivery store.
+        let webhook = match (&config.webhook_url, &config.webhook_secret) {
+            (Some(url), Some(secret)) if !url.is_empty() && !secret.is_empty() => {
+                let webhook_config = crate::webhook::WebhookConfig {
+                    url: url.clone(),
+                    secret: secret.clone(),
+                    max_retries: config.webhook_max_retries,
+                    max_concurrency: config.webhook_max_concurrency,
+                    dlq_path: crate::webhook::worker::dlq_path_from_audit_fallback(
+                        &config.audit_fallback_path,
+                    ),
+                    request_timeout: Duration::from_millis(config.webhook_timeout_ms),
+                };
+                let (webhook, handle) =
+                    crate::webhook::Webhook::new(webhook_delivery_store, webhook_config);
+                tokio::spawn(handle.run());
+                webhook
+            }
+            _ => crate::webhook::Webhook::disabled(),
+        };
+
         let state = Self {
             auth: Arc::new(AuthService::new(&config.jwt_secret)),
             device_manager,
@@ -135,19 +207,25 @@ impl AppState {
             audit_store,
             audit_writer,
             jobs,
+            control_jobs,
+            control_rate_limiter,
             connections,
+            browser_pending,
             events,
             output_stream,
             bootstrap_tokens: Arc::new(bootstrap_tokens),
             device_bootstrap_token: Arc::new(config.device_bootstrap_token),
             device_bootstrap_device_id: Arc::new(config.device_bootstrap_device_id),
             device_hello_max_age_ms: config.device_hello_max_age_ms,
-            device_heartbeat_interval_ms: config.device_heartbeat_interval_ms,
-            device_heartbeat_timeout_ms: config.device_heartbeat_timeout_ms,
+            device_staleness_probe_interval_ms: config.device_staleness_probe_interval_ms,
+            device_staleness_timeout_ms: config.device_staleness_timeout_ms,
+            device_expected_heartbeat_secs: config.device_expected_heartbeat_secs,
             device_presence_refresh_ms: config.device_presence_refresh_ms,
             service_token: Arc::new(config.service_token),
             dashboard_shared_password: Arc::new(config.dashboard_shared_password),
             dashboard_allowed_origins: Arc::new(config.dashboard_allowed_origins),
+            terminal_tokens: Arc::new(DashMap::new()),
+            webhook,
         };
         state
             .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())
@@ -206,6 +284,7 @@ impl AppState {
                 capabilities: Vec::new(),
                 version: None,
                 auth_method: "bootstrap".into(),
+                external_user_id: None,
             })
             .await?;
         self.devices.mark_offline(device_id).await?;
@@ -347,6 +426,10 @@ impl MemoryDeviceStore {
                 capabilities: hello.capabilities.clone(),
                 version: Some(hello.version.clone()),
                 auth_method: verified.auth_method.into(),
+                // Hello-flow upserts never overwrite an admin-set
+                // external_user_id; the upsert uses COALESCE so
+                // passing None preserves whatever was pre-registered.
+                external_user_id: None,
             })
             .await?;
         let device = persistent.get(device_id).await?.unwrap_or(Device {
@@ -400,6 +483,7 @@ impl DeviceStore for MemoryDeviceStore {
                     version: device.version,
                     auth_method: device.auth_method,
                     online: false,
+                    external_user_id: device.external_user_id,
                 };
                 entry.insert(StoredDevice {
                     device: device.clone(),
@@ -439,6 +523,117 @@ impl DeviceStore for MemoryDeviceStore {
         }
         self.devices.remove(device_id);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl DeviceAdminStore for MemoryDeviceStore {
+    async fn pre_register(
+        &self,
+        device_id: &str,
+        public_key: &[u8],
+        external_user_id: &str,
+    ) -> Result<(Device, DateTime<Utc>)> {
+        if let Some(persistent) = &self.persistent {
+            let (device, registered_at) = persistent
+                .pre_register(device_id, public_key, external_user_id)
+                .await?;
+            self.devices.insert(
+                device.id.clone(),
+                StoredDevice {
+                    device: device.clone(),
+                    last_signed_at_ms: 0,
+                },
+            );
+            return Ok((device, registered_at));
+        }
+
+        // Memory-backed: mirror the PgDeviceStore semantics exactly so
+        // tests that exercise the admin API against an in-memory hub
+        // behave identically to production.
+        //
+        // DashMap::entry() serializes concurrent first-inserts for the same key,
+        // preventing the unique-constraint race that the Pg path must retry around.
+        match self.devices.entry(device_id.into()) {
+            Entry::Occupied(mut entry) => {
+                let existing_user_id = entry.get().device.external_user_id.clone();
+                // Ownership check: if a row exists and is already claimed by a
+                // different external user, reject. A row with external_user_id = None
+                // (device inserted via the legacy bootstrap flow) can be claimed by
+                // any caller — this is intentional behavior that allows admin
+                // pre-registration to adopt unclaimed devices.
+                if let Some(existing_user) = existing_user_id.as_ref()
+                    && existing_user != external_user_id
+                {
+                    return Err(HubError::DeviceOwnedByDifferentUser {
+                        device_id: device_id.into(),
+                        existing_external_user_id: existing_user.clone(),
+                    });
+                }
+                // Update the row: overwrite public_key + external_user_id.
+                let stored = entry.get_mut();
+                stored.device.public_key = Some(public_key.to_vec());
+                stored.device.external_user_id = Some(external_user_id.into());
+                // Memory store has no persistent registered_at; use now() as a
+                // best-effort stable value (callers using the in-memory backend are
+                // in tests only — the real stable timestamp only matters for Postgres).
+                Ok((stored.device.clone(), Utc::now()))
+            }
+            Entry::Vacant(entry) => {
+                let registered_at = Utc::now();
+                let device = Device {
+                    id: device_id.into(),
+                    public_key: Some(public_key.to_vec()),
+                    hostname: "pending-device".into(),
+                    os: "unknown".into(),
+                    capabilities: Vec::new(),
+                    version: None,
+                    auth_method: "preregistered".into(),
+                    online: false,
+                    external_user_id: Some(external_user_id.into()),
+                };
+                entry.insert(StoredDevice {
+                    device: device.clone(),
+                    last_signed_at_ms: 0,
+                });
+                Ok((device, registered_at))
+            }
+        }
+    }
+
+    async fn find_by_id(&self, device_id: &str) -> Result<Option<Device>> {
+        self.get(device_id).await
+    }
+
+    async fn delete_device(&self, device_id: &str) -> Result<bool> {
+        if let Some(persistent) = &self.persistent {
+            let removed = persistent.delete_device(device_id).await?;
+            self.devices.remove(device_id);
+            return Ok(removed);
+        }
+        Ok(self.devices.remove(device_id).is_some())
+    }
+
+    async fn list_by_external_user(&self, external_user_id: &str) -> Result<Vec<Device>> {
+        if let Some(persistent) = &self.persistent {
+            return persistent.list_by_external_user(external_user_id).await;
+        }
+        let mut devices = self
+            .devices
+            .iter()
+            .filter(|entry| {
+                entry
+                    .value()
+                    .device
+                    .external_user_id
+                    .as_deref()
+                    .map(|user| user == external_user_id)
+                    .unwrap_or(false)
+            })
+            .map(|entry| entry.value().device.clone())
+            .collect::<Vec<_>>();
+        devices.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(devices)
     }
 }
 

@@ -1,0 +1,62 @@
+name: Deploy Hub
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "crates/ahand-hub/**"
+      - "crates/ahand-hub-core/**"
+      - "crates/ahand-hub-store/**"
+      - "crates/ahand-protocol/**"
+      - "proto/**"
+      - "Cargo.lock"
+      - "deploy/hub/Dockerfile"
+      - ".github/workflows/deploy-hub.yml"
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 471112576951.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPO: ahand-hub
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Determine env
+        run: |
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "ENV=prod" >> "$GITHUB_ENV"
+            echo "ECS_CLUSTER=openclaw-hive" >> "$GITHUB_ENV"
+            echo "SERVICE_NAME=ahand-hub-prod" >> "$GITHUB_ENV"
+          else
+            echo "ENV=dev" >> "$GITHUB_ENV"
+            echo "ECS_CLUSTER=openclaw-hive-dev" >> "$GITHUB_ENV"
+            echo "SERVICE_NAME=ahand-hub-dev" >> "$GITHUB_ENV"
+          fi
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::471112576951:role/GitHubActionsAhandHubDeploy
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build image (hub target)
+        run: |
+          docker build --platform linux/amd64 \
+            --target hub \
+            -f deploy/hub/Dockerfile \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            -t "$ECR_REGISTRY/$ECR_REPO:$ENV" \
+            -t "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}" .
+      - name: Push image
+        run: |
+          docker push "$ECR_REGISTRY/$ECR_REPO:$ENV"
+          docker push "$ECR_REGISTRY/$ECR_REPO:${{ github.sha }}"
+      - name: Deploy
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          # unset AWS_PROFILE so AWS CLI uses OIDC-injected session token
+          unset AWS_PROFILE && ./deploy/hub/deploy.sh "$ENV"

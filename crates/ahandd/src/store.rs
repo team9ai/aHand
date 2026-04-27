@@ -150,6 +150,11 @@ fn describe_payload(envelope: &Envelope) -> &'static str {
         Some(Payload::SessionQuery(_)) => "SessionQuery",
         Some(Payload::BrowserRequest(_)) => "BrowserRequest",
         Some(Payload::BrowserResponse(_)) => "BrowserResponse",
+        Some(Payload::UpdateCommand(_)) => "UpdateCommand",
+        Some(Payload::UpdateStatus(_)) => "UpdateStatus",
+        Some(Payload::StdinChunk(_)) => "StdinChunk",
+        Some(Payload::TerminalResize(_)) => "TerminalResize",
+        Some(Payload::Heartbeat(_)) => "Heartbeat",
         None => "none",
     }
 }

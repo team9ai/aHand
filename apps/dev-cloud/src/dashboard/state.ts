@@ -1,4 +1,4 @@
-import type { Job } from "@ahand/sdk";
+import type { Job } from "@ahandai/sdk";
 import type {
   ActiveJob,
   ApprovalRequestEvent,

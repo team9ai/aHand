@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use ahand_hub_core::HubError;
 use ahand_hub_core::device::{Device, NewDevice};
 use ahand_hub_core::services::device_manager::DeviceManager;
 use ahand_hub_core::traits::DeviceStore;
-use ahand_hub_core::HubError;
 use async_trait::async_trait;
 
 struct FixedDeviceStore {
@@ -45,6 +45,7 @@ async fn list_devices_returns_store_snapshot() {
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
             online: false,
+            external_user_id: None,
         }],
     }));
 
@@ -67,6 +68,7 @@ async fn list_devices_uses_injected_store() {
             version: Some("0.2.0".into()),
             auth_method: "ed25519".into(),
             online: true,
+            external_user_id: None,
         }],
     }));
 

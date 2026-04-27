@@ -5,6 +5,7 @@ use ahand_hub_core::HubError;
 use ahand_hub_core::job::{Job, JobFilter, JobStatus, NewJob, is_terminal_status};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::JobStore;
+use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Json, Path, Query, State};
@@ -29,6 +30,8 @@ pub struct CreateJobRequest {
     pub tool: String,
     pub args: Vec<String>,
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 impl CreateJobRequest {
@@ -41,6 +44,7 @@ impl CreateJobRequest {
             env: Default::default(),
             timeout_ms: self.timeout_ms,
             requested_by: requested_by.into(),
+            interactive: self.interactive,
         }
     }
 }
@@ -117,6 +121,7 @@ impl JobRuntime {
                     cwd: job.cwd.clone().unwrap_or_default(),
                     env: job.env.clone(),
                     timeout_ms: job.timeout_ms,
+                    interactive: job.interactive,
                 },
             )),
             ..Default::default()
@@ -251,17 +256,16 @@ impl JobRuntime {
                     self.connections.observe_inbound(device_id, seq, ack)?;
                     return Ok(());
                 }
-                if job.status != JobStatus::Running {
-                    if let Err(err) = self
+                if job.status != JobStatus::Running
+                    && let Err(err) = self
                         .transition_job(
                             &finished.job_id,
                             JobStatus::Running,
                             &format!("device:{device_id}"),
                         )
                         .await
-                    {
-                        return self.handle_stale_device_frame_error(device_id, seq, ack, err);
-                    }
+                {
+                    return self.handle_stale_device_frame_error(device_id, seq, ack, err);
                 }
                 let status = if finished.error == "cancelled" {
                     JobStatus::Cancelled
@@ -590,11 +594,11 @@ pub async fn create_job(
     State(state): State<AppState>,
     body: Result<Json<CreateJobRequest>, JsonRejection>,
 ) -> ApiResult<(axum::http::StatusCode, Json<CreateJobResponse>)> {
-    auth.require_admin()?;
+    auth.require_dashboard_access()?;
     let Json(body) = body.map_err(ApiError::from_json_rejection)?;
     let job = state
         .jobs
-        .create_job(body.into_new_job("service:api"))
+        .create_job(body.into_new_job(&format!("dashboard:{}", auth.0.subject)))
         .await
         .map_err(ApiError::from)?;
     Ok((
@@ -675,6 +679,118 @@ pub async fn cancel_job(
             status: job_status_name(job.status).into(),
         }),
     ))
+}
+
+#[derive(Deserialize)]
+pub struct ResizeRequest {
+    pub cols: u32,
+    pub rows: u32,
+}
+
+pub async fn send_stdin(
+    auth: AuthContextExt,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    body: Bytes,
+) -> ApiResult<axum::http::StatusCode> {
+    auth.require_dashboard_access()?;
+    let job = state
+        .jobs
+        .jobs
+        .get(&job_id)
+        .await
+        .map_err(|_| ApiError::internal("Failed to load job"))?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "JOB_NOT_FOUND",
+                format!("Job {job_id} was not found"),
+            )
+        })?;
+    if is_terminal_status(job.status) {
+        return Err(ApiError::gone(format!("Job {job_id} has already finished")));
+    }
+    state
+        .jobs
+        .connections
+        .send(
+            &job.device_id,
+            ahand_protocol::Envelope {
+                device_id: job.device_id.clone(),
+                msg_id: format!("stdin-{job_id}"),
+                ts_ms: now_ms(),
+                payload: Some(ahand_protocol::envelope::Payload::StdinChunk(
+                    ahand_protocol::StdinChunk {
+                        job_id: job_id.clone(),
+                        data: body.to_vec(),
+                    },
+                )),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "DEVICE_OFFLINE",
+                format!("Device {} is not currently connected", job.device_id),
+            )
+        })?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+pub async fn send_resize(
+    auth: AuthContextExt,
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+    body: Result<Json<ResizeRequest>, JsonRejection>,
+) -> ApiResult<axum::http::StatusCode> {
+    auth.require_dashboard_access()?;
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
+    let job = state
+        .jobs
+        .jobs
+        .get(&job_id)
+        .await
+        .map_err(|_| ApiError::internal("Failed to load job"))?
+        .ok_or_else(|| {
+            ApiError::new(
+                axum::http::StatusCode::NOT_FOUND,
+                "JOB_NOT_FOUND",
+                format!("Job {job_id} was not found"),
+            )
+        })?;
+    if is_terminal_status(job.status) {
+        return Err(ApiError::gone(format!("Job {job_id} has already finished")));
+    }
+    state
+        .jobs
+        .connections
+        .send(
+            &job.device_id,
+            ahand_protocol::Envelope {
+                device_id: job.device_id.clone(),
+                msg_id: format!("resize-{job_id}"),
+                ts_ms: now_ms(),
+                payload: Some(ahand_protocol::envelope::Payload::TerminalResize(
+                    ahand_protocol::TerminalResize {
+                        job_id: job_id.clone(),
+                        cols: body.cols,
+                        rows: body.rows,
+                    },
+                )),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                axum::http::StatusCode::CONFLICT,
+                "DEVICE_OFFLINE",
+                format!("Device {} is not currently connected", job.device_id),
+            )
+        })?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 pub async fn stream_output(
@@ -876,6 +992,7 @@ mod tests {
                 capabilities: vec!["exec".into()],
                 version: Some("0.1.2".into()),
                 auth_method: "ed25519".into(),
+                external_user_id: None,
             })
             .await
             .unwrap();
@@ -994,6 +1111,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap_err();
@@ -1058,6 +1176,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();
@@ -1106,6 +1225,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();
@@ -1151,6 +1271,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();
@@ -1189,6 +1310,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();
@@ -1235,6 +1357,7 @@ mod tests {
                 env: Default::default(),
                 timeout_ms: 30_000,
                 requested_by: "service:test".into(),
+                interactive: false,
             })
             .await
             .unwrap();

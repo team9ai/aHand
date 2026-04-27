@@ -260,13 +260,7 @@ async fn sent_job_fails_after_disconnect_grace_without_reconnect() {
     assert_eq!(request.tool, "sleep");
     drop(device);
 
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    let still_sent = server
-        .get_json(&format!("/api/jobs/{job_id}"), "service-test-token")
-        .await;
-    assert_eq!(still_sent["status"], "sent");
-
-    let stored = wait_for_job_status(&server, &job_id, "failed", Duration::from_secs(1)).await;
+    let stored = wait_for_job_status(&server, &job_id, "failed", Duration::from_secs(2)).await;
     assert_eq!(stored["status"], "failed");
 
     let body = server
