@@ -10,15 +10,16 @@ data "aws_lb" "traefik" {
 module "ahand_hub" {
   source = "../../modules/ahand-hub"
 
-  env                        = "prod"
-  ecs_cluster_name           = "openclaw-hive"
-  api_domain                 = "ahand-hub.team9.ai"
-  openclaw_rds_host          = var.openclaw_rds_host
-  vpc_id                     = var.vpc_id
-  subnet_ids                 = var.subnet_ids
-  traefik_security_group_id  = var.traefik_security_group_id
-  gateway_public_url         = "https://gateway.team9.ai"
-  redis_mode                 = "create"
+  env                            = "prod"
+  ecs_cluster_name               = "openclaw-hive"
+  api_domain                     = "ahand-hub.team9.ai"
+  openclaw_rds_host              = var.openclaw_rds_host
+  openclaw_rds_security_group_id = var.openclaw_rds_security_group_id
+  vpc_id                         = var.vpc_id
+  subnet_ids                     = var.subnet_ids
+  traefik_security_group_id      = var.traefik_security_group_id
+  gateway_public_url             = "https://gateway.team9.ai"
+  redis_mode                     = "create"
 }
 
 output "execution_role_arn" {
