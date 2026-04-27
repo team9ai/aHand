@@ -67,8 +67,8 @@
 Create `proto/ahand/v1/file_ops.proto` with the full spec content. This file contains all FileRequest/FileResponse messages, enums, and nested types as defined in the design spec at `docs/superpowers/specs/2026-04-12-device-file-operations-design.md`.
 
 The proto file must include:
-- `FileRequest` with oneof operation (13 variants)
-- `FileResponse` with oneof result (14 variants including error)
+- `FileRequest` with oneof operation (14 variants)
+- `FileResponse` with oneof result (15 variants including error)
 - All operation messages: `FileReadText`, `FileReadBinary`, `FileReadImage`, `FileWrite`, `FileEdit`, `FileDelete`, `FileChmod`, `FileStat`, `FileList`, `FileGlob`, `FileMkdir`, `FileCopy`, `FileMove`, `FileCreateSymlink`
 - All result messages
 - Helper messages: `LineCol`, `FilePosition`, `PositionInfo`, `TextLine`, `FileEntry`, `UnixPermission`, `WindowsAcl`, `AclEntry`, `FullWrite`, `FileAppend`, `StringReplace`, `LineRangeReplace`, `ByteRangeReplace`, `FileTransferUrl`
@@ -559,7 +559,9 @@ async fn test_read_text_max_bytes() {
 #[tokio::test]
 async fn test_read_text_target_end() {
     // File: 10 lines
-    // target_end = line 5 → 5 lines, TARGET_END
+    // target_end = line 5 → 4 lines returned (lines 1..4), TARGET_END
+    // Note: target_end is EXCLUSIVE — we read up to but not including the
+    // target line. The line-5 byte offset is where the read stops.
 }
 
 #[tokio::test]
@@ -1474,7 +1476,7 @@ git commit -m "feat(hub): add S3 pre-signed URL flow for large file transfer"
 
 **Acceptance Criteria:**
 - [ ] Full roundtrip: FileRequest encoded → sent via WebSocket → daemon processes → FileResponse returned
-- [ ] All 13 operations work end-to-end
+- [ ] All 14 operations work end-to-end
 - [ ] Policy rejection flows correctly (returns FileError with POLICY_DENIED)
 - [ ] Session mode STRICT triggers approval flow for file ops
 - [ ] Error cases return proper FileErrorCode values

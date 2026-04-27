@@ -86,10 +86,12 @@ List, read, upload, download, and modify files on the device.
 | Delete | Remove files (with policy enforcement) |
 
 **Current status:**
-- [ ] TODO: File operation protocol messages
-- [ ] TODO: Daemon file handler with policy enforcement
+- [x] File operation protocol messages — `proto/ahand/v1/file_ops.proto` (14 oneof variants on FileRequest / FileResponse, full FileError taxonomy, helper messages)
+- [x] Daemon file handler with policy enforcement — `crates/ahandd/src/file_manager/` (allowlist + denylist + dangerous_paths + STRICT-mode approval, traversal + symlink TOCTOU mitigations)
+- [x] Hub HTTP forwarding — `POST /api/devices/{id}/files` correlates the FileRequest/FileResponse pair across the WebSocket gateway with admission control + RAII slot cleanup
 - [ ] TODO: Dashboard file browser UI
 - [ ] TODO: Agent SDK file operation methods
+- [ ] Follow-up: full S3 large-file transfer flow (S3Client + S3Config + `FullWrite.s3_object_key` plumbing in place; the `POST /files/upload-url` route was withdrawn until the bidirectional download-before-forward + upload-after-read flow is wired end-to-end)
 
 ### 4. Remote Desktop / Screen Control
 

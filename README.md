@@ -94,13 +94,30 @@ The daemon enforces per-caller session modes:
 | **Trust** | Auto-approve with inactivity timeout (default 60 min) |
 | **Auto-Accept** | Auto-approve, no timeout |
 
+## File Operations
+
+The daemon exposes a 14-operation file API (read text/binary/image, write, edit, delete, stat, list, glob, mkdir, copy, move, create_symlink, chmod) gated by a `[file_policy]` block in `~/.ahand/config.toml`:
+
+```toml
+[file_policy]
+enabled = true
+path_allowlist  = ["~/projects/**", "/workspace/**"]
+path_denylist   = ["**/.git/**", "**/node_modules/**"]
+dangerous_paths = ["~/.ssh/**", "/etc/passwd"]
+max_read_bytes  = 104857600  # 100 MB
+max_write_bytes = 10485760   # 10 MB
+```
+
+`dangerous_paths` matches escalate to STRICT-mode approval. Allowlist patterns support `~` expansion (fail-loud if `HOME` is unavailable) and glob (`**`, `?`). The hub forwards via `POST /api/devices/{device_id}/files` with admission control. See `proto/ahand/v1/file_ops.proto` for the wire format.
+
 ## Repository Structure
 
 ```
 ahand/
 ├─ proto/ahand/v1/             # Protobuf definitions (single source of truth)
 │  ├─ envelope.proto           #   core protocol messages
-│  └─ browser.proto            #   browser automation messages
+│  ├─ browser.proto            #   browser automation messages
+│  └─ file_ops.proto           #   file operation messages (read/write/edit/delete/list/glob/copy/move/symlink/chmod)
 ├─ packages/
 │  ├─ proto-ts/                # @ahand/proto — ts-proto generated types
 │  └─ sdk/                     # @ahand/sdk — cloud control plane SDK

@@ -45,6 +45,7 @@ fn persistent_config(stack: &TestStack) -> Config {
             database_url: stack.database_url().into(),
             redis_url: stack.redis_url().into(),
         },
+        s3: None,
     }
 }
 

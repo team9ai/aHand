@@ -273,6 +273,11 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     }));
 
     let inner_config = build_inner_config(&config, &identity_path);
+    // FileManager is policy-driven; library callers don't yet expose
+    // file-policy config so we hand it the inner config's `file_policy`
+    // (defaulted in `build_inner_config`).
+    let file_policy_cfg = inner_config.file_policy.clone().unwrap_or_default();
+    let file_mgr = Arc::new(crate::file_manager::FileManager::new(&file_policy_cfg));
 
     let status_tx_task = status_tx.clone();
     let device_id_for_task = device_id.clone();
@@ -291,6 +296,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
             approval_mgr,
             approval_broadcast_tx,
             browser_mgr,
+            file_mgr,
             reporter,
         );
 
@@ -407,6 +413,11 @@ fn build_inner_config(cfg: &DaemonConfig, identity_path: &Path) -> Config {
                     .max(1),
             ),
         }),
+        // FilePolicy is opt-in; library callers (which are the consumers
+        // of this builder) don't expose file-policy config yet, so leave
+        // it as None — `FileManager::new(&FilePolicyConfig::default())`
+        // produces a disabled manager that refuses every FileRequest.
+        file_policy: None,
     }
 }
 

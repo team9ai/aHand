@@ -1,0 +1,1092 @@
+//! Filesystem operation handlers: stat, list, glob, mkdir, and (later) mutation ops.
+//!
+//! Each handler returns `Result<ResultType, FileError>`. The dispatch layer in
+//! `file_manager::mod` is responsible for running policy checks *before* invoking
+//! these handlers.
+
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::fs::Metadata;
+use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+
+use ahand_protocol::{
+    file_chmod, DeleteMode, FileChmod, FileChmodResult, FileCopy, FileCopyResult,
+    FileCreateSymlink, FileCreateSymlinkResult, FileDelete, FileDeleteResult, FileEntry, FileError,
+    FileErrorCode, FileGlob, FileGlobResult, FileList, FileListResult, FileMkdir, FileMkdirResult,
+    FileMove, FileMoveResult, FileStat, FileStatResult, FileType, UnixPermission,
+};
+
+use super::file_error;
+
+const DEFAULT_LIST_MAX: u32 = 1000;
+const DEFAULT_GLOB_MAX: u32 = 1000;
+
+/// Safety margin on top of `offset + max_results` retained in the list heap.
+/// Small extra room so near-tie mtimes don't break pagination boundaries.
+const LIST_HEAP_SAFETY_MARGIN: usize = 64;
+/// Absolute ceiling on retained entries. Prevents a pathological
+/// `max_results = u32::MAX` request from pre-allocating all of memory.
+const LIST_HEAP_RETAIN_CAP: usize = 100_000;
+
+/// Stat a file/directory/symlink and return its metadata.
+pub async fn handle_stat(req: &FileStat, resolved: &Path) -> Result<FileStatResult, FileError> {
+    let metadata = if req.no_follow_symlink {
+        tokio::fs::symlink_metadata(resolved).await
+    } else {
+        tokio::fs::metadata(resolved).await
+    }
+    .map_err(|e| io_to_file_error(e, resolved))?;
+
+    let file_type = map_file_type(&metadata);
+
+    let symlink_target = if metadata.file_type().is_symlink() {
+        tokio::fs::read_link(resolved)
+            .await
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
+    Ok(FileStatResult {
+        path: resolved.to_string_lossy().into_owned(),
+        file_type: file_type as i32,
+        size: metadata.len(),
+        modified_ms: system_time_to_ms(metadata.modified().ok()),
+        created_ms: system_time_to_ms(metadata.created().ok()),
+        accessed_ms: system_time_to_ms(metadata.accessed().ok()),
+        unix_permission: Some(unix_permission_from_metadata(&metadata)),
+        windows_acl: None,
+        symlink_target,
+    })
+}
+
+/// List entries in a directory, sorted by mtime desc with pagination.
+///
+/// Security / DoS properties:
+/// - Entry metadata is fetched via `symlink_metadata` so a symlink inside
+///   `resolved` never leaks its target's type, size, or mtime into the listing.
+///   The listing reports the symlink itself (type = Symlink) plus the target
+///   path string via `read_link`.
+/// - Entries are streamed into a bounded min-heap keyed by mtime. Only
+///   `offset + max_results + margin` entries are retained in memory, so a
+///   pathologically large directory cannot blow the heap. `total_count`
+///   still reflects every non-hidden entry scanned so pagination metadata
+///   (`has_more`) stays correct.
+pub async fn handle_list(req: &FileList, resolved: &Path) -> Result<FileListResult, FileError> {
+    let metadata = tokio::fs::metadata(resolved)
+        .await
+        .map_err(|e| io_to_file_error(e, resolved))?;
+    if !metadata.is_dir() {
+        return Err(file_error(
+            FileErrorCode::NotADirectory,
+            &req.path,
+            "path is not a directory",
+        ));
+    }
+
+    let max_results = req.max_results.unwrap_or(DEFAULT_LIST_MAX) as usize;
+    let offset = req.offset.unwrap_or(0) as usize;
+    // C4: refuse pagination requests we structurally cannot answer
+    // correctly. The bounded heap retains at most LIST_HEAP_RETAIN_CAP
+    // entries, so anything past that window can't be served accurately —
+    // we'd silently return an empty page with `has_more = true`, leaving
+    // the caller to spin forever. Return InvalidArgument so the client
+    // can surface a proper error instead.
+    if offset.saturating_add(max_results) > LIST_HEAP_RETAIN_CAP {
+        return Err(file_error(
+            FileErrorCode::InvalidPath,
+            &req.path,
+            format!(
+                "offset+max_results exceeds the directory listing window of {} entries; \
+                 narrow the listing or use FileGlob for deep pagination",
+                LIST_HEAP_RETAIN_CAP
+            ),
+        ));
+    }
+    // We need to retain offset+max_results entries to serve this page, plus a
+    // small safety margin so near-tie mtimes at the boundary don't drop a
+    // valid entry. Capped at LIST_HEAP_RETAIN_CAP regardless of request.
+    let retain = offset
+        .saturating_add(max_results)
+        .saturating_add(LIST_HEAP_SAFETY_MARGIN)
+        .min(LIST_HEAP_RETAIN_CAP);
+    // Pre-allocating the heap to `retain` is fine in the common case, but we
+    // still cap initial capacity so a huge `max_results` doesn't allocate
+    // eagerly before we've even seen one entry.
+    let initial_capacity = retain.min(1024);
+
+    // Min-heap (via `Reverse`) keyed by (mtime, name). The smallest mtime sits
+    // at the top; when the heap is full we peek the top and only push newer
+    // entries (evicting the oldest). The `name` tiebreaker keeps eviction
+    // deterministic when mtimes collide.
+    //
+    // `FileEntry` is a protobuf type and does not implement `Ord`, so the
+    // payload is stored in a parallel `Vec` and the heap only carries the
+    // comparable key plus an index into that vec. When the heap evicts an
+    // entry we "tombstone" its slot (`None`) rather than paying to compact
+    // the vec, then filter out tombstones when draining at the end.
+    let mut heap: BinaryHeap<Reverse<(u64, String, usize)>> =
+        BinaryHeap::with_capacity(initial_capacity);
+    let mut payload: Vec<Option<FileEntry>> = Vec::with_capacity(initial_capacity);
+    let mut total_count: u32 = 0;
+
+    let mut read_dir = tokio::fs::read_dir(resolved)
+        .await
+        .map_err(|e| io_to_file_error(e, resolved))?;
+    while let Some(entry) = read_dir
+        .next_entry()
+        .await
+        .map_err(|e| io_to_file_error(e, resolved))?
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !req.include_hidden && name.starts_with('.') {
+            continue;
+        }
+        // symlink_metadata never follows the entry's symlink, so a symlink
+        // pointing at /etc/passwd reports the link itself, not the target.
+        // tokio's `DirEntry` doesn't expose symlink_metadata directly, so we
+        // call it on the full path.
+        let Ok(metadata) = tokio::fs::symlink_metadata(entry.path()).await else {
+            continue;
+        };
+        let symlink_target = if metadata.file_type().is_symlink() {
+            tokio::fs::read_link(entry.path())
+                .await
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+
+        // Count every non-hidden entry we successfully stat'd, even if it
+        // later gets evicted from the heap. This keeps `has_more`/`total_count`
+        // accurate for pagination.
+        total_count = total_count.saturating_add(1);
+
+        let mtime = system_time_to_ms(metadata.modified().ok());
+        let file_entry = FileEntry {
+            name: name.clone(),
+            file_type: map_file_type(&metadata) as i32,
+            size: metadata.len(),
+            modified_ms: mtime,
+            symlink_target,
+        };
+
+        if heap.len() < retain {
+            let idx = payload.len();
+            payload.push(Some(file_entry));
+            heap.push(Reverse((mtime, name, idx)));
+        } else if let Some(Reverse((top_mtime, top_name, _))) = heap.peek() {
+            // Evict the oldest if this entry is newer. Ties are broken by
+            // name so eviction is deterministic.
+            if (mtime, &name) > (*top_mtime, top_name) {
+                if let Some(Reverse((_, _, evict_idx))) = heap.pop() {
+                    payload[evict_idx] = None;
+                }
+                let idx = payload.len();
+                payload.push(Some(file_entry));
+                heap.push(Reverse((mtime, name, idx)));
+            }
+        }
+    }
+
+    // Drain the heap and sort by mtime desc (tiebreaker: name asc) for a
+    // stable, user-facing order. Evicted slots are tombstoned `None`; we
+    // walk the payload vec in index order (which is heap insertion order)
+    // and filter those out before sorting.
+    let mut sorted: Vec<FileEntry> = payload.into_iter().flatten().collect();
+    sorted.sort_by(|a, b| {
+        b.modified_ms
+            .cmp(&a.modified_ms)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    let total = total_count;
+    // Pagination. Note: `sorted` only holds up to `retain` entries, so `offset`
+    // beyond that clamps to the end of the retained window. `has_more` is
+    // computed against the full scanned count so callers know more pages exist.
+    let start = offset.min(sorted.len());
+    let end = offset.saturating_add(max_results).min(sorted.len());
+    let paged: Vec<FileEntry> = sorted[start..end].to_vec();
+    let has_more = offset.saturating_add(max_results) < total as usize;
+
+    Ok(FileListResult {
+        entries: paged,
+        total_count: total,
+        has_more,
+    })
+}
+
+/// Match glob pattern against files under the (optional) base path.
+///
+/// Every matched path is re-checked against `policy` before being returned —
+/// without this filter, a `**` pattern rooted inside the allowlist could still
+/// surface symlinks or follow resolution paths whose canonical target lies
+/// outside the allowlist. The dispatcher also rejects obviously hostile
+/// patterns (absolute paths, `..` components) before calling us.
+pub async fn handle_glob(
+    req: &FileGlob,
+    base: Option<&Path>,
+    policy: &super::policy::FilePolicyChecker,
+) -> Result<FileGlobResult, FileError> {
+    let max_results = req.max_results.unwrap_or(DEFAULT_GLOB_MAX) as usize;
+
+    // Resolve pattern relative to base_path if provided. `Path::join` with an
+    // absolute `req.pattern` would discard the base entirely, so absolute
+    // patterns are rejected in the dispatcher before we get here.
+    let full_pattern = match base {
+        Some(b) => {
+            let joined: PathBuf = b.join(&req.pattern);
+            joined.to_string_lossy().into_owned()
+        }
+        None => req.pattern.clone(),
+    };
+
+    let glob_iter = glob::glob(&full_pattern).map_err(|e| {
+        file_error(
+            FileErrorCode::InvalidPath,
+            &req.pattern,
+            format!("invalid glob pattern: {e}"),
+        )
+    })?;
+
+    let mut entries: Vec<FileEntry> = Vec::new();
+    let mut total_matches: u32 = 0;
+    for entry in glob_iter {
+        let Ok(path) = entry else {
+            continue;
+        };
+        // Re-check every matched path against policy. Paths that resolve
+        // outside the allowlist (via symlinks inside an allowed directory,
+        // for example) are silently excluded — we neither leak metadata for
+        // them nor error out, because the caller asked for a pattern match,
+        // not a specific file.
+        let path_str = path.to_string_lossy();
+        if policy.check_path(&path_str, false, false).is_err() {
+            continue;
+        }
+        total_matches = total_matches.saturating_add(1);
+        if entries.len() >= max_results {
+            continue;
+        }
+        let Ok(metadata) = tokio::fs::symlink_metadata(&path).await else {
+            continue;
+        };
+        let symlink_target = if metadata.file_type().is_symlink() {
+            tokio::fs::read_link(&path)
+                .await
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        } else {
+            None
+        };
+        entries.push(FileEntry {
+            name: path.to_string_lossy().into_owned(),
+            file_type: map_file_type(&metadata) as i32,
+            size: metadata.len(),
+            modified_ms: system_time_to_ms(metadata.modified().ok()),
+            symlink_target,
+        });
+    }
+
+    // Sort by mtime desc for consistency with `list`.
+    entries.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+
+    let has_more = total_matches as usize > entries.len();
+
+    Ok(FileGlobResult {
+        entries,
+        total_matches,
+        has_more,
+    })
+}
+
+/// Create a directory (and optionally parents). Respects `mode` on Unix.
+pub async fn handle_mkdir(
+    req: &FileMkdir,
+    resolved: &Path,
+) -> Result<FileMkdirResult, FileError> {
+    if tokio::fs::try_exists(resolved).await.unwrap_or(false) {
+        // Enforce "must be a directory" when the path exists.
+        let metadata = tokio::fs::symlink_metadata(resolved)
+            .await
+            .map_err(|e| io_to_file_error(e, resolved))?;
+        if !metadata.is_dir() {
+            return Err(file_error(
+                FileErrorCode::AlreadyExists,
+                &req.path,
+                "path exists and is not a directory",
+            ));
+        }
+        return Ok(FileMkdirResult {
+            path: resolved.to_string_lossy().into_owned(),
+            already_existed: true,
+        });
+    }
+
+    if req.recursive {
+        tokio::fs::create_dir_all(resolved)
+            .await
+            .map_err(|e| io_to_file_error(e, resolved))?;
+    } else {
+        tokio::fs::create_dir(resolved)
+            .await
+            .map_err(|e| io_to_file_error(e, resolved))?;
+    }
+
+    #[cfg(unix)]
+    if let Some(mode) = req.mode {
+        let perms = std::fs::Permissions::from_mode(mode);
+        tokio::fs::set_permissions(resolved, perms)
+            .await
+            .map_err(|e| io_to_file_error(e, resolved))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-Unix platforms, `mode` is advisory and silently ignored.
+        let _ = req.mode;
+    }
+
+    Ok(FileMkdirResult {
+        path: resolved.to_string_lossy().into_owned(),
+        already_existed: false,
+    })
+}
+
+// ── Delete ─────────────────────────────────────────────────────────────────
+
+pub async fn handle_delete(
+    req: &FileDelete,
+    resolved: &Path,
+) -> Result<FileDeleteResult, FileError> {
+    let metadata = if req.no_follow_symlink {
+        tokio::fs::symlink_metadata(resolved).await
+    } else {
+        tokio::fs::metadata(resolved).await
+    }
+    .map_err(|e| io_to_file_error(e, resolved))?;
+
+    let mode = DeleteMode::try_from(req.mode).unwrap_or(DeleteMode::Trash);
+
+    match mode {
+        DeleteMode::Trash => {
+            // C5: TRASH was previously a "soft" delete that ignored the
+            // `recursive` flag entirely — sending a TRASH delete on a
+            // non-empty directory would silently move the whole tree
+            // even when `recursive = false`. PERMANENT delete enforces
+            // this guard; TRASH must too. Otherwise a caller checking
+            // "is this a single-file delete?" via `recursive=false`
+            // can't trust the call won't take a whole subtree.
+            let mut items_deleted: u32 = 1;
+            if metadata.is_dir() {
+                let count = count_recursive(resolved).await;
+                if !req.recursive && count > 1 {
+                    return Err(file_error(
+                        FileErrorCode::NotEmpty,
+                        &req.path,
+                        "directory not empty (use recursive=true)",
+                    ));
+                }
+                items_deleted = count;
+            }
+
+            let path_str = resolved.to_string_lossy().into_owned();
+            tokio::task::block_in_place(|| trash::delete(resolved)).map_err(|e| {
+                file_error(
+                    FileErrorCode::Io,
+                    &req.path,
+                    format!("failed to move to trash: {e}"),
+                )
+            })?;
+            // The `trash` crate (5.2.x) does not expose the post-delete
+            // destination: on macOS the `resultingItemURL` out-param from
+            // `NSFileManager::trashItemAtURL` is discarded, the Finder
+            // AppleScript path returns nothing, and the `os_limited` module
+            // (which can `list()` trash contents on freedesktop/Windows) is
+            // not compiled on macOS. So we fall back to a best-effort guess
+            // of the home trash location. This is a hint only — the trash
+            // system may rename the item to resolve name collisions, and on
+            // non-home volumes the real location is a per-volume
+            // `/Volumes/.../.Trashes/<uid>/` directory we don't try to
+            // detect. On unsupported platforms (Windows, other Unixes) we
+            // return `None` so callers can detect "unknown" rather than
+            // relying on a fabricated path.
+            let trash_path = guess_trash_path(resolved);
+            Ok(FileDeleteResult {
+                path: path_str,
+                mode: DeleteMode::Trash as i32,
+                items_deleted,
+                trash_path,
+            })
+        }
+        DeleteMode::Permanent => {
+            if metadata.is_dir() {
+                if !req.recursive {
+                    // Check if empty.
+                    let mut entries = tokio::fs::read_dir(resolved)
+                        .await
+                        .map_err(|e| io_to_file_error(e, resolved))?;
+                    if entries
+                        .next_entry()
+                        .await
+                        .map_err(|e| io_to_file_error(e, resolved))?
+                        .is_some()
+                    {
+                        return Err(file_error(
+                            FileErrorCode::NotEmpty,
+                            &req.path,
+                            "directory not empty (use recursive=true)",
+                        ));
+                    }
+                    tokio::fs::remove_dir(resolved)
+                        .await
+                        .map_err(|e| io_to_file_error(e, resolved))?;
+                    Ok(FileDeleteResult {
+                        path: resolved.to_string_lossy().into_owned(),
+                        mode: DeleteMode::Permanent as i32,
+                        items_deleted: 1,
+                        trash_path: None,
+                    })
+                } else {
+                    let count = count_recursive(resolved).await;
+                    tokio::fs::remove_dir_all(resolved)
+                        .await
+                        .map_err(|e| io_to_file_error(e, resolved))?;
+                    Ok(FileDeleteResult {
+                        path: resolved.to_string_lossy().into_owned(),
+                        mode: DeleteMode::Permanent as i32,
+                        items_deleted: count,
+                        trash_path: None,
+                    })
+                }
+            } else {
+                tokio::fs::remove_file(resolved)
+                    .await
+                    .map_err(|e| io_to_file_error(e, resolved))?;
+                Ok(FileDeleteResult {
+                    path: resolved.to_string_lossy().into_owned(),
+                    mode: DeleteMode::Permanent as i32,
+                    items_deleted: 1,
+                    trash_path: None,
+                })
+            }
+        }
+    }
+}
+
+/// Best-effort guess of where the home trash places an item after a
+/// `trash::delete` call.
+///
+/// The `trash` crate (5.2.x) does not return the destination path on any
+/// platform — see the comment in [`handle_delete`]'s TRASH branch for
+/// details. This helper reproduces the Freedesktop/macOS "home trash"
+/// location so the `FileDeleteResult.trash_path` field can carry a
+/// human-useful hint instead of always being `None`.
+///
+/// **This is a hint, not a guarantee.** Concretely:
+/// - The trash system may rename the item when another file with the same
+///   basename already exists (e.g. macOS appends " 2", freedesktop appends
+///   numeric suffixes to the `.trashinfo` file).
+/// - On macOS, items deleted from non-boot volumes are placed in a
+///   per-volume `/Volumes/<vol>/.Trashes/<uid>/` directory rather than
+///   `~/.Trash`. We do not try to detect this.
+/// - On Linux, items on a separate mount point land in that mount's
+///   `.Trash-<uid>/files/` directory, not the home trash.
+///
+/// Returns `None` on platforms where no stable user-visible path exists
+/// (currently Windows and any Unix other than macOS / freedesktop-compatible
+/// Linux) or when the required environment variables (`HOME`,
+/// `XDG_DATA_HOME`) are unset.
+pub fn guess_trash_path(original: &Path) -> Option<String> {
+    let basename = original.file_name()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        // Follows the default `DeleteMethod::Finder` path: moves into the
+        // user's home trash at `~/.Trash`.
+        let home = std::env::var_os("HOME")?;
+        if home.is_empty() {
+            return None;
+        }
+        let mut p = PathBuf::from(home);
+        p.push(".Trash");
+        p.push(basename);
+        return Some(p.to_string_lossy().into_owned());
+    }
+
+    #[cfg(all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    ))]
+    {
+        // Freedesktop Trash spec 1.0: the "home trash" is
+        // `$XDG_DATA_HOME/Trash` (default `$HOME/.local/share/Trash`), and
+        // deleted payloads live under its `files/` subdirectory.
+        let trash_root = if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+            if data_home.is_empty() {
+                None
+            } else {
+                let mut p = PathBuf::from(data_home);
+                p.push("Trash");
+                Some(p)
+            }
+        } else {
+            None
+        };
+        let trash_root = trash_root.or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            if home.is_empty() {
+                return None;
+            }
+            let mut p = PathBuf::from(home);
+            p.push(".local/share/Trash");
+            Some(p)
+        })?;
+        let mut p = trash_root;
+        p.push("files");
+        p.push(basename);
+        return Some(p.to_string_lossy().into_owned());
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            unix,
+            not(target_os = "macos"),
+            not(target_os = "ios"),
+            not(target_os = "android")
+        )
+    )))]
+    {
+        // Windows Recycle Bin does not expose a stable user-visible path;
+        // other platforms have no standard home trash location.
+        let _ = basename;
+        None
+    }
+}
+
+/// Count files + directories under a path recursively (including the root).
+async fn count_recursive(path: &Path) -> u32 {
+    fn walk(path: &std::path::Path, count: &mut u32) {
+        *count += 1;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    walk(&entry.path(), count);
+                } else {
+                    *count += 1;
+                }
+            }
+        }
+    }
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut count = 0u32;
+        walk(&path, &mut count);
+        count
+    })
+    .await
+    .unwrap_or(1)
+}
+
+// ── Copy / Move / Symlink ──────────────────────────────────────────────────
+
+pub async fn handle_copy(
+    req: &FileCopy,
+    source_resolved: &Path,
+    dest_resolved: &Path,
+) -> Result<FileCopyResult, FileError> {
+    let source_metadata = tokio::fs::symlink_metadata(source_resolved)
+        .await
+        .map_err(|e| io_to_file_error(e, source_resolved))?;
+
+    if tokio::fs::try_exists(dest_resolved).await.unwrap_or(false) && !req.overwrite {
+        return Err(file_error(
+            FileErrorCode::AlreadyExists,
+            &req.destination,
+            "destination exists (use overwrite=true)",
+        ));
+    }
+
+    let items_copied = if source_metadata.is_dir() {
+        if !req.recursive {
+            return Err(file_error(
+                FileErrorCode::IsADirectory,
+                &req.source,
+                "source is a directory (use recursive=true)",
+            ));
+        }
+        copy_dir_recursive(source_resolved, dest_resolved).await?
+    } else {
+        tokio::fs::copy(source_resolved, dest_resolved)
+            .await
+            .map_err(|e| io_to_file_error(e, dest_resolved))?;
+        1
+    };
+
+    Ok(FileCopyResult {
+        source: source_resolved.to_string_lossy().into_owned(),
+        destination: dest_resolved.to_string_lossy().into_owned(),
+        items_copied,
+    })
+}
+
+async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u32, FileError> {
+    let src = src.to_path_buf();
+    let dst = dst.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<u32, FileError> {
+        let mut count = 0u32;
+        std::fs::create_dir_all(&dst).map_err(|e| io_to_file_error(e, &dst))?;
+        copy_dir_sync(&src, &dst, &mut count)?;
+        Ok(count)
+    })
+    .await
+    .map_err(|e| {
+        file_error(
+            FileErrorCode::Io,
+            "",
+            format!("recursive copy join error: {e}"),
+        )
+    })?
+}
+
+fn copy_dir_sync(src: &Path, dst: &Path, count: &mut u32) -> Result<(), FileError> {
+    for entry in std::fs::read_dir(src).map_err(|e| io_to_file_error(e, src))? {
+        let entry = entry.map_err(|e| io_to_file_error(e, src))?;
+        let ty = entry.file_type().map_err(|e| io_to_file_error(e, src))?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            std::fs::create_dir_all(&to).map_err(|e| io_to_file_error(e, &to))?;
+            *count += 1;
+            copy_dir_sync(&from, &to, count)?;
+        } else if ty.is_file() {
+            std::fs::copy(&from, &to).map_err(|e| io_to_file_error(e, &to))?;
+            *count += 1;
+        } else if ty.is_symlink() {
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&from).map_err(|e| io_to_file_error(e, &from))?;
+                std::os::unix::fs::symlink(&target, &to)
+                    .map_err(|e| io_to_file_error(e, &to))?;
+                *count += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn handle_move(
+    req: &FileMove,
+    source_resolved: &Path,
+    dest_resolved: &Path,
+) -> Result<FileMoveResult, FileError> {
+    if tokio::fs::try_exists(dest_resolved).await.unwrap_or(false) && !req.overwrite {
+        return Err(file_error(
+            FileErrorCode::AlreadyExists,
+            &req.destination,
+            "destination exists (use overwrite=true)",
+        ));
+    }
+
+    // Try rename first (fast path, same filesystem). Fall back to copy+delete
+    // on cross-device renames.
+    match tokio::fs::rename(source_resolved, dest_resolved).await {
+        Ok(_) => {}
+        Err(e) if is_cross_device_error(&e) => {
+            tracing::info!(
+                source = %source_resolved.display(),
+                destination = %dest_resolved.display(),
+                "rename hit cross-device error; falling back to copy+delete"
+            );
+            cross_device_move_fallback(req, source_resolved, dest_resolved).await?;
+        }
+        Err(e) => return Err(io_to_file_error(e, source_resolved)),
+    }
+
+    Ok(FileMoveResult {
+        source: source_resolved.to_string_lossy().into_owned(),
+        destination: dest_resolved.to_string_lossy().into_owned(),
+    })
+}
+
+/// Cross-filesystem move payload. Extracted from `handle_move` so the
+/// fallback can be unit-tested directly: simulating the EXDEV trigger
+/// (`tokio::fs::rename` returning `CrossesDevices`) without a real
+/// multi-FS test environment requires either platform-specific tricks
+/// or runtime injection that's not worth the harness cost. Splitting
+/// the trigger from the payload lets us test each independently:
+/// `is_cross_device_error` covers detection, this helper covers the
+/// copy+delete sequence.
+async fn cross_device_move_fallback(
+    req: &FileMove,
+    source_resolved: &Path,
+    dest_resolved: &Path,
+) -> Result<(), FileError> {
+    let copy_req = FileCopy {
+        source: req.source.clone(),
+        destination: req.destination.clone(),
+        recursive: true,
+        overwrite: req.overwrite,
+    };
+    handle_copy(&copy_req, source_resolved, dest_resolved).await?;
+    let meta = tokio::fs::symlink_metadata(source_resolved)
+        .await
+        .map_err(|e| io_to_file_error(e, source_resolved))?;
+    if meta.is_dir() {
+        tokio::fs::remove_dir_all(source_resolved)
+            .await
+            .map_err(|e| io_to_file_error(e, source_resolved))?;
+    } else {
+        tokio::fs::remove_file(source_resolved)
+            .await
+            .map_err(|e| io_to_file_error(e, source_resolved))?;
+    }
+    Ok(())
+}
+
+/// I6: detect "cross-device" rename errors portably.
+///
+/// The previous check tested `raw_os_error() == Some(18)`, which is EXDEV on
+/// Linux/macOS but does NOT match Windows' `ERROR_NOT_SAME_DEVICE = 17`. On
+/// Windows, a cross-volume `MoveFile` would therefore skip the copy+delete
+/// fallback and surface as a generic IO error. We now prefer the stable
+/// `io::ErrorKind::CrossesDevices` (Rust 1.85+, mapped per platform by std)
+/// and keep the numeric checks as a defensive fallback for libc/Windows
+/// codes that std might not classify.
+fn is_cross_device_error(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::CrossesDevices {
+        return true;
+    }
+    match e.raw_os_error() {
+        // Unix: EXDEV (Linux, macOS, BSDs) is 18.
+        #[cfg(unix)]
+        Some(18) => true,
+        // Windows: ERROR_NOT_SAME_DEVICE = 17 (winerror.h). Distinct from
+        // the Unix EXDEV value despite the proximity.
+        #[cfg(windows)]
+        Some(17) => true,
+        _ => false,
+    }
+}
+
+pub async fn handle_create_symlink(
+    req: &FileCreateSymlink,
+    link_resolved: &Path,
+) -> Result<FileCreateSymlinkResult, FileError> {
+    #[cfg(unix)]
+    {
+        tokio::fs::symlink(&req.target, link_resolved)
+            .await
+            .map_err(|e| io_to_file_error(e, link_resolved))?;
+    }
+    #[cfg(not(unix))]
+    {
+        return Err(file_error(
+            FileErrorCode::Unspecified,
+            &req.link_path,
+            "symlinks are not supported on this platform",
+        ));
+    }
+    Ok(FileCreateSymlinkResult {
+        link_path: link_resolved.to_string_lossy().into_owned(),
+        target: req.target.clone(),
+    })
+}
+
+// ── Chmod ──────────────────────────────────────────────────────────────────
+
+pub async fn handle_chmod(
+    req: &FileChmod,
+    resolved: &Path,
+) -> Result<FileChmodResult, FileError> {
+    let Some(permission) = &req.permission else {
+        return Err(file_error(
+            FileErrorCode::Unspecified,
+            &req.path,
+            "no permission specified",
+        ));
+    };
+
+    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink)
+        .await?;
+
+    match permission {
+        file_chmod::Permission::Unix(unix) => {
+            if unix.owner.is_some() || unix.group.is_some() {
+                return Err(file_error(
+                    FileErrorCode::PermissionDenied,
+                    &req.path,
+                    "chown is not yet supported by this daemon",
+                ));
+            }
+            let Some(mode) = unix.mode else {
+                return Err(file_error(
+                    FileErrorCode::Unspecified,
+                    &req.path,
+                    "unix permission mode is required",
+                ));
+            };
+            #[cfg(unix)]
+            {
+                let items = set_unix_mode(resolved, mode, req.recursive).await?;
+                Ok(FileChmodResult {
+                    path: resolved.to_string_lossy().into_owned(),
+                    items_modified: items,
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (mode, req.recursive);
+                Err(file_error(
+                    FileErrorCode::Unspecified,
+                    &req.path,
+                    "Unix mode chmod not supported on this platform",
+                ))
+            }
+        }
+        file_chmod::Permission::Windows(_acl) => {
+            #[cfg(not(windows))]
+            {
+                Err(file_error(
+                    FileErrorCode::Unspecified,
+                    &req.path,
+                    "Windows ACLs are not supported on this platform",
+                ))
+            }
+            #[cfg(windows)]
+            {
+                // TODO: wire up real Windows ACL setting. For now, report
+                // that only mode-based chmod is implemented.
+                Err(file_error(
+                    FileErrorCode::Unspecified,
+                    &req.path,
+                    "Windows ACL chmod is not yet implemented",
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn set_unix_mode(path: &Path, mode: u32, recursive: bool) -> Result<u32, FileError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<u32, FileError> {
+        let mut count = 0u32;
+        set_unix_mode_sync(&path, mode, recursive, &mut count)?;
+        Ok(count)
+    })
+    .await
+    .map_err(|e| file_error(FileErrorCode::Io, "", format!("chmod join error: {e}")))?
+}
+
+#[cfg(unix)]
+fn set_unix_mode_sync(
+    path: &Path,
+    mode: u32,
+    recursive: bool,
+    count: &mut u32,
+) -> Result<(), FileError> {
+    let perms = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, perms).map_err(|e| io_to_file_error(e, path))?;
+    *count += 1;
+    if recursive {
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| io_to_file_error(e, path))?;
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(path).map_err(|e| io_to_file_error(e, path))? {
+                let entry = entry.map_err(|e| io_to_file_error(e, path))?;
+                let ty = entry.file_type().map_err(|e| io_to_file_error(e, path))?;
+                if ty.is_symlink() {
+                    continue; // Don't follow symlinks.
+                }
+                set_unix_mode_sync(&entry.path(), mode, recursive, count)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+
+pub fn map_file_type(metadata: &Metadata) -> FileType {
+    let ft = metadata.file_type();
+    if ft.is_dir() {
+        FileType::Directory
+    } else if ft.is_file() {
+        FileType::File
+    } else if ft.is_symlink() {
+        FileType::Symlink
+    } else {
+        FileType::Other
+    }
+}
+
+pub fn system_time_to_ms(time: Option<std::time::SystemTime>) -> u64 {
+    time.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn unix_permission_from_metadata(metadata: &Metadata) -> UnixPermission {
+    #[cfg(unix)]
+    {
+        UnixPermission {
+            mode: Some(metadata.permissions().mode()),
+            owner: None,
+            group: None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        UnixPermission {
+            mode: None,
+            owner: None,
+            group: None,
+        }
+    }
+}
+
+pub fn io_to_file_error(err: io::Error, path: &Path) -> FileError {
+    let path_str = path.to_string_lossy().into_owned();
+    let code = match err.kind() {
+        io::ErrorKind::NotFound => FileErrorCode::NotFound,
+        io::ErrorKind::PermissionDenied => FileErrorCode::PermissionDenied,
+        io::ErrorKind::AlreadyExists => FileErrorCode::AlreadyExists,
+        _ => {
+            // Map "not a directory" and "is a directory" via raw_os_error when possible.
+            match err.raw_os_error() {
+                Some(20) => FileErrorCode::NotADirectory, // ENOTDIR
+                Some(21) => FileErrorCode::IsADirectory,  // EISDIR
+                Some(39) => FileErrorCode::NotEmpty,      // ENOTEMPTY
+                _ => FileErrorCode::Io,
+            }
+        }
+    };
+    FileError {
+        code: code as i32,
+        message: err.to_string(),
+        path: path_str,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cross_device_move_fallback, is_cross_device_error};
+    use ahand_protocol::FileMove;
+    use std::io;
+    use std::path::Path;
+
+    #[test]
+    fn is_cross_device_error_detects_crosses_devices_kind() {
+        // I6 regression: the stable `io::ErrorKind::CrossesDevices` must
+        // be classified as cross-device on every platform. Without this,
+        // Windows cross-volume moves would skip the copy+delete fallback.
+        let e = io::Error::new(io::ErrorKind::CrossesDevices, "synthetic");
+        assert!(is_cross_device_error(&e));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_cross_device_error_detects_unix_exdev_raw_code() {
+        // EXDEV = 18 on Linux/macOS; std maps this to the CrossesDevices
+        // kind on supported toolchains, but we keep the numeric fallback
+        // for resilience.
+        let e = io::Error::from_raw_os_error(18);
+        assert!(is_cross_device_error(&e));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_cross_device_error_detects_windows_not_same_device_raw_code() {
+        // ERROR_NOT_SAME_DEVICE = 17 (winerror.h). Distinct from Unix
+        // EXDEV (also 18 vs 17) — checking only the Unix value would
+        // silently miss this on Windows.
+        let e = io::Error::from_raw_os_error(17);
+        assert!(is_cross_device_error(&e));
+    }
+
+    #[test]
+    fn is_cross_device_error_rejects_unrelated_errors() {
+        // Anything else must NOT trigger the copy+delete fallback,
+        // otherwise we'd silently mask real failures (PermissionDenied,
+        // NotFound, etc.).
+        let cases = [
+            io::Error::from(io::ErrorKind::NotFound),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+            io::Error::from(io::ErrorKind::AlreadyExists),
+            io::Error::from_raw_os_error(2),  // ENOENT
+            io::Error::from_raw_os_error(13), // EACCES
+        ];
+        for e in &cases {
+            assert!(
+                !is_cross_device_error(e),
+                "expected not-cross-device for {e:?}"
+            );
+        }
+    }
+
+    /// Build a FileMove with the strings filled in to match the resolved
+    /// paths the helper sees in production. The helper only consumes
+    /// `req.source` / `req.destination` / `req.overwrite` to forward into
+    /// `handle_copy`, so the exact strings don't matter for correctness;
+    /// keeping them aligned with the `Path` arguments avoids surprises in
+    /// log lines.
+    fn move_req(source: &Path, destination: &Path, overwrite: bool) -> FileMove {
+        FileMove {
+            source: source.to_string_lossy().into_owned(),
+            destination: destination.to_string_lossy().into_owned(),
+            overwrite,
+        }
+    }
+
+    /// Cross-device payload for a single file: copy to destination, remove source.
+    /// Trigger detection is covered separately via `is_cross_device_error_*`;
+    /// this isolates the payload so we can verify it without staging a real
+    /// multi-FS environment (which CI runners don't reliably provide).
+    #[tokio::test]
+    async fn cross_device_move_fallback_moves_a_single_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("source.txt");
+        let dst = dir.path().join("dest.txt");
+        std::fs::write(&src, b"payload").unwrap();
+
+        let req = move_req(&src, &dst, false);
+        cross_device_move_fallback(&req, &src, &dst).await.unwrap();
+
+        assert!(!src.exists(), "source should be gone after fallback");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+    }
+
+    /// Cross-device payload for a directory tree: recursive copy then
+    /// `remove_dir_all` on the source. Verifies that `is_dir()`-branch
+    /// in the fallback uses the right unlink primitive (a previous
+    /// implementation could have called `remove_file` and silently
+    /// failed for directories).
+    #[tokio::test]
+    async fn cross_device_move_fallback_moves_a_directory_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let src = dir.path().join("src_tree");
+        let dst = dir.path().join("dst_tree");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(src.join("nested")).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("nested/b.txt"), b"b").unwrap();
+
+        let req = move_req(&src, &dst, false);
+        cross_device_move_fallback(&req, &src, &dst).await.unwrap();
+
+        assert!(!src.exists(), "source tree should be gone");
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dst.join("nested/b.txt")).unwrap(), b"b");
+    }
+}
