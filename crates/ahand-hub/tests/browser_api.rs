@@ -69,10 +69,7 @@ fn mint_cp_jwt(external_user_id: &str) -> String {
 /// `None` for the default — i.e. no per-device restriction). Mirrors
 /// the helper in `tests/control_plane.rs` so the browser handler's
 /// allowlist branch can be exercised end-to-end.
-fn mint_cp_jwt_with_device_ids(
-    external_user_id: &str,
-    device_ids: Option<Vec<String>>,
-) -> String {
+fn mint_cp_jwt_with_device_ids(external_user_id: &str, device_ids: Option<Vec<String>>) -> String {
     use ahand_hub_core::auth::mint_control_plane_jwt;
     let (token, _) = mint_control_plane_jwt(
         JWT_SECRET.as_bytes(),
@@ -464,7 +461,9 @@ async fn control_browser_200_with_valid_jwt_and_owner_match() {
     // `browser_command_roundtrip` above); a regression that flips to
     // "always serialize as null" would silently break SDK consumers
     // that branch on `"error" in body`.
-    let body_obj = body.as_object().expect("response body must be a JSON object");
+    let body_obj = body
+        .as_object()
+        .expect("response body must be a JSON object");
     assert!(
         !body_obj.contains_key("error"),
         "`error` should be omitted when absent; got: {body}"
@@ -536,8 +535,7 @@ async fn control_browser_403_when_device_has_no_external_user_id() {
     // has external_user_id = None. Any control-plane JWT must be
     // refused — owners are matched explicitly, an unowned device is
     // never anyone's.
-    let server =
-        spawn_server_with_state(support::test_state_with_browser_device().await).await;
+    let server = spawn_server_with_state(support::test_state_with_browser_device().await).await;
     let token = mint_cp_jwt("user-anyone");
 
     let response = reqwest::Client::new()
@@ -771,10 +769,8 @@ async fn control_browser_403_when_device_not_in_allowlist() {
     // dispatch.
     let server = spawn_server_with_state(support::test_state().await).await;
     let _device = attach_owned_browser_device(&server, "cb-allowlist", "user-allowlist").await;
-    let token = mint_cp_jwt_with_device_ids(
-        "user-allowlist",
-        Some(vec!["other-device".to_string()]),
-    );
+    let token =
+        mint_cp_jwt_with_device_ids("user-allowlist", Some(vec!["other-device".to_string()]));
 
     let response = reqwest::Client::new()
         .post(format!("{}/api/control/browser", server.http_base_url()))
@@ -979,17 +975,14 @@ async fn control_browser_correlation_id_does_not_dedupe_currently() {
     // hang and the test would fail via the per-test timeout (or via
     // `second` panicking on the JSON shape if the hub answered from
     // a cache).
-    let req2 = tokio::time::timeout(
-        Duration::from_secs(3),
-        device.recv_browser_request(),
-    )
-    .await
-    .expect(
-        "daemon did not receive a second BrowserRequest within 3s — \
+    let req2 = tokio::time::timeout(Duration::from_secs(3), device.recv_browser_request())
+        .await
+        .expect(
+            "daemon did not receive a second BrowserRequest within 3s — \
          the hub appears to be deduping on correlation_id, which \
          contradicts the documented current behavior at \
          control_plane.rs:24-29. Update this test or the spec.",
-    );
+        );
     // Distinct request_id confirms the hub minted a fresh dispatch
     // rather than replaying the first one.
     assert_ne!(
@@ -1076,7 +1069,10 @@ async fn control_browser_500_when_response_channel_closed() {
     drop(removed);
 
     let response = api_task.await.unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
     let body: serde_json::Value = response.json().await.unwrap();
     assert_eq!(body["error"]["code"], "INTERNAL_ERROR");
 

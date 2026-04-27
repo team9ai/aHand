@@ -21,11 +21,11 @@ use thiserror::Error;
 
 use crate::state::AppState;
 
-/// RAII guard that removes a `browser_pending` entry on drop unless
-/// explicitly disarmed. Ensures cleanup even if the surrounding handler
-/// future is cancelled mid-`.await` (e.g. axum drops the future when the
-/// HTTP client disconnects or the worker SDK calls `controller.abort()`
-/// between `insert` and the oneshot resolving).
+/// RAII guard that removes a `browser_pending` entry on drop. Ensures
+/// cleanup even if the surrounding handler future is cancelled mid-`.await`
+/// (e.g. axum drops the future when the HTTP client disconnects or the
+/// worker SDK calls `controller.abort()` between `insert` and the oneshot
+/// resolving).
 ///
 /// `DashMap::remove` is idempotent (returns `Option<_>`), so the WS
 /// gateway's success-path remove at `device_gateway.rs:685` and this
@@ -181,7 +181,7 @@ pub async fn execute(
         // the caller as DEVICE_OFFLINE so it has the same external
         // contract regardless of whether the device went offline before
         // or during the dispatch. We surface the underlying error via
-        // `Internal` so `map_service_error` can render it the same way
+        // `SendFailed`, which `map_service_error` renders the same way
         // the original handler did ("Failed to send to device: <err>").
         return Err(BrowserServiceError::SendFailed {
             device_id: input.device_id.clone(),
