@@ -171,6 +171,11 @@ impl OutboxStore for InMemoryOutboxStore {
     async fn observe_ack(&self, device_id: &str, ack: u64) -> Result<()> {
         let mut g = self.inner.lock().await;
         if let Some(entry) = g.get_mut(device_id) {
+            // Ignore invalid acks (claim > issued) to protect the legitimate
+            // replay buffer from a buggy/compromised client.
+            if ack > entry.seq {
+                return Ok(());
+            }
             while let Some((seq, _)) = entry.buffer.front() {
                 if *seq <= ack {
                     entry.buffer.pop_front();
@@ -273,6 +278,19 @@ mod tests {
         s.observe_ack("dev", 2).await.unwrap();
         let frames = s.unacked_frames("dev", 0).await.unwrap();
         assert_eq!(frames, vec![vec![3u8]]);
+    }
+
+    #[tokio::test]
+    async fn observe_ack_ignores_invalid_ack_above_issued_seq() {
+        let s = store();
+        s.try_acquire_lock("dev", "sess-a").await.unwrap();
+        // Issue one frame, then send a bogus ack that exceeds the issued seq.
+        let seq = s.fenced_incr_seq("dev", "sess-a").await.unwrap();
+        s.xadd_frame("dev", "sess-a", seq, vec![1u8]).await.unwrap();
+        s.observe_ack("dev", 99).await.unwrap();
+        // The legitimate seq=1 frame must remain in the replay buffer.
+        let frames = s.unacked_frames("dev", 0).await.unwrap();
+        assert_eq!(frames, vec![vec![1u8]]);
     }
 
     #[tokio::test]

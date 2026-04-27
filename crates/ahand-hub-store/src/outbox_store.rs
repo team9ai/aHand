@@ -244,12 +244,17 @@ impl OutboxStore for RedisOutboxStore {
             return Ok(());
         }
         let mut conn = self.conn.lock().await;
-        let minid = format!("0-{}", ack + 1);
-        let _: i64 = redis::cmd("XTRIM")
-            .arg(Self::outbox_key(device_id))
-            .arg("MINID")
-            .arg(minid)
-            .query_async(&mut *conn)
+        // Lua-atomic: trim the stream only if the claimed ack is within
+        // the range of seqs we have actually issued. An invalid ack
+        // (claim > issued) is ignored to protect the legitimate replay
+        // buffer from a buggy/compromised client.
+        let _: i64 = self
+            .scripts
+            .bounded_observe_ack
+            .key(Self::seq_key(device_id))
+            .key(Self::outbox_key(device_id))
+            .arg(ack.to_string())
+            .invoke_async(&mut *conn)
             .await
             .map_err(redis_err)?;
         Ok(())

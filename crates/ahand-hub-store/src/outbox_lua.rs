@@ -94,6 +94,25 @@ redis.call('EXPIRE', KEYS[2], ARGV[5])
 return 1
 "#;
 
+pub const BOUNDED_OBSERVE_ACK: &str = r#"
+-- KEYS[1] = seq:{id}
+-- KEYS[2] = outbox:{id}
+-- ARGV[1] = ack (decimal)
+-- Trim acked entries only if the device's claimed ack is at most the
+-- max seq we have ever issued. An invalid ack (claim > issued) is
+-- ignored — defense against buggy/compromised clients that would
+-- otherwise wipe their own legitimate replay buffer.
+local current = tonumber(redis.call('GET', KEYS[1])) or 0
+local ack = tonumber(ARGV[1])
+if ack > current then
+  return -1
+end
+if ack > 0 then
+  redis.call('XTRIM', KEYS[2], 'MINID', '0-' .. (ack + 1))
+end
+return current
+"#;
+
 /// Pre-built [`redis::Script`] handles. `redis::Script` itself caches the
 /// SHA1 internally and uses `EVALSHA`-then-`EVAL` automatically, so this
 /// type is mostly a named bundle so callers do not have to repeat the raw
@@ -105,6 +124,7 @@ pub struct OutboxScripts {
     pub reconcile_on_hello: Script,
     pub fenced_incr_seq: Script,
     pub fenced_xadd: Script,
+    pub bounded_observe_ack: Script,
 }
 
 impl OutboxScripts {
@@ -116,6 +136,7 @@ impl OutboxScripts {
             reconcile_on_hello: Script::new(RECONCILE_ON_HELLO),
             fenced_incr_seq: Script::new(FENCED_INCR_SEQ),
             fenced_xadd: Script::new(FENCED_XADD),
+            bounded_observe_ack: Script::new(BOUNDED_OBSERVE_ACK),
         }
     }
 }
