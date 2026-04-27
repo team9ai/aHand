@@ -1,10 +1,11 @@
 //! Redis-backed [`OutboxStore`] implementation.
 //!
-//! This module currently ships the lock-related primitives (acquire / kick /
-//! subscribe / renew / release). The data-path methods
-//! (`reconcile_on_hello`, `unacked_frames`, `fenced_incr_seq`, `xadd_frame`,
-//! `observe_ack`) are stubbed and return [`HubError::Internal`] — they will
-//! land in Task 4.
+//! Ships both the lock-related primitives (acquire / kick / subscribe /
+//! renew / release) and the data-path methods (`reconcile_on_hello`,
+//! `unacked_frames`, `fenced_incr_seq`, `xadd_frame`, `observe_ack`).
+//! The data-path methods rely on fenced Lua scripts so a stale session
+//! cannot bump the seq counter or write into the stream after a newer
+//! session has taken the lock.
 
 use std::sync::Arc;
 
@@ -19,6 +20,8 @@ use tokio::sync::{Mutex, watch};
 use crate::outbox_lua::OutboxScripts;
 
 const LOCK_TTL_SECS: u64 = 30;
+const RETENTION_SECS: u64 = 30 * 24 * 60 * 60; // 30 days
+const STREAM_MAXLEN: u64 = 10_000;
 
 #[derive(Clone)]
 pub struct RedisOutboxStore {
@@ -45,10 +48,26 @@ impl RedisOutboxStore {
     fn kick_channel(device_id: &str) -> String {
         format!("kick:{device_id}")
     }
+
+    fn seq_key(device_id: &str) -> String {
+        format!("seq:{device_id}")
+    }
+
+    fn outbox_key(device_id: &str) -> String {
+        format!("outbox:{device_id}")
+    }
 }
 
 fn redis_err(err: redis::RedisError) -> HubError {
     HubError::Internal(err.to_string())
+}
+
+fn map_redis_err(err: redis::RedisError) -> HubError {
+    if err.code() == Some("NOT_OWNER") {
+        HubError::Unauthorized
+    } else {
+        HubError::Internal(err.to_string())
+    }
 }
 
 #[async_trait]
@@ -136,46 +155,103 @@ impl OutboxStore for RedisOutboxStore {
         Ok(())
     }
 
-    // ── stub implementations of the rest; filled in by Task 4 ──
-
     async fn reconcile_on_hello(
         &self,
-        _device_id: &str,
-        _session_id: &str,
-        _last_ack: u64,
+        device_id: &str,
+        session_id: &str,
+        last_ack: u64,
     ) -> Result<u64> {
-        Err(HubError::Internal(
-            "reconcile_on_hello not implemented (Task 4)".into(),
-        ))
+        let mut conn = self.conn.lock().await;
+        let returned: u64 = self
+            .scripts
+            .reconcile_on_hello
+            .key(Self::lock_key(device_id))
+            .key(Self::seq_key(device_id))
+            .key(Self::outbox_key(device_id))
+            .arg(session_id)
+            .arg(last_ack.to_string())
+            .arg(RETENTION_SECS)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(map_redis_err)?;
+        Ok(returned)
     }
 
-    async fn unacked_frames(&self, _device_id: &str, _last_ack: u64) -> Result<Vec<Vec<u8>>> {
-        Err(HubError::Internal(
-            "unacked_frames not implemented (Task 4)".into(),
-        ))
+    async fn unacked_frames(&self, device_id: &str, last_ack: u64) -> Result<Vec<Vec<u8>>> {
+        use redis::streams::StreamRangeReply;
+        let mut conn = self.conn.lock().await;
+        // XRANGE expects exclusive start prefixed with '('. last_ack=0 means
+        // "everything"; encode that as start='-' so we don't synthesize 0-0.
+        let start = if last_ack == 0 {
+            "-".to_string()
+        } else {
+            format!("(0-{last_ack}")
+        };
+        let reply: StreamRangeReply = conn
+            .xrange(Self::outbox_key(device_id), start, "+")
+            .await
+            .map_err(redis_err)?;
+        let mut frames = Vec::with_capacity(reply.ids.len());
+        for entry in reply.ids {
+            if let Some(bytes) = entry.get::<Vec<u8>>("frame") {
+                frames.push(bytes);
+            }
+        }
+        Ok(frames)
     }
 
-    async fn fenced_incr_seq(&self, _device_id: &str, _session_id: &str) -> Result<u64> {
-        Err(HubError::Internal(
-            "fenced_incr_seq not implemented (Task 4)".into(),
-        ))
+    async fn fenced_incr_seq(&self, device_id: &str, session_id: &str) -> Result<u64> {
+        let mut conn = self.conn.lock().await;
+        let seq: u64 = self
+            .scripts
+            .fenced_incr_seq
+            .key(Self::lock_key(device_id))
+            .key(Self::seq_key(device_id))
+            .arg(session_id)
+            .arg(RETENTION_SECS)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(map_redis_err)?;
+        Ok(seq)
     }
 
     async fn xadd_frame(
         &self,
-        _device_id: &str,
-        _session_id: &str,
-        _seq: u64,
-        _frame: Vec<u8>,
+        device_id: &str,
+        session_id: &str,
+        seq: u64,
+        frame: Vec<u8>,
     ) -> Result<()> {
-        Err(HubError::Internal(
-            "xadd_frame not implemented (Task 4)".into(),
-        ))
+        let mut conn = self.conn.lock().await;
+        let _: i64 = self
+            .scripts
+            .fenced_xadd
+            .key(Self::lock_key(device_id))
+            .key(Self::outbox_key(device_id))
+            .arg(session_id)
+            .arg(seq.to_string())
+            .arg(frame)
+            .arg(STREAM_MAXLEN)
+            .arg(RETENTION_SECS)
+            .invoke_async(&mut *conn)
+            .await
+            .map_err(map_redis_err)?;
+        Ok(())
     }
 
-    async fn observe_ack(&self, _device_id: &str, _ack: u64) -> Result<()> {
-        Err(HubError::Internal(
-            "observe_ack not implemented (Task 4)".into(),
-        ))
+    async fn observe_ack(&self, device_id: &str, ack: u64) -> Result<()> {
+        if ack == 0 {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().await;
+        let minid = format!("0-{}", ack + 1);
+        let _: i64 = redis::cmd("XTRIM")
+            .arg(Self::outbox_key(device_id))
+            .arg("MINID")
+            .arg(minid)
+            .query_async(&mut *conn)
+            .await
+            .map_err(redis_err)?;
+        Ok(())
     }
 }
