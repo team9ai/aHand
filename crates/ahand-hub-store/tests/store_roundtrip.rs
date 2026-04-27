@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahand_hub_core::HubError;
 use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
-use ahand_hub_core::HubError;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore, OutboxStore};
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
@@ -515,26 +515,57 @@ async fn audit_store_prunes_entries_older_than_cutoff() -> anyhow::Result<()> {
 #[tokio::test]
 async fn outbox_lock_acquire_and_release() -> anyhow::Result<()> {
     let stack = TestStack::start().await?;
-    assert!(stack.outbox.try_acquire_lock("dev-lock-1", "sess-a").await?);
-    assert!(!stack.outbox.try_acquire_lock("dev-lock-1", "sess-b").await?);
+    assert!(
+        stack
+            .outbox
+            .try_acquire_lock("dev-lock-1", "sess-a")
+            .await?
+    );
+    assert!(
+        !stack
+            .outbox
+            .try_acquire_lock("dev-lock-1", "sess-b")
+            .await?
+    );
     stack.outbox.release_lock("dev-lock-1", "sess-a").await?;
-    assert!(stack.outbox.try_acquire_lock("dev-lock-1", "sess-b").await?);
+    assert!(
+        stack
+            .outbox
+            .try_acquire_lock("dev-lock-1", "sess-b")
+            .await?
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn outbox_lock_release_with_wrong_session_is_noop() -> anyhow::Result<()> {
     let stack = TestStack::start().await?;
-    assert!(stack.outbox.try_acquire_lock("dev-lock-2", "sess-a").await?);
-    stack.outbox.release_lock("dev-lock-2", "sess-other").await?;
-    assert!(!stack.outbox.try_acquire_lock("dev-lock-2", "sess-b").await?);
+    assert!(
+        stack
+            .outbox
+            .try_acquire_lock("dev-lock-2", "sess-a")
+            .await?
+    );
+    stack
+        .outbox
+        .release_lock("dev-lock-2", "sess-other")
+        .await?;
+    assert!(
+        !stack
+            .outbox
+            .try_acquire_lock("dev-lock-2", "sess-b")
+            .await?
+    );
     Ok(())
 }
 
 #[tokio::test]
 async fn outbox_lock_renew_extends_ttl_for_owner_only() -> anyhow::Result<()> {
     let stack = TestStack::start().await?;
-    stack.outbox.try_acquire_lock("dev-lock-3", "sess-a").await?;
+    stack
+        .outbox
+        .try_acquire_lock("dev-lock-3", "sess-a")
+        .await?;
     assert!(stack.outbox.renew_lock("dev-lock-3", "sess-a").await?);
     assert!(!stack.outbox.renew_lock("dev-lock-3", "sess-b").await?);
     Ok(())

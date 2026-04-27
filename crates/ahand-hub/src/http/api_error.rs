@@ -149,9 +149,7 @@ impl From<HubError> for ApiError {
             HubError::OutboxLockContention(device_id) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "OUTBOX_LOCK_CONTENTION",
-                format!(
-                    "Device {device_id} session lock is contended; retry shortly"
-                ),
+                format!("Device {device_id} session lock is contended; retry shortly"),
             ),
             HubError::Internal(_) => Self::internal("Internal server error"),
         }

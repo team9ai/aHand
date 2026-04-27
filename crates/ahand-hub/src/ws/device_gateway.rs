@@ -1068,7 +1068,10 @@ mod tests {
         // Send 5 envelopes; drain each from the mpsc to confirm delivery.
         for i in 1..=5u8 {
             registry
-                .send("device-1", job_envelope(&format!("job-{i}"), &format!("job-{i}"), "x"))
+                .send(
+                    "device-1",
+                    job_envelope(&format!("job-{i}"), &format!("job-{i}"), "x"),
+                )
                 .await
                 .unwrap();
             let frame = rx_a.recv().await.expect("frame delivered");
@@ -1081,8 +1084,7 @@ mod tests {
         registry.unregister("device-1", conn_a).await.unwrap();
 
         // Re-register with last_ack=2 — only seqs 3..=5 should replay.
-        let (_conn_b, mut rx_b, _close_b) =
-            registry.register("device-1".into(), 2).await.unwrap();
+        let (_conn_b, mut rx_b, _close_b) = registry.register("device-1".into(), 2).await.unwrap();
         let mut replayed = Vec::new();
         while let Ok(Some(frame)) =
             tokio::time::timeout(Duration::from_millis(50), rx_b.recv()).await
@@ -1121,8 +1123,7 @@ mod tests {
     #[tokio::test]
     async fn unregister_removes_idle_entries() {
         let registry = ConnectionRegistry::new(Arc::new(InMemoryOutboxStore::new()));
-        let (connection_id, rx, _close_rx) =
-            registry.register("device-1".into(), 0).await.unwrap();
+        let (connection_id, rx, _close_rx) = registry.register("device-1".into(), 0).await.unwrap();
         drop(rx);
 
         let removed = registry
@@ -1161,8 +1162,7 @@ mod tests {
         // worst-case behavior. Once the holder unregisters, the next
         // register succeeds.
         let registry = ConnectionRegistry::new(Arc::new(InMemoryOutboxStore::new()));
-        let (conn_a, _rx_a, _close_a) =
-            registry.register("device-1".into(), 0).await.unwrap();
+        let (conn_a, _rx_a, _close_a) = registry.register("device-1".into(), 0).await.unwrap();
 
         let err = registry
             .register("device-1".into(), 0)
@@ -1175,7 +1175,6 @@ mod tests {
 
         registry.unregister("device-1", conn_a).await.unwrap();
         // After the holder releases, a fresh register succeeds.
-        let (_conn_b, _rx_b, _close_b) =
-            registry.register("device-1".into(), 0).await.unwrap();
+        let (_conn_b, _rx_b, _close_b) = registry.register("device-1".into(), 0).await.unwrap();
     }
 }

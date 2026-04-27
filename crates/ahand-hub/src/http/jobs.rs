@@ -182,7 +182,9 @@ impl JobRuntime {
     pub async fn handle_device_frame(&self, device_id: &str, frame: &[u8]) -> anyhow::Result<()> {
         let envelope = ahand_protocol::Envelope::decode(frame)?;
         if self.connections.has_seen_inbound(device_id, envelope.seq) {
-            self.connections.observe_ack(device_id, envelope.ack).await?;
+            self.connections
+                .observe_ack(device_id, envelope.ack)
+                .await?;
             return Ok(());
         }
 
@@ -195,7 +197,9 @@ impl JobRuntime {
                 };
                 self.clear_disconnect_task(&event.job_id);
                 if is_terminal_status(job.status) {
-                    self.connections.observe_inbound(device_id, seq, ack).await?;
+                    self.connections
+                        .observe_inbound(device_id, seq, ack)
+                        .await?;
                     return Ok(());
                 }
                 if let Some(event_kind) = event.event {
@@ -256,7 +260,9 @@ impl JobRuntime {
                 };
                 self.clear_disconnect_task(&finished.job_id);
                 if is_terminal_status(job.status) {
-                    self.connections.observe_inbound(device_id, seq, ack).await?;
+                    self.connections
+                        .observe_inbound(device_id, seq, ack)
+                        .await?;
                     return Ok(());
                 }
                 if job.status != JobStatus::Running
@@ -268,7 +274,9 @@ impl JobRuntime {
                         )
                         .await
                 {
-                    return self.handle_stale_device_frame_error(device_id, seq, ack, err).await;
+                    return self
+                        .handle_stale_device_frame_error(device_id, seq, ack, err)
+                        .await;
                 }
                 let status = if finished.error == "cancelled" {
                     JobStatus::Cancelled
@@ -287,7 +295,9 @@ impl JobRuntime {
                     )
                     .await
                 {
-                    return self.handle_stale_device_frame_error(device_id, seq, ack, err).await;
+                    return self
+                        .handle_stale_device_frame_error(device_id, seq, ack, err)
+                        .await;
                 }
             }
             Some(ahand_protocol::envelope::Payload::JobRejected(rejected)) => {
@@ -296,7 +306,9 @@ impl JobRuntime {
                 };
                 self.clear_disconnect_task(&rejected.job_id);
                 if is_terminal_status(job.status) {
-                    self.connections.observe_inbound(device_id, seq, ack).await?;
+                    self.connections
+                        .observe_inbound(device_id, seq, ack)
+                        .await?;
                     return Ok(());
                 }
                 if let Err(err) = self
@@ -309,13 +321,17 @@ impl JobRuntime {
                     )
                     .await
                 {
-                    return self.handle_stale_device_frame_error(device_id, seq, ack, err).await;
+                    return self
+                        .handle_stale_device_frame_error(device_id, seq, ack, err)
+                        .await;
                 }
             }
             _ => {}
         }
 
-        self.connections.observe_inbound(device_id, seq, ack).await?;
+        self.connections
+            .observe_inbound(device_id, seq, ack)
+            .await?;
         Ok(())
     }
 
@@ -549,7 +565,9 @@ impl JobRuntime {
             err.downcast_ref::<HubError>(),
             Some(HubError::IllegalJobTransition { current, .. }) if is_terminal_status(*current)
         ) {
-            self.connections.observe_inbound(device_id, seq, ack).await?;
+            self.connections
+                .observe_inbound(device_id, seq, ack)
+                .await?;
             return Ok(());
         }
         Err(err)
