@@ -77,13 +77,30 @@ pub trait AuditStore: Send + Sync {
 
 // ── Outbox persistence (hub→device durable buffer + multi-replica fencing) ──
 
+/// Wrapper around a [`tokio::task::JoinHandle`] that aborts the underlying
+/// task when dropped. Used by [`KickSubscription`] so downstream impls
+/// don't each have to remember to abort their background reader task.
+pub struct AbortOnDropHandle(tokio::task::JoinHandle<()>);
+
+impl AbortOnDropHandle {
+    pub fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+}
+
+impl Drop for AbortOnDropHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Subscription handle returned by [`OutboxStore::subscribe_kick`]. The
 /// receiver value increments whenever a kick is published on the device's
 /// channel. Drop releases the underlying Pub/Sub connection and aborts the
 /// background reader task.
 pub struct KickSubscription {
     pub recv: tokio::sync::watch::Receiver<u64>,
-    pub _drop_guard: tokio::task::JoinHandle<()>,
+    pub _drop_guard: AbortOnDropHandle,
 }
 
 /// Per-device durable outbox.
