@@ -16,7 +16,7 @@ progress state — this document is a short reference only.
 | Finding | Why skipped |
 |---|---|
 | FileResponse construction duplicated across layers | Minor refactor; not blocking |
-| `FileResponse::move_result` vs spec's `move` | `move` is a Rust keyword; renaming breaks generated code |
+| `FileResponse::move_result` vs spec's `move` | Proto already uses `move_result` (Rust keyword forced the rename); the spec was the side that hadn't been updated. Doc-only fix to the spec text was deferred. |
 | Pagination test 2ms sleep | Not flaking yet; low risk |
 | STOP_REASON_ERROR unemitted | Top-level FileError is the equivalent correct path |
 | Cross-filesystem move (EXDEV) untested | Needs multi-FS test infra; deferred to follow-up PR |
