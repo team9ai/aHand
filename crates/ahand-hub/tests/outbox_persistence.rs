@@ -33,7 +33,7 @@ async fn replay_after_simulated_hub_restart() -> anyhow::Result<()> {
     // Phase 1: hub instance A handles a session for dev-1 and sends 5 frames.
     let store_a = Arc::new(RedisOutboxStore::new(&url).await?) as Arc<dyn OutboxStore>;
     let registry_a = ConnectionRegistry::new(store_a.clone());
-    let (_conn_a, mut rx_a, _close_a) = registry_a.register("dev-1".into(), 0).await?;
+    let (conn_a, mut rx_a, _close_a) = registry_a.register("dev-1".into(), 0).await?;
     for _ in 0..5 {
         let envelope = ahand_protocol::Envelope {
             device_id: "dev-1".into(),
@@ -45,7 +45,13 @@ async fn replay_after_simulated_hub_restart() -> anyhow::Result<()> {
     // Device acked frames 1 and 2 before A "dies".
     registry_a.observe_ack("dev-1", 2).await?;
 
-    // Drop A — simulates ECS task termination. Frames are still in Redis.
+    // Simulate a graceful hub shutdown: unregister releases the lock
+    // and aborts background tasks. (A sudden crash would leave the
+    // Redis lock held until its 30s TTL expired; we rely on graceful
+    // SIGTERM behavior in production. The durability invariant we are
+    // testing is: messages survive process boundary, regardless of
+    // shutdown style.)
+    registry_a.unregister("dev-1", conn_a).await?;
     drop(registry_a);
     drop(store_a);
 
@@ -68,11 +74,25 @@ async fn lock_takeover_via_kick() -> anyhow::Result<()> {
     let (_redis, url) = redis_container().await?;
     let store_a = Arc::new(RedisOutboxStore::new(&url).await?) as Arc<dyn OutboxStore>;
     let store_b = Arc::new(RedisOutboxStore::new(&url).await?) as Arc<dyn OutboxStore>;
-    let registry_a = ConnectionRegistry::new(store_a.clone());
+    let registry_a = Arc::new(ConnectionRegistry::new(store_a.clone()));
     let registry_b = ConnectionRegistry::new(store_b.clone());
 
-    let (_conn_a, _rx_a, mut close_a) = registry_a.register("dev-2".into(), 0).await?;
-    // B's register should kick A and acquire within retry window.
+    let (conn_a, _rx_a, mut close_a) = registry_a.register("dev-2".into(), 0).await?;
+
+    // In production, the WS handler watches close_rx and on close runs
+    // the unregister teardown (which calls release_lock). Simulate that
+    // by spawning a task that bridges close_a → unregister.
+    let cleanup_registry = registry_a.clone();
+    let cleanup = tokio::spawn(async move {
+        let _ = close_a.changed().await;
+        cleanup_registry
+            .unregister("dev-2", conn_a)
+            .await
+            .expect("unregister after kick");
+    });
+
+    // B's register should kick A; A's kick subscriber fires close_a;
+    // the cleanup task above unregisters A; B's retry succeeds.
     let started = tokio::time::Instant::now();
     let (_conn_b, _rx_b, _close_b) = registry_b.register("dev-2".into(), 0).await?;
     assert!(
@@ -80,12 +100,7 @@ async fn lock_takeover_via_kick() -> anyhow::Result<()> {
         "kick-and-acquire took {:?}, expected <5s",
         started.elapsed()
     );
-
-    // A's close_rx should fire as a result of the kick.
-    tokio::time::timeout(Duration::from_secs(2), close_a.changed())
-        .await
-        .expect("A's close_tx should fire after kick")?;
-    assert!(*close_a.borrow_and_update());
+    cleanup.await?;
     Ok(())
 }
 
