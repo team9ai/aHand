@@ -71,7 +71,7 @@ It no longer holds the outbox state. All outbox reads/writes go through `OutboxS
 ```
 ahand-hub-core
   ├─ traits.rs
-  │    + pub trait OutboxStore { ... 6 methods ... }
+  │    + pub trait OutboxStore { ... 10 methods ... }
   └─ outbox.rs
        (existing in-memory Outbox kept; used by daemon and tests)
 
@@ -122,18 +122,20 @@ pub trait OutboxStore: Send + Sync {
     /// Read all unacked frames for replay (XRANGE outbox:{id} (0-{last_ack} +).
     async fn unacked_frames(&self, device_id: &str, last_ack: u64) -> Result<Vec<Vec<u8>>>;
 
-    /// Fenced send. Internally two round-trips:
-    ///   1) `fenced_incr_seq` — fence + INCR seq, returns assigned seq.
-    ///   2) Caller mutates `envelope.seq` and re-encodes.
-    ///   3) `fenced_xadd` — fence + XADD frame to stream.
-    /// Implementation owns the round-trip orchestration; callers see one logical op.
-    /// Returns the assigned seq, or `NotOwner` error.
-    async fn send(
+    /// Reserve the next seq atomically: fence + INCR. Returns the assigned
+    /// seq. Caller is then expected to stamp `envelope.seq = assigned`,
+    /// encode, and call [`Self::xadd_frame`].
+    async fn fenced_incr_seq(&self, device_id: &str, session_id: &str) -> Result<u64>;
+
+    /// Append the encoded frame to the device's stream at ID `0-{seq}`,
+    /// applying `MAXLEN ~ 10000` and `EXPIRE 30d`. Fenced.
+    async fn xadd_frame(
         &self,
         device_id: &str,
         session_id: &str,
-        envelope: &mut ahand_protocol::Envelope,
-    ) -> Result<u64>;
+        seq: u64,
+        frame: Vec<u8>,
+    ) -> Result<()>;
 
     /// Trim acked frames: XTRIM outbox:{id} MINID 0-{ack+1}. Fire-and-forget allowed.
     async fn observe_ack(&self, device_id: &str, ack: u64) -> Result<()>;
@@ -271,15 +273,18 @@ The renew operation reuses a small Lua script (`if GET == session_id then EXPIRE
 
 ### `send` (hub→device, e.g., from job dispatch)
 
-1. Caller invokes `OutboxStore::send(device_id, session_id, &mut envelope)`.
-2. The store does two Redis round-trips internally:
-   - `fenced_incr_seq` → returns the assigned seq.
-   - Mutate `envelope.seq = assigned`, encode to bytes.
-   - `fenced_xadd` → writes the frame into the stream with explicit ID `0-{seq}`.
-3. On `NOT_OWNER` from either script: this replica has been kicked or its lock expired. Mark the connection dead, signal close to the WS IO task, log error. Caller (job dispatch) sees `DeviceOffline`.
-4. On success: caller pushes the encoded frame into the connection's mpsc to be sent over the WS.
+The trait exposes two primitives — `fenced_incr_seq` and `xadd_frame` — and the gateway (`ConnectionRegistry::send`) orchestrates them:
 
-**Seq assignment + encoding ordering.** The seq is part of the protobuf-encoded `Envelope` bytes, so the bytes must carry the correct seq before they're durable in Redis. Lua cannot patch protobuf, which is why the `send` flow round-trips through Rust between `fenced_incr_seq` and `fenced_xadd`.
+1. `OutboxStore::fenced_incr_seq(device_id, session_id)` → returns the assigned seq.
+2. Mutate `envelope.seq = assigned`, encode to bytes.
+3. `OutboxStore::xadd_frame(device_id, session_id, seq, frame)` → writes the frame into the stream with explicit ID `0-{seq}`.
+4. Push the encoded frame into the connection's mpsc to be sent over the WS.
+
+On `NOT_OWNER` from either script: this replica has been kicked or its lock expired. Mark the connection dead, signal close to the WS IO task, log error. Caller (job dispatch) sees `DeviceOffline`.
+
+The orchestration lives in the gateway rather than inside the store because the bytes-must-carry-the-correct-seq invariant requires going through `ahand-protocol::Envelope` encoding — and `ahand-hub-core` (where the trait lives) does not and should not depend on `ahand-protocol`.
+
+**Seq assignment + encoding ordering.** The seq is part of the protobuf-encoded `Envelope` bytes, so the bytes must carry the correct seq before they're durable in Redis. Lua cannot patch protobuf, which is why the send flow round-trips through Rust between `fenced_incr_seq` and `xadd_frame`.
 
 Crash between the two round-trips leaves a seq gap (no entry in stream for that seq). This is harmless: the WS message was never actually sent either, and the protocol tolerates seq gaps — devices ack the highest seq they received, not "I received contiguous N seqs".
 
