@@ -543,9 +543,9 @@ async fn outbox_lock_renew_extends_ttl_for_owner_only() -> anyhow::Result<()> {
 async fn outbox_kick_delivers_to_subscriber() -> anyhow::Result<()> {
     let stack = TestStack::start().await?;
     let mut sub = stack.outbox.subscribe_kick("dev-kick-1").await?;
-    // Subscriber must be ready before publish; sleep briefly to let the
-    // background task complete its SUBSCRIBE.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // No sleep needed: subscribe_kick returns only after SUBSCRIBE has
+    // landed, so any kick published from this point is guaranteed to
+    // be delivered to the watch channel.
     stack.outbox.kick("dev-kick-1", "new-sess").await?;
     tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv.changed())
         .await

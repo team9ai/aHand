@@ -79,22 +79,20 @@ impl OutboxStore for RedisOutboxStore {
 
     async fn subscribe_kick(&self, device_id: &str) -> Result<KickSubscription> {
         let channel = Self::kick_channel(device_id);
-        let (tx, rx) = watch::channel(0u64);
-        let client = self.client.clone();
+        let mut pubsub = self.client.get_async_pubsub().await.map_err(redis_err)?;
+        pubsub
+            .subscribe(channel.as_str())
+            .await
+            .map_err(redis_err)?;
 
-        // Long-lived background task: subscribes to the kick channel and
-        // bumps the watch counter on each PUBLISH. The subscription
-        // PubSub connection is owned by the task; it lives until the
-        // task is aborted (via AbortOnDropHandle on KickSubscription drop)
-        // or the channel sender side is dropped.
+        let (tx, rx) = watch::channel(0u64);
+
+        // The subscribe call has already landed by the time we spawn this
+        // task; any kick PUBLISHed from now on will be delivered. The task
+        // owns the pubsub connection and lives until either:
+        //   - the watch receiver is dropped (we exit the loop on send error)
+        //   - AbortOnDropHandle::drop fires when KickSubscription is dropped
         let join = tokio::spawn(async move {
-            let mut pubsub = match client.get_async_pubsub().await {
-                Ok(p) => p,
-                Err(_) => return,
-            };
-            if pubsub.subscribe(channel.as_str()).await.is_err() {
-                return;
-            }
             let mut stream = pubsub.on_message();
             let mut counter: u64 = 0;
             while let Some(_msg) = stream.next().await {
