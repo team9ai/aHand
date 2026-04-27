@@ -297,7 +297,7 @@ async fn persistent_resume_with_expired_history_emits_resync_event() -> anyhow::
     device.send_stdout(&job_id, b"first\n").await;
     device.send_finished(&job_id, 0, "").await;
 
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let response = reqwest::Client::new()
         .get(format!(

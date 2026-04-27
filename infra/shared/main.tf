@@ -85,9 +85,9 @@ resource "aws_iam_role_policy" "github_actions_deploy" {
         Resource = "*"
       },
       {
-        Sid      = "PassAhandHubRoles"
-        Effect   = "Allow"
-        Action   = ["iam:PassRole"]
+        Sid    = "PassAhandHubRoles"
+        Effect = "Allow"
+        Action = ["iam:PassRole"]
         Resource = [
           "arn:aws:iam::${var.aws_account_id}:role/ahand-hub-prod-execution",
           "arn:aws:iam::${var.aws_account_id}:role/ahand-hub-dev-execution",

@@ -393,6 +393,20 @@ pub struct TestDevice {
     socket: tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
 }
 
+/// Build a [`TestDevice`] from a pre-handshaked socket. Used by tests
+/// that need to drive the pre-register flow themselves (e.g. the
+/// control-plane browser tests, which seed `external_user_id` on the
+/// device row before the daemon hellos).
+pub fn test_device_from_socket(
+    device_id: &str,
+    socket: tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+) -> TestDevice {
+    TestDevice {
+        device_id: device_id.into(),
+        socket,
+    }
+}
+
 impl TestDevice {
     pub async fn recv_job_request(&mut self) -> JobRequest {
         while let Some(message) = self.socket.next().await {
