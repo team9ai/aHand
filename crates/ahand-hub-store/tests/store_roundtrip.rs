@@ -8,7 +8,7 @@ use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
-use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
+use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore, OutboxStore};
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -508,5 +508,48 @@ async fn audit_store_prunes_entries_older_than_cutoff() -> anyhow::Result<()> {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].resource_id, "recent-job");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_lock_acquire_and_release() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    assert!(stack.outbox.try_acquire_lock("dev-lock-1", "sess-a").await?);
+    assert!(!stack.outbox.try_acquire_lock("dev-lock-1", "sess-b").await?);
+    stack.outbox.release_lock("dev-lock-1", "sess-a").await?;
+    assert!(stack.outbox.try_acquire_lock("dev-lock-1", "sess-b").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_lock_release_with_wrong_session_is_noop() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    assert!(stack.outbox.try_acquire_lock("dev-lock-2", "sess-a").await?);
+    stack.outbox.release_lock("dev-lock-2", "sess-other").await?;
+    assert!(!stack.outbox.try_acquire_lock("dev-lock-2", "sess-b").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_lock_renew_extends_ttl_for_owner_only() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    stack.outbox.try_acquire_lock("dev-lock-3", "sess-a").await?;
+    assert!(stack.outbox.renew_lock("dev-lock-3", "sess-a").await?);
+    assert!(!stack.outbox.renew_lock("dev-lock-3", "sess-b").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_kick_delivers_to_subscriber() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let mut sub = stack.outbox.subscribe_kick("dev-kick-1").await?;
+    // Subscriber must be ready before publish; sleep briefly to let the
+    // background task complete its SUBSCRIBE.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    stack.outbox.kick("dev-kick-1", "new-sess").await?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv.changed())
+        .await
+        .expect("kick should arrive within 2s")?;
+    assert!(*sub.recv.borrow() >= 1);
     Ok(())
 }
