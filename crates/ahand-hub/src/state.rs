@@ -100,6 +100,7 @@ impl AppState {
             persistent_fanout,
             bootstrap_tokens,
             webhook_delivery_store,
+            outbox,
         ) = match &config.store {
             crate::config::StoreConfig::Memory => (
                 Arc::new(MemoryDeviceStore::default()),
@@ -109,6 +110,8 @@ impl AppState {
                 None,
                 crate::bootstrap::BootstrapCredentials::memory(),
                 Arc::new(MemoryWebhookDeliveryStore::new()) as Arc<dyn WebhookDeliveryStore>,
+                Arc::new(crate::ws::in_memory_outbox::InMemoryOutboxStore::new())
+                    as Arc<dyn ahand_hub_core::traits::OutboxStore>,
             ),
             crate::config::StoreConfig::Persistent {
                 database_url,
@@ -121,6 +124,8 @@ impl AppState {
                     presence_redis,
                     config.device_presence_ttl_secs,
                 );
+                let outbox_store =
+                    ahand_hub_store::outbox_store::RedisOutboxStore::new(redis_url).await?;
                 (
                     Arc::new(MemoryDeviceStore::with_persistent(
                         PgDeviceStore::with_presence(pool.clone(), presence),
@@ -134,6 +139,7 @@ impl AppState {
                         bootstrap_reservation_ttl,
                     )),
                     Arc::new(PgWebhookDeliveryStore::new(pool)) as Arc<dyn WebhookDeliveryStore>,
+                    Arc::new(outbox_store) as Arc<dyn ahand_hub_core::traits::OutboxStore>,
                 )
             }
         };
@@ -149,12 +155,6 @@ impl AppState {
             Some(store) => crate::output_stream::OutputStream::persistent(store),
             None => crate::output_stream::OutputStream::new(finished_retention, 256),
         });
-        // Task 5 wires the registry to an in-memory OutboxStore so the
-        // refactored fencing/replay/lock paths exercise the trait. Task 6
-        // will branch on `StoreConfig::Persistent` to plug in
-        // `RedisOutboxStore` instead.
-        let outbox: Arc<dyn ahand_hub_core::traits::OutboxStore> =
-            Arc::new(crate::ws::in_memory_outbox::InMemoryOutboxStore::new());
         let connections = Arc::new(crate::ws::device_gateway::ConnectionRegistry::new(outbox));
         let events = Arc::new(match persistent_fanout {
             Some(fanout) => crate::events::EventBus::new_with_fanout(audit_store.clone(), fanout),
