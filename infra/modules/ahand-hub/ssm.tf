@@ -91,11 +91,17 @@ resource "aws_ssm_parameter" "device_bootstrap_device_id" {
 resource "aws_ssm_parameter" "webhook_url" {
   name = "/ahand-hub/${var.env}/WEBHOOK_URL"
   type = "String"
-  # Gateway uses NestJS URI versioning (defaultVersion='1') so the
-  # controller path resolves under /api/v1/ahand/hub-webhook, not
-  # /api/ahand/...
+  # Default value derives from gateway_public_url with the NestJS URI-version
+  # path the gateway exposes (defaultVersion='1' → /api/v1/ahand/hub-webhook).
+  # ignore_changes lets the operator pin a different value via put-parameter
+  # without Terraform reverting it on subsequent applies — same pattern as
+  # database_url, sentry_dsn, device_bootstrap_device_id.
   value = "${var.gateway_public_url}/api/v1/ahand/hub-webhook"
   tags  = local.common_tags
+
+  lifecycle {
+    ignore_changes = [value]
+  }
 }
 
 resource "aws_ssm_parameter" "sentry_dsn" {
