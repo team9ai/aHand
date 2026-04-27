@@ -399,6 +399,15 @@ describe("CloudClient.spawn", () => {
     expect((err as CloudClientError).httpStatus).toBe(500);
   });
 
+  it("bad: 504 POST → CloudClientError(timeout)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({ error: { message: "request timeout" } }, 504)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.spawn({ deviceId: "d", tool: "t" }).catch((e) => e);
+    expect((err as CloudClientError).code).toBe("timeout");
+    expect((err as CloudClientError).httpStatus).toBe(504);
+    expect((err as CloudClientError).message).toBe("request timeout");
+  });
+
   it("bad: fetch throws network error → CloudClientError(network)", async () => {
     const netErr = new Error("ECONNREFUSED");
     const { fn } = mockFetch([() => { throw netErr; }]);
@@ -467,6 +476,633 @@ describe("CloudClient.cancel", () => {
     const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
     await client.cancel("job/with/slash");
     expect(calls[0].url).toContain(encodeURIComponent("job/with/slash"));
+  });
+});
+
+describe("CloudClient.browser", () => {
+  it("happy: POSTs /api/control/browser with snake_case body + Bearer auth", async () => {
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse(
+          { success: true, data: { ok: true }, duration_ms: 12 },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const result = await client.browser({
+      deviceId: "d1",
+      sessionId: "browser-sess",
+      action: "click",
+      params: { ref: "e7" },
+      timeoutMs: 25_000,
+      correlationId: "c-1",
+    });
+
+    expect(calls[0].url).toBe("https://hub.test/api/control/browser");
+    expect(calls[0].init?.method).toBe("POST");
+    expect(calls[0].init?.headers).toMatchObject({
+      Authorization: "Bearer test-token",
+      "Content-Type": "application/json",
+    });
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body).toEqual({
+      device_id: "d1",
+      session_id: "browser-sess",
+      action: "click",
+      params: { ref: "e7" },
+      timeout_ms: 25_000,
+      correlation_id: "c-1",
+    });
+    expect(result).toEqual({
+      success: true,
+      data: { ok: true },
+      error: undefined,
+      binary: undefined,
+      durationMs: 12,
+    });
+  });
+
+  it("happy: decodes binary_data (base64) into Uint8Array with binary_mime", async () => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const b64 = Buffer.from(png).toString("base64");
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            success: true,
+            data: null,
+            binary_data: b64,
+            binary_mime: "image/png",
+            duration_ms: 8,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const r = await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "screenshot",
+    });
+    expect(r.success).toBe(true);
+    expect(r.binary).toBeDefined();
+    expect(r.binary?.mime).toBe("image/png");
+    expect(Array.from(r.binary!.data)).toEqual([0x89, 0x50, 0x4e, 0x47]);
+    expect(r.binary!.data).toBeInstanceOf(Uint8Array);
+    // Falsy `data` (null on the wire) collapses to `undefined`.
+    expect(r.data).toBeUndefined();
+    expect(r.durationMs).toBe(8);
+  });
+
+  it("happy: binary_data missing → result.binary is undefined", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          { success: true, data: { x: 1 }, duration_ms: 5 },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const r = await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "snapshot",
+    });
+    expect(r.binary).toBeUndefined();
+    expect(r.data).toEqual({ x: 1 });
+  });
+
+  it("happy: binary_data empty string → result.binary is undefined", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            success: true,
+            data: null,
+            binary_data: "",
+            binary_mime: "image/png",
+            duration_ms: 1,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const r = await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "screenshot",
+    });
+    expect(r.binary).toBeUndefined();
+  });
+
+  it("happy: binary_mime absent defaults to application/octet-stream", async () => {
+    const bytes = new Uint8Array([1, 2, 3]);
+    const b64 = Buffer.from(bytes).toString("base64");
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          { success: true, binary_data: b64, duration_ms: 2 },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const r = await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "download",
+    });
+    expect(r.binary?.mime).toBe("application/octet-stream");
+    expect(Array.from(r.binary!.data)).toEqual([1, 2, 3]);
+  });
+
+  it("happy: defaults timeout_ms to 30000 when not provided", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ success: true, duration_ms: 1 }, 200),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "snapshot",
+    });
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body.timeout_ms).toBe(30_000);
+  });
+
+  it("happy: omitted params field serializes as empty object {}", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ success: true, duration_ms: 1 }, 200),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "snapshot",
+    });
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body.params).toEqual({});
+    // correlation_id should NOT be present on the wire when caller didn't set it.
+    expect("correlation_id" in body).toBe(false);
+  });
+
+  it("happy: surfaces hub-supplied error string and success=false", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            success: false,
+            data: null,
+            error: "navigation failed",
+            duration_ms: 99,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const r = await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "open",
+      params: { url: "x" },
+    });
+    expect(r.success).toBe(false);
+    expect(r.error).toBe("navigation failed");
+    expect(r.durationMs).toBe(99);
+  });
+
+  it("bad: HTTP 401 → CloudClientError(unauthorized)", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse({ error: { message: "no token" } }, 401),
+    ]);
+    const client = new CloudClient({
+      hubUrl: "https://hub.test",
+      getAuthToken: async () => "",
+      fetch: fn,
+    });
+    const err = await client
+      .browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "open",
+        params: { url: "x" },
+      })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(CloudClientError);
+    expect((err as CloudClientError).code).toBe("unauthorized");
+    expect((err as CloudClientError).httpStatus).toBe(401);
+  });
+
+  it("bad: HTTP 403 → CloudClientError(forbidden)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 403)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("forbidden");
+  });
+
+  it("bad: HTTP 404 → CloudClientError(not_found)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 404)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("not_found");
+  });
+
+  it("bad: HTTP 429 → CloudClientError(rate_limited)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 429)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("rate_limited");
+  });
+
+  it("bad: HTTP 504 → CloudClientError(timeout)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ error: { message: "timed out" } }, 504),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("timeout");
+    expect((err as CloudClientError).httpStatus).toBe(504);
+  });
+
+  it("bad: HTTP 500 → CloudClientError(server_error)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 500)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("server_error");
+  });
+
+  it("bad: fetch throws (network) → CloudClientError(network) with cause", async () => {
+    const cause = new Error("ECONNREFUSED");
+    const fn = (async () => {
+      throw cause;
+    }) as unknown as typeof fetch;
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("network");
+    expect((err as CloudClientError).cause).toBe(cause);
+  });
+
+  it("bad: getAuthToken throws → propagates the original error", async () => {
+    const tokenErr = new Error("refresh failed");
+    const client = new CloudClient({
+      hubUrl: "https://hub.test",
+      getAuthToken: async () => {
+        throw tokenErr;
+      },
+    });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect(err).toBe(tokenErr);
+  });
+
+  it("bad: abort before request → no fetch call, code=abort", async () => {
+    const { fn, calls } = mockFetch([]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const err = await client
+      .browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+        signal: ctrl.signal,
+      })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("abort");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("bad: abort during fetch → CloudClientError(abort)", async () => {
+    const ctrl = new AbortController();
+    const fn = (async (_url: string | URL, init?: RequestInit) => {
+      await new Promise<never>((_, reject) => {
+        const onAbort = () => {
+          const ev = new Error("aborted");
+          (ev as Error & { name: string }).name = "AbortError";
+          reject(ev);
+        };
+        if (init?.signal?.aborted) onAbort();
+        else init?.signal?.addEventListener("abort", onAbort);
+      });
+      // Unreachable.
+      return new Response(null);
+    }) as unknown as typeof fetch;
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const promise = client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "snapshot",
+      signal: ctrl.signal,
+    });
+    setTimeout(() => ctrl.abort(), 5);
+    const err = await promise.catch((e) => e);
+    expect((err as CloudClientError).code).toBe("abort");
+  });
+
+  it("bad: getAuthToken is called once per request", async () => {
+    let calls = 0;
+    const { fn } = mockFetch([
+      () => jsonResponse({ success: true, duration_ms: 1 }, 200),
+    ]);
+    const client = new CloudClient({
+      hubUrl: "https://hub.test",
+      getAuthToken: async () => {
+        calls++;
+        return "tok";
+      },
+      fetch: fn,
+    });
+    await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "snapshot",
+    });
+    expect(calls).toBe(1);
+  });
+
+  it("bad: abort during getAuthToken → no fetch call, code=abort", async () => {
+    // Regression guard for the post-token-fetch abort fast-path. If
+    // someone removes the second `signal?.aborted` check, an abort that
+    // fires while the token is being refreshed would still proceed to
+    // call fetch — this test catches that.
+    let fetchCalls = 0;
+    const fn = (async () => {
+      fetchCalls++;
+      return jsonResponse({ success: true, duration_ms: 1 }, 200);
+    }) as unknown as typeof fetch;
+    const ctrl = new AbortController();
+    const client = new CloudClient({
+      hubUrl: "https://hub.test",
+      getAuthToken: async () => {
+        // Simulate a slow token refresh; fire abort while we wait.
+        await new Promise((r) => setTimeout(r, 10));
+        return "tok";
+      },
+      fetch: fn,
+    });
+    const promise = client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "snapshot",
+      signal: ctrl.signal,
+    });
+    // Abort while getAuthToken is still pending.
+    setTimeout(() => ctrl.abort(), 1);
+    const err = await promise.catch((e) => e);
+    expect((err as CloudClientError).code).toBe("abort");
+    expect(fetchCalls).toBe(0);
+  });
+
+  it("bad: response missing 'success' field → CloudClientError(server_error)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ duration_ms: 1 }, 200),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await expect(
+      client.browser({ deviceId: "d", sessionId: "s", action: "snapshot" }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("bad: response with non-boolean 'success' (e.g. 1) → CloudClientError(server_error)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ success: 1, duration_ms: 1 }, 200),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await expect(
+      client.browser({ deviceId: "d", sessionId: "s", action: "snapshot" }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("bad: HTTP 400 → CloudClientError(bad_request)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ error: { message: "invalid params" } }, 400),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(CloudClientError);
+    expect((err as CloudClientError).code).toBe("bad_request");
+    expect((err as CloudClientError).httpStatus).toBe(400);
+  });
+
+  it("bad: HTTP 502 → CloudClientError(server_error) (non-mapped 5xx)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 502)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("server_error");
+    expect((err as CloudClientError).httpStatus).toBe(502);
+  });
+
+  it("bad: HTTP 503 → CloudClientError(server_error) (non-mapped 5xx)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 503)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("server_error");
+    expect((err as CloudClientError).httpStatus).toBe(503);
+  });
+
+  it("bad: HTTP 418 → CloudClientError(bad_request) (non-mapped 4xx)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 418)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client
+      .browser({ deviceId: "d", sessionId: "s", action: "snapshot" })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("bad_request");
+    expect((err as CloudClientError).httpStatus).toBe(418);
+  });
+
+  it("bad: 200 with non-JSON body → CloudClientError(server_error)", async () => {
+    // Upstream gateway can swap an HTML 502 page in front of a 200 status.
+    // `res.json()` then throws a `SyntaxError` which must surface as
+    // `server_error`, not a raw exception.
+    const fakeFetch = async () =>
+      new Response("<html>oops</html>", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("bad: AbortError thrown by res.json() body stream → CloudClientError(abort)", async () => {
+    // If the caller aborts while the body is still draining, `res.json()`
+    // throws an `AbortError`. That must surface as `abort`, not `network`.
+    const fakeFetch = async () => {
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.error(new DOMException("aborted", "AbortError"));
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "abort" });
+  });
+
+  it("bad: generic error in res.json() body stream → CloudClientError(network)", async () => {
+    // A mid-body `TypeError` (e.g. socket reset) must surface as `network`.
+    const fakeFetch = async () => {
+      const stream = new ReadableStream({
+        pull(controller) {
+          controller.error(new TypeError("network reset"));
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "network" });
+  });
+
+  it("forwards AbortSignal to underlying fetch", async () => {
+    // Sanity check: the caller-supplied signal must reach `fetch()` so
+    // aborts actually cancel the in-flight request.
+    let capturedSignal: AbortSignal | undefined | null;
+    const fakeFetch = async (
+      _input: unknown,
+      init?: RequestInit,
+    ): Promise<Response> => {
+      capturedSignal = init?.signal;
+      return new Response(
+        JSON.stringify({ success: true, duration_ms: 1 }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    };
+    const ctrl = new AbortController();
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await client.browser({
+      deviceId: "d",
+      sessionId: "s",
+      action: "snapshot",
+      signal: ctrl.signal,
+    });
+    expect(capturedSignal).toBe(ctrl.signal);
+  });
+
+  it("rejects malformed root: response is the literal value null", async () => {
+    // `JSON.parse("null")` is the literal value `null`. Reading
+    // `.success` off it would throw `TypeError: Cannot read properties
+    // of null` — guard must reject before that.
+    const fakeFetch = async () =>
+      new Response("null", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("rejects malformed root: response is a non-object (number)", async () => {
+    // A misbehaving proxy could emit a bare number/string. The root
+    // check must reject these as malformed instead of crashing on
+    // property access.
+    const fakeFetch = async () =>
+      new Response("42", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("rejects malformed root: response is a JSON array", async () => {
+    // `JSON.parse("[]")` returns an array — `typeof [] === "object"` so
+    // it slips past the `typeof !== "object"` check, but reading
+    // `.success` returns `undefined`, which fails the boolean check.
+    // Pin this so a future refactor that loosens the boolean check
+    // (e.g. coerces with `Boolean(json.success)`) does not silently
+    // start accepting array roots.
+    const fakeFetch = async () =>
+      new Response("[]", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(
+      client.browser({
+        deviceId: "d",
+        sessionId: "s",
+        action: "snapshot",
+      }),
+    ).rejects.toMatchObject({ code: "server_error" });
   });
 });
 

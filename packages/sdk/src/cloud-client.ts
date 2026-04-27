@@ -79,6 +79,51 @@ export interface SpawnResult {
   durationMs: number;
 }
 
+/**
+ * Parameters for a single `browser()` invocation. Maps to the hub's
+ * `POST /api/control/browser` request body (snake_case wire format).
+ */
+export interface BrowserParams {
+  deviceId: string;
+  /** Browser session identifier (derived by HostComponent). */
+  sessionId: string;
+  /** Action verb, e.g. `"open"`, `"click"`, `"snapshot"`, `"screenshot"`. */
+  action: string;
+  /**
+   * Action-specific parameters. Sent verbatim as the `params` JSON
+   * object on the wire — defaults to `{}` if omitted (NOT dropped).
+   */
+  params?: Record<string, unknown>;
+  /** Per-request timeout. Defaults to 30 000 ms when not provided. */
+  timeoutMs?: number;
+  /**
+   * Idempotency / tracing key. Forwarded as `correlation_id` on the
+   * wire; sent only when provided.
+   */
+  correlationId?: string;
+  /**
+   * AbortSignal — aborting cancels the in-flight fetch and rejects with
+   * a `CloudClientError` whose `code === "abort"`.
+   */
+  signal?: AbortSignal;
+}
+
+/**
+ * Resolved result of a successful `browser()` call. Decoded from the
+ * hub's snake_case JSON response: `binary_data` (base64) → `Uint8Array`
+ * in `binary.data`; `binary_mime` → `binary.mime`. When the hub omits
+ * `binary_data` (or sends an empty string), `binary` is `undefined`.
+ */
+export interface BrowserResult {
+  success: boolean;
+  /** Parsed `result_json` from the device, or `undefined` when absent. */
+  data?: unknown;
+  /** Hub-supplied error string (only set when `success === false`). */
+  error?: string;
+  binary?: { data: Uint8Array; mime: string };
+  durationMs: number;
+}
+
 /** Discriminated error codes surfaced by `CloudClient`. */
 export type CloudClientErrorCode =
   | "unauthorized"
@@ -90,7 +135,8 @@ export type CloudClientErrorCode =
   | "stream_ended"
   | "job_error"
   | "abort"
-  | "network";
+  | "network"
+  | "timeout";
 
 /**
  * Typed error raised by `CloudClient`. Use `.code` to discriminate,
@@ -159,6 +205,9 @@ async function toTypedHttpError(res: Response): Promise<CloudClientError> {
       break;
     case 429:
       code = "rate_limited";
+      break;
+    case 504:
+      code = "timeout";
       break;
     default:
       code = res.status >= 500 ? "server_error" : "bad_request";
@@ -301,6 +350,131 @@ export class CloudClient {
     } finally {
       p.signal?.removeEventListener("abort", abortHandler);
     }
+  }
+
+  /**
+   * `POST /api/control/browser`. Single request-response (no SSE):
+   * dispatches a browser action via the hub, decodes the snake_case
+   * response into camelCase + `Uint8Array` for binary payloads, and
+   * resolves with a `BrowserResult`. Errors map to the same taxonomy
+   * as `spawn()` (401→`unauthorized`, 504→`timeout`, etc).
+   */
+  async browser(params: BrowserParams): Promise<BrowserResult> {
+    if (params.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted before request");
+    }
+
+    const fetchImpl = this.fetchImpl();
+    const token = await this.opts.getAuthToken();
+    if (params.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
+
+    // Wire format is snake_case. We always send `params: {}` (not
+    // omitted) so the hub side always sees an object — matches the
+    // schema Task 9 lands. `correlation_id` is sent only when set.
+    const requestBody: Record<string, unknown> = {
+      device_id: params.deviceId,
+      session_id: params.sessionId,
+      action: params.action,
+      params: params.params ?? {},
+      timeout_ms: params.timeoutMs ?? 30_000,
+    };
+    if (params.correlationId !== undefined) {
+      requestBody.correlation_id = params.correlationId;
+    }
+
+    let res: Response;
+    try {
+      res = await fetchImpl(`${this.opts.hubUrl}/api/control/browser`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+        signal: params.signal,
+      });
+    } catch (err) {
+      throw this.normalizeFetchError(err);
+    }
+    if (!res.ok) throw await toTypedHttpError(res);
+
+    let json: {
+      success?: boolean;
+      data?: unknown;
+      error?: string | null;
+      binary_data?: string | null;
+      binary_mime?: string | null;
+      duration_ms?: number;
+    };
+    try {
+      json = (await res.json()) as typeof json;
+    } catch (e: unknown) {
+      // `res.json()` can fail two ways after the headers/status looked
+      // OK: (a) the signal aborted while we were still draining the
+      // body, or (b) the body wasn't valid JSON (e.g. an upstream
+      // gateway swapped in an HTML 502 page with a 200 status). Both
+      // need to surface as proper `CloudClientError`s so callers don't
+      // see a raw `SyntaxError` / `AbortError` leaking through.
+      if (isAbortError(e)) {
+        throw new CloudClientError(
+          "abort",
+          "browser request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw new CloudClientError("network", String(e), { cause: e });
+    }
+
+    // Strict shape check: a missing or non-boolean `success` field
+    // means the hub's wire contract has drifted (e.g. a serializer
+    // change emitting `success: 1`). Coercing `=== true` would silently
+    // turn every such response into `success: false` with no signal —
+    // throw instead so the regression is immediately visible. We also
+    // guard the root itself: `JSON.parse("null")` is the literal value
+    // `null`, and a misbehaving proxy could return any non-object
+    // primitive — accessing `.success` on those would throw a
+    // `TypeError` that would escape uncaught.
+    if (
+      json === null ||
+      typeof json !== "object" ||
+      typeof (json as { success?: unknown }).success !== "boolean"
+    ) {
+      throw new CloudClientError(
+        "server_error",
+        "Hub response malformed: 'success' field missing, not an object, or not a boolean",
+      );
+    }
+
+    // Decode base64 binary payload into a Uint8Array. `Buffer` is
+    // available everywhere this SDK runs (Node + Tauri renderer with
+    // node-compat shim) — same assumption already made in
+    // `connection.ts`. `Buffer` is a `Uint8Array` subclass, which
+    // satisfies the type without an extra copy.
+    const binaryB64 = json.binary_data;
+    const binary =
+      binaryB64 && binaryB64.length > 0
+        ? {
+            data: Buffer.from(binaryB64, "base64") as Uint8Array,
+            mime: json.binary_mime ?? "application/octet-stream",
+          }
+        : undefined;
+
+    return {
+      success: json.success as boolean,
+      data: json.data ?? undefined,
+      error: json.error ? json.error : undefined,
+      binary,
+      durationMs: typeof json.duration_ms === "number" ? json.duration_ms : 0,
+    };
   }
 
   /** `POST /api/control/jobs/{id}/cancel`. Returns 202 with no body. */

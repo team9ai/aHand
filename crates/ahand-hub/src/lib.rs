@@ -1,6 +1,7 @@
 pub mod audit_writer;
 pub mod auth;
 pub mod bootstrap;
+pub mod browser_service;
 pub mod config;
 pub mod control_jobs;
 pub mod events;

@@ -33,6 +33,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "tower",

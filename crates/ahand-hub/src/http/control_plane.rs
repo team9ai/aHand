@@ -7,6 +7,7 @@
 //!   * `POST /api/control/jobs`            — dispatch a job
 //!   * `GET  /api/control/jobs/{id}/stream` — SSE event stream
 //!   * `POST /api/control/jobs/{id}/cancel` — best-effort cancel
+//!   * `POST /api/control/browser`         — synchronous browser command
 //!
 //! Auth: **control-plane JWT** (`token_type = ControlPlane`) only —
 //! device JWTs are rejected by [`verify_control_plane_jwt`]. The JWT's
@@ -16,10 +17,16 @@
 //! Rate limiting: per-`external_user_id` token bucket (see
 //! [`crate::state::default_control_plane_rate_limiter`]).
 //!
-//! Idempotency: POST accepts an optional `correlation_id`. A second
-//! POST with the same `(external_user_id, correlation_id)` pair while
-//! the original job is still live returns the original `job_id`
-//! without re-dispatching.
+//! Idempotency: `POST /api/control/jobs` accepts an optional
+//! `correlation_id`. A second POST with the same
+//! `(external_user_id, correlation_id)` pair while the original job is
+//! still live returns the original `job_id` without re-dispatching.
+//! `POST /api/control/browser` accepts the field in its wire schema
+//! but does not currently dedupe — `correlation_id` is forwarded into
+//! `BrowserCommandInput` but discarded by `browser_service::execute`.
+//! Hub-layer dedupe for the browser endpoint is tracked as a
+//! follow-up; today's worker semantics rely on best-effort retries
+//! via fresh requests.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -36,11 +43,15 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use base64::Engine as _;
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::browser_service::{self, BrowserCommandInput};
 use crate::control_jobs::ControlJobEvent;
+use crate::http::api_error::{ApiError, ApiResult};
+use crate::http::browser::map_service_error;
 use crate::state::AppState;
 
 /// Mount the control-plane router. The caller passes the shared
@@ -51,6 +62,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/control/jobs", post(create_job))
         .route("/api/control/jobs/{id}/stream", get(stream_job))
         .route("/api/control/jobs/{id}/cancel", post(cancel_job))
+        .route("/api/control/browser", post(browser_command_control))
         .layer(middleware::from_fn_with_state(
             state,
             require_control_plane_jwt,
@@ -550,4 +562,182 @@ impl IntoResponse for ControlError {
         )
             .into_response()
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// `POST /api/control/browser` — synchronous worker-side browser command.
+//
+// Wire-format twin of the dashboard `POST /api/browser` handler with
+// two differences:
+//   1. Auth is via control-plane JWT (mounted under the same middleware
+//      that protects `/api/control/jobs`), and ownership is checked
+//      against `claims.external_user_id == device.external_user_id`.
+//   2. The response includes a `duration_ms` field measuring elapsed
+//      time from request start to service return — the SDK surfaces
+//      this so callers can observe round-trip latency.
+//
+// Both endpoints share `browser_service::execute()` (refactored in
+// Task 8) and the same error mapper `http::browser::map_service_error`,
+// so error codes and HTTP statuses are byte-for-byte identical to the
+// dashboard endpoint.
+// ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct ControlBrowserRequest {
+    pub device_id: String,
+    pub session_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+    #[serde(default = "default_browser_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+}
+
+fn default_browser_timeout_ms() -> u64 {
+    30_000
+}
+
+#[derive(Debug, Serialize)]
+pub struct ControlBrowserResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_mime: Option<String>,
+    pub duration_ms: u64,
+}
+
+pub async fn browser_command_control(
+    Extension(claims): Extension<ControlPlaneJwtClaims>,
+    State(state): State<AppState>,
+    body: Result<Json<ControlBrowserRequest>, JsonRejection>,
+) -> ApiResult<Json<ControlBrowserResponse>> {
+    // Validate the scope claim before any DB / WS work, mirroring the
+    // sibling handlers (`create_job`, `stream_job`, `cancel_job`). A
+    // token minted with a non-`jobs:execute` scope (e.g. `jobs:read`)
+    // must be rejected before we touch the device store or rate
+    // limiter.
+    if claims.scope != "jobs:execute" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT scope does not permit this action",
+        ));
+    }
+
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
+
+    // Per-user rate-limit BEFORE any DB / WS work, mirroring the jobs
+    // handler. A storm of bogus POSTs from one tenant can't DOS the
+    // device store or burn WS dispatch slots for other tenants.
+    if state
+        .control_rate_limiter
+        .check_key(&claims.external_user_id)
+        .is_err()
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Rate limit exceeded for this user",
+        ));
+    }
+
+    // Ownership check: the device must exist AND be owned by the
+    // calling user. We deliberately return 403 (not 404) on mismatch
+    // here because the SDK's own error contract distinguishes
+    // "you don't own this device" from "device is offline / unknown" —
+    // and at this point the JWT has already authenticated, so the
+    // status-code oracle is a non-issue (the caller can prove their
+    // own user id from the JWT they minted).
+    let device = state
+        .devices
+        .find_by_id(&body.device_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("device store: {e}")))?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "DEVICE_NOT_FOUND",
+                format!("Device {} not found", body.device_id),
+            )
+        })?;
+    if device.external_user_id.as_deref() != Some(claims.external_user_id.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "NOT_DEVICE_OWNER",
+            format!("Caller does not own device {}", body.device_id),
+        ));
+    }
+    // Device-allowlist enforcement: if the JWT is scoped to a subset
+    // of devices, refuse 403 just like `create_job` does.
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&body.device_id)
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT does not grant access to this device",
+        ));
+    }
+
+    let started = std::time::Instant::now();
+
+    // Stringify params once; an empty `params` field is forwarded as
+    // an empty string (the daemon already accepts that).
+    let params_json = body
+        .params
+        .map(|p| serde_json::to_string(&p).unwrap_or_default())
+        .unwrap_or_default();
+
+    let response = browser_service::execute(
+        &state,
+        BrowserCommandInput {
+            device_id: body.device_id,
+            session_id: body.session_id,
+            action: body.action,
+            params_json,
+            timeout_ms: body.timeout_ms,
+            correlation_id: body.correlation_id,
+        },
+    )
+    .await
+    .map_err(map_service_error)?;
+
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    let data = if response.result_json.is_empty() {
+        None
+    } else {
+        serde_json::from_str(&response.result_json).ok()
+    };
+    let binary_data = if response.binary_data.is_empty() {
+        None
+    } else {
+        Some(base64::engine::general_purpose::STANDARD.encode(&response.binary_data))
+    };
+    let binary_mime = if response.binary_mime.is_empty() {
+        None
+    } else {
+        Some(response.binary_mime)
+    };
+    let error = if response.error.is_empty() {
+        None
+    } else {
+        Some(response.error)
+    };
+
+    Ok(Json(ControlBrowserResponse {
+        success: response.success,
+        data,
+        error,
+        binary_data,
+        binary_mime,
+        duration_ms,
+    }))
 }
