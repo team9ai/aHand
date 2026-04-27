@@ -106,11 +106,13 @@ impl ConnectionRegistry {
             let _ = self.outbox.release_lock(&device_id, &session_id).await;
             return Err(err);
         }
-        let replay = self
-            .outbox
-            .unacked_frames(&device_id, last_ack)
-            .await
-            .unwrap_or_default();
+        let replay = match self.outbox.unacked_frames(&device_id, last_ack).await {
+            Ok(frames) => frames,
+            Err(err) => {
+                let _ = self.outbox.release_lock(&device_id, &session_id).await;
+                return Err(err);
+            }
+        };
 
         // 3) Build per-connection state.
         let (tx, rx) = mpsc::unbounded_channel();
@@ -587,11 +589,25 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             .await?;
         let device_id = envelope.device_id.clone();
         let hostname = hello.hostname.clone();
-        let (connection_id, mut outbound_rx, close_rx) = state
+        let (connection_id, mut outbound_rx, close_rx) = match state
             .connections
             .register(device_id.clone(), hello.last_ack)
             .await
-            .map_err(anyhow::Error::from)?;
+        {
+            Ok(tuple) => tuple,
+            Err(HubError::OutboxLockContention(_)) => {
+                let _ = send_handshake_close(
+                    &mut sender,
+                    axum::extract::ws::close_code::AGAIN,
+                    "outbox-lock-contention",
+                )
+                .await;
+                return Err(anyhow::Error::from(HubError::OutboxLockContention(
+                    device_id.clone(),
+                )));
+            }
+            Err(err) => return Err(anyhow::Error::from(err)),
+        };
         let (control_tx, mut control_rx) = mpsc::unbounded_channel::<WsMessage>();
         let last_inbound_at = Arc::new(AsyncMutex::new(tokio::time::Instant::now()));
         active_connection = Some((device_id.clone(), connection_id));
