@@ -155,26 +155,31 @@ impl ConnectionRegistry {
             })
         };
 
-        // 5) Spawn kick subscriber.
+        // 5) Subscribe to kicks BEFORE returning, so a kick that fires
+        //    moments after register completes (e.g., a sibling replica
+        //    racing for the same device) cannot slip through the window
+        //    while a spawned task hasn't yet issued SUBSCRIBE. The
+        //    subscribe_kick call awaits the underlying SUBSCRIBE; the
+        //    spawned task only owns the watch loop.
+        let mut kick_sub = match self.outbox.subscribe_kick(&device_id).await {
+            Ok(sub) => sub,
+            Err(err) => {
+                tracing::warn!(
+                    device_id = %device_id,
+                    error = %err,
+                    "failed to subscribe to kick channel; releasing lock",
+                );
+                let _ = self.outbox.release_lock(&device_id, &session_id).await;
+                return Err(err);
+            }
+        };
         let kick_task = {
-            let outbox = self.outbox.clone();
-            let device_id = device_id.clone();
+            let device_id_inner = device_id.clone();
             let close_tx = close_tx.clone();
             tokio::spawn(async move {
-                let mut sub = match outbox.subscribe_kick(&device_id).await {
-                    Ok(sub) => sub,
-                    Err(err) => {
-                        tracing::warn!(
-                            device_id = %device_id,
-                            error = %err,
-                            "failed to subscribe to kick channel",
-                        );
-                        return;
-                    }
-                };
-                if sub.recv.changed().await.is_ok() {
+                if kick_sub.recv.changed().await.is_ok() {
                     tracing::info!(
-                        device_id = %device_id,
+                        device_id = %device_id_inner,
                         "received kick, signalling close",
                     );
                     let _ = close_tx.send(true);
