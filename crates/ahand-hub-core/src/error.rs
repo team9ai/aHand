@@ -34,6 +34,8 @@ pub enum HubError {
     InvalidSignature,
     #[error("invalid peer ack {ack}, max issued seq is {max}")]
     InvalidPeerAck { ack: u64, max: u64 },
+    #[error("outbox lock contention for device {0}")]
+    OutboxLockContention(String),
     #[error("internal: {0}")]
     Internal(String),
 }
