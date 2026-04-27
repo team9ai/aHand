@@ -45,8 +45,17 @@ struct ActiveConnection {
     kick_task: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
 }
 
-pub(crate) struct OutboundFrame {
-    pub(crate) frame: Vec<u8>,
+pub struct OutboundFrame {
+    pub frame: Vec<u8>,
+}
+
+impl OutboundFrame {
+    /// Borrow the frame bytes as a slice. Convenience helper for
+    /// integration tests that drain the receiver and want to decode
+    /// without poking at the field directly.
+    pub fn as_slice(&self) -> &[u8] {
+        self.frame.as_slice()
+    }
 }
 
 impl ConnectionRegistry {
@@ -57,7 +66,7 @@ impl ConnectionRegistry {
         }
     }
 
-    pub(crate) async fn register(
+    pub async fn register(
         &self,
         device_id: String,
         last_ack: u64,
@@ -344,7 +353,7 @@ impl ConnectionRegistry {
             .unwrap_or(false)
     }
 
-    pub(crate) async fn observe_ack(&self, device_id: &str, ack: u64) -> anyhow::Result<()> {
+    pub async fn observe_ack(&self, device_id: &str, ack: u64) -> anyhow::Result<()> {
         if ack == 0 {
             return Ok(());
         }
@@ -377,7 +386,7 @@ impl ConnectionRegistry {
         self.observe_ack(device_id, ack).await
     }
 
-    pub(crate) async fn unregister(
+    pub async fn unregister(
         &self,
         device_id: &str,
         connection_id: uuid::Uuid,
