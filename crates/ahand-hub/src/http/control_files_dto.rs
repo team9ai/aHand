@@ -36,12 +36,22 @@
 //!
 //! ## Error semantics
 //!
-//! Daemon-side failures (file not found, permission denied, policy
-//! denied, ...) come back as `success: false` with an `error` field
-//! and HTTP 200. Hub-level failures (auth, ownership, offline,
-//! timeout, rate limit) return appropriate 4xx/5xx HTTP statuses with
-//! the standard `{error: {code, message}}` envelope. This matches the
-//! browser endpoint.
+//! Most daemon-side failures (file not found, I/O error, encoding
+//! mismatch, ...) come back as `success: false` with an `error` field
+//! and HTTP 200 — callers commonly want to handle these gracefully
+//! (e.g. probing for an optional config) rather than catching a
+//! thrown error.
+//!
+//! The exception is `policy_denied`: the hub elevates it to a
+//! hub-level HTTP 403 with body `{error: {code: "POLICY_DENIED", ...}}`
+//! so the SDK can branch on `err.code === "policy_denied"` without
+//! inspecting the response envelope. A path the daemon's policy
+//! refuses isn't fixable by retrying — it deserves the typed-error
+//! treatment, alongside auth and ownership failures.
+//!
+//! Hub-level failures (auth, ownership, offline, timeout, rate limit)
+//! return appropriate 4xx/5xx HTTP statuses with the standard
+//! `{error: {code, message}}` envelope.
 
 use ahand_protocol as proto;
 use serde::{Deserialize, Serialize};
@@ -118,7 +128,14 @@ pub fn build_request_operation(
         "glob" => Operation::Glob(parse!(GlobParams).into()),
         "read_text" => Operation::ReadText(parse!(ReadTextParams).into()),
         "read_binary" => Operation::ReadBinary(parse!(ReadBinaryParams).into()),
-        "read_image" => Operation::ReadImage(parse!(ReadImageParams).into()),
+        "read_image" => {
+            Operation::ReadImage(parse!(ReadImageParams).try_into().map_err(|msg: String| {
+                DtoError::InvalidParams {
+                    op: "read_image".into(),
+                    message: msg,
+                }
+            })?)
+        }
         "write" => Operation::Write(parse!(WriteParams).try_into().map_err(|msg: String| {
             DtoError::InvalidParams {
                 op: "write".into(),
@@ -131,7 +148,12 @@ pub fn build_request_operation(
                 message: msg,
             }
         })?),
-        "delete" => Operation::Delete(parse!(DeleteParams).into()),
+        "delete" => Operation::Delete(parse!(DeleteParams).try_into().map_err(|msg: String| {
+            DtoError::InvalidParams {
+                op: "delete".into(),
+                message: msg,
+            }
+        })?),
         "chmod" => Operation::Chmod(parse!(ChmodParams).try_into().map_err(|msg: String| {
             DtoError::InvalidParams {
                 op: "chmod".into(),
@@ -325,28 +347,35 @@ pub struct ReadImageParams {
     #[serde(default)]
     pub no_follow_symlink: bool,
 }
-impl From<ReadImageParams> for proto::FileReadImage {
-    fn from(p: ReadImageParams) -> Self {
-        Self {
+impl TryFrom<ReadImageParams> for proto::FileReadImage {
+    type Error = String;
+    fn try_from(p: ReadImageParams) -> Result<Self, Self::Error> {
+        let output_format = match p.output_format.as_deref() {
+            None | Some("") | Some("original") => proto::ImageFormat::Original as i32,
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "jpeg" | "jpg" => proto::ImageFormat::Jpeg as i32,
+                "png" => proto::ImageFormat::Png as i32,
+                "webp" => proto::ImageFormat::Webp as i32,
+                // Reject unknown values explicitly so a user typo
+                // (`tiff`, `gif`) doesn't silently fall back to
+                // Original — that would mask the bug at the hub and
+                // hand the daemon something it didn't ask for.
+                other => {
+                    return Err(format!(
+                        "output_format '{other}' is not one of: original, jpeg, png, webp"
+                    ));
+                }
+            },
+        };
+        Ok(Self {
             path: p.path,
             max_width: p.max_width,
             max_height: p.max_height,
             max_bytes: p.max_bytes,
             quality: p.quality,
-            output_format: Some(image_format_to_i32(p.output_format.as_deref())),
+            output_format: Some(output_format),
             no_follow_symlink: p.no_follow_symlink,
-        }
-    }
-}
-fn image_format_to_i32(s: Option<&str>) -> i32 {
-    match s.unwrap_or("").to_ascii_lowercase().as_str() {
-        "" | "original" => proto::ImageFormat::Original as i32,
-        "jpeg" | "jpg" => proto::ImageFormat::Jpeg as i32,
-        "png" => proto::ImageFormat::Png as i32,
-        "webp" => proto::ImageFormat::Webp as i32,
-        // Unknown values fall back to the proto default — daemon will
-        // surface a clearer error than the hub could.
-        _ => proto::ImageFormat::Original as i32,
+        })
     }
 }
 
@@ -552,24 +581,29 @@ pub struct DeleteParams {
     #[serde(default)]
     pub no_follow_symlink: bool,
 }
-impl From<DeleteParams> for proto::FileDelete {
-    fn from(p: DeleteParams) -> Self {
-        let mode = match p
-            .mode
-            .as_deref()
-            .unwrap_or("trash")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "permanent" => proto::DeleteMode::Permanent as i32,
-            _ => proto::DeleteMode::Trash as i32,
+impl TryFrom<DeleteParams> for proto::FileDelete {
+    type Error = String;
+    fn try_from(p: DeleteParams) -> Result<Self, Self::Error> {
+        let mode = match p.mode.as_deref() {
+            None | Some("") | Some("trash") => proto::DeleteMode::Trash as i32,
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "trash" => proto::DeleteMode::Trash as i32,
+                "permanent" => proto::DeleteMode::Permanent as i32,
+                // Reject unknown values explicitly — a typo like
+                // "permaent" must not silently degrade to "trash"
+                // (which has very different filesystem semantics
+                // than "permanent" and could surprise the caller).
+                other => {
+                    return Err(format!("mode '{other}' is not one of: trash, permanent"));
+                }
+            },
         };
-        Self {
+        Ok(Self {
             path: p.path,
             recursive: p.recursive,
             mode,
             no_follow_symlink: p.no_follow_symlink,
-        }
+        })
     }
 }
 
@@ -619,30 +653,35 @@ pub struct AclEntryJson {
     #[serde(default)]
     pub entry_type: Option<String>,
 }
-impl From<WindowsAclJson> for proto::WindowsAcl {
-    fn from(p: WindowsAclJson) -> Self {
-        Self {
-            entries: p.entries.into_iter().map(Into::into).collect(),
-        }
+impl TryFrom<WindowsAclJson> for proto::WindowsAcl {
+    type Error = String;
+    fn try_from(p: WindowsAclJson) -> Result<Self, Self::Error> {
+        let entries: Result<Vec<_>, _> = p.entries.into_iter().map(TryInto::try_into).collect();
+        Ok(Self { entries: entries? })
     }
 }
-impl From<AclEntryJson> for proto::AclEntry {
-    fn from(p: AclEntryJson) -> Self {
-        let entry_type = match p
-            .entry_type
-            .as_deref()
-            .unwrap_or("allow")
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "deny" => proto::AclEntryType::Deny as i32,
-            _ => proto::AclEntryType::Allow as i32,
+impl TryFrom<AclEntryJson> for proto::AclEntry {
+    type Error = String;
+    fn try_from(p: AclEntryJson) -> Result<Self, Self::Error> {
+        let entry_type = match p.entry_type.as_deref() {
+            None | Some("") | Some("allow") => proto::AclEntryType::Allow as i32,
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "allow" => proto::AclEntryType::Allow as i32,
+                "deny" => proto::AclEntryType::Deny as i32,
+                // Reject unknown values explicitly — a typo on a
+                // chmod ACL entry must surface, since silently
+                // defaulting to "allow" would be a security
+                // footgun (the caller may have meant "deny").
+                other => {
+                    return Err(format!("entry_type '{other}' is not one of: allow, deny"));
+                }
+            },
         };
-        Self {
+        Ok(Self {
             principal: p.principal,
             access_mask: p.access_mask,
             entry_type,
-        }
+        })
     }
 }
 impl TryFrom<ChmodParams> for proto::FileChmod {
@@ -651,7 +690,7 @@ impl TryFrom<ChmodParams> for proto::FileChmod {
         use proto::file_chmod::Permission;
         let permission = match p.permission {
             ChmodPermission::Unix { unix } => Permission::Unix(unix.into()),
-            ChmodPermission::Windows { windows } => Permission::Windows(windows.into()),
+            ChmodPermission::Windows { windows } => Permission::Windows(windows.try_into()?),
         };
         Ok(Self {
             path: p.path,

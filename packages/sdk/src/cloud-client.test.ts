@@ -1179,21 +1179,24 @@ describe("CloudClient.files", () => {
     expect("timeout_ms" in body).toBe(false);
   });
 
-  it("happy: surfaces daemon-side error inside the result envelope", async () => {
-    // policy_denied is the canonical "daemon refused" case. The SDK
-    // surfaces it as `success: false` plus an `error` field — NOT as a
-    // thrown CloudClientError.
+  it("happy: surfaces non-policy daemon errors inside the result envelope", async () => {
+    // Daemon-level errors that the user typically wants to handle
+    // gracefully (NOT_FOUND, IO, ENCODING, ...) come back inside the
+    // resolved FileResult — `success: false` + an `error` field —
+    // NOT as a thrown CloudClientError. (The exception is
+    // POLICY_DENIED, which the hub elevates to HTTP 403; see the
+    // bad-path test below.)
     const { fn } = mockFetch([
       () =>
         jsonResponse(
           {
-            request_id: "r-pol",
-            operation: "delete",
+            request_id: "r-nf",
+            operation: "stat",
             success: false,
             error: {
-              code: "policy_denied",
-              message: "policy refused: protected path",
-              path: "/etc/shadow",
+              code: "not_found",
+              message: "no such file",
+              path: "/does/not/exist",
             },
             duration_ms: 4,
           },
@@ -1203,13 +1206,13 @@ describe("CloudClient.files", () => {
     const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
     const r = await client.files({
       deviceId: "d",
-      operation: "delete",
-      params: { path: "/etc/shadow", recursive: false, mode: "permanent" },
+      operation: "stat",
+      params: { path: "/does/not/exist" },
     });
     expect(r.success).toBe(false);
-    expect(r.error?.code).toBe("policy_denied");
-    expect(r.error?.path).toBe("/etc/shadow");
-    expect(r.error?.message).toContain("policy refused");
+    expect(r.error?.code).toBe("not_found");
+    expect(r.error?.path).toBe("/does/not/exist");
+    expect(r.error?.message).toContain("no such file");
     expect(r.result).toBeUndefined();
   });
 
@@ -1285,6 +1288,50 @@ describe("CloudClient.files", () => {
     await expect(
       client.files({ deviceId: "d", operation: "stat", params: { path: "/tmp/x" } }),
     ).rejects.toMatchObject({ code: "unauthorized", httpStatus: 401 });
+  });
+
+  it("bad: HTTP 403 with POLICY_DENIED → CloudClientError(policy_denied)", async () => {
+    // The hub elevates daemon-side POLICY_DENIED to HTTP 403 with a
+    // distinguishing code, so the SDK surfaces it as a typed error.
+    // A plain 403 with code FORBIDDEN (e.g. NOT_DEVICE_OWNER) still
+    // maps to "forbidden" — the discriminator is the body's
+    // `error.code`, not just the status.
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          { error: { code: "POLICY_DENIED", message: "policy refused: protected path" } },
+          403,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await expect(
+      client.files({
+        deviceId: "d",
+        operation: "delete",
+        params: { path: "/etc/shadow", mode: "permanent" },
+      }),
+    ).rejects.toMatchObject({
+      code: "policy_denied",
+      httpStatus: 403,
+      message: "policy refused: protected path",
+    });
+  });
+
+  it("bad: HTTP 403 with FORBIDDEN → CloudClientError(forbidden)", async () => {
+    // Sanity-check the discriminator: a 403 with a non-POLICY_DENIED
+    // body code (e.g. NOT_DEVICE_OWNER, FORBIDDEN) must still surface
+    // as `forbidden`, not `policy_denied`.
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          { error: { code: "NOT_DEVICE_OWNER", message: "not your device" } },
+          403,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await expect(
+      client.files({ deviceId: "d", operation: "stat", params: { path: "/tmp/x" } }),
+    ).rejects.toMatchObject({ code: "forbidden", httpStatus: 403 });
   });
 
   it("bad: HTTP 409 with DEVICE_OFFLINE → CloudClientError(device_offline)", async () => {

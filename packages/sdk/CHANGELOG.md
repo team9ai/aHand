@@ -50,6 +50,14 @@
   a known device is not currently connected) maps to this code. Other
   409s fall through to `bad_request`. Existing `spawn()` / `browser()`
   consumers are unaffected because neither endpoint returns 409.
+- **`"policy_denied"` `CloudClientErrorCode`** — HTTP 403 with body
+  `{error:{code:"POLICY_DENIED"}}` maps to this code. The hub elevates
+  daemon-side `policy_denied` file errors to a hub-level 403 (other
+  daemon errors like `not_found` / `io` stay inside the
+  `success: false` body) so consumers can branch on
+  `err.code === "policy_denied"` without inspecting the response
+  envelope. Plain 403 + `FORBIDDEN` / `NOT_DEVICE_OWNER` still maps
+  to `forbidden`.
 - **Strict response shape validation** — `browser()` and `files()`
   reject malformed hub responses (null / non-object root, array root,
   missing or non-boolean `success`) with

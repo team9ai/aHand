@@ -907,7 +907,34 @@ pub async fn control_files(
         })?;
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-    let _ = request_id; // request_id ends up inside `response` already
+    // Elevate daemon-side `policy_denied` to a hub-level HTTP 403 with
+    // code `POLICY_DENIED`. Spec mandate: operationally, a refused
+    // path is a different category than a missing file or an I/O
+    // error — the caller can't fix it by retrying / falling back, so
+    // surface it at the HTTP layer where typed-error consumers (the
+    // SDK's `policy_denied` `CloudClientErrorCode`) can branch on it
+    // without having to inspect the JSON envelope. Other daemon-level
+    // errors (`not_found`, `io`, `encoding`, ...) stay inside the
+    // success:false body — those ARE typically things callers want
+    // to handle gracefully.
+    if let Some(ahand_protocol::file_response::Result::Error(file_err)) = &response.result
+        && file_err.code == ahand_protocol::FileErrorCode::PolicyDenied as i32
+    {
+        let message = if file_err.message.is_empty() {
+            format!(
+                "Daemon refused operation by policy on path {}",
+                file_err.path
+            )
+        } else {
+            file_err.message.clone()
+        };
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "POLICY_DENIED",
+            message,
+        ));
+    }
+
     let envelope =
         control_files_dto::build_response_envelope(response, &body.operation, duration_ms);
     Ok(Json(envelope))

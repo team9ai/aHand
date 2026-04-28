@@ -215,11 +215,18 @@ async fn control_files_stat_happy_path_round_trips() {
 }
 
 #[tokio::test]
-async fn control_files_policy_denied_returns_success_false_with_error_code() {
-    // Daemon-side policy refusal: success: false, error.code = "policy_denied",
-    // HTTP 200. This mirrors the dashboard contract — daemon-level errors
-    // are surfaced inside the response envelope, hub-level errors are HTTP
-    // codes. The SDK branches on `success` + `error.code` for these.
+async fn control_files_policy_denied_returns_403_with_error_code() {
+    // Daemon-side policy refusal is elevated to a hub-level HTTP 403
+    // with code POLICY_DENIED. Spec mandate: a refused path is a
+    // different category than a missing file or an I/O error — the
+    // caller can't fix it by retrying, so surface it at the HTTP
+    // layer where typed-error consumers (the SDK's `policy_denied`
+    // CloudClientErrorCode) can branch on it without inspecting the
+    // JSON envelope.
+    //
+    // Other daemon-level errors (NOT_FOUND, IO, ENCODING, ...) stay
+    // inside the success:false body and are tested separately in
+    // `control_files_not_found_returns_success_false_with_error_code`.
     let server = spawn_server_with_state(support::test_state().await).await;
     let mut device = attach_owned_device(&server, "cf-policy", "user-policy").await;
     let token = mint_cp_jwt("user-policy");
@@ -260,22 +267,105 @@ async fn control_files_policy_denied_returns_success_false_with_error_code() {
         .await;
 
     let response = api_task.await.unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
     let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["success"], false);
-    assert_eq!(body["operation"], "delete");
-    assert_eq!(body["error"]["code"], "policy_denied");
-    assert_eq!(body["error"]["path"], "/etc/shadow");
+    assert_eq!(body["error"]["code"], "POLICY_DENIED");
     assert!(
         body["error"]["message"]
             .as_str()
             .unwrap()
             .contains("policy refused")
     );
-    // No `result` field on error.
-    assert!(body.as_object().unwrap().get("result").is_none());
 
     drop(device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_files_not_found_returns_success_false_with_error_code() {
+    // Daemon-level NOT_FOUND is NOT elevated — it stays in the
+    // response envelope as `success: false`, since callers commonly
+    // want to handle "file doesn't exist" gracefully (e.g., probing
+    // for an optional config). Only POLICY_DENIED is HTTP-elevated.
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let mut device = attach_owned_device(&server, "cf-notfound", "user-nf").await;
+    let token = mint_cp_jwt("user-nf");
+
+    let api_task = {
+        let base_url = server.http_base_url().to_string();
+        let token = token.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base_url}/api/control/files"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "device_id": "cf-notfound",
+                    "operation": "stat",
+                    "params": { "path": "/does/not/exist" },
+                    "timeout_ms": 5_000,
+                }))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+
+    let req = device.recv_file_request().await;
+    device
+        .send_file_response(FileResponse {
+            request_id: req.request_id.clone(),
+            result: Some(file_response::Result::Error(FileError {
+                code: FileErrorCode::NotFound as i32,
+                message: "no such file".into(),
+                path: "/does/not/exist".into(),
+            })),
+        })
+        .await;
+
+    let response = api_task.await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert_eq!(body["operation"], "stat");
+    assert_eq!(body["error"]["code"], "not_found");
+    assert_eq!(body["error"]["path"], "/does/not/exist");
+
+    drop(device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_files_400_when_delete_mode_unknown() {
+    // Reject typos / unknown enum values explicitly so a user error
+    // doesn't silently fall back to a different mode (e.g.
+    // "permaent" → "trash") with surprising filesystem semantics.
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let _device = attach_owned_device(&server, "cf-bad-mode", "user-bm").await;
+    let token = mint_cp_jwt("user-bm");
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/control/files", server.http_base_url()))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "device_id": "cf-bad-mode",
+            "operation": "delete",
+            "params": { "path": "/tmp/x", "mode": "permaent" },
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_PARAMS");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("permaent")
+    );
+
+    drop(_device);
     server.shutdown().await;
 }
 

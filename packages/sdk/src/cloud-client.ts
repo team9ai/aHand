@@ -249,7 +249,8 @@ export type CloudClientErrorCode =
   | "abort"
   | "network"
   | "timeout"
-  | "device_offline";
+  | "device_offline"
+  | "policy_denied";
 
 /**
  * Typed error raised by `CloudClient`. Use `.code` to discriminate,
@@ -338,11 +339,17 @@ async function toTypedHttpError(res: Response): Promise<CloudClientError> {
     if (body?.error?.message) {
       message = body.error.message;
     }
-    // Inspect the hub's discriminator code for the file-offline case so a
-    // SDK consumer can branch on `err.code === "device_offline"` without
-    // string-matching the message.
+    // Inspect the hub's discriminator code for two surface-elevated
+    // cases so a SDK consumer can branch on `err.code` without
+    // string-matching the message:
+    //   * `device_offline` — files endpoint, 409 + DEVICE_OFFLINE.
+    //   * `policy_denied`  — files endpoint, 403 + POLICY_DENIED
+    //     (daemon refused the operation by policy; surfaced at the
+    //     hub layer so callers don't have to inspect the result body).
     if (res.status === 409 && body?.error?.code === "DEVICE_OFFLINE") {
       code = "device_offline";
+    } else if (res.status === 403 && body?.error?.code === "POLICY_DENIED") {
+      code = "policy_denied";
     }
   } catch {
     // Body wasn't JSON — keep the status-based message.
