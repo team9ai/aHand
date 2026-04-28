@@ -775,6 +775,79 @@ async fn full_write_with_s3_object_key_gets_download_url_injected() {
     server.shutdown().await;
 }
 
+/// `FullWrite { s3_object_key }` carrying a `..` traversal must be
+/// rejected at the hub. Without this guard, an attacker who could send
+/// arbitrary FullWrite proto could attempt to read other tenants'
+/// objects by crafting a key like `../other-prefix/...`.
+#[tokio::test]
+async fn full_write_with_s3_object_key_rejects_path_traversal() {
+    let state = test_state_with_s3().await;
+    let server = spawn_server_with_state(state).await;
+    let token = dashboard_token(&server).await;
+
+    let req = FileRequest {
+        request_id: "req-traversal".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: "/tmp/traversal.bin".into(),
+            create_parents: false,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::S3ObjectKey(
+                    "file-ops/device-2/../other-tenant/secret.bin".into(),
+                )),
+                s3_download_url: None,
+                s3_download_url_expires_ms: None,
+            })),
+            encoding: None,
+            no_follow_symlink: false,
+        })),
+    };
+    let url = format!("{}/api/devices/device-2/files", server.http_base_url());
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .header("content-type", PROTOBUF_CONTENT_TYPE)
+        .body(req.encode_to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body_json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body_json.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("INVALID_S3_OBJECT_KEY"),
+    );
+    server.shutdown().await;
+}
+
+/// `POST /files/upload-url` must reject a device_id with traversal
+/// characters. Captures the `Path<String>` segment which axum URL-
+/// decodes — a caller passing `device-2%2F..%2Fother` would otherwise
+/// produce an object key that escapes its bucket prefix.
+#[tokio::test]
+async fn upload_url_rejects_device_id_with_traversal() {
+    let state = test_state_with_s3().await;
+    let server = spawn_server_with_state(state).await;
+    let token = dashboard_token(&server).await;
+
+    let url = format!(
+        "{}/api/devices/device-2%2F..%2Fother/files/upload-url",
+        server.http_base_url()
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body_json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body_json.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("INVALID_DEVICE_ID"),
+    );
+    server.shutdown().await;
+}
+
 /// `FullWrite { s3_object_key }` must fail-fast at the hub when no
 /// `[s3]` is configured, instead of forwarding a half-baked request to
 /// the daemon. Returns 503 + `S3_DISABLED` matching the upload-url

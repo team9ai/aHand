@@ -456,7 +456,12 @@ enum FileErrorCode {
 
 // ── S3 Transfer ────────────────────────────────────────────────
 
+// Deprecated: not used on the wire as of the v2 large-file flow.
+// The same data now arrives as the JSON body of
+// `POST /api/devices/{id}/files/upload-url`. Kept for forward-
+// compatibility / clients that still reference the type name.
 message FileTransferUrl {
+  option deprecated = true;
   string url = 1;
   uint64 expires_ms = 2;
   string object_key = 3;

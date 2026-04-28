@@ -264,6 +264,12 @@ message FullWrite {
     bytes content = 1;            // small file: direct content
     string s3_object_key = 2;    // large file: confirm S3 upload complete
   }
+  // Hub-injected on the way to the daemon when source is
+  // s3_object_key. The daemon does a plain HTTP GET against this URL
+  // and writes the response body to disk; no AWS SDK on the daemon.
+  // Clients leave these fields empty; the hub fills them in.
+  optional string s3_download_url = 10;
+  optional uint64 s3_download_url_expires_ms = 11;
 }
 
 message FileAppend {
@@ -599,6 +605,8 @@ Agent/Dashboard:
   else:
     use response.content inline
 ```
+
+Read-side keys carry a `read-` segment so operators writing S3 lifecycle rules (e.g. shorter expiry on read-side spillover than on write-side staging objects) can target them without affecting the upload-url path.
 
 Daemons return inline content uniformly; the swap is invisible to them. If `[s3]` is unconfigured the hub forwards the response unchanged — large responses still work but use one big WebSocket frame instead of an out-of-band download.
 

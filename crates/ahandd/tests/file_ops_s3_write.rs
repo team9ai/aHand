@@ -279,3 +279,79 @@ async fn full_write_with_s3_object_key_but_no_download_url_returns_error() {
     );
     assert!(!target.exists());
 }
+
+/// Streaming guard: a server that omits Content-Length AND streams a
+/// body bigger than `max_write_bytes` must be aborted mid-stream
+/// rather than buffered to OOM. The body is just over the 8 KiB cap;
+/// the chunked-transfer wrapper hides its size from the pre-read
+/// check, so the daemon must rely on the running-total check inside
+/// the stream loop.
+#[tokio::test]
+async fn full_write_with_s3_url_chunked_oversized_body_is_aborted() {
+    let body = vec![b'y'; 9_000];
+    let stub = spawn_stub(StubMode::OkNoContentLength(body)).await;
+    let tmp = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&tmp);
+    let target = root.join("chunked-toobig.bin");
+
+    let req = full_write_request(&target, "stream", Some(stub.url("/object")));
+    let resp = mgr.handle(&req).await;
+    let err = match resp.result {
+        Some(file_response::Result::Error(e)) => e,
+        other => panic!("expected Error, got {other:?}"),
+    };
+    assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+    assert!(!target.exists());
+
+    stub.stop().await;
+}
+
+/// Connection refused: when the URL points at a port nothing is
+/// listening on, daemon surfaces `Io` so operators can distinguish
+/// "S3 unreachable" from a real S3 4xx.
+#[tokio::test]
+async fn full_write_with_s3_url_connection_refused_returns_io_error() {
+    let tmp = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&tmp);
+    let target = root.join("unreach.bin");
+    // Port 1 is reserved; nothing should ever listen here.
+    let url = "http://127.0.0.1:1/object".to_string();
+
+    let req = full_write_request(&target, "k", Some(url));
+    let resp = mgr.handle(&req).await;
+    let err = match resp.result {
+        Some(file_response::Result::Error(e)) => e,
+        other => panic!("expected Error, got {other:?}"),
+    };
+    assert_eq!(err.code, FileErrorCode::Io as i32);
+    assert!(!target.exists());
+}
+
+/// SSRF guard: a non-http(s) URL (e.g. file://) must be rejected
+/// before any network/filesystem call. A compromised hub that
+/// injected `file:///etc/passwd` would otherwise turn the daemon into
+/// a file-disclosure oracle.
+#[tokio::test]
+async fn full_write_with_s3_url_rejects_non_http_scheme() {
+    let tmp = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&tmp);
+    let target = root.join("ssrf.bin");
+
+    let req = full_write_request(
+        &target,
+        "k",
+        Some("file:///etc/passwd".to_string()),
+    );
+    let resp = mgr.handle(&req).await;
+    let err = match resp.result {
+        Some(file_response::Result::Error(e)) => e,
+        other => panic!("expected Error, got {other:?}"),
+    };
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+    assert!(
+        err.message.to_lowercase().contains("scheme"),
+        "error should mention the bad scheme, got: {}",
+        err.message
+    );
+    assert!(!target.exists());
+}

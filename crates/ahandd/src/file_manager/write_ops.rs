@@ -6,6 +6,7 @@
 //! the target file to already exist.
 
 use std::path::Path;
+use std::time::Duration;
 
 use ahand_protocol::{
     file_edit, file_write, full_write, ByteRangeReplace, FileAppend, FileEdit, FileEditResult,
@@ -510,24 +511,50 @@ fn enforce_size_limit(size: u64, max: u64, path: &str) -> Result<(), FileError> 
     }
 }
 
+/// Cap on a single S3 download. Per-request HTTP timeout matters because
+/// a stalled S3 transfer would otherwise pin a daemon worker
+/// indefinitely; 5 minutes is generous for the file sizes we expect
+/// while still terminating obviously-broken uploads.
+const S3_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+
 /// Download bytes via plain HTTP GET against a hub-provided presigned
 /// S3 URL. This is the daemon-side leg of the large-file write flow:
 /// the hub mints the URL, the daemon fetches and writes to disk. The
 /// daemon does not need (and intentionally does not have) S3
 /// credentials — a presigned URL works as a regular HTTP resource.
 ///
-/// We enforce `max_write_bytes` twice: once against `Content-Length`
-/// (so an obviously oversized object is rejected before we read the
-/// body), and again against the actual byte count (defense against a
-/// missing or lying header). A missing `Content-Length` is allowed —
-/// pre-signed S3 URLs may omit it under chunked transfer — but the
-/// post-read size check still catches oversized payloads.
+/// SSRF defense: the hub injects this URL, but a compromised hub
+/// could otherwise ask the daemon to GET `file:///etc/passwd`, the
+/// EC2 instance-metadata endpoint at `169.254.169.254`, etc. We
+/// constrain the URL to the `http`/`https` schemes via `reqwest`'s
+/// default no-`file`-handler behavior plus an explicit scheme check.
+/// A more aggressive allowlist (S3 hostnames only) would break
+/// LocalStack/MinIO setups that legitimately point at private
+/// addresses, so we stop at scheme validation.
+///
+/// OOM defense: when the response carries no `Content-Length` (chunked
+/// transfer), `resp.bytes()` would happily buffer gigabytes before the
+/// post-read size check ever runs. Stream chunk-by-chunk instead and
+/// abort the moment we cross `max_write_bytes`.
 async fn fetch_full_write_bytes(
     url: &str,
     max_write_bytes: u64,
     req_path: &str,
 ) -> Result<Vec<u8>, FileError> {
-    let resp = reqwest::get(url).await.map_err(|e| {
+    validate_download_url_scheme(url, req_path)?;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(S3_DOWNLOAD_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| {
+            file_error(
+                FileErrorCode::Io,
+                req_path,
+                format!("failed to construct HTTP client: {e}"),
+            )
+        })?;
+
+    let resp = client.get(url).send().await.map_err(|e| {
         file_error(
             FileErrorCode::Io,
             req_path,
@@ -541,6 +568,8 @@ async fn fetch_full_write_bytes(
             format!("S3 download HTTP status {}", resp.status()),
         ));
     }
+    // Cheap pre-read check: if the server told us the body is too
+    // big, refuse before allocating anything.
     if let Some(len) = resp.content_length()
         && len > max_write_bytes
     {
@@ -550,24 +579,60 @@ async fn fetch_full_write_bytes(
             format!("S3 object size {len} exceeds max_write_bytes ({max_write_bytes})"),
         ));
     }
-    let bytes = resp.bytes().await.map_err(|e| {
+
+    // Stream body chunks, accumulating under the cap. A server with
+    // missing/misleading Content-Length cannot trick us into
+    // buffering more than `max_write_bytes` because we abort the
+    // read the moment we'd exceed the cap.
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        let chunk = chunk.map_err(|e| {
+            file_error(
+                FileErrorCode::Io,
+                req_path,
+                format!("S3 download body read failed: {e}"),
+            )
+        })?;
+        // saturating_add avoids u64 overflow on a pathological stream.
+        let next = (buf.len() as u64).saturating_add(chunk.len() as u64);
+        if next > max_write_bytes {
+            return Err(file_error(
+                FileErrorCode::TooLarge,
+                req_path,
+                format!(
+                    "S3 object size > max_write_bytes ({max_write_bytes}); aborting partial download"
+                ),
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Reject URLs whose scheme isn't `http` or `https`. `file://`,
+/// `gopher://`, and similar are obvious SSRF vectors when the URL
+/// originates from another process (here: the hub). We deliberately
+/// don't restrict by hostname — LocalStack / MinIO / in-VPC S3
+/// endpoints all use private addresses, and the integration tests
+/// stand up an axum server on `127.0.0.1`.
+fn validate_download_url_scheme(url: &str, req_path: &str) -> Result<(), FileError> {
+    let parsed = url::Url::parse(url).map_err(|e| {
         file_error(
-            FileErrorCode::Io,
+            FileErrorCode::InvalidPath,
             req_path,
-            format!("S3 download body read failed: {e}"),
+            format!("invalid s3_download_url: {e}"),
         )
     })?;
-    if bytes.len() as u64 > max_write_bytes {
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
         return Err(file_error(
-            FileErrorCode::TooLarge,
+            FileErrorCode::InvalidPath,
             req_path,
-            format!(
-                "S3 object size {} exceeds max_write_bytes ({max_write_bytes})",
-                bytes.len()
-            ),
+            format!("s3_download_url must use http(s); got scheme '{scheme}'"),
         ));
     }
-    Ok(bytes.to_vec())
+    Ok(())
 }
 
 /// I3: stat the existing file BEFORE we slurp it into memory for an
