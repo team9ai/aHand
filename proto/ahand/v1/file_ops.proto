@@ -194,6 +194,13 @@ message FullWrite {
     bytes content = 1;
     string s3_object_key = 2;
   }
+  // Hub-injected presigned GET URL when source is s3_object_key.
+  // Daemons fetch the bytes via plain HTTP GET against this URL and
+  // write them to disk. Clients leave these empty — the hub fills them
+  // in before forwarding the FileRequest to the daemon. This keeps S3
+  // credentials hub-side: the daemon never speaks to S3 directly.
+  optional string s3_download_url = 10;
+  optional uint64 s3_download_url_expires_ms = 11;
 }
 
 message FileAppend {
