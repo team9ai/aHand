@@ -139,13 +139,17 @@ fn expires_at_ms(expiration: Duration) -> u64 {
     now + expiration.as_millis() as u64
 }
 
-/// Test-only constructor that builds an `S3Client` from an already-configured
-/// `aws_sdk_s3::Client`. This lets tests inject explicit credentials via the
-/// SDK config builder instead of mutating process-wide environment variables,
-/// which is unsound under cargo's parallel test runner.
-#[cfg(test)]
 impl S3Client {
-    pub(crate) fn for_test(
+    /// Build an `S3Client` from an already-configured `aws_sdk_s3::Client`.
+    /// Lets callers inject explicit credentials via the SDK config builder
+    /// instead of mutating process-wide environment variables (unsound
+    /// under cargo's parallel test runner).
+    ///
+    /// Intended for tests and other callers that need full control over
+    /// the inner SDK client. Production code should use
+    /// [`S3Client::new`] which loads credentials from the environment in
+    /// the standard AWS chain.
+    pub fn from_aws_client(
         client: aws_sdk_s3::Client,
         bucket: &str,
         threshold: u64,
@@ -196,7 +200,7 @@ mod tests {
     fn build_test_s3_client(config: &S3Config) -> S3Client {
         let endpoint = config.endpoint.as_ref().expect("test config has endpoint");
         let aws_client = sdk_client_with_explicit_creds(endpoint, &config.region);
-        S3Client::for_test(
+        S3Client::from_aws_client(
             aws_client,
             &config.bucket,
             config.file_transfer_threshold_bytes,

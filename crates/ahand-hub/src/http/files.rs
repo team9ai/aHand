@@ -9,11 +9,13 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use prost::Message;
+use serde::Serialize;
 
 use ahand_protocol::{FileError, FileErrorCode, FileRequest, FileResponse, envelope};
 
@@ -148,6 +150,12 @@ pub async fn file_operation(
         request_id: request_id.clone(),
     };
 
+    // Translate client-supplied FullWrite{s3_object_key} into one the
+    // daemon can act on by injecting a presigned GET URL. Daemons never
+    // hold S3 credentials, so the hub is the only place that can speak
+    // S3 directly.
+    maybe_inject_full_write_download_url(&state, &mut request).await?;
+
     let envelope = ahand_protocol::Envelope {
         device_id: device_id.clone(),
         msg_id: format!("file-{}", request_id),
@@ -181,6 +189,12 @@ pub async fn file_operation(
         }
     };
 
+    // For large reads, swap inline content for a presigned S3 download
+    // URL. Daemons always return inline bytes; the hub decides whether
+    // the payload exceeds the threshold and uploads on the daemon's
+    // behalf. Symmetric with the write path: only the hub talks to S3.
+    let response = maybe_swap_large_read_response(&state, &device_id, response).await?;
+
     let encoded = response.encode_to_vec();
     Ok((
         StatusCode::OK,
@@ -191,6 +205,153 @@ pub async fn file_operation(
         encoded,
     )
         .into_response())
+}
+
+// ── S3 large-file transfer helpers ────────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct UploadUrlResponse {
+    pub object_key: String,
+    pub upload_url: String,
+    pub expires_at_ms: u64,
+}
+
+/// Issue a presigned PUT URL for a large-file upload. The client uploads
+/// directly to S3, then sends `FileRequest { write: FullWrite { s3_object_key } }`
+/// — `file_operation` will inject the corresponding presigned GET URL
+/// before forwarding to the daemon.
+///
+/// Returns 503 with code `S3_DISABLED` when the hub has no `[s3]` block,
+/// matching the route's contract: callers must treat S3 features as
+/// optional and degrade gracefully when disabled.
+pub async fn upload_url(
+    auth: AuthContextExt,
+    State(state): State<AppState>,
+    Path(device_id): Path<String>,
+) -> ApiResult<Json<UploadUrlResponse>> {
+    auth.require_dashboard_access()?;
+
+    let Some(s3) = state.s3_client.as_ref() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "S3_DISABLED",
+            "S3 is not configured on this hub",
+        ));
+    };
+
+    let object_key = format!("file-ops/{device_id}/{}.bin", uuid::Uuid::new_v4());
+    let presigned = s3.generate_upload_url(&object_key).await.map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "S3_PRESIGN_FAILED",
+            format!("failed to generate upload URL: {err}"),
+        )
+    })?;
+
+    Ok(Json(UploadUrlResponse {
+        object_key: presigned.object_key,
+        upload_url: presigned.url,
+        expires_at_ms: presigned.expires_at_ms,
+    }))
+}
+
+/// Inspect a `FileResponse` produced by the daemon. If it carries inline
+/// `read_binary` / `read_image` content larger than the configured
+/// threshold, upload the bytes to S3 and rewrite the result to use a
+/// presigned GET URL instead. The client then downloads directly from
+/// S3, keeping the WebSocket frame size bounded.
+async fn maybe_swap_large_read_response(
+    state: &AppState,
+    device_id: &str,
+    mut response: FileResponse,
+) -> Result<FileResponse, ApiError> {
+    let Some(s3) = state.s3_client.as_ref() else {
+        return Ok(response);
+    };
+    let threshold = s3.threshold();
+
+    use ahand_protocol::file_response::Result as Res;
+    match response.result.as_mut() {
+        Some(Res::ReadBinary(r)) if (r.content.len() as u64) > threshold => {
+            let key = format!("file-ops/{device_id}/read-{}.bin", uuid::Uuid::new_v4());
+            let bytes = std::mem::take(&mut r.content);
+            let presigned = upload_and_presign(s3.as_ref(), &key, bytes).await?;
+            r.download_url = Some(presigned.url);
+            r.download_url_expires_ms = Some(presigned.expires_at_ms);
+        }
+        Some(Res::ReadImage(r)) if (r.content.len() as u64) > threshold => {
+            let key = format!("file-ops/{device_id}/read-{}.bin", uuid::Uuid::new_v4());
+            let bytes = std::mem::take(&mut r.content);
+            let presigned = upload_and_presign(s3.as_ref(), &key, bytes).await?;
+            r.download_url = Some(presigned.url);
+            r.download_url_expires_ms = Some(presigned.expires_at_ms);
+        }
+        _ => {}
+    }
+    Ok(response)
+}
+
+async fn upload_and_presign(
+    s3: &crate::s3::S3Client,
+    key: &str,
+    bytes: Vec<u8>,
+) -> Result<crate::s3::PresignedUrl, ApiError> {
+    s3.upload_bytes(key, bytes).await.map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "S3_UPLOAD_FAILED",
+            format!("failed to upload to S3: {err}"),
+        )
+    })?;
+    s3.generate_download_url(key).await.map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "S3_PRESIGN_FAILED",
+            format!("failed to generate download URL: {err}"),
+        )
+    })
+}
+
+/// If the request is a `FullWrite { s3_object_key }`, fill in
+/// `s3_download_url` so the daemon (which holds no S3 credentials) can
+/// fetch the bytes via plain HTTP. Returns `503 S3_DISABLED` if the
+/// client supplied an `s3_object_key` but the hub has no S3 configured —
+/// fail fast at the hub layer instead of letting the daemon surface a
+/// confusing "no download URL" error.
+async fn maybe_inject_full_write_download_url(
+    state: &AppState,
+    request: &mut FileRequest,
+) -> Result<(), ApiError> {
+    use ahand_protocol::{file_request, file_write, full_write};
+
+    let Some(file_request::Operation::Write(write)) = request.operation.as_mut() else {
+        return Ok(());
+    };
+    let Some(file_write::Method::FullWrite(fw)) = write.method.as_mut() else {
+        return Ok(());
+    };
+    let Some(full_write::Source::S3ObjectKey(key)) = fw.source.as_ref() else {
+        return Ok(());
+    };
+
+    let Some(s3) = state.s3_client.as_ref() else {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "S3_DISABLED",
+            "S3 is not configured on this hub",
+        ));
+    };
+
+    let presigned = s3.generate_download_url(key).await.map_err(|err| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "S3_PRESIGN_FAILED",
+            format!("failed to generate download URL: {err}"),
+        )
+    })?;
+    fw.s3_download_url = Some(presigned.url);
+    fw.s3_download_url_expires_ms = Some(presigned.expires_at_ms);
+    Ok(())
 }
 
 /// Build a synthetic FileError response for internal error paths.
@@ -208,25 +369,3 @@ pub fn error_response(request_id: String, message: impl Into<String>) -> FileRes
 // PendingFileRequests unit tests live with the type itself in
 // `crate::pending_file_requests`. The HTTP-level integration tests for
 // `file_operation` are in `tests/http_files.rs`.
-
-// ── S3 large-file transfer ────────────────────────────────────────────────
-//
-// The `POST /files/upload-url` endpoint used to live here. It was removed
-// during Round 1 review because the full large-file transfer flow (hub
-// downloads from S3 before forwarding writes, hub uploads large responses
-// before returning reads) was only half-wired: the endpoint produced valid
-// presigned PUT URLs but the daemon rejected any FileRequest carrying
-// `FullWrite.s3_object_key`. Exposing a half-working API surface is worse
-// than not exposing it at all, so the route was dropped until the entire
-// path is implemented.
-//
-// The underlying plumbing is intentionally kept:
-// - `s3::S3Client` (generate_upload_url/generate_download_url/
-//   upload_bytes/download_bytes)
-// - `config::S3Config`
-// - `AppState.s3_client`
-// - proto field `FullWrite.s3_object_key`
-//
-// A follow-up PR can wire the full flow inside `file_operation` (S3 fetch
-// before forwarding writes, S3 push after large reads) without having to
-// re-establish any of the skeleton.
