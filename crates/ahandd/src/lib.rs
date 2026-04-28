@@ -5,6 +5,7 @@ pub mod browser_setup;
 pub mod config;
 pub mod device_identity;
 pub mod executor;
+pub mod file_manager;
 pub mod outbox;
 pub mod registry;
 pub mod session;

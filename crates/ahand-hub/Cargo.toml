@@ -26,6 +26,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 subtle = "2"
+thiserror.workspace = true
 tokio.workspace = true
 tower.workspace = true
 tower-http.workspace = true
@@ -35,9 +36,16 @@ ulid = "1"
 url = "2"
 uuid.workspace = true
 
+# S3 support for large file transfer. Optional in config; skipped at runtime
+# when the `[s3]` section is not present in the hub config.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
+
 [dev-dependencies]
 ahand-hub-store = { path = "../ahand-hub-store", features = ["test-support"] }
-base64 = "0.22"
+# Used by the `s3` test module to build an `aws_sdk_s3::Client` with explicit
+# synthetic credentials, avoiding unsafe process-wide env var mutation.
+aws-credential-types = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 futures-util = "0.3"
 prost.workspace = true

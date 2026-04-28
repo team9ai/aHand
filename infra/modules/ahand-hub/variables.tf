@@ -40,6 +40,11 @@ variable "openclaw_rds_port" {
   default     = 5432
 }
 
+variable "openclaw_rds_security_group_id" {
+  description = "Security group attached to the openclaw-hive RDS instance. Required so the ahand-hub ECS task SG can be authorized inbound on port 5432."
+  type        = string
+}
+
 variable "vpc_id" {
   description = "VPC that hosts ECS tasks, RDS, and Redis"
   type        = string

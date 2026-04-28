@@ -154,6 +154,8 @@ fn describe_payload(envelope: &Envelope) -> &'static str {
         Some(Payload::UpdateStatus(_)) => "UpdateStatus",
         Some(Payload::StdinChunk(_)) => "StdinChunk",
         Some(Payload::TerminalResize(_)) => "TerminalResize",
+        Some(Payload::FileRequest(_)) => "FileRequest",
+        Some(Payload::FileResponse(_)) => "FileResponse",
         Some(Payload::Heartbeat(_)) => "Heartbeat",
         None => "none",
     }
@@ -170,4 +172,88 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::describe_payload;
+    use ahand_protocol::envelope::Payload;
+    use ahand_protocol::*;
+
+    /// Build an envelope wrapping the given payload and assert
+    /// `describe_payload` returns `expected`. Pinning every Payload
+    /// variant so a regression that drops or renames an arm fails the
+    /// suite. Without this, `tracing::trace!(kind = ...)` emits the
+    /// wrong label and operators get misleading logs — entirely silent
+    /// at runtime.
+    fn check(payload: Payload, expected: &str) {
+        let envelope = Envelope {
+            payload: Some(payload),
+            ..Default::default()
+        };
+        assert_eq!(describe_payload(&envelope), expected);
+    }
+
+    #[test]
+    fn describe_payload_covers_every_variant() {
+        check(Payload::HelloChallenge(HelloChallenge::default()), "HelloChallenge");
+        check(Payload::HelloAccepted(HelloAccepted::default()), "HelloAccepted");
+        check(Payload::Hello(Hello::default()), "Hello");
+        check(Payload::JobRequest(JobRequest::default()), "JobRequest");
+        check(Payload::JobEvent(JobEvent::default()), "JobEvent");
+        check(Payload::JobFinished(JobFinished::default()), "JobFinished");
+        check(Payload::JobRejected(JobRejected::default()), "JobRejected");
+        check(Payload::CancelJob(CancelJob::default()), "CancelJob");
+        check(
+            Payload::ApprovalRequest(ApprovalRequest::default()),
+            "ApprovalRequest",
+        );
+        check(
+            Payload::ApprovalResponse(ApprovalResponse::default()),
+            "ApprovalResponse",
+        );
+        check(Payload::PolicyQuery(PolicyQuery::default()), "PolicyQuery");
+        check(Payload::PolicyState(PolicyState::default()), "PolicyState");
+        check(Payload::PolicyUpdate(PolicyUpdate::default()), "PolicyUpdate");
+        check(
+            Payload::SetSessionMode(SetSessionMode::default()),
+            "SetSessionMode",
+        );
+        check(Payload::SessionState(SessionState::default()), "SessionState");
+        check(Payload::SessionQuery(SessionQuery::default()), "SessionQuery");
+        check(
+            Payload::BrowserRequest(BrowserRequest::default()),
+            "BrowserRequest",
+        );
+        check(
+            Payload::BrowserResponse(BrowserResponse::default()),
+            "BrowserResponse",
+        );
+        check(
+            Payload::UpdateCommand(UpdateCommand::default()),
+            "UpdateCommand",
+        );
+        check(Payload::UpdateStatus(UpdateStatus::default()), "UpdateStatus");
+        check(Payload::StdinChunk(StdinChunk::default()), "StdinChunk");
+        check(
+            Payload::TerminalResize(TerminalResize::default()),
+            "TerminalResize",
+        );
+        check(Payload::FileRequest(FileRequest::default()), "FileRequest");
+        check(
+            Payload::FileResponse(FileResponse::default()),
+            "FileResponse",
+        );
+        check(Payload::Heartbeat(Heartbeat::default()), "Heartbeat");
+    }
+
+    #[test]
+    fn describe_payload_handles_envelope_without_payload() {
+        // Envelope with `payload: None` is the wire shape for an
+        // ill-formed frame. The function must not panic and must
+        // return the documented sentinel `"none"` so downstream trace
+        // logs are still parseable.
+        let envelope = Envelope::default();
+        assert_eq!(describe_payload(&envelope), "none");
+    }
 }

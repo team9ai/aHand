@@ -3,6 +3,7 @@ syntax = "proto3";
 package ahand.v1;
 
 import "ahand/v1/browser.proto";
+import "ahand/v1/file_ops.proto";
 
 // Envelope wraps all messages on the wire (WS and IPC).
 message Envelope {
@@ -37,6 +38,13 @@ message Envelope {
     StdinChunk       stdin_chunk       = 29;
     TerminalResize   terminal_resize   = 30;
     Heartbeat        heartbeat         = 31;
+    // Tag 32 is intentionally skipped: PR #1 (c9b8a4d, 2026-04-28)
+    // briefly assigned `FileResponse = 32` on `dev` and shifted
+    // Heartbeat to 33, breaking wire compat with deployed daemons.
+    // Don't reuse 32 even though no client ever decoded it correctly —
+    // a hub built between c9b8a4d and the fix will emit/parse it.
+    FileRequest      file_request      = 33;
+    FileResponse     file_response     = 34;
   }
 }
 

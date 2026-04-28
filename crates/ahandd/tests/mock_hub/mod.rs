@@ -1,11 +1,18 @@
 //! Minimal in-process WebSocket hub used by `lib_spawn` integration tests.
 //!
-//! Two server flavours are provided:
+//! Server flavours:
 //!   * [`start_accepting`] — completes the `HelloChallenge` → `Hello` →
 //!     `HelloAccepted` handshake, then holds the connection open quietly.
 //!   * [`start_rejecting_401`] — sends `HelloChallenge`, reads the client's
 //!     `Hello`, then closes with a `Policy("auth-rejected")` close frame
 //!     (the same signal the real hub uses for auth failure).
+//!   * [`start_silent_after_handshake`] — accepts handshake then stops
+//!     reading, leaving the WS in a half-zombie state for the watchdog to
+//!     catch.
+//!   * [`start_with_file_request`] — accepts handshake, immediately injects
+//!     a [`FileRequest`] envelope and captures the daemon's [`FileResponse`].
+//!     Used to exercise the daemon's `handle_file_request` glue end-to-end
+//!     through the WS layer.
 //!
 //! Keep this module small and self-contained — it exists so the daemon's
 //! status state machine has something to race against, not to model the
@@ -13,7 +20,9 @@
 
 #![allow(dead_code)]
 
-use ahand_protocol::{Envelope, Heartbeat, HelloAccepted, HelloChallenge, envelope};
+use ahand_protocol::{
+    Envelope, FileRequest, FileResponse, Heartbeat, HelloAccepted, HelloChallenge, envelope,
+};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use std::borrow::Cow;
@@ -30,6 +39,7 @@ use tokio_tungstenite::tungstenite::{
 pub struct Mock {
     pub port: u16,
     heartbeats: Arc<Mutex<Vec<Heartbeat>>>,
+    file_responses: Arc<Mutex<Vec<FileResponse>>>,
     _shutdown: oneshot::Sender<()>,
     _task: JoinHandle<()>,
 }
@@ -48,6 +58,13 @@ impl Mock {
     /// integration-test assertions, not for high-volume production use.
     pub fn captured_heartbeats(&self) -> Vec<Heartbeat> {
         self.heartbeats.lock().unwrap().clone()
+    }
+
+    /// Snapshot of every `FileResponse` envelope observed from connected
+    /// daemons. Populated by `start_with_file_request`-style mock servers
+    /// that inject a `FileRequest` and capture the daemon's reply.
+    pub fn captured_file_responses(&self) -> Vec<FileResponse> {
+        self.file_responses.lock().unwrap().clone()
     }
 }
 
@@ -76,11 +93,23 @@ pub async fn start_silent_after_handshake() -> Mock {
     start(Behavior::SilentAfterHandshake).await
 }
 
-#[derive(Clone, Copy)]
+/// Start a mock hub that accepts the handshake, then immediately injects
+/// the supplied `FileRequest` over the WebSocket. Captures every inbound
+/// `FileResponse` the daemon sends back into `Mock::captured_file_responses()`.
+/// Used to exercise the daemon's `handle_file_request` glue end-to-end —
+/// from envelope decode in the read loop, through `FileManager::handle`,
+/// back through the buffered envelope sender, and onto the wire as a
+/// FileResponse envelope.
+pub async fn start_with_file_request(req: FileRequest) -> Mock {
+    start(Behavior::SendFileRequest(Arc::new(req))).await
+}
+
+#[derive(Clone)]
 enum Behavior {
     Accept,
     RejectAuth,
     SilentAfterHandshake,
+    SendFileRequest(Arc<FileRequest>),
 }
 
 async fn start(behavior: Behavior) -> Mock {
@@ -88,8 +117,10 @@ async fn start(behavior: Behavior) -> Mock {
     let port = listener.local_addr().expect("local_addr").port();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let heartbeats: Arc<Mutex<Vec<Heartbeat>>> = Arc::new(Mutex::new(Vec::new()));
+    let file_responses: Arc<Mutex<Vec<FileResponse>>> = Arc::new(Mutex::new(Vec::new()));
 
     let heartbeats_for_task = heartbeats.clone();
+    let file_responses_for_task = file_responses.clone();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -99,7 +130,12 @@ async fn start(behavior: Behavior) -> Mock {
                         Ok(pair) => pair,
                         Err(_) => break,
                     };
-                    tokio::spawn(handle_conn(stream, behavior, heartbeats_for_task.clone()));
+                    tokio::spawn(handle_conn(
+                        stream,
+                        behavior.clone(),
+                        heartbeats_for_task.clone(),
+                        file_responses_for_task.clone(),
+                    ));
                 }
             }
         }
@@ -108,6 +144,7 @@ async fn start(behavior: Behavior) -> Mock {
     Mock {
         port,
         heartbeats,
+        file_responses,
         _shutdown: shutdown_tx,
         _task: task,
     }
@@ -117,6 +154,7 @@ async fn handle_conn(
     stream: tokio::net::TcpStream,
     behavior: Behavior,
     heartbeats: Arc<Mutex<Vec<Heartbeat>>>,
+    file_responses: Arc<Mutex<Vec<FileResponse>>>,
 ) {
     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
         return;
@@ -209,6 +247,52 @@ async fn handle_conn(
             // than any test's heartbeat_interval).
             let _keep_alive = (sink, src);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+        Behavior::SendFileRequest(req) => {
+            let accepted = Envelope {
+                device_id: "mock-hub".into(),
+                msg_id: "accepted-files".into(),
+                ts_ms: 0,
+                payload: Some(envelope::Payload::HelloAccepted(HelloAccepted {
+                    auth_method: "bootstrap".into(),
+                    update_suggestion: None,
+                })),
+                ..Default::default()
+            };
+            let _ = sink.send(WsMessage::Binary(accepted.encode_to_vec())).await;
+
+            let file_req = Envelope {
+                device_id: "mock-hub".into(),
+                msg_id: "file-req-1".into(),
+                ts_ms: 0,
+                payload: Some(envelope::Payload::FileRequest((*req).clone())),
+                ..Default::default()
+            };
+            let _ = sink
+                .send(WsMessage::Binary(file_req.encode_to_vec()))
+                .await;
+
+            // Capture every inbound envelope's FileResponse, plus
+            // record heartbeats so existing assertions still work.
+            while let Some(m) = src.next().await {
+                let frame = match m {
+                    Ok(WsMessage::Binary(bytes)) => bytes,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                };
+                let Ok(envelope) = Envelope::decode(frame.as_ref()) else {
+                    continue;
+                };
+                match envelope.payload {
+                    Some(envelope::Payload::FileResponse(resp)) => {
+                        file_responses.lock().unwrap().push(resp);
+                    }
+                    Some(envelope::Payload::Heartbeat(hb)) => {
+                        heartbeats.lock().unwrap().push(hb);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }

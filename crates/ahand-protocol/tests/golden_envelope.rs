@@ -28,10 +28,11 @@
 
 use ahand_protocol::{
     ApprovalRequest, ApprovalResponse, BootstrapAuth, BrowserRequest, BrowserResponse, CancelJob,
-    Ed25519Auth, Envelope, Heartbeat, Hello, HelloAccepted, HelloChallenge, JobEvent, JobFinished,
-    JobRejected, JobRequest, PolicyQuery, PolicyState, PolicyUpdate, RefusalContext, SessionMode,
-    SessionQuery, SessionState, SetSessionMode, StdinChunk, TerminalResize, UpdateCommand,
-    UpdateState, UpdateStatus, UpdateSuggestion, envelope, hello, job_event,
+    Ed25519Auth, Envelope, FileRequest, FileResponse, Heartbeat, Hello, HelloAccepted,
+    HelloChallenge, JobEvent, JobFinished, JobRejected, JobRequest, PolicyQuery, PolicyState,
+    PolicyUpdate, RefusalContext, SessionMode, SessionQuery, SessionState, SetSessionMode,
+    StdinChunk, TerminalResize, UpdateCommand, UpdateState, UpdateStatus, UpdateSuggestion,
+    envelope, hello, job_event,
 };
 use prost::Message;
 use std::path::{Path, PathBuf};
@@ -447,6 +448,28 @@ fn golden_heartbeat() {
     assert_golden("heartbeat", &env);
 }
 
+#[test]
+fn golden_file_request() {
+    // Minimal Stat request — exercises the variant without committing to
+    // a specific file_request::Operation in the fixture (the operation is
+    // an oneof, so we pin the surrounding envelope and leave the inner
+    // operation as default for stability).
+    let env = base_envelope(envelope::Payload::FileRequest(FileRequest {
+        request_id: "req-1".into(),
+        operation: None,
+    }));
+    assert_golden("file_request", &env);
+}
+
+#[test]
+fn golden_file_response() {
+    let env = base_envelope(envelope::Payload::FileResponse(FileResponse {
+        request_id: "req-1".into(),
+        result: None,
+    }));
+    assert_golden("file_response", &env);
+}
+
 // ── Exhaustiveness lock ─────────────────────────────────────────────────
 //
 // Every arm of `envelope::Payload` must map to a fixture name AND that
@@ -488,6 +511,8 @@ fn payload_fixture_name(p: &envelope::Payload) -> &'static str {
         UpdateStatus(_) => "update_status",
         StdinChunk(_) => "stdin_chunk",
         TerminalResize(_) => "terminal_resize",
+        FileRequest(_) => "file_request",
+        FileResponse(_) => "file_response",
         Heartbeat(_) => "heartbeat",
     }
 }
@@ -528,6 +553,8 @@ fn every_payload_variant_has_a_fixture_file() {
         envelope::Payload::UpdateStatus(UpdateStatus::default()),
         envelope::Payload::StdinChunk(StdinChunk::default()),
         envelope::Payload::TerminalResize(TerminalResize::default()),
+        envelope::Payload::FileRequest(FileRequest::default()),
+        envelope::Payload::FileResponse(FileResponse::default()),
         envelope::Payload::Heartbeat(Heartbeat::default()),
     ];
 

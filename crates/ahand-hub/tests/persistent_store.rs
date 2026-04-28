@@ -41,10 +41,12 @@ fn persistent_config(stack: &TestStack) -> Config {
         webhook_max_retries: 8,
         webhook_max_concurrency: 50,
         webhook_timeout_ms: 5_000,
+        file_request_timeout_ms: 30_000,
         store: StoreConfig::Persistent {
             database_url: stack.database_url().into(),
             redis_url: stack.redis_url().into(),
         },
+        s3: None,
     }
 }
 

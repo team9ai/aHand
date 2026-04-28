@@ -11,11 +11,14 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite;
 use tracing::{error, info, warn};
 
+use tokio::sync::watch;
+
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::config::Config;
 use crate::device_identity::DeviceIdentity;
 use crate::executor::{self, EnvelopeSink as _};
+use crate::file_manager::FileManager;
 use crate::outbox::{Outbox, prepare_outbound};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
@@ -25,6 +28,20 @@ use crate::store::{Direction, RunStore};
 pub enum HelloAuthMode {
     Ed25519,
     Bootstrap(String),
+}
+
+/// RAII helper that flips a `watch` channel to `true` when dropped. Used by
+/// `connect_with_auth` to signal connection close to any detached approval
+/// tasks that the dispatch loop spawned, so they can bail out instead of
+/// waiting for the ApprovalManager's default 24-hour timeout.
+struct CloseGuard {
+    tx: watch::Sender<bool>,
+}
+
+impl Drop for CloseGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(true);
+    }
 }
 
 #[derive(Clone)]
@@ -118,6 +135,7 @@ pub async fn run(
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
+    file_mgr: Arc<FileManager>,
 ) -> anyhow::Result<()> {
     run_with_reporter(
         config,
@@ -128,6 +146,7 @@ pub async fn run(
         approval_mgr,
         approval_broadcast_tx,
         browser_mgr,
+        file_mgr,
         Arc::new(NoopReporter),
     )
     .await
@@ -147,6 +166,7 @@ pub async fn run_with_reporter(
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
+    file_mgr: Arc<FileManager>,
     reporter: Arc<dyn ClientReporter>,
 ) -> anyhow::Result<()> {
     let hub_config = config.hub_config();
@@ -186,6 +206,7 @@ pub async fn run_with_reporter(
             &approval_mgr,
             &approval_broadcast_tx,
             &browser_mgr,
+            &file_mgr,
             reporter.as_ref(),
         )
         .await;
@@ -222,6 +243,7 @@ async fn connect_reporting(
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
+    file_mgr: &Arc<FileManager>,
     reporter: &dyn ClientReporter,
 ) -> anyhow::Result<()> {
     let auth_modes = hello_auth_modes(bearer_token.as_deref());
@@ -241,6 +263,7 @@ async fn connect_reporting(
             approval_mgr,
             approval_broadcast_tx,
             browser_mgr,
+            file_mgr,
             reporter,
         )
         .await;
@@ -276,6 +299,7 @@ async fn connect_with_auth(
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
+    file_mgr: &Arc<FileManager>,
     reporter: &dyn ClientReporter,
 ) -> Result<(), ConnectError> {
     // OS-level TCP keepalive is the lower-tier twin of the WS Ping/Pong
@@ -303,6 +327,7 @@ async fn connect_with_auth(
         identity,
         last_ack,
         browser_mgr.is_enabled(),
+        file_mgr.is_enabled(),
         &challenge.nonce,
         match auth_mode {
             HelloAuthMode::Ed25519 => None,
@@ -342,6 +367,14 @@ async fn connect_with_auth(
     let (raw_tx, mut rx) = mpsc::unbounded_channel::<OutboundFrame>();
     let tx = BufferedEnvelopeSender::new(raw_tx, Arc::clone(outbox));
     let store_send = store.clone();
+
+    // R20: a watch channel signals connection close to detached approval
+    // tasks spawned by handle_file_request. When connect_with_auth returns
+    // (normal or error), the guard is dropped and close_rx.changed() fires,
+    // letting pending approval waiters bail out immediately instead of
+    // waiting up to 24 hours for the approval-mgr timeout.
+    let (close_tx, close_rx) = watch::channel(false);
+    let _close_guard = CloseGuard { tx: close_tx };
 
     if let Some(suggestion) = accepted.update_suggestion {
         info!(update_id = %suggestion.update_id, target = %suggestion.target_version,
@@ -521,6 +554,20 @@ async fn connect_with_auth(
                 handle_browser_request(device_id, caller_uid, &req, &tx, session_mgr, browser_mgr)
                     .await;
             }
+            Some(envelope::Payload::FileRequest(req)) => {
+                handle_file_request(
+                    device_id,
+                    caller_uid,
+                    req,
+                    &tx,
+                    session_mgr,
+                    file_mgr,
+                    approval_mgr,
+                    approval_broadcast_tx,
+                    &close_rx,
+                )
+                .await;
+            }
             Some(envelope::Payload::UpdateCommand(cmd)) => {
                 info!(update_id = %cmd.update_id, target = %cmd.target_version,
                     "received update command from hub");
@@ -565,14 +612,22 @@ async fn connect_with_auth(
         }
     }
 
-    // Abort the heartbeat task BEFORE dropping `tx`. The heartbeat task
-    // holds its own clone of the `BufferedEnvelopeSender`, so if we
-    // dropped `tx` first, the send task's mpsc receiver would still see
-    // a live sender (from the heartbeat clone) and block on `rx.recv()`
-    // indefinitely — `send_handle.await` would hang until the WS broke
-    // naturally. Aborting the heartbeat task drops its sender clone, so
-    // dropping `tx` here leaves zero senders and `rx.recv()` resolves to
-    // `None`. Same logic for `ws_ping_task`.
+    // Teardown order matters here. Three independent things still hold
+    // sender clones and could wedge `send_handle.await`:
+    //
+    // 1. Detached file-approval tasks spawned by handle_file_request hold
+    //    a `tx_clone` AND wait on `close_rx`. They only release their
+    //    clone once `close_tx` fires — which CloseGuard does on drop.
+    //    Without dropping the guard FIRST, the task would block until
+    //    the ApprovalManager 24h timeout and wedge teardown for a day.
+    //    (C1 round-3 fix.)
+    // 2. The heartbeat task holds its own clone of
+    //    `BufferedEnvelopeSender` — if we dropped `tx` first, the send
+    //    task's mpsc receiver would still see a live sender and block on
+    //    `rx.recv()` indefinitely until the WS broke naturally. Aborting
+    //    the task drops its clone.
+    // 3. Same logic for `ws_ping_task`.
+    drop(_close_guard);
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
     ws_ping_task.abort();
@@ -707,6 +762,7 @@ pub fn build_hello_envelope(
     identity: &DeviceIdentity,
     last_ack: u64,
     browser_enabled: bool,
+    file_enabled: bool,
     challenge_nonce: &[u8],
     bearer_token: Option<String>,
 ) -> Envelope {
@@ -714,6 +770,9 @@ pub fn build_hello_envelope(
     let mut capabilities = vec!["exec".to_string()];
     if browser_enabled {
         capabilities.push("browser".to_string());
+    }
+    if file_enabled {
+        capabilities.push("file".to_string());
     }
 
     let mut hello = Hello {
@@ -1122,6 +1181,298 @@ async fn handle_browser_request<T>(
             };
             let _ = tx.send(resp_env);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_file_request<T>(
+    device_id: &str,
+    caller_uid: &str,
+    req: ahand_protocol::FileRequest,
+    tx: &T,
+    session_mgr: &Arc<SessionManager>,
+    file_mgr: &Arc<FileManager>,
+    approval_mgr: &Arc<ApprovalManager>,
+    approval_broadcast_tx: &broadcast::Sender<Envelope>,
+    close_rx: &watch::Receiver<bool>,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    info!(
+        request_id = %req.request_id,
+        operation = ?req.operation.as_ref().map(file_op_name),
+        "received file request"
+    );
+
+    let send_file_response = |resp: ahand_protocol::FileResponse| {
+        let env = Envelope {
+            device_id: device_id.to_string(),
+            msg_id: new_msg_id(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::FileResponse(resp)),
+            ..Default::default()
+        };
+        let _ = tx.send(env);
+    };
+
+    // Derive a single string identifying the path(s) this request
+    // touches, for inclusion in any synthetic FileError.path we build
+    // at this layer. file_mgr.request_paths(&req) returns one entry
+    // per operand (Move/Copy/CreateSymlink → two, single-path ops →
+    // one); join with comma so the operator can see exactly which
+    // file the daemon refused to act on, instead of a blank `path`
+    // field hiding behind a generic "PolicyDenied" message.
+    let req_paths_joined = file_mgr.request_paths(&req).join(", ");
+
+    if !file_mgr.is_enabled() {
+        send_file_response(crate::file_manager::error_response(
+            req.request_id.clone(),
+            ahand_protocol::FileErrorCode::PolicyDenied,
+            &req_paths_joined,
+            "file operations are not enabled on this daemon",
+        ));
+        return;
+    }
+
+    // Pre-flight policy check — runs the same allowlist/denylist checks that
+    // dispatch would, but also surfaces `dangerous_paths` hits as
+    // "needs_approval". If any path is outright denied, short-circuit with
+    // the FileError. Otherwise we carry the structured `policy_escalation`
+    // forward so the session-mode branch below can escalate to approval —
+    // and use the specific reason from policy (which path / why) rather
+    // than a generic "dangerous_paths" string.
+    let policy_escalation = match file_mgr.check_request_approval(&req).await {
+        Ok(escalation) => escalation,
+        Err(err) => {
+            warn!(request_id = %req.request_id, code = err.code, "file request denied by policy pre-check");
+            send_file_response(ahand_protocol::FileResponse {
+                request_id: req.request_id.clone(),
+                result: Some(ahand_protocol::file_response::Result::Error(err)),
+            });
+            return;
+        }
+    };
+
+    // Session mode check — file operations always go through the same gate as
+    // other cloud-initiated tools. We synthesise a JobRequest with
+    // tool="file" so that the session manager can apply the caller's current
+    // policy.
+    //
+    // R6 — file approvals get a dedicated `file-req:` job_id namespace so
+    // a file-request approval can never accidentally evict a real job's
+    // pending approval (or vice versa). Previously both shared the
+    // caller-chosen request_id/job_id and could collide inside
+    // ApprovalManager.
+    //
+    // R8 — include the paths the request touches in `args` so the user
+    // sees what's actually being approved in the UI, not just `tool=file`
+    // with `args=[op_name]`.
+    let op_name = req
+        .operation
+        .as_ref()
+        .map(file_op_name)
+        .unwrap_or("unspecified")
+        .to_string();
+    let approval_job_id = format!("file-req:{}", req.request_id);
+    let mut approval_args = vec![op_name];
+    approval_args.extend(file_mgr.request_paths(&req));
+    let synthetic_req = ahand_protocol::JobRequest {
+        job_id: approval_job_id.clone(),
+        tool: "file".to_string(),
+        args: approval_args,
+        ..Default::default()
+    };
+
+    let session_decision = session_mgr.check(&synthetic_req, caller_uid).await;
+
+    let (approval_reason, previous_refusals) = match session_decision {
+        SessionDecision::Deny(reason) => {
+            warn!(request_id = %req.request_id, reason = %reason, "file request denied by session mode");
+            send_file_response(crate::file_manager::error_response(
+                req.request_id.clone(),
+                ahand_protocol::FileErrorCode::PolicyDenied,
+                &req_paths_joined,
+                &reason,
+            ));
+            return;
+        }
+        SessionDecision::Allow if policy_escalation.is_none() => {
+            // Fast path — nothing dangerous, session would allow.
+            let response = file_mgr.handle(&req).await;
+            send_file_response(response);
+            return;
+        }
+        SessionDecision::Allow => {
+            // Session would Allow, but policy pre-check flagged the
+            // request (dangerous path, recursive permanent delete, glob
+            // scan cap hit, etc.). Force the approval flow with the
+            // specific reason policy gave us — operators see e.g.
+            // "path '/etc/passwd' is listed in dangerous_paths" rather
+            // than a generic "path is listed in dangerous_paths" line.
+            let escalation = policy_escalation
+                .as_ref()
+                .expect("guarded by SessionDecision::Allow if policy_escalation.is_none()");
+            info!(
+                request_id = %req.request_id,
+                kind = ?escalation.kind,
+                reason = %escalation.reason,
+                "file request escalated to approval by policy pre-check"
+            );
+            (escalation.reason.clone(), Vec::new())
+        }
+        SessionDecision::NeedsApproval {
+            reason,
+            previous_refusals,
+        } => {
+            info!(
+                request_id = %req.request_id,
+                reason = %reason,
+                "file request needs approval (strict mode)"
+            );
+            (reason, previous_refusals)
+        }
+    };
+
+    // Both the Allow+dangerous and NeedsApproval branches fall through here.
+    let (approval_req, approval_rx) = approval_mgr
+        .submit(synthetic_req, caller_uid, approval_reason, previous_refusals)
+        .await;
+
+    // Send ApprovalRequest to cloud via WS and broadcast to IPC clients.
+    let approval_env = Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::ApprovalRequest(approval_req.clone())),
+        ..Default::default()
+    };
+    let _ = tx.send(approval_env.clone());
+    let _ = approval_broadcast_tx.send(approval_env);
+
+    // Wait for the approval response (or timeout, or connection close) in a
+    // detached task so the dispatch loop keeps draining inbound frames
+    // while approval is pending. R20: we select on close_rx so the task
+    // exits promptly when the parent WS connection tears down, instead of
+    // lingering until the 24-hour approval timeout.
+    let tx_clone = (*tx).clone();
+    let file_mgr_clone = Arc::clone(file_mgr);
+    let amgr = Arc::clone(approval_mgr);
+    let did = device_id.to_string();
+    let timeout = amgr.default_timeout();
+    // The approval manager key is the namespaced job_id (`file-req:<rid>`),
+    // but every FileResponse we emit back to the caller still uses the
+    // bare request_id so the HTTP layer can correlate.
+    let response_request_id = req.request_id.clone();
+    let approval_key = approval_job_id;
+    let mut close_rx_clone = close_rx.clone();
+    // Clone the joined paths so the spawned task can populate
+    // FileError.path on the Denied / TimedOut branches — without it
+    // the operator only sees a generic "approval denied" / "approval
+    // timed out" with no indication of *which* file. Same observability
+    // pattern Copilot caught one layer down in text/binary readers.
+    let req_paths_joined_for_task = req_paths_joined.clone();
+
+    tokio::spawn(async move {
+        let reply = |resp: ahand_protocol::FileResponse| {
+            let env = Envelope {
+                device_id: did.clone(),
+                msg_id: new_msg_id(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::FileResponse(resp)),
+                ..Default::default()
+            };
+            let _ = tx_clone.send(env);
+        };
+
+        // Outcome of the wait: either we know whether the caller approved
+        // or we bailed out because the connection closed / timed out.
+        enum Outcome {
+            Approved,
+            Denied(String),
+            TimedOut,
+            ConnectionClosed,
+        }
+
+        let outcome = tokio::select! {
+            result = tokio::time::timeout(timeout, approval_rx) => {
+                match result {
+                    Ok(Ok(resp)) if resp.approved => Outcome::Approved,
+                    Ok(Ok(resp)) => {
+                        let reason = if resp.reason.is_empty() {
+                            "approval denied".to_string()
+                        } else {
+                            format!("approval denied: {}", resp.reason)
+                        };
+                        Outcome::Denied(reason)
+                    }
+                    _ => Outcome::TimedOut,
+                }
+            }
+            changed = close_rx_clone.changed() => {
+                // The watch channel flipped to true (or the sender dropped).
+                // Either way the connection is going away — bail out.
+                let _ = changed;
+                Outcome::ConnectionClosed
+            }
+        };
+
+        match outcome {
+            Outcome::Approved => {
+                info!(request_id = %response_request_id, "file approval granted");
+                let response = file_mgr_clone.handle(&req).await;
+                reply(response);
+            }
+            Outcome::Denied(reason) => {
+                info!(request_id = %response_request_id, "file approval denied");
+                amgr.expire(&approval_key).await;
+                reply(crate::file_manager::error_response(
+                    response_request_id.clone(),
+                    ahand_protocol::FileErrorCode::PolicyDenied,
+                    &req_paths_joined_for_task,
+                    &reason,
+                ));
+            }
+            Outcome::TimedOut => {
+                info!(request_id = %response_request_id, "file approval timed out");
+                amgr.expire(&approval_key).await;
+                reply(crate::file_manager::error_response(
+                    response_request_id.clone(),
+                    ahand_protocol::FileErrorCode::PolicyDenied,
+                    &req_paths_joined_for_task,
+                    "approval timed out",
+                ));
+            }
+            Outcome::ConnectionClosed => {
+                // Connection is already torn down; no point replying via
+                // `tx` — the receiver task has exited. Just clean up the
+                // approval manager entry and let the task exit.
+                info!(
+                    request_id = %response_request_id,
+                    "file approval cancelled: parent connection closed"
+                );
+                amgr.expire(&approval_key).await;
+            }
+        }
+    });
+}
+
+fn file_op_name(op: &ahand_protocol::file_request::Operation) -> &'static str {
+    use ahand_protocol::file_request::Operation;
+    match op {
+        Operation::ReadText(_) => "read_text",
+        Operation::ReadBinary(_) => "read_binary",
+        Operation::ReadImage(_) => "read_image",
+        Operation::Write(_) => "write",
+        Operation::Edit(_) => "edit",
+        Operation::Delete(_) => "delete",
+        Operation::Chmod(_) => "chmod",
+        Operation::Stat(_) => "stat",
+        Operation::List(_) => "list",
+        Operation::Glob(_) => "glob",
+        Operation::Mkdir(_) => "mkdir",
+        Operation::Copy(_) => "copy",
+        Operation::Move(_) => "move",
+        Operation::CreateSymlink(_) => "create_symlink",
     }
 }
 

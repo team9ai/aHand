@@ -66,7 +66,55 @@ pub struct Config {
     /// matches the deployed `task-definition.json` so a hub booted
     /// without the env var still meets the spec.
     pub webhook_timeout_ms: u64,
+    /// Per-request timeout for the `POST /api/devices/{id}/files` proxy
+    /// in milliseconds. The handler waits this long for the device's
+    /// FileResponse to come back over the WebSocket before giving up
+    /// with `504 GATEWAY_TIMEOUT`. Was a hard-coded 30s constant
+    /// (T17 deferred); now configurable so timeout-path integration
+    /// tests can use a short window without `#[ignore]`'ing them and
+    /// operators with slow large-file workloads can extend it.
+    pub file_request_timeout_ms: u64,
     pub store: StoreConfig,
+    /// Optional S3 configuration for large file transfer.
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+}
+
+/// S3 configuration used by the file operation transfer path.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct S3Config {
+    pub bucket: String,
+    pub region: String,
+    /// Custom S3 endpoint (e.g. for MinIO or LocalStack).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// File-size threshold above which hub uses S3 instead of inlining the
+    /// content in the FileResponse/FileRequest envelope. Defaults to 1 MB.
+    #[serde(default = "default_file_transfer_threshold_bytes")]
+    pub file_transfer_threshold_bytes: u64,
+    /// Pre-signed URL expiration, in seconds. Defaults to 1 hour.
+    #[serde(default = "default_url_expiration_secs")]
+    pub url_expiration_secs: u64,
+}
+
+fn default_file_transfer_threshold_bytes() -> u64 {
+    1_048_576
+}
+
+fn default_url_expiration_secs() -> u64 {
+    3_600
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            file_transfer_threshold_bytes: default_file_transfer_threshold_bytes(),
+            url_expiration_secs: default_url_expiration_secs(),
+        }
+    }
 }
 
 impl Config {
@@ -157,10 +205,15 @@ impl Config {
                 .map(|value| value.parse())
                 .transpose()?
                 .unwrap_or(5_000),
+            file_request_timeout_ms: getenv("AHAND_HUB_FILE_REQUEST_TIMEOUT_MS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(30_000),
             store: StoreConfig::Persistent {
                 database_url: required_env(&getenv, "AHAND_HUB_DATABASE_URL")?,
                 redis_url: required_env(&getenv, "AHAND_HUB_REDIS_URL")?,
             },
+            s3: s3_config_from_env(&getenv)?,
         };
         if config.webhook_url.is_some() && config.webhook_secret.is_none() {
             return Err(anyhow::anyhow!(
@@ -169,6 +222,32 @@ impl Config {
         }
         Ok(config)
     }
+}
+
+fn s3_config_from_env<F>(getenv: &F) -> anyhow::Result<Option<S3Config>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(bucket) = getenv("AHAND_HUB_S3_BUCKET") else {
+        return Ok(None);
+    };
+    let region = getenv("AHAND_HUB_S3_REGION").unwrap_or_else(|| "us-east-1".into());
+    let endpoint = getenv("AHAND_HUB_S3_ENDPOINT");
+    let threshold = getenv("AHAND_HUB_S3_THRESHOLD_BYTES")
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or_else(default_file_transfer_threshold_bytes);
+    let expiration = getenv("AHAND_HUB_S3_URL_EXPIRATION_SECS")
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or_else(default_url_expiration_secs);
+    Ok(Some(S3Config {
+        bucket,
+        region,
+        endpoint,
+        file_transfer_threshold_bytes: threshold,
+        url_expiration_secs: expiration,
+    }))
 }
 
 fn default_audit_fallback_path() -> PathBuf {

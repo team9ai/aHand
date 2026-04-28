@@ -56,6 +56,19 @@ resource "aws_security_group_rule" "redis_ingress_from_task" {
   description              = "ahand-hub-${var.env} ECS task"
 }
 
+# Attach the task SG to the openclaw-hive RDS SG ingress on 5432. The RDS
+# SG is owned by the openclaw-hive stack so we only authorize an extra
+# source group here; we do not manage the SG itself.
+resource "aws_security_group_rule" "rds_ingress_from_task" {
+  type                     = "ingress"
+  from_port                = var.openclaw_rds_port
+  to_port                  = var.openclaw_rds_port
+  protocol                 = "tcp"
+  security_group_id        = var.openclaw_rds_security_group_id
+  source_security_group_id = aws_security_group.task.id
+  description              = "ahand-hub-${var.env} ECS task to RDS ${var.openclaw_rds_port}"
+}
+
 resource "aws_ecs_task_definition" "stub" {
   family                   = "ahand-hub-${var.env}"
   cpu                      = var.env == "prod" ? "512" : "256"
@@ -99,8 +112,8 @@ resource "aws_ecs_service" "ahand_hub" {
   launch_type     = "FARGATE"
 
   network_configuration {
-    subnets          = var.subnet_ids
-    security_groups  = [aws_security_group.task.id]
+    subnets         = var.subnet_ids
+    security_groups = [aws_security_group.task.id]
     # VPC has only public subnets → Fargate tasks need public IPs to reach
     # ECR / SSM / CloudWatch via the IGW. Traefik still targets the private
     # IP via Docker labels; the public IP is outbound-only in practice.
