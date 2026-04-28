@@ -6,6 +6,7 @@ mod cli;
 mod config;
 mod device_identity;
 mod executor;
+mod file_manager;
 mod ipc;
 mod openclaw;
 mod outbox;
@@ -160,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
                     openclaw: None,
                     browser: None,
                     hub: None,
+                    file_policy: None,
                 }
             }
         } else {
@@ -184,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
                 openclaw: None,
                 browser: None,
                 hub: None,
+                file_policy: None,
             }
         }
     };
@@ -295,6 +298,9 @@ async fn main() -> anyhow::Result<()> {
 
     let browser_mgr = Arc::new(browser::BrowserManager::new(cfg.browser_config()));
 
+    let file_policy_cfg = cfg.file_policy.clone().unwrap_or_default();
+    let file_mgr = Arc::new(file_manager::FileManager::new(&file_policy_cfg));
+
     // Broadcast channel for pushing approval requests to all IPC clients.
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
 
@@ -337,7 +343,7 @@ async fn main() -> anyhow::Result<()> {
                     ));
 
                     tokio::select! {
-                        r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx, Arc::clone(&browser_mgr)) => r,
+                        r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx, Arc::clone(&browser_mgr), Arc::clone(&file_mgr)) => r,
                         r = ipc_handle => {
                             r??;
                             Ok(())
@@ -353,6 +359,7 @@ async fn main() -> anyhow::Result<()> {
                         approval_mgr,
                         approval_broadcast_tx,
                         browser_mgr,
+                        file_mgr,
                     )
                     .await
                 }

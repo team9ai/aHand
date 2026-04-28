@@ -188,6 +188,7 @@ fn build_hello_envelope_signature_verifies_under_deterministic_identity() {
         &identity,
         FIXTURE_LAST_ACK,
         true,
+        true,
         FIXTURE_CHALLENGE_NONCE,
         None,
     );

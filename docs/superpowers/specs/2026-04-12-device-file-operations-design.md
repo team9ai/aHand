@@ -64,11 +64,17 @@ message FileResponse {
     FileGlobResult glob = 19;
     FileMkdirResult mkdir = 20;
     FileCopyResult copy = 21;
-    FileMoveResult move = 22;
+    FileMoveResult move_result = 22;  // renamed from spec's "move" — `move` is a Rust keyword
     FileCreateSymlinkResult create_symlink = 23;
   }
 }
 ```
+
+> **Note on Heartbeat field number.** The implementation also added a
+> `Heartbeat heartbeat = 33;` arm to `Envelope.payload` (in a separate stream
+> of work that landed alongside file ops). Heartbeat sits at 33 specifically
+> so it doesn't clash with FileRequest=31 / FileResponse=32 — see
+> `proto/ahand/v1/envelope.proto` for the canonical field numbers.
 
 ## Text File Reading (FileReadText)
 
@@ -227,6 +233,13 @@ message FileReadImageResult {
 
 ## Write & Edit Operations
 
+> **v1 encoding limitation.** Writes and edits accept `encoding=""`
+> (auto, treated as UTF-8) or `"utf-8"` / `"utf8"` (case-insensitive).
+> Any other value is rejected with `FILE_ERROR_CODE_ENCODING`.
+> Full encoding conversion on write — equivalent to the read-side
+> chardetng/encoding_rs path — is intentionally future work; v1
+> contracts assume callers serialize their content as UTF-8.
+
 ### FileWrite (create or overwrite files)
 
 ```protobuf
@@ -378,12 +391,14 @@ message WindowsAcl {
 message AclEntry {
   string principal = 1;           // user/group name
   uint32 access_mask = 2;        // Windows ACCESS_MASK
-  AclEntryType type = 3;
+  AclEntryType entry_type = 3;   // renamed from spec's "type" — Rust keyword
 }
 
 enum AclEntryType {
-  ACL_ENTRY_ALLOW = 0;
-  ACL_ENTRY_DENY = 1;
+  // proto3 best practice prefixes the enum type name onto every value
+  // so sibling enums in the same package can't collide.
+  ACL_ENTRY_TYPE_ALLOW = 0;
+  ACL_ENTRY_TYPE_DENY = 1;
 }
 
 message FileChmodResult {
@@ -530,23 +545,45 @@ message FileError {
 }
 
 enum FileErrorCode {
-  FILE_ERROR_UNSPECIFIED = 0;
-  FILE_ERROR_NOT_FOUND = 1;
-  FILE_ERROR_PERMISSION_DENIED = 2;
-  FILE_ERROR_ALREADY_EXISTS = 3;
-  FILE_ERROR_NOT_A_DIRECTORY = 4;
-  FILE_ERROR_IS_A_DIRECTORY = 5;
-  FILE_ERROR_NOT_EMPTY = 6;         // non-recursive delete on non-empty dir
-  FILE_ERROR_TOO_LARGE = 7;         // exceeds transfer limit
-  FILE_ERROR_INVALID_PATH = 8;      // path traversal or security issue
-  FILE_ERROR_IO = 9;
-  FILE_ERROR_ENCODING = 10;         // encoding detection/conversion failed
-  FILE_ERROR_MULTIPLE_MATCHES = 11; // StringReplace found multiple matches
-  FILE_ERROR_POLICY_DENIED = 12;    // blocked by file policy
+  // proto3 best practice prefixes the enum type name onto every value;
+  // matching the implementation in proto/ahand/v1/file_ops.proto.
+  FILE_ERROR_CODE_UNSPECIFIED = 0;
+  FILE_ERROR_CODE_NOT_FOUND = 1;
+  FILE_ERROR_CODE_PERMISSION_DENIED = 2;
+  FILE_ERROR_CODE_ALREADY_EXISTS = 3;
+  FILE_ERROR_CODE_NOT_A_DIRECTORY = 4;
+  FILE_ERROR_CODE_IS_A_DIRECTORY = 5;
+  FILE_ERROR_CODE_NOT_EMPTY = 6;         // non-recursive delete on non-empty dir
+  FILE_ERROR_CODE_TOO_LARGE = 7;         // exceeds transfer limit
+  FILE_ERROR_CODE_INVALID_PATH = 8;      // path traversal or security issue
+  FILE_ERROR_CODE_IO = 9;
+  FILE_ERROR_CODE_ENCODING = 10;         // encoding detection/conversion failed
+  FILE_ERROR_CODE_MULTIPLE_MATCHES = 11; // StringReplace found multiple matches
+  FILE_ERROR_CODE_POLICY_DENIED = 12;    // blocked by file policy
 }
 ```
 
 ## Large File S3 Transfer
+
+> **v1 status (post-Round-1 review).** The plumbing for large-file
+> transfer is in place — `S3Client` (`crates/ahand-hub/src/s3.rs`),
+> `S3Config` (`crates/ahand-hub/src/config.rs`), `AppState.s3_client`
+> (`crates/ahand-hub/src/state.rs`), the `FullWrite.s3_object_key`
+> proto field — but the bidirectional flow described in this section
+> (hub generates pre-signed URLs, daemon uploads/downloads, hub
+> replies with `download_url`) is **not wired end-to-end** in this
+> PR. The `POST /files/upload-url` route was deliberately withdrawn
+> in Round 1 because exposing a half-working API surface is worse
+> than not exposing one at all (see `crates/ahand-hub/src/http/files.rs`
+> file-trailing comment block for the rationale and the list of items
+> kept for v2).
+>
+> Until v2 lands: large reads return `FILE_ERROR_CODE_TOO_LARGE` once
+> the configured `max_read_bytes` budget is hit, and the daemon
+> rejects writes with a non-empty `FullWrite.s3_object_key` (no
+> upload-url flow). The `needs_upload` and `file_size` fields below
+> are spec-only — they are not present in `proto/ahand/v1/file_ops.proto`
+> and will be added when the flow is wired.
 
 ### Threshold
 

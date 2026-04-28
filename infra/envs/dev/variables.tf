@@ -22,3 +22,8 @@ variable "openclaw_rds_host" {
   type    = string
   default = "openclaw-hive-dev.chq8i2se49qd.us-east-1.rds.amazonaws.com"
 }
+
+variable "openclaw_rds_security_group_id" {
+  type    = string
+  default = "sg-03be90e5bf963ddc3"
+}

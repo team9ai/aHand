@@ -78,6 +78,8 @@ pub struct AppState {
     pub dashboard_shared_password: Arc<String>,
     pub dashboard_allowed_origins: Arc<Vec<String>>,
     pub terminal_tokens: Arc<DashMap<String, crate::http::terminal::TerminalToken>>,
+    pub pending_file_requests: Arc<crate::pending_file_requests::PendingFileRequests>,
+    pub s3_client: Option<Arc<crate::s3::S3Client>>,
     /// Outbound webhook dispatcher. Always present; when
     /// `config.webhook_url` is `None`, this is a no-op (`Webhook::disabled()`)
     /// so call sites can always invoke `state.webhook.enqueue_*` without
@@ -160,6 +162,12 @@ impl AppState {
             jobs_store.clone(),
             audit_store.clone(),
         ));
+        let pending_file_requests = crate::pending_file_requests::new_pending_requests();
+        let s3_client = if let Some(ref s3_cfg) = config.s3 {
+            Some(Arc::new(crate::s3::S3Client::new(s3_cfg).await))
+        } else {
+            None
+        };
         let jobs = Arc::new(crate::http::jobs::JobRuntime::new(
             job_dispatcher.clone(),
             jobs_store.clone(),
@@ -168,6 +176,7 @@ impl AppState {
             output_stream.clone(),
             config.job_timeout_grace_ms,
             config.device_disconnect_grace_ms,
+            pending_file_requests.clone(),
         ));
 
         let browser_pending = Arc::new(DashMap::new());
@@ -225,6 +234,8 @@ impl AppState {
             dashboard_shared_password: Arc::new(config.dashboard_shared_password),
             dashboard_allowed_origins: Arc::new(config.dashboard_allowed_origins),
             terminal_tokens: Arc::new(DashMap::new()),
+            pending_file_requests,
+            s3_client,
             webhook,
         };
         state

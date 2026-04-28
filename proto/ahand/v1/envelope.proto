@@ -3,6 +3,7 @@ syntax = "proto3";
 package ahand.v1;
 
 import "ahand/v1/browser.proto";
+import "ahand/v1/file_ops.proto";
 
 // Envelope wraps all messages on the wire (WS and IPC).
 message Envelope {
@@ -36,7 +37,9 @@ message Envelope {
     UpdateStatus     update_status     = 28;
     StdinChunk       stdin_chunk       = 29;
     TerminalResize   terminal_resize   = 30;
-    Heartbeat        heartbeat         = 31;
+    FileRequest      file_request      = 31;
+    FileResponse     file_response     = 32;
+    Heartbeat        heartbeat         = 33;
   }
 }
 

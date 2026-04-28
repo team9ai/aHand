@@ -1,0 +1,146 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-12-file-ops-review-round1-fixes.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "T0: Gate S3 upload-url flow (remove hub route, keep s3.rs for v2)",
+      "status": "completed",
+      "description": "Remove the POST /files/upload-url route and its handler; the underlying `s3::S3Client`, `S3Config`, and `AppState.s3_client` stay in place so a follow-up PR can wire the full threshold-based transfer path without re-doing the skeleton. Daemon-side rejection of `s3_object_key` stays as defense-in-depth. Addresses review issue #11.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/mod.rs\", \"crates/ahand-hub/src/http/files.rs\"], \"verifyCommand\": \"cargo build -p ahand-hub\", \"acceptanceCriteria\": [\"/api/devices/{id}/files/upload-url route removed\", \"get_upload_url handler and UploadUrlResponse struct deleted\", \"s3.rs, S3Config, AppState.s3_client untouched (ready for v2)\", \"cargo build -p ahand-hub succeeds\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "T1: Replace base64 wrapper with application/x-protobuf on POST /files",
+      "status": "completed",
+      "description": "Change the file operation endpoint to accept raw protobuf bytes and return raw protobuf bytes, instead of wrapping them in a JSON `{proto_b64: ...}` envelope. Delete the hand-rolled base64 module (also fixes review issue #27 about malformed padding). Addresses review issue #15.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\"], \"verifyCommand\": \"cargo build -p ahand-hub\", \"acceptanceCriteria\": [\"file_operation accepts axum::body::Bytes with content-type application/x-protobuf\", \"Response body is raw proto with the same content-type\", \"simple_base64 module removed entirely\", \"FileOperationRequest / FileOperationResponse structs removed\", \"cargo build -p ahand-hub succeeds\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "T2: Policy canonicalizes paths (resolve symlinks before allowlist check)",
+      "status": "completed",
+      "blockedBy": [],
+      "description": "`FilePolicyChecker::check_path` currently only does lexical normalization. Switch to canonicalizing existing paths (via `std::fs::canonicalize`) and, for paths that don't exist yet (Write/Mkdir/Copy/Move destinations), canonicalizing the deepest existing parent and re-joining the tail. Re-check the resolved path against allowlist and denylist. Addresses review issue #2.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/policy.rs\", \"crates/ahandd/src/file_manager/mod.rs\"], \"verifyCommand\": \"cargo test -p ahandd --lib file_manager::policy\", \"acceptanceCriteria\": [\"Existing paths are canonicalized before matching allowlist/denylist\", \"Non-existing paths canonicalize their deepest existing parent\", \"New test: symlink inside allowlist pointing at /etc/passwd is rejected\", \"Existing policy tests still pass\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "T3: FileGlob re-checks each matched path against policy",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "Two-part fix for glob escape (review issue #1): (a) reject glob patterns containing `..` or starting with an absolute path when no `base_path` is set, (b) inside `handle_glob`, run each matched path through `policy.check_path` before returning it. Addresses review issue #1.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/file_manager/fs_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops glob\", \"acceptanceCriteria\": [\"Glob with absolute pattern /etc/** and no base is rejected\", \"Glob pattern containing .. is rejected\", \"Each matched path is re-checked against policy and excluded if denied\", \"Existing glob tests still pass\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "T4: Plumb NeedsApproval through handle_file_request (strict-mode file-op approval)",
+      "status": "completed",
+      "description": "`handle_file_request` currently treats `SessionDecision::NeedsApproval` the same as `Allow`. Mirror the approval flow from `handle_job_request`: when approval is required, register with `approval_mgr`, emit an `ApprovalRequest` envelope, await the response, and only then dispatch to `FileManager`. Addresses review issue #3.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo build -p ahandd\", \"acceptanceCriteria\": [\"NeedsApproval branch fires an ApprovalRequest and waits for the reply\", \"Approved requests are dispatched to FileManager\", \"Denied/timed-out requests return a FileError with PolicyDenied\", \"Build passes\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "T5: Wire dangerous_paths.needs_approval into the approval path",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "`PolicyResult.needs_approval` is computed but ignored. Have `FileManager::dispatch` return the `needs_approval` flag alongside the handler result, and have `handle_file_request` force the approval flow when either the session decision OR the policy result says approval is required. Addresses review issue #5.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo test -p ahandd --lib\", \"acceptanceCriteria\": [\"Requests touching a path in dangerous_paths always require approval, regardless of session mode\", \"New test: AutoAccept session + dangerous path → approval requested\", \"Existing tests still pass\"]}\n```"
+    },
+    {
+      "id": 6,
+      "subject": "T6: Enforce max_read_bytes at the dispatch boundary",
+      "status": "completed",
+      "description": "`FilePolicyConfig.max_read_bytes` exists but no handler consults it. Clamp the effective read cap for read_text/read_binary/read_image to `min(request_max, policy.max_read_bytes())`, and refuse to buffer the whole file for text reads when `file_size > max_read_bytes`. Addresses review issue #6.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/mod.rs\", \"crates/ahandd/src/file_manager/text_read.rs\", \"crates/ahandd/src/file_manager/binary_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops\", \"acceptanceCriteria\": [\"max_read_bytes policy value is respected for all three read operations\", \"New test: config with max_read_bytes=1024 + 2KB file → TooLarge or truncated at 1024\", \"Existing read tests still pass\"]}\n```"
+    },
+    {
+      "id": 7,
+      "subject": "T7: Text read respects target_end / max_bytes mid-line",
+      "status": "completed",
+      "description": "Current pagination stops only at line boundaries, so `target_end` at column 5 still returns the whole line and `max_bytes=120` can return up to the next newline. Rework the loop to evaluate stop conditions per byte, truncating the current line to the exact stop point. Addresses review issue #7.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"target_end at column 5 of line N returns lines 1..N-1 plus 5 bytes of line N\", \"max_bytes=X stops at exactly X bytes consumed, not at the next newline\", \"New tests for both mid-line scenarios\", \"Existing text read tests still pass\"]}\n```"
+    },
+    {
+      "id": 8,
+      "subject": "T8: Text read reports raw on-disk byte positions (not decoded buffer offsets)",
+      "status": "completed",
+      "blockedBy": [7],
+      "description": "Compute line offsets and all reported positions (start_byte, target_end resolution, PositionInfo.byte_in_file, remaining_bytes) on the raw file bytes, then decode only the output slices. This keeps the proto's `byte_in_file` contract honest for GBK/Shift-JIS/etc. Addresses review issue #8.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/text_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_text\", \"acceptanceCriteria\": [\"Line offsets computed on raw bytes\", \"start_pos/end_pos/byte_in_file/remaining_bytes reported in raw bytes\", \"New test: GBK file with non-UTF-8 cursor position round-trips correctly\", \"Existing UTF-8 tests still pass\"]}\n```"
+    },
+    {
+      "id": 9,
+      "subject": "T9: ByteRangeReplace uses checked_add and rejects overflow",
+      "status": "completed",
+      "description": "`(br.byte_offset + br.byte_length) as usize` is unchecked u64 addition and can wrap, crashing the handler task. Switch to `checked_add`, validate `end <= file.len()`, and return an `InvalidPath` or `TooLarge` error on overflow. Addresses review issue #10.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/write_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops byte_range\", \"acceptanceCriteria\": [\"byte_length = u64::MAX returns an error instead of panicking\", \"byte_offset + byte_length > file_size returns a clear error\", \"New regression test with u64::MAX byte_length\", \"Existing byte-range tests still pass\"]}\n```"
+    },
+    {
+      "id": 10,
+      "subject": "T10: Image read adds decompression bomb guard and raw-passthrough mode",
+      "status": "completed",
+      "description": "Two fixes in one place (review issues #9 and #21): (a) before `reader.decode()`, call `image::image_dimensions` (which doesn't decode pixels) to check `width * height * 4 <= max_read_bytes` and reject bombs; (b) when request has no `max_width`/`max_height`/`max_bytes`/`quality`, and `output_format` is Original, return the raw file bytes unchanged (true passthrough).\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/binary_read.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops read_image\", \"acceptanceCriteria\": [\"Images whose declared dimensions exceed max_read_bytes are rejected pre-decode\", \"Passthrough returns raw file bytes byte-for-byte\", \"New test: passthrough equality with original file bytes\", \"Existing image tests still pass\"]}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "T11: Honor no_follow_symlink in write/edit/chmod",
+      "status": "completed",
+      "description": "The proto exposes `no_follow_symlink` on FileWrite, FileEdit, and FileChmod, but handlers ignore it. Use `symlink_metadata` to detect symlinks when the flag is set, and error out with a clear message before touching the filesystem. For chmod specifically, branch on the flag to avoid following symlinks when applying mode bits. Addresses review issue #14.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/write_ops.rs\", \"crates/ahandd/src/file_manager/fs_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops symlink\", \"acceptanceCriteria\": [\"Write/Edit/Chmod with no_follow_symlink=true on a symlink returns an error and does not modify the target\", \"Same operations with no_follow_symlink=false still work\", \"New tests for all three handlers\"]}\n```"
+    },
+    {
+      "id": 12,
+      "subject": "T12: Key PendingFileRequests by (device_id, request_id)",
+      "status": "completed",
+      "description": "`PendingFileRequests` currently keys on `request_id` alone, so two devices with a colliding caller-chosen ID cross-contaminate. Change the DashMap key to `(String, String)`, update registration and resolution sites, and reject duplicate registrations instead of silently overwriting. Addresses review issue #4.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\", \"crates/ahand-hub/src/http/jobs.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib\", \"acceptanceCriteria\": [\"Map keyed by (device_id, request_id) tuple\", \"Duplicate register returns an error instead of overwriting\", \"handle_device_frame passes device_id into resolve()\", \"Existing hub lib tests still pass\"]}\n```"
+    },
+    {
+      "id": 13,
+      "subject": "T13: Admission control on PendingFileRequests (cap inflight waiters)",
+      "status": "completed",
+      "blockedBy": [12],
+      "description": "Cap `PendingFileRequests` at a configurable max (default 1024). Once the table is full, return a 503 `TOO_MANY_REQUESTS` error from the file endpoint. Addresses review issue #12.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/files.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib\", \"acceptanceCriteria\": [\"Hard cap enforced (default 1024)\", \"New request at capacity returns 503 with a stable error code\", \"New test covers the saturation path\"]}\n```"
+    },
+    {
+      "id": 14,
+      "subject": "T14: Reject non-UTF-8 encoding for writes + document in proto",
+      "status": "completed",
+      "description": "`FileWrite.encoding` is currently ignored. Until full encoding support lands, explicitly reject anything other than empty/'utf-8' with a `FILE_ERROR_CODE_ENCODING` error, and update the proto comment to say 'v1 only supports UTF-8 for writes'. Addresses review issue #18.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/write_ops.rs\", \"proto/ahand/v1/file_ops.proto\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops encoding\", \"acceptanceCriteria\": [\"FileWrite with encoding='gbk' returns FILE_ERROR_CODE_ENCODING\", \"FileWrite with encoding empty or 'utf-8' works\", \"Proto comment updated\", \"New test covers the rejection path\"]}\n```"
+    },
+    {
+      "id": 15,
+      "subject": "T15: Gate Unix-only APIs in fs_ops.rs behind cfg(unix)",
+      "status": "completed",
+      "description": "`fs_ops.rs` unconditionally imports `std::os::unix::fs::PermissionsExt`, uses `Permissions::from_mode`, and calls `.mode()`. Gate these behind `#[cfg(unix)]` and provide Windows-safe alternatives (or at least cfg-out the feature on Windows). Addresses review issue #13.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/fs_ops.rs\"], \"verifyCommand\": \"cargo check -p ahandd\", \"acceptanceCriteria\": [\"Unix-only imports and calls are cfg-gated\", \"Windows equivalents exist (UnixPermission returned as None on Windows, mkdir mode ignored)\", \"cargo check on native platform still succeeds\", \"Rustdoc note added explaining Windows behavior\"]}\n```"
+    },
+    {
+      "id": 16,
+      "subject": "T16: Advertise file capability in daemon Hello when enabled",
+      "status": "completed",
+      "description": "When `file_mgr.is_enabled()`, push `\"file\"` into the capabilities vector in `build_hello_envelope`. Mirrors the existing `browser` capability handling. Addresses review issue #19.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test hub_handshake\", \"acceptanceCriteria\": [\"Capabilities vector contains 'file' when file_mgr is enabled\", \"Capabilities vector does not contain 'file' when disabled\", \"Existing hub_handshake tests still pass\"]}\n```"
+    },
+    {
+      "id": 17,
+      "subject": "T17: Tests for crates/ahand-hub/src/http/files.rs (axum handler)",
+      "status": "completed",
+      "blockedBy": [1, 12, 13],
+      "description": "Add axum-level tests for the (post-T1) protobuf file operation handler: happy path via fake ConnectionRegistry + pending-request resolver, device offline → 409, timeout → 504, malformed protobuf body → 400, admission cap → 503. Addresses review issue #16.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/tests/http_files.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --test http_files\", \"acceptanceCriteria\": [\"Happy path test: request forwarded to fake device, response round-trips\", \"Device offline test\", \"Timeout test (with short timeout override)\", \"Malformed protobuf body test\", \"Admission cap test (from T13)\"]}\n```"
+    },
+    {
+      "id": 18,
+      "subject": "T18: Daemon test coverage batch — write/edit/fs edge cases",
+      "status": "completed",
+      "blockedBy": [9, 11],
+      "description": "Fill coverage gaps called out by Reviewer C: FileWrite StringReplace NotFound, line-range OOB (start_line > total, end_line > total, no trailing newline), byte-range EOF insert (byte_offset == file.len(), byte_length == 0 mid-file), recursive copy overwrite, symlink delete follow/no-follow, chmod no_follow_symlink, TRASH delete round-trip (guarded with #[ignore] or a real tempdir cleanup). Addresses review issues #23, #28, parts of #14 and #10.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops\", \"acceptanceCriteria\": [\"Every bullet above has at least one test\", \"Total test count in file_ops.rs increases by 8+ tests\", \"All new tests pass\"]}\n```"
+    },
+    {
+      "id": 19,
+      "subject": "T19: Daemon test coverage batch — text/image edges",
+      "status": "completed",
+      "blockedBy": [8, 10],
+      "description": "Fill coverage for the fixes in T8 and T10: text non-UTF-8 auto-detect (GBK without forcing the encoding parameter), total_lines field assertion, full PositionInfo (byte_in_file and byte_in_line) assertion after a mid-line start; image max-height-only resize, both-axis resize, non-PNG source (JPEG or WebP), quality clamp to 1..=100. Addresses review issues #24, #4, #6, #7.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/file_ops.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops\", \"acceptanceCriteria\": [\"Text auto-detect test uses a GBK file without the encoding parameter and succeeds\", \"total_lines and full PositionInfo are asserted\", \"Image tests cover max-height, both-axis, non-PNG source, and quality=0/quality=101 clamping\", \"All new tests pass\"]}\n```"
+    },
+    {
+      "id": 20,
+      "subject": "T20: Tiny holes — operation=None test, target_end semantics alignment",
+      "status": "completed",
+      "description": "Add a regression test for `FileRequest { operation: None }` expecting FILE_ERROR_CODE_UNSPECIFIED, and align the plan's target_end=5 sample (currently says '5 lines returned') with the exclusive semantics the test asserts (4 lines returned). Update the plan text, not the test. Addresses review issues #26, #29.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/tests/file_ops.rs\", \"docs/superpowers/plans/2026-04-12-device-file-operations.md\"], \"verifyCommand\": \"cargo test -p ahandd --test file_ops\", \"acceptanceCriteria\": [\"New test for operation=None → Unspecified error\", \"Plan text reads '4 lines' for target_end=5 (exclusive semantics)\", \"Tests pass\"]}\n```"
+    },
+    {
+      "id": 21,
+      "subject": "T21: Unit tests for s3.rs (config, construction, accessors, presign smoke test)",
+      "status": "completed",
+      "description": "Add unit tests for s3.rs that don't need a real S3 endpoint: (a) S3Config defaults, (b) S3Client::new with a localhost fake endpoint doesn't panic, (c) threshold()/bucket() return configured values, (d) generate_upload_url/generate_download_url produce plausibly-shaped URLs when pointed at the fake endpoint. Full round-trip tests (upload/download) remain a follow-up PR. Addresses review issue #17.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/s3.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib s3\", \"acceptanceCriteria\": [\"S3Config default test\", \"S3Client construction test with fake endpoint\", \"Accessor tests for threshold and bucket\", \"Presign URL format smoke test\", \"Tests pass without real AWS credentials\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-12T09:30:00Z"
+}
