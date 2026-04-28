@@ -822,13 +822,19 @@ async fn full_write_with_s3_object_key_rejects_path_traversal() {
 /// `POST /files/upload-url` must reject a device_id with traversal
 /// characters. Captures the `Path<String>` segment which axum URL-
 /// decodes — a caller passing `device-2%2F..%2Fother` would otherwise
-/// produce an object key that escapes its bucket prefix.
+/// produce an object key that escapes its bucket prefix. We test
+/// both the slash form (axum-decode-dependent) and the no-slash
+/// form (`..` alone, robust against routing-layer changes).
 #[tokio::test]
 async fn upload_url_rejects_device_id_with_traversal() {
     let state = test_state_with_s3().await;
     let server = spawn_server_with_state(state).await;
     let token = dashboard_token(&server).await;
 
+    // Form 1: %2F-encoded slash. Whether this reaches the validator
+    // vs. 404s at the router depends on axum's URL-decoding of path
+    // segments — but if it DOES reach our handler, we want it
+    // rejected by the validator, not silently accepted.
     let url = format!(
         "{}/api/devices/device-2%2F..%2Fother/files/upload-url",
         server.http_base_url()
@@ -839,12 +845,39 @@ async fn upload_url_rejects_device_id_with_traversal() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 400);
+    let status = resp.status().as_u16();
+    if status == 400 {
+        let body_json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body_json.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("INVALID_DEVICE_ID"),
+        );
+    } else {
+        // 404 from the router (segment split) is also acceptable —
+        // the request never reached a handler that could mint a URL.
+        assert_eq!(status, 404, "expected 400 or 404, got {status}");
+    }
+
+    // Form 2: literal `..` segment, no slash. This always reaches the
+    // handler because there is no `/` to confuse routing, so the
+    // validator MUST be the thing that rejects it.
+    let url = format!(
+        "{}/api/devices/..%20segment/files/upload-url",
+        server.http_base_url()
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400, "validator should reject \"..\"");
     let body_json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
         body_json.pointer("/error/code").and_then(|v| v.as_str()),
         Some("INVALID_DEVICE_ID"),
     );
+
     server.shutdown().await;
 }
 

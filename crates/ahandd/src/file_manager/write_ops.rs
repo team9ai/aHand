@@ -118,7 +118,17 @@ async fn handle_full_write(
     max_write_bytes: u64,
 ) -> Result<FileWriteResult, FileError> {
     let bytes: Vec<u8> = match &fw.source {
-        Some(full_write::Source::Content(c)) => c.clone(),
+        Some(full_write::Source::Content(c)) => {
+            // Refuse before cloning: a 200 MB inline payload against a
+            // 100 MB cap would otherwise allocate twice the body
+            // before enforce_size_limit on line ~148 ever runs. The
+            // bytes are already in memory once (the proto is
+            // decoded), but cloning them again just to fail the
+            // size check is wasteful and, on memory-tight devices,
+            // can be the difference between a clean 4xx and OOM.
+            enforce_size_limit(c.len() as u64, max_write_bytes, req_path)?;
+            c.clone()
+        }
         Some(full_write::Source::S3ObjectKey(_)) => {
             // The daemon never holds S3 credentials directly; the hub
             // injects a presigned GET URL into FullWrite.s3_download_url
