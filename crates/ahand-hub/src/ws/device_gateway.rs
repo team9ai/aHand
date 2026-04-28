@@ -1,95 +1,219 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, watch};
+use tokio::task::JoinHandle;
 
 use ahand_hub_core::HubError;
-use ahand_hub_core::traits::DeviceStore;
+use ahand_hub_core::traits::{DeviceStore, OutboxStore};
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 
 use crate::state::AppState;
 
-#[derive(Default)]
+const LEASE_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const LOCK_ACQUIRE_RETRIES: u32 = 5;
+const LOCK_ACQUIRE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
 pub struct ConnectionRegistry {
     senders: DashMap<String, ConnectionEntry>,
+    outbox: Arc<dyn OutboxStore>,
 }
 
 struct ConnectionEntry {
     active: Option<ActiveConnection>,
-    outbox: Mutex<ahand_hub_core::Outbox>,
 }
 
 #[derive(Clone)]
 struct ActiveConnection {
     connection_id: uuid::Uuid,
+    /// UUID acting as the fencing token in every OutboxStore call.
+    session_id: String,
     sender: mpsc::UnboundedSender<OutboundFrame>,
     close_tx: watch::Sender<bool>,
+    /// Highest inbound seq observed from this device on this connection.
+    /// Used both for dedup (`has_seen_inbound`) and to populate the `ack`
+    /// field on outbound envelopes so the daemon can trim its own outbox.
+    last_inbound_seq: Arc<AtomicU64>,
+    /// Aborted on close so the lease renewer stops attempting to renew.
+    lease_task: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
+    /// Aborted on close so the kick subscriber stops listening.
+    kick_task: Arc<AsyncMutex<Option<JoinHandle<()>>>>,
 }
 
-pub(crate) struct OutboundFrame {
-    pub(crate) frame: Vec<u8>,
+pub struct OutboundFrame {
+    pub frame: Vec<u8>,
+}
+
+impl OutboundFrame {
+    /// Borrow the frame bytes as a slice. Convenience helper for
+    /// integration tests that drain the receiver and want to decode
+    /// without poking at the field directly.
+    pub fn as_slice(&self) -> &[u8] {
+        self.frame.as_slice()
+    }
 }
 
 impl ConnectionRegistry {
-    pub(crate) fn register(
+    pub fn new(outbox: Arc<dyn OutboxStore>) -> Self {
+        Self {
+            senders: DashMap::new(),
+            outbox,
+        }
+    }
+
+    pub async fn register(
         &self,
         device_id: String,
         last_ack: u64,
-    ) -> anyhow::Result<(
-        uuid::Uuid,
-        mpsc::UnboundedReceiver<OutboundFrame>,
-        watch::Receiver<bool>,
-    )> {
+    ) -> Result<
+        (
+            uuid::Uuid,
+            mpsc::UnboundedReceiver<OutboundFrame>,
+            watch::Receiver<bool>,
+        ),
+        HubError,
+    > {
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        // 1) Acquire the lock with a kick-then-retry dance. The kick is
+        //    addressed to the *previous* holder, but we publish ours as the
+        //    "new owner" payload so subscribers can decide whether to bail.
+        let mut acquired = self
+            .outbox
+            .try_acquire_lock(&device_id, &session_id)
+            .await?;
+        if !acquired {
+            self.outbox.kick(&device_id, &session_id).await?;
+            for _ in 0..LOCK_ACQUIRE_RETRIES {
+                tokio::time::sleep(LOCK_ACQUIRE_BACKOFF).await;
+                acquired = self
+                    .outbox
+                    .try_acquire_lock(&device_id, &session_id)
+                    .await?;
+                if acquired {
+                    break;
+                }
+            }
+        }
+        if !acquired {
+            return Err(HubError::OutboxLockContention(device_id));
+        }
+
+        // 2) Reconcile + read replay frames BEFORE we wire the in-process
+        //    state, so a failure during reconcile leaves the lock in a
+        //    clean state via the release_lock in the error arm.
+        if let Err(err) = self
+            .outbox
+            .reconcile_on_hello(&device_id, &session_id, last_ack)
+            .await
+        {
+            let _ = self.outbox.release_lock(&device_id, &session_id).await;
+            return Err(err);
+        }
+        let replay = match self.outbox.unacked_frames(&device_id, last_ack).await {
+            Ok(frames) => frames,
+            Err(err) => {
+                let _ = self.outbox.release_lock(&device_id, &session_id).await;
+                return Err(err);
+            }
+        };
+
+        // 3) Build per-connection state.
         let (tx, rx) = mpsc::unbounded_channel();
         let connection_id = uuid::Uuid::new_v4();
         let (close_tx, close_rx) = watch::channel(false);
-        let active = ActiveConnection {
-            connection_id,
-            sender: tx.clone(),
-            close_tx,
+
+        // 4) Spawn lease renewer.
+        let lease_task = {
+            let outbox = self.outbox.clone();
+            let device_id = device_id.clone();
+            let session_id = session_id.clone();
+            let close_tx = close_tx.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(LEASE_RENEW_INTERVAL);
+                interval.tick().await; // first tick is immediate; skip
+                loop {
+                    interval.tick().await;
+                    match outbox.renew_lock(&device_id, &session_id).await {
+                        Ok(true) => continue,
+                        Ok(false) | Err(_) => {
+                            tracing::warn!(
+                                device_id = %device_id,
+                                session_id = %session_id,
+                                "lease lost, signalling close",
+                            );
+                            let _ = close_tx.send(true);
+                            break;
+                        }
+                    }
+                }
+            })
         };
 
+        // 5) Subscribe to kicks BEFORE returning, so a kick that fires
+        //    moments after register completes (e.g., a sibling replica
+        //    racing for the same device) cannot slip through the window
+        //    while a spawned task hasn't yet issued SUBSCRIBE. The
+        //    subscribe_kick call awaits the underlying SUBSCRIBE; the
+        //    spawned task only owns the watch loop.
+        let mut kick_sub = match self.outbox.subscribe_kick(&device_id).await {
+            Ok(sub) => sub,
+            Err(err) => {
+                tracing::warn!(
+                    device_id = %device_id,
+                    error = %err,
+                    "failed to subscribe to kick channel; releasing lock",
+                );
+                let _ = self.outbox.release_lock(&device_id, &session_id).await;
+                return Err(err);
+            }
+        };
+        let kick_task = {
+            let device_id_inner = device_id.clone();
+            let close_tx = close_tx.clone();
+            tokio::spawn(async move {
+                if kick_sub.recv.changed().await.is_ok() {
+                    tracing::info!(
+                        device_id = %device_id_inner,
+                        "received kick, signalling close",
+                    );
+                    let _ = close_tx.send(true);
+                }
+            })
+        };
+
+        let active = ActiveConnection {
+            connection_id,
+            session_id: session_id.clone(),
+            sender: tx.clone(),
+            close_tx: close_tx.clone(),
+            last_inbound_seq: Arc::new(AtomicU64::new(0)),
+            lease_task: Arc::new(AsyncMutex::new(Some(lease_task))),
+            kick_task: Arc::new(AsyncMutex::new(Some(kick_task))),
+        };
+
+        // 6) Push replay frames first, then publish the active connection.
+        for frame in replay {
+            let _ = tx.send(OutboundFrame { frame });
+        }
         match self.senders.entry(device_id) {
             dashmap::mapref::entry::Entry::Occupied(mut entry) => {
                 let entry = entry.get_mut();
-                let replay = {
-                    let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-                    if !outbox.try_on_peer_ack(last_ack) {
-                        return Err(HubError::InvalidPeerAck {
-                            ack: last_ack,
-                            max: outbox.last_issued_seq(),
-                        }
-                        .into());
-                    }
-                    outbox.replay_from(0)
-                };
-                if let Some(previous) = entry.active.replace(active.clone()) {
-                    let _ = previous.close_tx.send(true);
-                }
-                for frame in replay {
-                    let _ = tx.send(OutboundFrame { frame });
+                if let Some(prev) = entry.active.replace(active) {
+                    let _ = prev.close_tx.send(true);
                 }
             }
             dashmap::mapref::entry::Entry::Vacant(entry) => {
-                let mut outbox = ahand_hub_core::Outbox::new(10_000);
-                if !outbox.try_on_peer_ack(last_ack) {
-                    return Err(HubError::InvalidPeerAck {
-                        ack: last_ack,
-                        max: outbox.last_issued_seq(),
-                    }
-                    .into());
-                }
                 entry.insert(ConnectionEntry {
                     active: Some(active),
-                    outbox: Mutex::new(outbox),
                 });
             }
         }
-
         Ok((connection_id, rx, close_rx))
     }
 
@@ -98,49 +222,70 @@ impl ConnectionRegistry {
         device_id: &str,
         mut envelope: ahand_protocol::Envelope,
     ) -> anyhow::Result<()> {
-        let (seq, frame) = {
+        let (sender, session_id, connection_id, last_inbound_seq) = {
             let entry = self
                 .senders
-                .get_mut(device_id)
+                .get(device_id)
                 .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
-            let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-            let seq = outbox.reserve_seq();
-            envelope.seq = seq;
-            envelope.ack = outbox.local_ack();
-            let frame = envelope.encode_to_vec();
-            outbox.store(seq, frame.clone());
-            (seq, frame)
+            let active = entry
+                .active
+                .as_ref()
+                .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
+            (
+                active.sender.clone(),
+                active.session_id.clone(),
+                active.connection_id,
+                active.last_inbound_seq.clone(),
+            )
         };
 
-        loop {
-            let (sender, connection_id) = {
-                let entry = self
-                    .senders
-                    .get(device_id)
-                    .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
-                let active = entry
-                    .active
-                    .as_ref()
-                    .ok_or_else(|| HubError::DeviceOffline(device_id.into()))?;
-                (active.sender.clone(), active.connection_id)
-            };
-            if sender
-                .send(OutboundFrame {
-                    frame: frame.clone(),
-                })
-                .is_err()
-            {
-                self.clear_current_sender(device_id, connection_id);
-                if !self.has_active(device_id) {
-                    if let Some(entry) = self.senders.get_mut(device_id) {
-                        let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-                        outbox.remove(seq);
-                    }
-                    return Err(HubError::DeviceOffline(device_id.into()).into());
-                }
-                continue;
+        let seq = match self.outbox.fenced_incr_seq(device_id, &session_id).await {
+            Ok(seq) => seq,
+            Err(HubError::Unauthorized) => {
+                self.fail_connection(device_id, connection_id);
+                return Err(HubError::DeviceOffline(device_id.into()).into());
             }
-            return Ok(());
+            Err(err) => return Err(err.into()),
+        };
+        envelope.seq = seq;
+        envelope.ack = last_inbound_seq.load(Ordering::Relaxed);
+        let frame = envelope.encode_to_vec();
+
+        if let Err(err) = self
+            .outbox
+            .xadd_frame(device_id, &session_id, seq, frame.clone())
+            .await
+        {
+            if matches!(err, HubError::Unauthorized) {
+                self.fail_connection(device_id, connection_id);
+                return Err(HubError::DeviceOffline(device_id.into()).into());
+            }
+            return Err(err.into());
+        }
+
+        if sender.send(OutboundFrame { frame }).is_err() {
+            // The WS IO task is gone; the message stays in the durable
+            // stream and will replay on next reconnect.
+            self.fail_connection(device_id, connection_id);
+            return Err(HubError::DeviceOffline(device_id.into()).into());
+        }
+        Ok(())
+    }
+
+    /// Mark the active connection for `device_id` dead if it still matches
+    /// `connection_id`. Signals close_tx so the WS handler tears down. The
+    /// background tasks are aborted by `unregister`, which is reached via
+    /// the close_tx path.
+    fn fail_connection(&self, device_id: &str, connection_id: uuid::Uuid) {
+        if let Some(mut entry) = self.senders.get_mut(device_id)
+            && entry
+                .active
+                .as_ref()
+                .map(|a| a.connection_id == connection_id)
+                .unwrap_or(false)
+            && let Some(active) = entry.active.take()
+        {
+            let _ = active.close_tx.send(true);
         }
     }
 
@@ -189,11 +334,7 @@ impl ConnectionRegistry {
     }
 
     /// Public wrapper around [`Self::send`] so the control-plane HTTP
-    /// handlers can dispatch envelopes to a device. The underlying
-    /// path is the same as the dashboard job flow; we expose it here
-    /// to keep the module boundary tight rather than promoting
-    /// `send` itself to public (which would also expose the retry
-    /// loop semantics to more call sites).
+    /// handlers can dispatch envelopes to a device.
     pub async fn send_envelope(
         &self,
         device_id: &str,
@@ -202,96 +343,105 @@ impl ConnectionRegistry {
         self.send(device_id, envelope).await
     }
 
+    /// True iff the device's connection has already observed an inbound
+    /// envelope with seq >= `seq`. Used by the WS handler and JobRuntime
+    /// to dedup retransmits — the durable stream is hub→device only, so
+    /// this is per-connection state, not store-backed.
     pub(crate) fn has_seen_inbound(&self, device_id: &str, seq: u64) -> bool {
         if seq == 0 {
             return false;
         }
         self.senders
             .get(device_id)
-            .map(|entry| {
-                let outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-                outbox.local_ack() >= seq
-            })
+            .and_then(|entry| entry.active.as_ref().map(|a| a.last_inbound_seq.clone()))
+            .map(|last| last.load(Ordering::Relaxed) >= seq)
             .unwrap_or(false)
     }
 
-    pub(crate) fn observe_ack(&self, device_id: &str, ack: u64) -> anyhow::Result<()> {
+    pub async fn observe_ack(&self, device_id: &str, ack: u64) -> anyhow::Result<()> {
         if ack == 0 {
             return Ok(());
         }
-        let should_cleanup = if let Some(entry) = self.senders.get_mut(device_id) {
-            let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-            if !outbox.try_on_peer_ack(ack) {
-                return Err(HubError::InvalidPeerAck {
-                    ack,
-                    max: outbox.last_issued_seq(),
-                }
-                .into());
-            }
-            entry.active.is_none() && outbox.is_empty()
-        } else {
-            false
-        };
-        if should_cleanup {
-            self.senders.remove(device_id);
+        // Fire-and-forget: the durable stream is the authority and the
+        // next successful ack or MAXLEN trim will catch up if this one
+        // fails. We log so the failure shows up in the hub's tracing.
+        if let Err(err) = self.outbox.observe_ack(device_id, ack).await {
+            tracing::warn!(
+                device_id = %device_id,
+                ack = ack,
+                error = %err,
+                "outbox observe_ack failed",
+            );
         }
         Ok(())
     }
 
-    pub(crate) fn observe_inbound(
+    pub(crate) async fn observe_inbound(
         &self,
         device_id: &str,
         seq: u64,
         ack: u64,
     ) -> anyhow::Result<()> {
-        let should_cleanup = if let Some(entry) = self.senders.get_mut(device_id) {
-            let mut outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-            if seq > 0 {
-                outbox.on_recv(seq);
-            }
-            if ack > 0 && !outbox.try_on_peer_ack(ack) {
-                return Err(HubError::InvalidPeerAck {
-                    ack,
-                    max: outbox.last_issued_seq(),
-                }
-                .into());
-            }
-            entry.active.is_none() && outbox.is_empty()
-        } else {
-            false
-        };
-        if should_cleanup {
-            self.senders.remove(device_id);
+        if seq > 0
+            && let Some(entry) = self.senders.get(device_id)
+            && let Some(active) = entry.active.as_ref()
+        {
+            active.last_inbound_seq.fetch_max(seq, Ordering::Relaxed);
         }
-        Ok(())
+        self.observe_ack(device_id, ack).await
     }
 
-    pub(crate) async fn unregister(
+    pub async fn unregister(
         &self,
         device_id: &str,
         connection_id: uuid::Uuid,
     ) -> anyhow::Result<bool> {
-        if let Some(mut entry) = self.senders.get_mut(device_id)
-            && entry
-                .active
-                .as_ref()
-                .map(|active| active.connection_id == connection_id)
-                .unwrap_or(false)
-        {
-            if let Some(active) = entry.active.take() {
-                let _ = active.close_tx.send(true);
+        // Take the active connection out of the map first (synchronous,
+        // bounded by the DashMap shard lock) before we drop the guard
+        // and switch to async work.
+        let taken = {
+            if let Some(mut entry) = self.senders.get_mut(device_id) {
+                if entry
+                    .active
+                    .as_ref()
+                    .map(|a| a.connection_id == connection_id)
+                    .unwrap_or(false)
+                {
+                    entry.active.take()
+                } else {
+                    None
+                }
+            } else {
+                None
             }
-            let should_remove = {
-                let outbox = entry.outbox.lock().expect("outbox mutex poisoned");
-                outbox.is_empty()
-            };
-            drop(entry);
-            if should_remove {
-                self.senders.remove(device_id);
-            }
-            return Ok(true);
+        };
+
+        let Some(active) = taken else {
+            return Ok(false);
+        };
+
+        let _ = active.close_tx.send(true);
+        if let Some(handle) = active.lease_task.lock().await.take() {
+            handle.abort();
         }
-        Ok(false)
+        if let Some(handle) = active.kick_task.lock().await.take() {
+            handle.abort();
+        }
+        if let Err(err) = self
+            .outbox
+            .release_lock(device_id, &active.session_id)
+            .await
+        {
+            tracing::warn!(
+                device_id = %device_id,
+                error = %err,
+                "release_lock failed",
+            );
+        }
+        // No active = nothing to keep around in the local map. The durable
+        // stream lives on in the OutboxStore.
+        self.senders.remove(device_id);
+        Ok(true)
     }
 
     fn has_active(&self, device_id: &str) -> bool {
@@ -299,30 +449,6 @@ impl ConnectionRegistry {
             .get(device_id)
             .map(|entry| entry.active.is_some())
             .unwrap_or(false)
-    }
-
-    fn clear_current_sender(&self, device_id: &str, connection_id: uuid::Uuid) {
-        let should_cleanup = if let Some(mut entry) = self.senders.get_mut(device_id) {
-            if entry
-                .active
-                .as_ref()
-                .map(|active| active.connection_id == connection_id)
-                .unwrap_or(false)
-            {
-                entry.active = None;
-            }
-            entry.active.is_none()
-                && entry
-                    .outbox
-                    .lock()
-                    .expect("outbox mutex poisoned")
-                    .is_empty()
-        } else {
-            false
-        };
-        if should_cleanup {
-            self.senders.remove(device_id);
-        }
     }
 }
 
@@ -454,6 +580,34 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                 );
             }
         }
+        let device_id = envelope.device_id.clone();
+        let hostname = hello.hostname.clone();
+        // Register BEFORE sending HelloAccepted so the in-process
+        // DashMap entry is observable by the time the client sees the
+        // accepted frame and starts dispatching jobs. With the
+        // OutboxStore-backed registry, register involves Redis I/O —
+        // sending HelloAccepted first would let a fast client race the
+        // register completion and see is_online=false on its first
+        // request.
+        let (connection_id, mut outbound_rx, close_rx) = match state
+            .connections
+            .register(device_id.clone(), hello.last_ack)
+            .await
+        {
+            Ok(tuple) => tuple,
+            Err(HubError::OutboxLockContention(_)) => {
+                let _ = send_handshake_close(
+                    &mut sender,
+                    axum::extract::ws::close_code::AGAIN,
+                    "outbox-lock-contention",
+                )
+                .await;
+                return Err(anyhow::Error::from(HubError::OutboxLockContention(
+                    device_id.clone(),
+                )));
+            }
+            Err(err) => return Err(anyhow::Error::from(err)),
+        };
         sender
             .send(WsMessage::Binary(
                 ahand_protocol::Envelope {
@@ -475,11 +629,6 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                 .into(),
             ))
             .await?;
-        let device_id = envelope.device_id.clone();
-        let hostname = hello.hostname.clone();
-        let (connection_id, mut outbound_rx, close_rx) = state
-            .connections
-            .register(device_id.clone(), hello.last_ack)?;
         let (control_tx, mut control_rx) = mpsc::unbounded_channel::<WsMessage>();
         let last_inbound_at = Arc::new(AsyncMutex::new(tokio::time::Instant::now()));
         active_connection = Some((device_id.clone(), connection_id));
@@ -627,7 +776,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     *last_inbound_at.lock().await = tokio::time::Instant::now();
                     let envelope = ahand_protocol::Envelope::decode(frame.as_ref())?;
                     if state.connections.has_seen_inbound(&device_id, envelope.seq) {
-                        state.connections.observe_ack(&device_id, envelope.ack)?;
+                        state.connections.observe_ack(&device_id, envelope.ack).await?;
                     } else if let Some(ahand_protocol::envelope::Payload::Heartbeat(ref hb)) =
                         envelope.payload
                     {
@@ -637,7 +786,8 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                         // device presence without polling.
                         state
                             .connections
-                            .observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                            .observe_inbound(&device_id, envelope.seq, envelope.ack)
+                            .await?;
                         let ttl = state
                             .device_expected_heartbeat_secs
                             .saturating_mul(3);
@@ -690,7 +840,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                                 "received BrowserResponse with no pending request"
                             );
                         }
-                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
                     } else if dispatch_control_plane_event(&state, &envelope) {
                         // The envelope's job_id was registered in the
                         // control-plane tracker — the tee has already
@@ -699,7 +849,8 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                         // unknown job id) and just advance seq/ack.
                         state
                             .connections
-                            .observe_inbound(&device_id, envelope.seq, envelope.ack)?;
+                            .observe_inbound(&device_id, envelope.seq, envelope.ack)
+                            .await?;
                     } else {
                         state.jobs.handle_device_frame(&device_id, &frame).await?;
                     }
@@ -894,133 +1045,97 @@ async fn send_handshake_close(
 
 #[cfg(test)]
 mod tests {
-    use prost::Message;
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use prost::Message;
+
     use super::ConnectionRegistry;
+    use crate::ws::in_memory_outbox::InMemoryOutboxStore;
+
+    fn job_envelope(msg_id: &str, job_id: &str, arg: &str) -> ahand_protocol::Envelope {
+        ahand_protocol::Envelope {
+            device_id: "device-1".into(),
+            msg_id: msg_id.into(),
+            payload: Some(ahand_protocol::envelope::Payload::JobRequest(
+                ahand_protocol::JobRequest {
+                    job_id: job_id.into(),
+                    tool: "echo".into(),
+                    args: vec![arg.into()],
+                    cwd: String::new(),
+                    env: Default::default(),
+                    timeout_ms: 30_000,
+                    interactive: false,
+                },
+            )),
+            ..Default::default()
+        }
+    }
 
     #[tokio::test]
     async fn register_replays_only_messages_after_last_ack() {
-        let registry = ConnectionRegistry::default();
-        let (_connection_id, mut initial_rx, _close_rx) =
-            registry.register("device-1".into(), 0).unwrap();
-        let transport = tokio::spawn(async move {
-            while let Some(outbound) = initial_rx.recv().await {
-                let _ = outbound;
-            }
-        });
+        let registry = ConnectionRegistry::new(Arc::new(InMemoryOutboxStore::new()));
+        let (conn_a, mut rx_a, _close_a) = registry.register("device-1".into(), 0).await.unwrap();
 
-        registry
-            .send(
-                "device-1",
-                ahand_protocol::Envelope {
-                    device_id: "device-1".into(),
-                    msg_id: "job-1".into(),
-                    payload: Some(ahand_protocol::envelope::Payload::JobRequest(
-                        ahand_protocol::JobRequest {
-                            job_id: "job-1".into(),
-                            tool: "echo".into(),
-                            args: vec!["one".into()],
-                            cwd: String::new(),
-                            env: Default::default(),
-                            timeout_ms: 30_000,
-                            interactive: false,
-                        },
-                    )),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        registry
-            .send(
-                "device-1",
-                ahand_protocol::Envelope {
-                    device_id: "device-1".into(),
-                    msg_id: "job-2".into(),
-                    payload: Some(ahand_protocol::envelope::Payload::JobRequest(
-                        ahand_protocol::JobRequest {
-                            job_id: "job-2".into(),
-                            tool: "echo".into(),
-                            args: vec!["two".into()],
-                            cwd: String::new(),
-                            env: Default::default(),
-                            timeout_ms: 30_000,
-                            interactive: false,
-                        },
-                    )),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        transport.abort();
-
-        let (_reconnect_id, mut replay_rx, _close_rx) =
-            registry.register("device-1".into(), 1).unwrap();
-        let replayed = replay_rx.recv().await.expect("replayed frame should exist");
-        let replayed = ahand_protocol::Envelope::decode(replayed.frame.as_slice()).unwrap();
-        let Some(ahand_protocol::envelope::Payload::JobRequest(job)) = replayed.payload else {
-            panic!("expected replayed job request");
-        };
-        assert_eq!(job.job_id, "job-2");
-        assert_eq!(replayed.seq, 2);
-        assert_eq!(replayed.ack, 0);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), replay_rx.recv())
+        // Send 5 envelopes; drain each from the mpsc to confirm delivery.
+        for i in 1..=5u8 {
+            registry
+                .send(
+                    "device-1",
+                    job_envelope(&format!("job-{i}"), &format!("job-{i}"), "x"),
+                )
                 .await
-                .is_err()
-        );
+                .unwrap();
+            let frame = rx_a.recv().await.expect("frame delivered");
+            let env = ahand_protocol::Envelope::decode(frame.frame.as_slice()).unwrap();
+            assert_eq!(env.seq, u64::from(i));
+        }
+
+        // Drop the live connection. unregister releases the lock so the
+        // re-register below can grab it without going through the kick path.
+        registry.unregister("device-1", conn_a).await.unwrap();
+
+        // Re-register with last_ack=2 — only seqs 3..=5 should replay.
+        let (_conn_b, mut rx_b, _close_b) = registry.register("device-1".into(), 2).await.unwrap();
+        let mut replayed = Vec::new();
+        while let Ok(Some(frame)) =
+            tokio::time::timeout(Duration::from_millis(50), rx_b.recv()).await
+        {
+            replayed.push(frame);
+        }
+        assert_eq!(replayed.len(), 3, "only seqs 3..=5 should replay");
+        let first = ahand_protocol::Envelope::decode(replayed[0].frame.as_slice()).unwrap();
+        assert_eq!(first.seq, 3);
+        let last = ahand_protocol::Envelope::decode(replayed[2].frame.as_slice()).unwrap();
+        assert_eq!(last.seq, 5);
     }
 
     #[tokio::test]
     async fn inbound_seq_updates_outbound_ack() {
-        let registry = ConnectionRegistry::default();
-        let (_connection_id, mut rx, _close_rx) = registry.register("device-1".into(), 0).unwrap();
-        registry.observe_inbound("device-1", 7, 0).unwrap();
+        let registry = ConnectionRegistry::new(Arc::new(InMemoryOutboxStore::new()));
+        let (_connection_id, mut rx, _close_rx) =
+            registry.register("device-1".into(), 0).await.unwrap();
 
-        let transport = tokio::spawn(async move {
-            while let Some(outbound) = rx.recv().await {
-                let _ = outbound;
-            }
-        });
+        // Mirror the daemon→hub direction: an inbound envelope at seq=7
+        // bumps the per-connection counter, so the next outbound envelope
+        // must carry ack=7 in its header.
+        registry.observe_inbound("device-1", 7, 0).await.unwrap();
 
         registry
-            .send(
-                "device-1",
-                ahand_protocol::Envelope {
-                    device_id: "device-1".into(),
-                    msg_id: "job-1".into(),
-                    payload: Some(ahand_protocol::envelope::Payload::JobRequest(
-                        ahand_protocol::JobRequest {
-                            job_id: "job-1".into(),
-                            tool: "echo".into(),
-                            args: vec!["hello".into()],
-                            cwd: String::new(),
-                            env: Default::default(),
-                            timeout_ms: 30_000,
-                            interactive: false,
-                        },
-                    )),
-                    ..Default::default()
-                },
-            )
+            .send("device-1", job_envelope("job-1", "job-1", "hello"))
             .await
             .unwrap();
 
-        let frame = registry.senders.get("device-1").unwrap();
-        let outbound = frame.outbox.lock().unwrap().replay_from(0).pop().unwrap();
-        let outbound = ahand_protocol::Envelope::decode(outbound.as_slice()).unwrap();
-        assert_eq!(outbound.seq, 1);
-        assert_eq!(outbound.ack, 7);
-        transport.abort();
+        let outbound = rx.recv().await.expect("frame delivered");
+        let envelope = ahand_protocol::Envelope::decode(outbound.frame.as_slice()).unwrap();
+        assert_eq!(envelope.seq, 1);
+        assert_eq!(envelope.ack, 7);
     }
 
     #[tokio::test]
     async fn unregister_removes_idle_entries() {
-        let registry = ConnectionRegistry::default();
-        let (connection_id, rx, _close_rx) = registry.register("device-1".into(), 0).unwrap();
+        let registry = ConnectionRegistry::new(Arc::new(InMemoryOutboxStore::new()));
+        let (connection_id, rx, _close_rx) = registry.register("device-1".into(), 0).await.unwrap();
         drop(rx);
 
         let removed = registry
@@ -1030,5 +1145,48 @@ mod tests {
 
         assert!(removed);
         assert!(registry.senders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn has_seen_inbound_uses_per_connection_counter() {
+        let registry = ConnectionRegistry::new(Arc::new(InMemoryOutboxStore::new()));
+        let (_connection_id, _rx, _close_rx) =
+            registry.register("device-1".into(), 0).await.unwrap();
+
+        assert!(!registry.has_seen_inbound("device-1", 5));
+        registry.observe_inbound("device-1", 5, 0).await.unwrap();
+        assert!(registry.has_seen_inbound("device-1", 5));
+        // seq=0 is never seen (sentinel).
+        assert!(!registry.has_seen_inbound("device-1", 0));
+        // A lower seq is also "seen" (we track high water mark).
+        assert!(registry.has_seen_inbound("device-1", 3));
+        // A higher seq we haven't observed yet is not seen.
+        assert!(!registry.has_seen_inbound("device-1", 6));
+    }
+
+    #[tokio::test]
+    async fn second_register_returns_lock_contention_when_first_holds_lock() {
+        // The lock held by the first session is the OutboxStore's, so the
+        // second registration's kick-then-retry cycle exhausts and the
+        // call surfaces `OutboxLockContention`. In a real Redis deployment
+        // the kicked session would release on receiving the kick; the
+        // in-memory impl doesn't model that, so this test is the
+        // worst-case behavior. Once the holder unregisters, the next
+        // register succeeds.
+        let registry = ConnectionRegistry::new(Arc::new(InMemoryOutboxStore::new()));
+        let (conn_a, _rx_a, _close_a) = registry.register("device-1".into(), 0).await.unwrap();
+
+        let err = registry
+            .register("device-1".into(), 0)
+            .await
+            .expect_err("should fail with contention");
+        assert!(matches!(
+            err,
+            ahand_hub_core::HubError::OutboxLockContention(d) if d == "device-1",
+        ));
+
+        registry.unregister("device-1", conn_a).await.unwrap();
+        // After the holder releases, a fresh register succeeds.
+        let (_conn_b, _rx_b, _close_b) = registry.register("device-1".into(), 0).await.unwrap();
     }
 }

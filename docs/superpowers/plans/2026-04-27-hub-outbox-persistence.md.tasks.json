@@ -11,51 +11,66 @@
       "id": 1,
       "subject": "Task 1: InMemoryOutboxStore implementation",
       "status": "pending",
-      "blockedBy": [0],
+      "blockedBy": [
+        0
+      ],
       "description": "**Goal:** Process-local OutboxStore impl for StoreConfig::Memory and unit tests; mirrors RedisOutboxStore semantics method-for-method including the bootstrap branch.\n\n**Files:**\n- Create: crates/ahand-hub/src/ws/in_memory_outbox.rs\n- Modify: crates/ahand-hub/src/ws/mod.rs\n\n**Verify:** `cargo test -p ahand-hub --lib ws::in_memory_outbox::tests`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/ws/in_memory_outbox.rs\", \"crates/ahand-hub/src/ws/mod.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib ws::in_memory_outbox::tests\", \"acceptanceCriteria\": [\"all 10 trait methods implemented\", \"lock acquisition is atomic\", \"bootstrap path returns last_ack\", \"fence rejects writes from non-owning session\", \"kick subscription delivers tick\", \"unit tests cover lock/kick/fence/bootstrap/replay/ack-trim\"]}\n```"
     },
     {
       "id": 2,
       "subject": "Task 2: Lua scripts module + EVALSHA wrapper",
       "status": "pending",
-      "blockedBy": [0],
-      "description": "**Goal:** Centralize the six Lua script source strings and wrap them in redis::Script handles for transparent EVALSHA→NOSCRIPT→EVAL fallback.\n\n**Files:**\n- Create: crates/ahand-hub-store/src/outbox_lua.rs\n- Modify: crates/ahand-hub-store/src/lib.rs\n\n**Verify:** `cargo check -p ahand-hub-store`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-store/src/outbox_lua.rs\", \"crates/ahand-hub-store/src/lib.rs\"], \"verifyCommand\": \"cargo check -p ahand-hub-store\", \"acceptanceCriteria\": [\"six script constants defined\", \"OutboxScripts::load returns pre-built redis::Script handles\", \"compiles clean\"]}\n```"
+      "blockedBy": [
+        0
+      ],
+      "description": "**Goal:** Centralize the six Lua script source strings and wrap them in redis::Script handles for transparent EVALSHA\u2192NOSCRIPT\u2192EVAL fallback.\n\n**Files:**\n- Create: crates/ahand-hub-store/src/outbox_lua.rs\n- Modify: crates/ahand-hub-store/src/lib.rs\n\n**Verify:** `cargo check -p ahand-hub-store`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-store/src/outbox_lua.rs\", \"crates/ahand-hub-store/src/lib.rs\"], \"verifyCommand\": \"cargo check -p ahand-hub-store\", \"acceptanceCriteria\": [\"six script constants defined\", \"OutboxScripts::load returns pre-built redis::Script handles\", \"compiles clean\"]}\n```"
     },
     {
       "id": 3,
       "subject": "Task 3: RedisOutboxStore lock primitives",
       "status": "pending",
-      "blockedBy": [2],
+      "blockedBy": [
+        2
+      ],
       "description": "**Goal:** Stand up RedisOutboxStore with the five lock-related methods (acquire, kick, subscribe, renew, release). Send/reconcile/replay/ack remain stubbed for Task 4.\n\n**Files:**\n- Create: crates/ahand-hub-store/src/outbox_store.rs\n- Modify: crates/ahand-hub-store/src/lib.rs\n- Modify: crates/ahand-hub-store/tests/support/mod.rs\n- Modify: crates/ahand-hub-store/tests/store_roundtrip.rs\n\n**Verify:** `cargo test -p ahand-hub-store --features test-support --test store_roundtrip outbox_lock outbox_kick`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-store/src/outbox_store.rs\", \"crates/ahand-hub-store/src/lib.rs\", \"crates/ahand-hub-store/tests/support/mod.rs\", \"crates/ahand-hub-store/tests/store_roundtrip.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub-store --features test-support --test store_roundtrip outbox_lock outbox_kick\", \"acceptanceCriteria\": [\"new(redis_url) connects + caches scripts\", \"try_acquire_lock NX exclusive\", \"kick publishes\", \"subscribe_kick ticks watch on PUBLISH\", \"renew/release Lua-checked by session_id\", \"integration tests pass\"]}\n```"
     },
     {
       "id": 4,
       "subject": "Task 4: RedisOutboxStore send/reconcile/replay/observe_ack",
       "status": "pending",
-      "blockedBy": [3],
+      "blockedBy": [
+        3
+      ],
       "description": "**Goal:** Fill in the five remaining methods. fenced_incr_seq + xadd_frame implement the two-step send. reconcile_on_hello includes the bootstrap branch that auto-recovers wedged devices.\n\n**Files:**\n- Modify: crates/ahand-hub-store/src/outbox_store.rs\n- Modify: crates/ahand-hub-store/tests/store_roundtrip.rs\n\n**Verify:** `cargo test -p ahand-hub-store --features test-support --test store_roundtrip outbox_`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-store/src/outbox_store.rs\", \"crates/ahand-hub-store/tests/store_roundtrip.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub-store --features test-support --test store_roundtrip outbox_\", \"acceptanceCriteria\": [\"NOT_OWNER maps to HubError::Unauthorized\", \"fenced_incr_seq increments + fences\", \"xadd_frame writes at 0-{seq}\", \"unacked_frames XRANGE-based replay\", \"observe_ack XTRIM MINID-based\", \"reconcile bootstrap path seeds + clears\", \"integration tests pass\"]}\n```"
     },
     {
       "id": 5,
       "subject": "Task 5: Refactor ConnectionRegistry to use OutboxStore",
-      "status": "pending",
-      "blockedBy": [1, 4],
+      "status": "completed",
+      "blockedBy": [
+        1,
+        4
+      ],
       "description": "**Goal:** Cut the in-memory Outbox out of ConnectionRegistry. Wire Arc<dyn OutboxStore>, add session_id fencing, lease renewer task, kick subscriber task.\n\n**Files:**\n- Modify: crates/ahand-hub/src/ws/device_gateway.rs\n\n**Verify:** `cargo test -p ahand-hub --lib ws::device_gateway::tests && cargo test -p ahand-hub`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/ws/device_gateway.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --lib ws::device_gateway::tests && cargo test -p ahand-hub\", \"acceptanceCriteria\": [\"ConnectionRegistry::new(Arc<dyn OutboxStore>) is the only constructor\", \"ConnectionEntry holds session_id not Outbox\", \"register is async with kick-then-retry, returns OutboxLockContention on failure\", \"register replays unacked frames\", \"lease renewer + kick subscriber tasks per connection\", \"send fully fenced (fenced_incr_seq + xadd_frame)\", \"observe_ack delegates to store\", \"unregister releases lock and aborts background tasks\"]}\n```"
     },
     {
       "id": 6,
       "subject": "Task 6: Wire OutboxStore into AppState",
-      "status": "pending",
-      "blockedBy": [5],
+      "status": "completed",
+      "blockedBy": [
+        5
+      ],
       "description": "**Goal:** Construct an Arc<dyn OutboxStore> based on StoreConfig and pass it to ConnectionRegistry::new.\n\n**Files:**\n- Modify: crates/ahand-hub/src/state.rs\n\n**Verify:** `cargo check -p ahand-hub && cargo test -p ahand-hub`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/state.rs\"], \"verifyCommand\": \"cargo check -p ahand-hub && cargo test -p ahand-hub\", \"acceptanceCriteria\": [\"Memory config builds InMemoryOutboxStore\", \"Persistent config builds RedisOutboxStore via REDIS_URL\", \"ConnectionRegistry::new(outbox) is the only constructor invocation\", \"no remaining ConnectionRegistry::default() call sites\"]}\n```"
     },
     {
       "id": 7,
       "subject": "Task 7: End-to-end regression tests",
-      "status": "pending",
-      "blockedBy": [6],
+      "status": "completed",
+      "blockedBy": [
+        6
+      ],
       "description": "**Goal:** Codify the original incident as a regression test plus replay-after-restart, lock takeover, and bootstrap-path scenarios.\n\n**Files:**\n- Create: crates/ahand-hub/tests/outbox_persistence.rs\n\n**Verify:** `cargo test -p ahand-hub --test outbox_persistence`\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/tests/outbox_persistence.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --test outbox_persistence\", \"acceptanceCriteria\": [\"replay_after_simulated_hub_restart passes\", \"lock_takeover_via_kick passes within 5s\", \"bootstrap_path_unblocks_wedged_device passes\", \"original_incident_regression passes (the keystone test)\"]}\n```"
     }
   ],
-  "lastUpdated": "2026-04-27"
+  "lastUpdated": "2026-04-27T23:18:46.348750"
 }
