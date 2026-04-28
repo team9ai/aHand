@@ -871,7 +871,11 @@ async fn upload_url_rejects_device_id_with_traversal() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status().as_u16(), 400, "validator should reject \"..\"");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "validator should reject \"..\""
+    );
     let body_json: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
         body_json.pointer("/error/code").and_then(|v| v.as_str()),
