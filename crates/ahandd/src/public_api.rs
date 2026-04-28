@@ -11,8 +11,9 @@
 //! Only the `ahand-cloud` connection mode is supported here — the
 //! `openclaw-gateway` path remains CLI-only for now.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{broadcast, oneshot, watch};
@@ -206,6 +207,37 @@ pub struct DaemonHandle {
     device_id: String,
 }
 
+static ACTIVE_DAEMONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct ActiveDaemonGuard {
+    key: String,
+}
+
+impl Drop for ActiveDaemonGuard {
+    fn drop(&mut self) {
+        let mut active = active_daemons()
+            .lock()
+            .expect("active daemon registry poisoned");
+        active.remove(&self.key);
+    }
+}
+
+fn active_daemons() -> &'static Mutex<HashSet<String>> {
+    ACTIVE_DAEMONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn reserve_active_daemon(hub_url: &str, device_id: &str) -> anyhow::Result<ActiveDaemonGuard> {
+    let key = format!("{hub_url}\0{device_id}");
+    let mut active = active_daemons()
+        .lock()
+        .expect("active daemon registry poisoned");
+    if !active.insert(key.clone()) {
+        anyhow::bail!("ahandd daemon already running for hub URL {hub_url} and device {device_id}");
+    }
+    Ok(ActiveDaemonGuard { key })
+}
+
 impl DaemonHandle {
     /// Request a graceful shutdown and wait for the inner task to finish.
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
@@ -258,6 +290,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         config.device_id,
         identity.device_id()
     );
+    let active_guard = reserve_active_daemon(&config.hub_url, &device_id)?;
 
     let (status_tx, status_rx) = watch::channel(DaemonStatus::Connecting);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -287,6 +320,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         Arc::new(StatusReporter::new(reporter_status_tx, reporter_device_id));
 
     let join = tokio::spawn(async move {
+        let _active_guard = active_guard;
         let run_fut = ahand_client::run_with_reporter(
             inner_config,
             device_id_for_task,
