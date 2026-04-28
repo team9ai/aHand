@@ -6,6 +6,8 @@
 
 pub mod binary_read;
 pub mod fs_ops;
+#[cfg(unix)]
+pub mod io_safe;
 pub mod policy;
 pub mod text_read;
 pub mod write_ops;
@@ -150,8 +152,7 @@ impl FileManager {
             if d.mode == DeleteMode::Permanent as i32 && d.recursive {
                 return Ok(Some(ApprovalEscalation {
                     kind: EscalationKind::RecursivePermanentDelete,
-                    reason: "recursive permanent delete requires explicit approval"
-                        .to_string(),
+                    reason: "recursive permanent delete requires explicit approval".to_string(),
                     path: Some(d.path.clone()),
                 }));
             }
@@ -245,9 +246,9 @@ impl FileManager {
     ) -> Result<file_response::Result, FileError> {
         match op {
             file_request::Operation::Stat(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, false, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = fs_ops::handle_stat(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Stat(result))
             }
@@ -305,9 +306,9 @@ impl FileManager {
                 Ok(file_response::Result::Mkdir(result))
             }
             file_request::Operation::ReadText(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, false, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = text_read::handle_read_text(
                     req,
                     checked.resolved_path.as_path(),
@@ -317,9 +318,9 @@ impl FileManager {
                 Ok(file_response::Result::ReadText(result))
             }
             file_request::Operation::ReadBinary(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, false, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = binary_read::handle_read_binary(
                     req,
                     checked.resolved_path.as_path(),
@@ -329,9 +330,9 @@ impl FileManager {
                 Ok(file_response::Result::ReadBinary(result))
             }
             file_request::Operation::ReadImage(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, false, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = binary_read::handle_read_image(
                     req,
                     checked.resolved_path.as_path(),
@@ -341,9 +342,9 @@ impl FileManager {
                 Ok(file_response::Result::ReadImage(result))
             }
             file_request::Operation::Write(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, true, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = write_ops::handle_write(
                     req,
                     checked.resolved_path.as_path(),
@@ -362,9 +363,9 @@ impl FileManager {
                 Ok(file_response::Result::Write(result))
             }
             file_request::Operation::Edit(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, true, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = write_ops::handle_edit(
                     req,
                     checked.resolved_path.as_path(),
@@ -374,16 +375,16 @@ impl FileManager {
                 Ok(file_response::Result::Edit(result))
             }
             file_request::Operation::Delete(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, true, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = fs_ops::handle_delete(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Delete(result))
             }
             file_request::Operation::Chmod(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, true, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = fs_ops::handle_chmod(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Chmod(result))
             }
@@ -708,11 +709,27 @@ pub enum PostCreateCleanup {
 /// the operation catches most such swaps; the `cleanup` argument controls
 /// what to do with any artifact that landed at a now-rejected path.
 ///
-/// Full TOCTOU protection requires fd-based syscalls (openat2 +
-/// RESOLVE_NO_SYMLINKS on Linux, O_NOFOLLOW elsewhere). That refactor is
-/// out of scope here — this round's fix is to make the cleanup *not
-/// destroy data the caller can't recover from*, in particular the Move
-/// data-loss case where rename already removed the source.
+/// **The race window itself** is now closed in the same PR as this comment
+/// by [`super::io_safe::safe_open_parent_dirfd_for`] — every write-class
+/// op (mkdir / move / copy / symlink / chmod) routes its syscall through
+/// a parent dirfd opened via `openat2(RESOLVE_NO_SYMLINKS)` on Linux 5.6+
+/// or a `openat(O_NOFOLLOW)` chain on macOS / older Linux. An attacker
+/// swapping an ancestor for a symlink during the race window now causes
+/// the safe-open to fail (ELOOP / ENOTDIR → `PolicyDenied`) before any
+/// mutation occurs.
+///
+/// `verify_post_create` is **kept on as belt-and-suspenders**:
+/// - **Recursive ops** (mkdir -p, recursive copy, recursive chmod) close
+///   the race only for the **outermost** dirfd open; the inner walk uses
+///   path-based ops that re-resolve sub-paths. This re-check catches a
+///   sub-path that landed somewhere weird despite the outer guard.
+/// - **Windows** has no openat2 / O_NOFOLLOW chain equivalent and falls
+///   back to path-based syscalls — the race window remains there, and
+///   this verifier is the only catch.
+/// - **Cross-device move fallback**: `rename(2)` returning EXDEV downshifts
+///   to copy+delete which is itself path-based for the inner copy.
+///
+/// In short: io_safe is the *primary* defense; this is the *backstop*.
 #[doc(hidden)]
 pub async fn verify_post_create(
     policy: &FilePolicyChecker,
