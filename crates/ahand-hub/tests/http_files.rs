@@ -391,7 +391,6 @@ async fn file_operation_returns_504_when_device_does_not_respond_within_configur
     // so we can build a state with a 100 ms window, attach a device,
     // intentionally NOT respond, and assert the 504 envelope arrives
     // shortly after the configured deadline.
-    use ahand_hub::config::{Config, StoreConfig};
     use ahand_hub::state::AppState;
     use support::spawn_server_with_state;
 

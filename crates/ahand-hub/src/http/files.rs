@@ -8,7 +8,6 @@
 //! content type.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
