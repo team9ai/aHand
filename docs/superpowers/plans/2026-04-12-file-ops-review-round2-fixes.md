@@ -37,11 +37,21 @@ as deferred are:
   trigger from real cross-FS rename remains deferred.
 - **Hub HTTP body in JSON vs protobuf** — Round 1 decided
   `application/x-protobuf`; this is a contract decision, not a bug.
-  Note: a follow-up issue tracked from Round 3 is the **R10 / TOCTOU**
-  residual — `verify_post_create` is best-effort cleanup and can lose
-  data on Move under an attacker-controlled symlink swap; the full
-  fix needs `openat2(RESOLVE_NO_SYMLINKS)`. Documented in the
-  `verify_post_create` docstring and tracked for round 4.
+- **R10 / TOCTOU residual — full openat2 / RESOLVE_NO_SYMLINKS fix**
+  remains open. The Move data-loss vector that this concretely
+  produced (rename destroys source → post-canonicalize rejects →
+  cleanup deletes the destination → both copies of the data are
+  gone) was **closed in round 4 follow-up `fix/file-ops-r10-toctou`**
+  by switching `verify_post_create`'s cleanup to a per-call-site
+  policy: `RemoveFileOrDir` for Mkdir / Write / Symlink, the new
+  `RemoveTreeAll` for recursive Copy (so partial trees don't leak
+  on rejection), and the new `Leave` for Move (which now preserves
+  data at the rejected destination so the operator can recover).
+  The race window itself still exists — closing it requires
+  `openat2(RESOLVE_NO_SYMLINKS)` on Linux + `O_NOFOLLOW`-chain on
+  macOS + Windows equivalent — but the resulting failure no longer
+  destroys user data; it surfaces as `PolicyDenied` with the
+  rejected path named in the FileError.
 - **`T17` 30s timeout integration test** — production constant; would
   need a test-only override hook. Round 3's `sent_job_fails_after_disconnect_grace_without_reconnect`
   CI-stability fix uses an elapsed-time floor instead, which is the
