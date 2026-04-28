@@ -819,3 +819,76 @@ fn unimplemented_error(path: &str) -> FileError {
         "operation not yet implemented",
     )
 }
+
+#[cfg(test)]
+mod lexically_normalize_tests {
+    //! Unit tests for `lexically_normalize` — the path-collapsing helper
+    //! used by `collect_request_paths` (approval prompt) AND the
+    //! CreateSymlink dispatch arm. The two call sites must agree on
+    //! the canonical post-normalization string; if they diverge,
+    //! relative symlinks that escape their parent get caught at the
+    //! approval layer but rejected (or worse, redirected) at dispatch.
+    //! These tests pin the helper's behavior on edge cases that the
+    //! integration suite doesn't directly exercise.
+    use super::lexically_normalize;
+    use std::path::{Path, PathBuf};
+
+    #[track_caller]
+    fn check(input: &str, expected: &str) {
+        let got = lexically_normalize(Path::new(input));
+        assert_eq!(
+            got,
+            PathBuf::from(expected),
+            "lexically_normalize({input:?}) = {got:?}; expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn collapses_parent_components() {
+        check("/tmp/a/../b", "/tmp/b");
+        check("/tmp/a/b/../..", "/tmp");
+        check("/tmp/a/b/c/../d", "/tmp/a/b/d");
+    }
+
+    #[test]
+    fn drops_curdir_components() {
+        check("/tmp/./a", "/tmp/a");
+        check("/tmp/a/./b", "/tmp/a/b");
+        check("./relative", "relative");
+    }
+
+    #[test]
+    fn pop_past_root_is_a_noop() {
+        // `out.pop()` returns false when `out` is empty or contains
+        // only a root prefix. The expected behavior is "stop popping
+        // and stay at root" — never panic, never produce a malformed
+        // path. This is the branch the test-completeness audit
+        // flagged as untested.
+        check("/..", "/");
+        check("/../..", "/");
+        check("/../../foo", "/foo");
+        check("/a/../../b", "/b");
+    }
+
+    #[test]
+    fn empty_input_returns_empty_path() {
+        let got = lexically_normalize(Path::new(""));
+        assert_eq!(got, PathBuf::new());
+    }
+
+    #[test]
+    fn root_only_passes_through() {
+        check("/", "/");
+    }
+
+    #[test]
+    fn relative_only_dotdot_drains_to_empty() {
+        // No root, just `..` components — there's nothing to pop, so
+        // the result is empty. Production paths always have a leading
+        // `/` because callers pass `parent.join(target)` where parent
+        // is canonical, but this case must still not panic.
+        check("..", "");
+        check("../..", "");
+        check("a/../..", "");
+    }
+}

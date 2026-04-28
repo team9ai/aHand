@@ -79,6 +79,11 @@ pub struct AppState {
     pub dashboard_allowed_origins: Arc<Vec<String>>,
     pub terminal_tokens: Arc<DashMap<String, crate::http::terminal::TerminalToken>>,
     pub pending_file_requests: Arc<crate::pending_file_requests::PendingFileRequests>,
+    /// How long the `POST /api/devices/{id}/files` proxy waits for the
+    /// device's FileResponse before returning `504 GATEWAY_TIMEOUT`.
+    /// Plumbed from `Config::file_request_timeout_ms` so tests can
+    /// configure a short window (T17 follow-up).
+    pub file_request_timeout: Duration,
     pub s3_client: Option<Arc<crate::s3::S3Client>>,
     /// Outbound webhook dispatcher. Always present; when
     /// `config.webhook_url` is `None`, this is a no-op (`Webhook::disabled()`)
@@ -235,6 +240,7 @@ impl AppState {
             dashboard_allowed_origins: Arc::new(config.dashboard_allowed_origins),
             terminal_tokens: Arc::new(DashMap::new()),
             pending_file_requests,
+            file_request_timeout: Duration::from_millis(config.file_request_timeout_ms),
             s3_client,
             webhook,
         };
