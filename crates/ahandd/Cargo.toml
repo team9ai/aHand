@@ -65,3 +65,7 @@ disable-ws-ping = []
 
 [dev-dependencies]
 tempfile = "3"
+# Used by tests/file_ops_s3_write.rs to spin up a tiny HTTP server that
+# stands in for an S3 endpoint. Pulled at test-time only; the daemon
+# binary continues to use plain `reqwest` against presigned URLs.
+axum.workspace = true

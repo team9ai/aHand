@@ -119,11 +119,21 @@ async fn handle_full_write(
     let bytes: Vec<u8> = match &fw.source {
         Some(full_write::Source::Content(c)) => c.clone(),
         Some(full_write::Source::S3ObjectKey(_)) => {
-            return Err(file_error(
-                FileErrorCode::Unspecified,
-                req_path,
-                "S3 large-file uploads are not wired yet",
-            ));
+            // The daemon never holds S3 credentials directly; the hub
+            // injects a presigned GET URL into FullWrite.s3_download_url
+            // before forwarding. If the URL is missing, that's either a
+            // hub bug or an old-hub/new-daemon mismatch — surface clearly
+            // rather than letting the write silently succeed with empty
+            // content.
+            let url = fw.s3_download_url.as_deref().ok_or_else(|| {
+                file_error(
+                    FileErrorCode::Unspecified,
+                    req_path,
+                    "FullWrite carries s3_object_key but hub did not inject \
+                     s3_download_url",
+                )
+            })?;
+            fetch_full_write_bytes(url, max_write_bytes, req_path).await?
         }
         None => {
             return Err(file_error(
@@ -498,6 +508,66 @@ fn enforce_size_limit(size: u64, max: u64, path: &str) -> Result<(), FileError> 
     } else {
         Ok(())
     }
+}
+
+/// Download bytes via plain HTTP GET against a hub-provided presigned
+/// S3 URL. This is the daemon-side leg of the large-file write flow:
+/// the hub mints the URL, the daemon fetches and writes to disk. The
+/// daemon does not need (and intentionally does not have) S3
+/// credentials — a presigned URL works as a regular HTTP resource.
+///
+/// We enforce `max_write_bytes` twice: once against `Content-Length`
+/// (so an obviously oversized object is rejected before we read the
+/// body), and again against the actual byte count (defense against a
+/// missing or lying header). A missing `Content-Length` is allowed —
+/// pre-signed S3 URLs may omit it under chunked transfer — but the
+/// post-read size check still catches oversized payloads.
+async fn fetch_full_write_bytes(
+    url: &str,
+    max_write_bytes: u64,
+    req_path: &str,
+) -> Result<Vec<u8>, FileError> {
+    let resp = reqwest::get(url).await.map_err(|e| {
+        file_error(
+            FileErrorCode::Io,
+            req_path,
+            format!("S3 download failed: {e}"),
+        )
+    })?;
+    if !resp.status().is_success() {
+        return Err(file_error(
+            FileErrorCode::Io,
+            req_path,
+            format!("S3 download HTTP status {}", resp.status()),
+        ));
+    }
+    if let Some(len) = resp.content_length()
+        && len > max_write_bytes
+    {
+        return Err(file_error(
+            FileErrorCode::TooLarge,
+            req_path,
+            format!("S3 object size {len} exceeds max_write_bytes ({max_write_bytes})"),
+        ));
+    }
+    let bytes = resp.bytes().await.map_err(|e| {
+        file_error(
+            FileErrorCode::Io,
+            req_path,
+            format!("S3 download body read failed: {e}"),
+        )
+    })?;
+    if bytes.len() as u64 > max_write_bytes {
+        return Err(file_error(
+            FileErrorCode::TooLarge,
+            req_path,
+            format!(
+                "S3 object size {} exceeds max_write_bytes ({max_write_bytes})",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(bytes.to_vec())
 }
 
 /// I3: stat the existing file BEFORE we slurp it into memory for an
