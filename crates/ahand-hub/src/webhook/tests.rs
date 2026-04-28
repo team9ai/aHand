@@ -154,10 +154,7 @@ async fn online_event_serializes_empty_capabilities_when_none_declared() {
     let (webhook, handle) = Webhook::new(store.clone(), noop_config());
     drop(handle);
 
-    webhook
-        .enqueue_online("device-3", None, &[])
-        .await
-        .unwrap();
+    webhook.enqueue_online("device-3", None, &[]).await.unwrap();
 
     let rows = store.lease_due(chrono::Utc::now(), 10).await.unwrap();
     assert_eq!(rows.len(), 1);
@@ -220,10 +217,7 @@ async fn revoked_event_unaffected_by_capabilities_change() {
     let (webhook, handle) = Webhook::new(store.clone(), noop_config());
     drop(handle);
 
-    webhook
-        .enqueue_revoked("device-1", None)
-        .await
-        .unwrap();
+    webhook.enqueue_revoked("device-1", None).await.unwrap();
 
     let rows = store.lease_due(chrono::Utc::now(), 10).await.unwrap();
     let payload: WebhookPayload = serde_json::from_value(rows[0].payload.clone()).unwrap();
