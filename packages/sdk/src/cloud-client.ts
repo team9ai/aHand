@@ -80,6 +80,118 @@ export interface SpawnResult {
 }
 
 /**
+ * The 14 file operations the daemon supports. Each name maps 1:1 to a
+ * variant of the protobuf `FileRequest.operation` oneof; the hub
+ * translates the JSON request body into the right proto variant. Use
+ * the per-op shape below to fill `FileParams.params`.
+ */
+export type FileOperation =
+  | "stat"
+  | "list"
+  | "glob"
+  | "read_text"
+  | "read_binary"
+  | "read_image"
+  | "write"
+  | "edit"
+  | "delete"
+  | "chmod"
+  | "mkdir"
+  | "copy"
+  | "move"
+  | "create_symlink";
+
+/**
+ * Parameters for a single `files()` invocation. Maps to the hub's
+ * `POST /api/control/files` request body (snake_case wire format).
+ *
+ * `params` holds the operation-specific fields and is forwarded to the
+ * hub verbatim (the hub validates against the proto schema). The SDK
+ * does NOT do client-side path validation — the daemon's policy engine
+ * is the source of truth, so consumers should expect a `success: false`
+ * result with `error.code === "policy_denied"` for refused paths.
+ *
+ * Examples of well-formed `params` for the most common ops (this is a
+ * subset — see the hub's `http::control_files_dto` module for the full
+ * field-by-field schema):
+ *
+ *   * `stat`:         `{ path: "/tmp/x", no_follow_symlink?: boolean }`
+ *   * `list`:         `{ path: "/tmp", max_results?, offset?, include_hidden? }`
+ *   * `read_text`:    `{ path, start?: { start_line: 1 }, max_lines?, line_numbers? }`
+ *   * `write` (full): `{ path, create_parents?, full_write: { content: "..." } }`
+ *   * `delete`:       `{ path, recursive?, mode?: "trash" | "permanent" }`
+ */
+export interface FileParams {
+  deviceId: string;
+  operation: FileOperation;
+  /**
+   * Operation-specific parameters. Defaults to `{}` if omitted (the
+   * stat/glob/read_* ops require at least a `path`/`pattern` field, so
+   * an empty object will yield a 400 INVALID_PARAMS from the hub).
+   */
+  params?: Record<string, unknown>;
+  /** Per-request timeout. Defaults to 30 000 ms when not provided. */
+  timeoutMs?: number;
+  /**
+   * Idempotency / tracing key. Forwarded as `correlation_id` on the
+   * wire; sent only when provided. Hub-side dedupe is a follow-up;
+   * today the field is opaque metadata.
+   */
+  correlationId?: string;
+  /**
+   * AbortSignal — aborting cancels the in-flight fetch and rejects with
+   * a `CloudClientError` whose `code === "abort"`.
+   */
+  signal?: AbortSignal;
+}
+
+/** Daemon-side error envelope returned inside a `FileResult`. */
+export interface FileErrorPayload {
+  /**
+   * Lower-snake-case error code. Stable wire values include:
+   * `not_found`, `permission_denied`, `already_exists`, `not_a_directory`,
+   * `is_a_directory`, `not_empty`, `too_large`, `invalid_path`, `io`,
+   * `encoding`, `multiple_matches`, `policy_denied`, `unspecified`.
+   */
+  code: string;
+  message: string;
+  /** Path the daemon was operating on when the error fired (may be ""). */
+  path: string;
+}
+
+/**
+ * Resolved result of a successful `files()` HTTP round-trip. Hub-level
+ * failures (auth, offline, timeout) are thrown as `CloudClientError`;
+ * daemon-level failures (file not found, policy refusal, ...) come back
+ * as `success: false` with an `error` field populated. This is
+ * symmetric with `BrowserResult.error` and matches the dashboard's
+ * protobuf-envelope semantics.
+ *
+ * `result` shape mirrors the proto result for the requested op (see
+ * `proto/ahand/v1/file_ops.proto`). All field names are snake_case to
+ * match the wire — the SDK does NOT do per-op typed unwrapping. Cast
+ * to your own per-op types as needed.
+ */
+export interface FileResult {
+  /** Hub-minted UUID echoed back so callers can correlate logs. */
+  requestId: string;
+  /** Operation tag the caller sent ("stat", "list", ...). */
+  operation: string;
+  /**
+   * `true` when the daemon completed the op successfully (in which
+   * case `result` is set). `false` when the daemon refused or hit a
+   * filesystem error (in which case `error` is set).
+   */
+  success: boolean;
+  /** Operation-specific result body, present when `success === true`. */
+  result?: unknown;
+  /** Daemon error envelope, present when `success === false`. */
+  error?: FileErrorPayload;
+  /** Hub-measured wall-clock latency for the round trip. */
+  durationMs: number;
+}
+
+/**
  * Parameters for a single `browser()` invocation. Maps to the hub's
  * `POST /api/control/browser` request body (snake_case wire format).
  */
@@ -136,7 +248,8 @@ export type CloudClientErrorCode =
   | "job_error"
   | "abort"
   | "network"
-  | "timeout";
+  | "timeout"
+  | "device_offline";
 
 /**
  * Typed error raised by `CloudClient`. Use `.code` to discriminate,
@@ -203,6 +316,13 @@ async function toTypedHttpError(res: Response): Promise<CloudClientError> {
     case 404:
       code = "not_found";
       break;
+    case 409:
+      // Files-endpoint hub contract: 409 with body {error:{code:"DEVICE_OFFLINE"}}
+      // means the device is registered but not currently connected over WS.
+      // Other 409s (none today) fall through to bad_request below after the
+      // body is inspected.
+      code = "bad_request";
+      break;
     case 429:
       code = "rate_limited";
       break;
@@ -217,6 +337,12 @@ async function toTypedHttpError(res: Response): Promise<CloudClientError> {
     const body = (await res.json()) as HubErrorEnvelope;
     if (body?.error?.message) {
       message = body.error.message;
+    }
+    // Inspect the hub's discriminator code for the file-offline case so a
+    // SDK consumer can branch on `err.code === "device_offline"` without
+    // string-matching the message.
+    if (res.status === 409 && body?.error?.code === "DEVICE_OFFLINE") {
+      code = "device_offline";
     }
   } catch {
     // Body wasn't JSON — keep the status-based message.
@@ -473,6 +599,131 @@ export class CloudClient {
       data: json.data ?? undefined,
       error: json.error ? json.error : undefined,
       binary,
+      durationMs: typeof json.duration_ms === "number" ? json.duration_ms : 0,
+    };
+  }
+
+  /**
+   * `POST /api/control/files`. Single request-response: dispatches a
+   * file operation via the hub, decodes the snake_case JSON envelope
+   * into camelCase, and resolves with a `FileResult`. Errors map to
+   * the same taxonomy as `browser()` plus `device_offline` for the
+   * 409 case (which the dashboard endpoint also surfaces).
+   *
+   * Daemon-level errors (NOT_FOUND, POLICY_DENIED, ...) are returned
+   * inside the resolved `FileResult` — `success === false` plus an
+   * `error` field — rather than thrown as `CloudClientError`. This
+   * matches the proto envelope semantics: a successful round-trip is
+   * not the same thing as a successful operation.
+   */
+  async files(params: FileParams): Promise<FileResult> {
+    if (params.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted before request");
+    }
+
+    const fetchImpl = this.fetchImpl();
+    const token = await this.opts.getAuthToken();
+    if (params.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
+
+    // Wire format is snake_case. Always send `params: {}` (not omitted)
+    // so the hub side always sees an object — same convention browser()
+    // follows. `correlation_id` is sent only when set.
+    const requestBody: Record<string, unknown> = {
+      device_id: params.deviceId,
+      operation: params.operation,
+      params: params.params ?? {},
+    };
+    if (params.timeoutMs !== undefined) {
+      requestBody.timeout_ms = params.timeoutMs;
+    }
+    if (params.correlationId !== undefined) {
+      requestBody.correlation_id = params.correlationId;
+    }
+
+    let res: Response;
+    try {
+      res = await fetchImpl(`${this.opts.hubUrl}/api/control/files`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+        signal: params.signal,
+      });
+    } catch (err) {
+      throw this.normalizeFetchError(err);
+    }
+    if (!res.ok) throw await toTypedHttpError(res);
+
+    let json: {
+      request_id?: string;
+      operation?: string;
+      success?: boolean;
+      result?: unknown;
+      error?: { code?: string; message?: string; path?: string } | null;
+      duration_ms?: number;
+    };
+    try {
+      json = (await res.json()) as typeof json;
+    } catch (e: unknown) {
+      // Same defensive read as `browser()`: aborted-mid-body and
+      // non-JSON responses both need to surface as proper
+      // `CloudClientError`s.
+      if (isAbortError(e)) {
+        throw new CloudClientError(
+          "abort",
+          "files request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw new CloudClientError("network", String(e), { cause: e });
+    }
+
+    // Strict shape check — same rationale as `browser()`. A non-object
+    // root or missing `success` field means the hub's wire contract has
+    // drifted; coercing would silently mask the regression.
+    if (
+      json === null ||
+      typeof json !== "object" ||
+      Array.isArray(json) ||
+      typeof (json as { success?: unknown }).success !== "boolean"
+    ) {
+      throw new CloudClientError(
+        "server_error",
+        "Hub response malformed: 'success' field missing, not an object, or not a boolean",
+      );
+    }
+
+    const error =
+      json.error && typeof json.error === "object"
+        ? {
+            code:
+              typeof json.error.code === "string" ? json.error.code : "unspecified",
+            message:
+              typeof json.error.message === "string" ? json.error.message : "",
+            path: typeof json.error.path === "string" ? json.error.path : "",
+          }
+        : undefined;
+
+    return {
+      requestId: typeof json.request_id === "string" ? json.request_id : "",
+      operation:
+        typeof json.operation === "string" ? json.operation : params.operation,
+      success: json.success as boolean,
+      // `result` is the daemon's per-op payload — pass through as
+      // `unknown`. Callers should cast based on `params.operation`.
+      result: json.result === null ? undefined : json.result,
+      error,
       durationMs: typeof json.duration_ms === "number" ? json.duration_ms : 0,
     };
   }
