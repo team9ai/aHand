@@ -204,6 +204,7 @@ fn write_request_full(path: &Path, content: &[u8], create_parents: bool) -> File
             no_follow_symlink: false,
             method: Some(file_write::Method::FullWrite(FullWrite {
                 source: Some(full_write::Source::Content(content.to_vec())),
+                ..Default::default()
             })),
         })),
     }
@@ -2461,6 +2462,7 @@ async fn file_write_encoding_non_utf8_rejected() {
             no_follow_symlink: false,
             method: Some(file_write::Method::FullWrite(FullWrite {
                 source: Some(full_write::Source::Content(b"new".to_vec())),
+                ..Default::default()
             })),
         })),
     };
@@ -2518,6 +2520,7 @@ async fn write_refuses_symlink_when_no_follow_set() {
             no_follow_symlink: true,
             method: Some(file_write::Method::FullWrite(FullWrite {
                 source: Some(full_write::Source::Content(b"hijacked".to_vec())),
+                ..Default::default()
             })),
         })),
     };
@@ -3547,7 +3550,7 @@ async fn full_write_with_no_source_returns_unspecified_error() {
             create_parents: false,
             encoding: None,
             no_follow_symlink: false,
-            method: Some(file_write::Method::FullWrite(FullWrite { source: None })),
+            method: Some(file_write::Method::FullWrite(FullWrite::default())),
         })),
     };
     let err = expect_error(mgr.handle(&req).await);
@@ -3555,11 +3558,14 @@ async fn full_write_with_no_source_returns_unspecified_error() {
 }
 
 #[tokio::test]
-async fn full_write_with_s3_object_key_source_returns_unspecified_error() {
-    // The hub-side S3 transfer flow is intentionally deferred (per the
-    // PR description). Until it ships, the daemon must reject S3-keyed
-    // writes loudly so the operator gets a clear error rather than a
-    // mysterious "no content" outcome.
+async fn full_write_with_s3_object_key_but_no_download_url_returns_unspecified_error() {
+    // The S3 large-file flow requires the hub to inject s3_download_url
+    // before forwarding. If a daemon receives a FullWrite carrying only
+    // s3_object_key with no URL, that's either a hub bug or an
+    // old-hub/new-daemon mismatch — the daemon must reject loudly so
+    // the operator gets a clear error rather than a silent empty write.
+    // (The happy-path S3 fetch behavior lives in
+    // tests/file_ops_s3_write.rs.)
     use ahand_protocol::full_write;
     let dir = TempDir::new().unwrap();
     let (mgr, root) = test_manager(&dir);
@@ -3573,6 +3579,8 @@ async fn full_write_with_s3_object_key_source_returns_unspecified_error() {
             no_follow_symlink: false,
             method: Some(file_write::Method::FullWrite(FullWrite {
                 source: Some(full_write::Source::S3ObjectKey("upload-key-123".into())),
+                s3_download_url: None,
+                s3_download_url_expires_ms: None,
             })),
         })),
     };
