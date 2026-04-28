@@ -153,11 +153,8 @@ pub async fn file_operation(
     // Translate client-supplied FullWrite{s3_object_key} into one the
     // daemon can act on by injecting a presigned GET URL. Daemons never
     // hold S3 credentials, so the hub is the only place that can speak
-    // S3 directly. Note: any S3 object-key construction below the line
-    // also runs validate_device_id_for_s3_key on the URL path segment
-    // — that prevents a hostile device_id from escaping its bucket
-    // namespace.
-    maybe_inject_full_write_download_url(&state, &device_id, &mut request).await?;
+    // S3 directly. Object-key validation lives inside the helper.
+    maybe_inject_full_write_download_url(&state, &mut request).await?;
 
     let envelope = ahand_protocol::Envelope {
         device_id: device_id.clone(),
@@ -383,7 +380,6 @@ async fn upload_and_presign(
 /// confusing "no download URL" error.
 async fn maybe_inject_full_write_download_url(
     state: &AppState,
-    device_id: &str,
     request: &mut FileRequest,
 ) -> Result<(), ApiError> {
     use ahand_protocol::{file_request, file_write, full_write};
@@ -406,14 +402,13 @@ async fn maybe_inject_full_write_download_url(
         ));
     };
 
-    // Reject keys that would let a caller escape the
-    // `file-ops/<device_id>/` prefix the upload-url route created.
-    // We don't insist on the prefix being literally there (callers may
-    // legitimately reuse a key generated for a different device — the
-    // S3 ACL is what controls access), but `..` / `\0` / leading `/`
-    // are obvious traversal/injection attempts.
+    // Reject keys that would let a caller poison a presigned URL via
+    // path-traversal characters. We don't insist on the
+    // `file-ops/<device_id>/` prefix being literally present (callers
+    // may legitimately reuse a key generated for a different device —
+    // the S3 ACL is what controls access), but `..` / `\0` / leading
+    // `/` are obvious traversal/injection attempts.
     validate_object_key(key)?;
-    validate_device_id_for_s3_key(device_id)?;
 
     let presigned = s3.generate_download_url(key).await.map_err(|err| {
         ApiError::new(
