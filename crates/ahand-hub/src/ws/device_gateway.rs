@@ -570,7 +570,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             };
             if let Err(err) = state
                 .webhook
-                .enqueue_registered(&envelope.device_id, external_user_id.as_deref())
+                .enqueue_registered(&envelope.device_id, external_user_id.as_deref(), &hello.capabilities)
                 .await
             {
                 tracing::warn!(
@@ -647,7 +647,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         };
         if let Err(err) = state
             .webhook
-            .enqueue_online(&device_id, online_external_user_id.as_deref())
+            .enqueue_online(&device_id, online_external_user_id.as_deref(), &hello.capabilities)
             .await
         {
             tracing::warn!(

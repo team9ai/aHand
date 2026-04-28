@@ -206,7 +206,7 @@ async fn happy_path_posts_signed_payload_and_deletes_row() {
     let worker_task = tokio::spawn(worker.run());
 
     webhook
-        .enqueue_online("device-1", Some("user-1"))
+        .enqueue_online("device-1", Some("user-1"), &[])
         .await
         .unwrap();
 
@@ -540,7 +540,7 @@ async fn concurrent_enqueue_is_bounded_by_semaphore() {
 
     for n in 0..100 {
         webhook
-            .enqueue_online(&format!("device-{n}"), Some("user-1"))
+            .enqueue_online(&format!("device-{n}"), Some("user-1"), &[])
             .await
             .unwrap();
     }
