@@ -382,10 +382,76 @@ async fn file_operation_releases_slot_on_client_cancellation() {
     server.shutdown().await;
 }
 
-// Timeout tests are intentionally NOT included here:
-// `DEFAULT_REQUEST_TIMEOUT_SECS = 30` in http/files.rs is baked at compile
-// time and the test support layer does not currently expose an override.
-// Adding a production hook just for tests is worse than leaving this gap,
-// so the timeout path is verified by inspection and by the unit-level tests
-// in files.rs (`pending_file_requests_admission_control_accepts_after_cancel`
-// and the cancel path covered by the happy-path integration test).
+#[tokio::test]
+async fn file_operation_returns_504_when_device_does_not_respond_within_configured_timeout() {
+    // T17 follow-up: the timeout window used to be a hard-coded 30s
+    // constant (`DEFAULT_REQUEST_TIMEOUT_SECS`), which made writing an
+    // integration test prohibitively slow. It's now driven by
+    // `Config::file_request_timeout_ms` → `AppState::file_request_timeout`,
+    // so we can build a state with a 100 ms window, attach a device,
+    // intentionally NOT respond, and assert the 504 envelope arrives
+    // shortly after the configured deadline.
+    use ahand_hub::state::AppState;
+    use support::spawn_server_with_state;
+
+    let mut config = support::test_config();
+    config.file_request_timeout_ms = 100;
+    let state = AppState::from_config(config).await.unwrap();
+    let server = spawn_server_with_state(state).await;
+    let token = dashboard_token(&server).await;
+
+    // Attach a device so the request makes it past the offline guard
+    // (which would otherwise return 409 immediately) — but DO NOT
+    // respond to the FileRequest. The hub will time out after 100 ms.
+    let mut device = server
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+
+    let url = format!("{}/api/devices/device-2/files", server.http_base_url());
+    let body = encoded_read_text("/tmp/fake.txt", "req-timeout");
+    let token_clone = token.clone();
+
+    let started = std::time::Instant::now();
+    let http_handle = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token_clone)
+            .header("content-type", PROTOBUF_CONTENT_TYPE)
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    });
+
+    // Wait for the device to *receive* the FileRequest (so we know the
+    // hub has armed its timeout) but never reply.
+    let received = device.recv_file_request().await;
+    assert_eq!(received.request_id, "req-timeout");
+
+    let response = http_handle.await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(response.status().as_u16(), 504);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains("100ms") || body.contains("DEVICE_TIMEOUT"),
+        "expected DEVICE_TIMEOUT envelope citing the 100ms deadline, got: {body}"
+    );
+
+    // Sanity bound: the timeout should fire close to the configured
+    // 100 ms deadline. Floor at 80 ms (catches a regression to "fires
+    // immediately" / grace=0); ceiling generous at 5 s for slow CI.
+    assert!(
+        elapsed >= Duration::from_millis(80),
+        "timeout fired suspiciously fast: {elapsed:?} (configured 100ms)"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "timeout took too long: {elapsed:?} (configured 100ms)"
+    );
+
+    // Tidy up: also assert the slot was released, since the timeout
+    // path runs `cancel()` via the RAII guard.
+    drop(device);
+    server.shutdown().await;
+}

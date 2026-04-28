@@ -3667,3 +3667,153 @@ async fn chmod_with_unix_permission_but_no_mode_or_owner_returns_unspecified_err
     let err = expect_error(mgr.handle(&req).await);
     assert_eq!(err.code, FileErrorCode::Unspecified as i32);
 }
+
+// ── R10 follow-up: PostCreateCleanup behavior ─────────────────────────────
+//
+// These tests directly drive `verify_post_create` (test-only doc-hidden
+// API) to pin each cleanup mode independently of an actual TOCTOU race.
+// The race window is microseconds and unreliable to trigger from a
+// single-threaded integration test, so we verify the **cleanup
+// contract** instead: given that a post-create policy check rejects,
+// what does each mode do to the on-disk artifact?
+
+/// Build a `FilePolicyChecker` whose allowlist contains exactly `tmp_root`
+/// (and its descendants), so any path *outside* that root will be
+/// rejected by `policy.check_path`.
+fn restrictive_policy(tmp_root: &Path) -> ahandd::file_manager::policy::FilePolicyChecker {
+    let root_str = tmp_root.to_string_lossy().into_owned();
+    ahandd::file_manager::policy::FilePolicyChecker::new(
+        &ahandd::config::FilePolicyConfig {
+            enabled: true,
+            path_allowlist: vec![format!("{}/**", root_str), root_str.clone()],
+            path_denylist: vec![],
+            max_read_bytes: 100_000_000,
+            max_write_bytes: 100_000_000,
+            dangerous_paths: vec![],
+        },
+    )
+}
+
+#[tokio::test]
+async fn verify_post_create_remove_file_or_dir_unlinks_a_rejected_file() {
+    // Mode invariant for Mkdir / Write / Symlink: when post-check
+    // rejects, the artifact at the rejected path is unlinked so the
+    // caller's failure surface is "operation didn't happen".
+    let allowed = TempDir::new().unwrap();
+    let allowed_root = allowed.path().canonicalize().unwrap();
+    let policy = restrictive_policy(&allowed_root);
+
+    // The artifact lives outside the allowlist — the post-check will
+    // reject it and the cleanup must unlink.
+    let outside = TempDir::new().unwrap();
+    let outside_root = outside.path().canonicalize().unwrap();
+    let leaked = outside_root.join("leaked.txt");
+    fs::write(&leaked, "ghost").unwrap();
+    assert!(leaked.exists());
+
+    let err = ahandd::file_manager::verify_post_create(
+        &policy,
+        &leaked,
+        ahandd::file_manager::PostCreateCleanup::RemoveFileOrDir,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
+    assert!(
+        !leaked.exists(),
+        "RemoveFileOrDir must unlink the rejected file"
+    );
+}
+
+#[tokio::test]
+async fn verify_post_create_remove_tree_all_purges_a_rejected_directory_tree() {
+    // Mode invariant for recursive Copy: a partially-populated
+    // directory tree at the rejected path must be fully removed —
+    // `remove_dir` cannot unlink non-empty dirs, so a cleanup that
+    // used the file-or-dir variant would leak the partial tree on
+    // disk after returning PolicyDenied.
+    let allowed = TempDir::new().unwrap();
+    let policy = restrictive_policy(&allowed.path().canonicalize().unwrap());
+
+    let outside = TempDir::new().unwrap();
+    let outside_root = outside.path().canonicalize().unwrap();
+    let tree_root = outside_root.join("tree");
+    fs::create_dir(&tree_root).unwrap();
+    fs::create_dir(tree_root.join("nested")).unwrap();
+    fs::write(tree_root.join("a.txt"), b"a").unwrap();
+    fs::write(tree_root.join("nested/b.txt"), b"b").unwrap();
+    assert!(tree_root.exists());
+
+    let err = ahandd::file_manager::verify_post_create(
+        &policy,
+        &tree_root,
+        ahandd::file_manager::PostCreateCleanup::RemoveTreeAll,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
+    assert!(
+        !tree_root.exists(),
+        "RemoveTreeAll must recursively unlink the rejected tree (no leaked partial copy)"
+    );
+}
+
+#[tokio::test]
+async fn verify_post_create_leave_preserves_data_at_rejected_path() {
+    // Mode invariant for Move: rename has already destroyed the source
+    // by the time post-check runs. If the destination's canonical
+    // resolution then rejects, deleting the destination would compound
+    // the data loss — the user's data would be gone from BOTH the
+    // original source path (deleted by rename) AND the rejected
+    // destination (deleted by us). `Leave` preserves the data so the
+    // operator can recover by inspecting the rejected destination.
+    let allowed = TempDir::new().unwrap();
+    let policy = restrictive_policy(&allowed.path().canonicalize().unwrap());
+
+    let outside = TempDir::new().unwrap();
+    let outside_root = outside.path().canonicalize().unwrap();
+    let preserved = outside_root.join("user_data.txt");
+    fs::write(&preserved, b"do not delete").unwrap();
+
+    let err = ahandd::file_manager::verify_post_create(
+        &policy,
+        &preserved,
+        ahandd::file_manager::PostCreateCleanup::Leave,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
+    assert!(
+        preserved.exists(),
+        "Leave must NOT touch the rejected artifact — that is the entire point"
+    );
+    assert_eq!(
+        fs::read(&preserved).unwrap(),
+        b"do not delete",
+        "Leave must preserve content byte-for-byte"
+    );
+}
+
+#[tokio::test]
+async fn verify_post_create_returns_ok_when_path_is_inside_allowlist() {
+    // Sanity: every cleanup mode is a no-op when the post-check passes.
+    // We verify this for the Leave variant explicitly because it's the
+    // new one — Remove* modes were already exercised by the existing
+    // integration suite via Mkdir / Write / Copy / Symlink.
+    let allowed = TempDir::new().unwrap();
+    let allowed_root = allowed.path().canonicalize().unwrap();
+    let policy = restrictive_policy(&allowed_root);
+
+    let inside = allowed_root.join("ok.txt");
+    fs::write(&inside, b"safe").unwrap();
+
+    ahandd::file_manager::verify_post_create(
+        &policy,
+        &inside,
+        ahandd::file_manager::PostCreateCleanup::Leave,
+    )
+    .await
+    .expect("inside-allowlist path must pass post-check");
+    assert!(inside.exists());
+    assert_eq!(fs::read(&inside).unwrap(), b"safe");
+}

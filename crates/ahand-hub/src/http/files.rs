@@ -8,7 +8,6 @@
 //! content type.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -23,7 +22,6 @@ use crate::http::api_error::{ApiError, ApiResult};
 use crate::pending_file_requests::{PendingFileRequests, PendingFileRequestsError};
 use crate::state::AppState;
 
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
 // PendingFileRequests itself now lives in `crate::pending_file_requests`
@@ -163,8 +161,8 @@ pub async fn file_operation(
 
     state.connections.send(&device_id, envelope).await?;
 
-    let timeout_secs = DEFAULT_REQUEST_TIMEOUT_SECS;
-    let response = match tokio::time::timeout(Duration::from_secs(timeout_secs), rx).await {
+    let timeout = state.file_request_timeout;
+    let response = match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(_)) => {
             return Err(ApiError::internal(
@@ -175,7 +173,10 @@ pub async fn file_operation(
             return Err(ApiError::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 "DEVICE_TIMEOUT",
-                format!("device {device_id} did not respond within {timeout_secs}s"),
+                format!(
+                    "device {device_id} did not respond within {}ms",
+                    timeout.as_millis()
+                ),
             ));
         }
     };

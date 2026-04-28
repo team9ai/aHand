@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ahand_hub_core::HubError;
 use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
-use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
+use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore, OutboxStore};
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -508,5 +509,170 @@ async fn audit_store_prunes_entries_older_than_cutoff() -> anyhow::Result<()> {
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].resource_id, "recent-job");
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_lock_acquire_and_release() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    assert!(
+        stack
+            .outbox
+            .try_acquire_lock("dev-lock-1", "sess-a")
+            .await?
+    );
+    assert!(
+        !stack
+            .outbox
+            .try_acquire_lock("dev-lock-1", "sess-b")
+            .await?
+    );
+    stack.outbox.release_lock("dev-lock-1", "sess-a").await?;
+    assert!(
+        stack
+            .outbox
+            .try_acquire_lock("dev-lock-1", "sess-b")
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_lock_release_with_wrong_session_is_noop() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    assert!(
+        stack
+            .outbox
+            .try_acquire_lock("dev-lock-2", "sess-a")
+            .await?
+    );
+    stack
+        .outbox
+        .release_lock("dev-lock-2", "sess-other")
+        .await?;
+    assert!(
+        !stack
+            .outbox
+            .try_acquire_lock("dev-lock-2", "sess-b")
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_lock_renew_extends_ttl_for_owner_only() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    stack
+        .outbox
+        .try_acquire_lock("dev-lock-3", "sess-a")
+        .await?;
+    assert!(stack.outbox.renew_lock("dev-lock-3", "sess-a").await?);
+    assert!(!stack.outbox.renew_lock("dev-lock-3", "sess-b").await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_kick_delivers_to_subscriber() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let mut sub = stack.outbox.subscribe_kick("dev-kick-1").await?;
+    // No sleep needed: subscribe_kick returns only after SUBSCRIBE has
+    // landed, so any kick published from this point is guaranteed to
+    // be delivered to the watch channel.
+    stack.outbox.kick("dev-kick-1", "new-sess").await?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv.changed())
+        .await
+        .expect("kick should arrive within 2s")?;
+    assert!(*sub.recv.borrow() >= 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_send_and_replay_roundtrip() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let dev = "dev-send-1";
+    let sess = "sess-a";
+    stack.outbox.try_acquire_lock(dev, sess).await?;
+
+    let mut seqs = Vec::new();
+    for i in 0..5u8 {
+        let seq = stack.outbox.fenced_incr_seq(dev, sess).await?;
+        stack.outbox.xadd_frame(dev, sess, seq, vec![i]).await?;
+        seqs.push(seq);
+    }
+    assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+
+    let frames = stack.outbox.unacked_frames(dev, 0).await?;
+    assert_eq!(
+        frames,
+        vec![vec![0u8], vec![1u8], vec![2u8], vec![3u8], vec![4u8]]
+    );
+
+    let frames = stack.outbox.unacked_frames(dev, 2).await?;
+    assert_eq!(frames, vec![vec![2u8], vec![3u8], vec![4u8]]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_observe_ack_trims() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let dev = "dev-ack-1";
+    let sess = "sess-a";
+    stack.outbox.try_acquire_lock(dev, sess).await?;
+
+    for i in 0..3u8 {
+        let seq = stack.outbox.fenced_incr_seq(dev, sess).await?;
+        stack.outbox.xadd_frame(dev, sess, seq, vec![i]).await?;
+    }
+    stack.outbox.observe_ack(dev, 2).await?;
+    let frames = stack.outbox.unacked_frames(dev, 0).await?;
+    assert_eq!(frames, vec![vec![2u8]]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_reconcile_normal_path_returns_current_seq() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let dev = "dev-rec-normal";
+    let sess = "sess-a";
+    stack.outbox.try_acquire_lock(dev, sess).await?;
+    for _ in 0..5 {
+        let seq = stack.outbox.fenced_incr_seq(dev, sess).await?;
+        stack.outbox.xadd_frame(dev, sess, seq, vec![]).await?;
+    }
+    let current = stack.outbox.reconcile_on_hello(dev, sess, 3).await?;
+    assert_eq!(current, 5);
+    let frames = stack.outbox.unacked_frames(dev, 0).await?;
+    // 1..=3 trimmed; 4..=5 remain
+    assert_eq!(frames.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_reconcile_bootstrap_path_seeds_and_clears() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let dev = "dev-rec-bootstrap";
+    let sess = "sess-a";
+    stack.outbox.try_acquire_lock(dev, sess).await?;
+    // Fresh device, last_ack=9 — the wedged-after-restart case.
+    let returned = stack.outbox.reconcile_on_hello(dev, sess, 9).await?;
+    assert_eq!(returned, 9);
+    let next = stack.outbox.fenced_incr_seq(dev, sess).await?;
+    assert_eq!(next, 10);
+    let frames = stack.outbox.unacked_frames(dev, 9).await?;
+    assert!(frames.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_send_rejects_non_owner() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let dev = "dev-fence";
+    stack.outbox.try_acquire_lock(dev, "sess-a").await?;
+    let err = stack
+        .outbox
+        .fenced_incr_seq(dev, "sess-b")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HubError::Unauthorized));
     Ok(())
 }

@@ -66,6 +66,14 @@ pub struct Config {
     /// matches the deployed `task-definition.json` so a hub booted
     /// without the env var still meets the spec.
     pub webhook_timeout_ms: u64,
+    /// Per-request timeout for the `POST /api/devices/{id}/files` proxy
+    /// in milliseconds. The handler waits this long for the device's
+    /// FileResponse to come back over the WebSocket before giving up
+    /// with `504 GATEWAY_TIMEOUT`. Was a hard-coded 30s constant
+    /// (T17 deferred); now configurable so timeout-path integration
+    /// tests can use a short window without `#[ignore]`'ing them and
+    /// operators with slow large-file workloads can extend it.
+    pub file_request_timeout_ms: u64,
     pub store: StoreConfig,
     /// Optional S3 configuration for large file transfer.
     #[serde(default)]
@@ -197,6 +205,10 @@ impl Config {
                 .map(|value| value.parse())
                 .transpose()?
                 .unwrap_or(5_000),
+            file_request_timeout_ms: getenv("AHAND_HUB_FILE_REQUEST_TIMEOUT_MS")
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(30_000),
             store: StoreConfig::Persistent {
                 database_url: required_env(&getenv, "AHAND_HUB_DATABASE_URL")?,
                 redis_url: required_env(&getenv, "AHAND_HUB_REDIS_URL")?,

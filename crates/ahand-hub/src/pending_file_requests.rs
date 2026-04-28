@@ -254,4 +254,99 @@ mod tests {
             .expect("room available after cancel");
         assert_eq!(table.in_flight(), 2);
     }
+
+    #[tokio::test]
+    async fn cancel_on_missing_key_is_a_noop() {
+        // Defensive property: cancel(d, r) for a key that was never
+        // registered must not panic, must not decrement the in_flight
+        // counter, and must leave the existing entry for a different
+        // (d, r) untouched. The cancel implementation guards on
+        // `pending.remove(...).is_some()` for exactly this reason.
+        let table = PendingFileRequests::default();
+        let _rx = table.register("device-1", "r1").unwrap();
+        assert_eq!(table.in_flight(), 1);
+
+        // Different request id — never registered.
+        table.cancel("device-1", "nonexistent-r");
+        // Different device + same request id — never registered.
+        table.cancel("device-2", "r1");
+        // Both never seen.
+        table.cancel("device-x", "r-x");
+
+        // Original slot still alive.
+        assert_eq!(table.in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_on_missing_key_is_a_noop() {
+        // Defensive property: resolve(d, r, response) for a key that
+        // was never registered (or already resolved/cancelled) must
+        // drop the response silently and not corrupt the counter.
+        // This guarantees the WS gateway can forward duplicate or
+        // late-arriving responses without state damage.
+        let table = PendingFileRequests::default();
+        let _rx = table.register("device-1", "r1").unwrap();
+        assert_eq!(table.in_flight(), 1);
+
+        table.resolve("device-1", "nonexistent-r", ok_response("nope"));
+        table.resolve("device-2", "r1", ok_response("nope"));
+
+        assert_eq!(table.in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn double_cancel_does_not_double_decrement_in_flight() {
+        // The counter must stay consistent even when two paths race
+        // to cancel the same key (e.g. RAII guard runs after an
+        // explicit cancel from the timeout path). DashMap's atomic
+        // remove ensures exactly one of the two `pending.remove`
+        // calls returns `Some`; the loser is a no-op.
+        let table = PendingFileRequests::default();
+        let _rx = table.register("device-1", "r1").unwrap();
+        let _rx2 = table.register("device-1", "r2").unwrap();
+        assert_eq!(table.in_flight(), 2);
+
+        table.cancel("device-1", "r1");
+        assert_eq!(table.in_flight(), 1);
+        table.cancel("device-1", "r1"); // Second cancel — must no-op.
+        assert_eq!(table.in_flight(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_after_cancel_is_a_noop() {
+        // Realistic race: HTTP client closes mid-flight, the RAII
+        // slot guard runs cancel(); then the device's response
+        // arrives at the WS gateway and tries to resolve(). The
+        // late resolve must be silently dropped — the slot is gone
+        // and the receiver has been dropped, so we can't deliver.
+        let table = PendingFileRequests::default();
+        let _rx = table.register("device-1", "r1").unwrap();
+
+        table.cancel("device-1", "r1");
+        assert_eq!(table.in_flight(), 0);
+
+        // Device's late response arrives.
+        table.resolve("device-1", "r1", ok_response("late"));
+
+        // No double-decrement, no panic.
+        assert_eq!(table.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_after_resolve_is_a_noop() {
+        // Inverse race: device responds, gateway calls resolve()
+        // which removes the slot and decrements in_flight. Later the
+        // HTTP handler's RAII guard drops and calls cancel(). The
+        // cancel must not double-decrement (the most common
+        // production interleaving — every successful HTTP file
+        // operation goes through this exact pattern).
+        let table = PendingFileRequests::default();
+        let _rx = table.register("device-1", "r1").unwrap();
+
+        table.resolve("device-1", "r1", ok_response("on time"));
+        assert_eq!(table.in_flight(), 0);
+
+        table.cancel("device-1", "r1");
+        assert_eq!(table.in_flight(), 0);
+    }
 }

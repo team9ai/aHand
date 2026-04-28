@@ -292,8 +292,16 @@ impl FileManager {
                 let result = fs_ops::handle_mkdir(req, checked.resolved_path.as_path()).await?;
                 // R10: verify the just-created directory's canonical path
                 // is still inside the allowlist (TOCTOU mitigation for
-                // nonexistent-path symlink swaps).
-                verify_post_create(&self.policy, checked.resolved_path.as_path()).await?;
+                // nonexistent-path symlink swaps). Cleanup with
+                // RemoveFileOrDir — handle_mkdir's recursive=true creates
+                // intermediate dirs but leaves any pre-existing ancestors
+                // alone, so a leaf-level remove_dir is the right inverse.
+                verify_post_create(
+                    &self.policy,
+                    checked.resolved_path.as_path(),
+                    PostCreateCleanup::RemoveFileOrDir,
+                )
+                .await?;
                 Ok(file_response::Result::Mkdir(result))
             }
             file_request::Operation::ReadText(req) => {
@@ -342,8 +350,15 @@ impl FileManager {
                     self.policy.max_write_bytes(),
                 )
                 .await?;
-                // R10: post-create verification for new files.
-                verify_post_create(&self.policy, checked.resolved_path.as_path()).await?;
+                // R10: post-create verification for new files. Cleanup
+                // with RemoveFileOrDir — Write created exactly one file
+                // at this path, so remove_file undoes it without leaking.
+                verify_post_create(
+                    &self.policy,
+                    checked.resolved_path.as_path(),
+                    PostCreateCleanup::RemoveFileOrDir,
+                )
+                .await?;
                 Ok(file_response::Result::Write(result))
             }
             file_request::Operation::Edit(req) => {
@@ -382,7 +397,16 @@ impl FileManager {
                 )
                 .await?;
                 // R10: verify the copy destination is still inside policy.
-                verify_post_create(&self.policy, dest.resolved_path.as_path()).await?;
+                // RemoveTreeAll — recursive copy may have populated a
+                // partial directory tree, and `remove_dir` cannot unlink
+                // a non-empty dir. Source is intact, so an aggressive
+                // recursive remove is safe (re-copying is the recovery).
+                verify_post_create(
+                    &self.policy,
+                    dest.resolved_path.as_path(),
+                    PostCreateCleanup::RemoveTreeAll,
+                )
+                .await?;
                 Ok(file_response::Result::Copy(result))
             }
             file_request::Operation::Move(req) => {
@@ -394,8 +418,20 @@ impl FileManager {
                     dest.resolved_path.as_path(),
                 )
                 .await?;
-                // R10: verify the move destination is still inside policy.
-                verify_post_create(&self.policy, dest.resolved_path.as_path()).await?;
+                // R10 (round-2): verify the move destination is still
+                // inside policy. **Leave** on rejection — Move's rename
+                // already removed the source, so deleting the destination
+                // would compound the data loss into a strict regression.
+                // Operator gets a PolicyDenied error envelope naming the
+                // rejected destination + the original source from the
+                // request, and can recover by manually inspecting/moving
+                // the data back.
+                verify_post_create(
+                    &self.policy,
+                    dest.resolved_path.as_path(),
+                    PostCreateCleanup::Leave,
+                )
+                .await?;
                 Ok(file_response::Result::MoveResult(result))
             }
             file_request::Operation::CreateSymlink(req) => {
@@ -438,7 +474,14 @@ impl FileManager {
                     fs_ops::handle_create_symlink(req, checked.resolved_path.as_path()).await?;
                 // R10: post-create verification — after the symlink exists,
                 // re-check the link's own canonical path to catch any race.
-                verify_post_create(&self.policy, checked.resolved_path.as_path()).await?;
+                // RemoveFileOrDir — the symlink itself is a single inode;
+                // remove_file unlinks it without following.
+                verify_post_create(
+                    &self.policy,
+                    checked.resolved_path.as_path(),
+                    PostCreateCleanup::RemoveFileOrDir,
+                )
+                .await?;
                 Ok(file_response::Result::CreateSymlink(result))
             }
         }
@@ -612,57 +655,104 @@ fn glob_has_dangerous_match(
     }
 }
 
+/// What `verify_post_create` should do with a resource that has just
+/// been created at a path the policy now rejects (the TOCTOU window
+/// landed on the wrong side of an attacker-supplied symlink swap).
+///
+/// **Test-only hook.** Exposed so `crates/ahandd/tests/file_ops.rs`
+/// can drive each cleanup mode directly without simulating an actual
+/// race (which is unreliable on a single-thread integration test).
+/// Production code constructs these inline at each call site; nothing
+/// outside the integration tests should be reaching for this.
+#[doc(hidden)]
+///
+/// The choice is per-call-site, not per-policy:
+///
+/// - `RemoveFileOrDir` — single-shot resource. Mkdir, Write, Symlink,
+///   single-file Copy. We can `remove_file` / `remove_dir` and undo
+///   the operation cleanly. Even if the cleanup itself walks the
+///   compromised path, the worst-case is an attacker-controlled
+///   regular file gets unlinked, which is no worse than the original
+///   write that landed there.
+///
+/// - `RemoveTreeAll` — recursive Copy. The on-disk artifact may be a
+///   partially-populated directory tree; `remove_dir` can't unlink
+///   those (it requires the dir be empty). Use `remove_dir_all` so
+///   the partial tree doesn't leak. Yes, the recursive remove also
+///   walks the compromised path — we accept that the source is
+///   already intact (Copy doesn't delete source), so the worst we
+///   can do is unlink attacker-controlled files inside an
+///   attacker-controlled subtree, which is no escalation over what
+///   the original copy already did.
+///
+/// - `Leave` — Move. `handle_move` already destroyed the source via
+///   rename before we got here. If we now also unlink the destination,
+///   the user's data is gone from BOTH places (source: deleted by
+///   rename, dest: deleted by us). That's a strict regression vs
+///   leaving the data at the rejected destination so the operator can
+///   inspect and recover. The error envelope still surfaces both the
+///   rejected canonical path and (via the caller's `req.source`) the
+///   original source identifier, so recovery is procedural.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostCreateCleanup {
+    RemoveFileOrDir,
+    RemoveTreeAll,
+    Leave,
+}
+
 /// R10: post-create verification to mitigate the nonexistent-path symlink
 /// TOCTOU race. The canonicalize_or_parent helper in policy rebuilds a
 /// non-existing path from its deepest existing ancestor, so an attacker
 /// who swaps a component for a symlink between the policy check and the
 /// operation can redirect the write/mkdir target. Re-canonicalizing AFTER
-/// the operation catches most such swaps; anything escaping the allowlist
-/// is cleaned up (best-effort) and reported as PolicyDenied.
+/// the operation catches most such swaps; the `cleanup` argument controls
+/// what to do with any artifact that landed at a now-rejected path.
 ///
 /// Full TOCTOU protection requires fd-based syscalls (openat2 +
-/// RESOLVE_NO_SYMLINKS on Linux, O_NOFOLLOW elsewhere) — that refactor is
-/// deferred to a follow-up PR.
-async fn verify_post_create(policy: &FilePolicyChecker, resolved: &Path) -> Result<(), FileError> {
+/// RESOLVE_NO_SYMLINKS on Linux, O_NOFOLLOW elsewhere). That refactor is
+/// out of scope here — this round's fix is to make the cleanup *not
+/// destroy data the caller can't recover from*, in particular the Move
+/// data-loss case where rename already removed the source.
+#[doc(hidden)]
+pub async fn verify_post_create(
+    policy: &FilePolicyChecker,
+    resolved: &Path,
+    cleanup: PostCreateCleanup,
+) -> Result<(), FileError> {
     let path_str = resolved.to_string_lossy();
     match policy.check_path(&path_str, false, false) {
         Ok(_) => Ok(()),
         Err(err) => {
-            // Best-effort cleanup: try file removal first, then directory.
-            // If the created resource can't be removed, leave it in place
-            // and still return the error so the caller knows the op was
-            // rejected.
-            //
-            // KNOWN LIMITATIONS — see also the round-4 follow-up issue:
-            //
-            // 1. **Move can lose data.** Caller arms: `handle_move`
-            //    `rename`s the source to `resolved` *before* this
-            //    function runs. If `policy.check_path` then rejects
-            //    `resolved` (TOCTOU swap on a parent component slipped
-            //    a symlink past the pre-check), the cleanup deletes
-            //    `resolved` — and the original source is already gone.
-            //    The caller observes `PolicyDenied` with no recovery
-            //    path. Full fix needs `openat2(RESOLVE_NO_SYMLINKS)`
-            //    or equivalent so the rename target can't be diverted.
-            //
-            // 2. **Copy of a directory tree leaves a partial copy.**
-            //    `remove_dir` (below) does NOT recurse, so a
-            //    recursive copy that hits a post-op canonical
-            //    rejection leaves the partial tree in the rejected
-            //    location. The source is intact, so this is a leak
-            //    rather than data loss; using `remove_dir_all` would
-            //    fully clean up but also runs against the same
-            //    TOCTOU surface (an attacker who can swap a parent
-            //    can reroute the recursive remove).
-            //
-            // Both issues are already implicit in the "best-effort"
-            // wording, but we name them here so future readers don't
-            // have to re-derive the failure modes.
-            if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await {
-                if metadata.is_dir() {
-                    let _ = tokio::fs::remove_dir(resolved).await;
-                } else {
-                    let _ = tokio::fs::remove_file(resolved).await;
+            match cleanup {
+                PostCreateCleanup::RemoveFileOrDir => {
+                    if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await {
+                        if metadata.is_dir() {
+                            let _ = tokio::fs::remove_dir(resolved).await;
+                        } else {
+                            let _ = tokio::fs::remove_file(resolved).await;
+                        }
+                    }
+                }
+                PostCreateCleanup::RemoveTreeAll => {
+                    if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await {
+                        if metadata.is_dir() {
+                            let _ = tokio::fs::remove_dir_all(resolved).await;
+                        } else {
+                            let _ = tokio::fs::remove_file(resolved).await;
+                        }
+                    }
+                }
+                PostCreateCleanup::Leave => {
+                    // Don't touch the resource. See PostCreateCleanup
+                    // docstring for why this is the right choice on
+                    // Move's destruction-on-rename path.
+                    tracing::warn!(
+                        path = %resolved.display(),
+                        code = err.code,
+                        "post-create policy rejected destination; \
+                         leaving in place because cleanup would compound \
+                         data loss (likely Move TOCTOU)"
+                    );
                 }
             }
             Err(err)
@@ -728,4 +818,77 @@ fn unimplemented_error(path: &str) -> FileError {
         path,
         "operation not yet implemented",
     )
+}
+
+#[cfg(test)]
+mod lexically_normalize_tests {
+    //! Unit tests for `lexically_normalize` — the path-collapsing helper
+    //! used by `collect_request_paths` (approval prompt) AND the
+    //! CreateSymlink dispatch arm. The two call sites must agree on
+    //! the canonical post-normalization string; if they diverge,
+    //! relative symlinks that escape their parent get caught at the
+    //! approval layer but rejected (or worse, redirected) at dispatch.
+    //! These tests pin the helper's behavior on edge cases that the
+    //! integration suite doesn't directly exercise.
+    use super::lexically_normalize;
+    use std::path::{Path, PathBuf};
+
+    #[track_caller]
+    fn check(input: &str, expected: &str) {
+        let got = lexically_normalize(Path::new(input));
+        assert_eq!(
+            got,
+            PathBuf::from(expected),
+            "lexically_normalize({input:?}) = {got:?}; expected {expected:?}"
+        );
+    }
+
+    #[test]
+    fn collapses_parent_components() {
+        check("/tmp/a/../b", "/tmp/b");
+        check("/tmp/a/b/../..", "/tmp");
+        check("/tmp/a/b/c/../d", "/tmp/a/b/d");
+    }
+
+    #[test]
+    fn drops_curdir_components() {
+        check("/tmp/./a", "/tmp/a");
+        check("/tmp/a/./b", "/tmp/a/b");
+        check("./relative", "relative");
+    }
+
+    #[test]
+    fn pop_past_root_is_a_noop() {
+        // `out.pop()` returns false when `out` is empty or contains
+        // only a root prefix. The expected behavior is "stop popping
+        // and stay at root" — never panic, never produce a malformed
+        // path. This is the branch the test-completeness audit
+        // flagged as untested.
+        check("/..", "/");
+        check("/../..", "/");
+        check("/../../foo", "/foo");
+        check("/a/../../b", "/b");
+    }
+
+    #[test]
+    fn empty_input_returns_empty_path() {
+        let got = lexically_normalize(Path::new(""));
+        assert_eq!(got, PathBuf::new());
+    }
+
+    #[test]
+    fn root_only_passes_through() {
+        check("/", "/");
+    }
+
+    #[test]
+    fn relative_only_dotdot_drains_to_empty() {
+        // No root, just `..` components — there's nothing to pop, so
+        // the result is empty. Production paths always have a leading
+        // `/` because callers pass `parent.join(target)` where parent
+        // is canonical, but this case must still not panic.
+        check("..", "");
+        check("../..", "");
+        check("a/../..", "");
+    }
 }

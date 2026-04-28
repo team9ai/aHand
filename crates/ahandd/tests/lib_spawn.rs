@@ -43,6 +43,32 @@ async fn spawn_connects_and_reports_online() {
 }
 
 #[tokio::test]
+async fn spawn_rejects_duplicate_daemon_for_same_hub_and_device() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
+        .heartbeat_interval(Duration::from_millis(200))
+        .build();
+
+    let handle = spawn(config.clone()).await.expect("first spawn ok");
+    let err = spawn(config.clone())
+        .await
+        .expect_err("second spawn for same hub/device should be rejected");
+
+    assert!(
+        err.to_string().contains("already running"),
+        "unexpected duplicate-spawn error: {err}"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+
+    let handle = spawn(config)
+        .await
+        .expect("spawn after shutdown should release active daemon guard");
+    handle.shutdown().await.expect("second shutdown clean");
+}
+
+#[tokio::test]
 async fn spawn_surfaces_auth_error() {
     let mock = mock_hub::start_rejecting_401().await;
     let tmp = TempDir::new().unwrap();
