@@ -16,8 +16,8 @@ use axum::response::Response;
 use crate::state::AppState;
 
 const LEASE_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-const LOCK_ACQUIRE_RETRIES: u32 = 5;
-const LOCK_ACQUIRE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+const LOCK_ACQUIRE_RETRIES: u32 = 45;
+const LOCK_ACQUIRE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 pub struct ConnectionRegistry {
     senders: DashMap<String, ConnectionEntry>,
