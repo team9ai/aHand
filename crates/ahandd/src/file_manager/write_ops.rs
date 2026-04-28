@@ -543,8 +543,15 @@ async fn fetch_full_write_bytes(
 ) -> Result<Vec<u8>, FileError> {
     validate_download_url_scheme(url, req_path)?;
 
+    // Refuse all redirects. A real S3 presigned URL never redirects;
+    // a redirect from this URL would either be a misconfigured S3
+    // proxy or an attacker bouncing the daemon to file:// /
+    // 169.254.169.254 / a private IP. The scheme guard above only
+    // covers the *initial* URL, so without this the SSRF window
+    // re-opens via the redirect chain.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(S3_DOWNLOAD_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| {
             file_error(

@@ -403,11 +403,16 @@ async fn maybe_inject_full_write_download_url(
     };
 
     // Reject keys that would let a caller poison a presigned URL via
-    // path-traversal characters. We don't insist on the
-    // `file-ops/<device_id>/` prefix being literally present (callers
-    // may legitimately reuse a key generated for a different device —
-    // the S3 ACL is what controls access), but `..` / `\0` / leading
-    // `/` are obvious traversal/injection attempts.
+    // path-traversal characters. `..` / `\0` / leading `/` are
+    // obvious traversal/injection attempts.
+    //
+    // Note on cross-device key reuse: this code does NOT enforce that
+    // the key carry the request's `device_id` prefix. The hub's
+    // dashboard auth model is currently flat — any authenticated
+    // operator can hit any device — so cross-device key reuse is in
+    // scope of legitimate workflows (e.g. cloning a config from one
+    // device to another). When per-device authorization lands, the
+    // right place to enforce a prefix match is here.
     validate_object_key(key)?;
 
     let presigned = s3.generate_download_url(key).await.map_err(|err| {

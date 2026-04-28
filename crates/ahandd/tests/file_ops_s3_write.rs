@@ -62,6 +62,11 @@ enum StubMode {
     /// (chunked). Used to verify the daemon still works when S3
     /// returns chunked transfers without a length header.
     OkNoContentLength(Vec<u8>),
+    /// 302 redirect to the given Location. Used to verify the
+    /// daemon's no-redirects policy — without it the scheme guard on
+    /// the initial URL is trivially bypassed by a 302 to file:// /
+    /// 169.254.169.254 / etc.
+    Redirect(String),
     /// 404.
     NotFound,
 }
@@ -87,6 +92,15 @@ async fn stub_get(State(state): State<Arc<StubState>>) -> Response {
             let body = bytes.clone();
             let s = stream::once(async move { Ok::<_, std::io::Error>(body) });
             (StatusCode::OK, Body::from_stream(s)).into_response()
+        }
+        StubMode::Redirect(target) => {
+            use axum::http::HeaderValue;
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::LOCATION,
+                HeaderValue::from_str(target).unwrap(),
+            );
+            (StatusCode::FOUND, h, "").into_response()
         }
         StubMode::NotFound => (StatusCode::NOT_FOUND, "missing").into_response(),
     }
@@ -325,6 +339,40 @@ async fn full_write_with_s3_url_connection_refused_returns_io_error() {
     };
     assert_eq!(err.code, FileErrorCode::Io as i32);
     assert!(!target.exists());
+}
+
+/// SSRF guard via redirect chain: even when the initial URL is
+/// http(s), a 302 to `file://` or `http://169.254.169.254/...` would
+/// re-open the SSRF window if redirects were followed. The daemon
+/// disables redirects entirely on this client; a 302 surfaces as a
+/// non-success status and we error out as `Io`. Real S3 never
+/// redirects — there is no legitimate reason to follow one.
+#[tokio::test]
+async fn full_write_with_s3_url_does_not_follow_redirects() {
+    // Stub returns 302 → file:///etc/passwd. If reqwest were following
+    // redirects, the second hop would either succeed (data leak) or
+    // fail with a confusing scheme error. With redirects disabled,
+    // we instead see status=302 → mapped to Io.
+    let stub = spawn_stub(StubMode::Redirect("file:///etc/passwd".into())).await;
+    let tmp = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&tmp);
+    let target = root.join("redirect.bin");
+
+    let req = full_write_request(&target, "k", Some(stub.url("/object")));
+    let resp = mgr.handle(&req).await;
+    let err = match resp.result {
+        Some(file_response::Result::Error(e)) => e,
+        other => panic!("expected Error, got {other:?}"),
+    };
+    assert_eq!(err.code, FileErrorCode::Io as i32);
+    assert!(
+        err.message.contains("302"),
+        "should surface the redirect status, got: {}",
+        err.message
+    );
+    assert!(!target.exists());
+
+    stub.stop().await;
 }
 
 /// SSRF guard: a non-http(s) URL (e.g. file://) must be rejected
