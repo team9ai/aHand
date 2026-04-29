@@ -7,6 +7,156 @@ import { POST as logoutPost } from "@/app/api/auth/logout/route";
 import { GET as proxyGet } from "@/app/api/proxy/[...path]/route";
 import { middleware } from "@/middleware";
 
+describe("POST /api/proxy/*", () => {
+  const HUB_BASE_URL = "http://hub.internal:8080";
+
+  beforeEach(() => {
+    vi.stubEnv("AHAND_HUB_BASE_URL", HUB_BASE_URL);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  it("forwards protobuf bodies with content-type preserved", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Uint8Array([0x0a, 0x03, 0x66, 0x6f, 0x6f]), {
+        status: 200,
+        headers: { "content-type": "application/x-protobuf" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { POST: proxyPost } = await import("@/app/api/proxy/[...path]/route");
+    const bodyBytes = new Uint8Array([0x08, 0x01, 0x12, 0x04, 0x74, 0x65, 0x73, 0x74]);
+    const request = new NextRequest(
+      "http://localhost/api/proxy/api/devices/dev-1/files",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-protobuf",
+          accept: "application/x-protobuf",
+          cookie: "ahand_hub_session=session-token",
+        },
+        body: bodyBytes,
+      },
+    );
+
+    const response = await proxyPost(request, {
+      params: Promise.resolve({ path: ["api", "devices", "dev-1", "files"] }),
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [calledUrl, calledInit] = fetchMock.mock.calls[0];
+    expect(calledUrl).toBe(`${HUB_BASE_URL}/api/devices/dev-1/files`);
+    expect(calledInit.method).toBe("POST");
+    expect(calledInit.headers).toMatchObject({
+      authorization: "Bearer session-token",
+      "content-type": "application/x-protobuf",
+      accept: "application/x-protobuf",
+    });
+    const forwarded = new Uint8Array(
+      calledInit.body instanceof ArrayBuffer
+        ? calledInit.body
+        : (calledInit.body as Uint8Array).buffer,
+    );
+    expect(Array.from(forwarded)).toEqual(Array.from(bodyBytes));
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toBe("application/x-protobuf");
+  });
+
+  it("strips upstream set-cookie from the proxied response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Uint8Array([0x01]), {
+        status: 200,
+        headers: {
+          "content-type": "application/x-protobuf",
+          "set-cookie": "hub_plant=evil; Path=/; HttpOnly",
+        },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { POST: proxyPost } = await import("@/app/api/proxy/[...path]/route");
+    const request = new NextRequest(
+      "http://localhost/api/proxy/api/devices/dev-1/files",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-protobuf",
+          cookie: "ahand_hub_session=session-token",
+        },
+        body: new Uint8Array([0x00]),
+      },
+    );
+
+    const response = await proxyPost(request, {
+      params: Promise.resolve({ path: ["api", "devices", "dev-1", "files"] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(response.headers.get("content-type")).toBe("application/x-protobuf");
+  });
+
+  it("returns 401 JSON envelope when session cookie is missing", async () => {
+    const { POST: proxyPost } = await import("@/app/api/proxy/[...path]/route");
+    const request = new NextRequest("http://localhost/api/proxy/api/devices/x/files", {
+      method: "POST",
+      headers: { "content-type": "application/x-protobuf" },
+      body: new Uint8Array([0x00]),
+    });
+    const response = await proxyPost(request, {
+      params: Promise.resolve({ path: ["api", "devices", "x", "files"] }),
+    });
+    expect(response.status).toBe(401);
+    const body = await response.json();
+    expect(body.error.code).toBe("unauthorized");
+  });
+
+  it("returns 503 when AHAND_HUB_BASE_URL is missing", async () => {
+    vi.unstubAllEnvs();
+    const { POST: proxyPost } = await import("@/app/api/proxy/[...path]/route");
+    const request = new NextRequest("http://localhost/api/proxy/api/devices/x/files", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-protobuf",
+        cookie: "ahand_hub_session=session-token",
+      },
+      body: new Uint8Array([0x00]),
+    });
+    const response = await proxyPost(request, {
+      params: Promise.resolve({ path: ["api", "devices", "x", "files"] }),
+    });
+    expect(response.status).toBe(503);
+    const body = await response.json();
+    expect(body.error.code).toBe("hub_unavailable");
+  });
+
+  it("returns 503 when the upstream fetch throws", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new Error("ECONNREFUSED")),
+    );
+    const { POST: proxyPost } = await import("@/app/api/proxy/[...path]/route");
+    const request = new NextRequest("http://localhost/api/proxy/api/devices/x/files", {
+      method: "POST",
+      headers: {
+        "content-type": "application/x-protobuf",
+        cookie: "ahand_hub_session=session-token",
+      },
+      body: new Uint8Array([0x00]),
+    });
+    const response = await proxyPost(request, {
+      params: Promise.resolve({ path: ["api", "devices", "x", "files"] }),
+    });
+    expect(response.status).toBe(503);
+    const body = await response.json();
+    expect(body.error.code).toBe("hub_unavailable");
+  });
+});
+
 const HUB_BASE_URL = "https://hub.example";
 
 describe("hub dashboard auth server flow", () => {

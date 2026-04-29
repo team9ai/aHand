@@ -65,6 +65,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build shared TS packages
+        # proto-ts exposes its types via dist/ (main/types point there).
+        # hub-dashboard now imports @ahandai/proto, so the package needs to
+        # be built before lint / test / build can resolve it.
+        run: pnpm --filter @ahandai/proto build
+
       - name: Lint hub dashboard
         run: pnpm --filter @ahand/hub-dashboard lint
 

@@ -1,0 +1,47 @@
+{
+  "planPath": "docs/superpowers/plans/2026-04-30-dashboard-files-tab.md",
+  "tasks": [
+    {
+      "id": 0,
+      "subject": "Task 0: Workspace wiring — add proto dep + re-export file_ops types + Buffer polyfill",
+      "status": "completed",
+      "description": "**Goal:** Make `FileRequest` / `FileResponse` and related types importable from `@ahandai/proto` inside `apps/hub-dashboard`, and ensure `Buffer` works in the browser bundle.\n\n**Files:**\n- Modify: `apps/hub-dashboard/package.json`\n- Modify: `packages/proto-ts/src/index.ts`\n\n**Acceptance Criteria:**\n- `@ahandai/proto` types import cleanly in hub-dashboard\n- `pnpm install` succeeds\n- `pnpm --filter @ahandai/proto build` succeeds\n- `tsc --noEmit` passes\n\n**Verify:** `pnpm --filter @ahand/hub-dashboard exec tsc --noEmit`\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/package.json\", \"packages/proto-ts/src/index.ts\"], \"verifyCommand\": \"pnpm --filter @ahand/hub-dashboard exec tsc --noEmit\", \"acceptanceCriteria\": [\"@ahandai/proto types import cleanly in hub-dashboard\", \"pnpm install succeeds\", \"pnpm --filter @ahandai/proto build succeeds\", \"tsc --noEmit passes\"]}\n```"
+    },
+    {
+      "id": 1,
+      "subject": "Task 1: Dashboard proxy POST handler for protobuf",
+      "status": "completed",
+      "blockedBy": [0],
+      "description": "**Goal:** Teach the dashboard proxy route to forward POST requests (protobuf or JSON) through to the hub with body + `content-type` preserved.\n\n**Files:**\n- Modify: `apps/hub-dashboard/src/app/api/proxy/[...path]/route.ts`\n- Modify: `apps/hub-dashboard/tests/auth-server.test.ts`\n\n**Acceptance Criteria:**\n- POST forwards raw ArrayBuffer body\n- content-type header preserved\n- 401 when session missing\n- 503 when base url missing or fetch error\n- auth-server tests pass\n\n**Verify:** `pnpm --filter @ahand/hub-dashboard test -- auth-server`\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/src/app/api/proxy/[...path]/route.ts\", \"apps/hub-dashboard/tests/auth-server.test.ts\"], \"verifyCommand\": \"pnpm --filter @ahand/hub-dashboard test -- auth-server\", \"acceptanceCriteria\": [\"POST forwards raw ArrayBuffer body\", \"content-type header preserved\", \"401 when session missing\", \"503 when base url missing or fetch error\"]}\n```"
+    },
+    {
+      "id": 2,
+      "subject": "Task 2: file-ops-client.ts — typed request builders + encode/decode + error handling",
+      "status": "completed",
+      "blockedBy": [1],
+      "description": "**Goal:** Provide one small, well-tested module the React component can call. It hides protobuf serialization, the Buffer polyfill, and the two error-envelope paths.\n\n**Files:**\n- Create: `apps/hub-dashboard/src/lib/file-ops-client.ts`\n- Create: `apps/hub-dashboard/tests/file-ops-client.test.ts`\n\n**Acceptance Criteria:**\n- Exports listFiles/readText/readImage/readBinary/mkdir/deleteFile/writeFile\n- FileOpsError class with code/message/httpStatus\n- HTTP 4xx JSON envelope → FileOpsError\n- FileResponse.error → FileOpsError\n- writeFile guards against >1 MiB payloads\n- Buffer polyfill idempotent\n\n**Verify:** `pnpm --filter @ahand/hub-dashboard test -- file-ops-client`\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/src/lib/file-ops-client.ts\", \"apps/hub-dashboard/tests/file-ops-client.test.ts\"], \"verifyCommand\": \"pnpm --filter @ahand/hub-dashboard test -- file-ops-client\", \"acceptanceCriteria\": [\"Exports typed request builders\", \"FileOpsError handles both error paths\", \"writeFile >1MiB rejects without fetch\", \"Buffer polyfill works in jsdom\"]}\n```"
+    },
+    {
+      "id": 3,
+      "subject": "Task 3: DeviceFiles component — list, navigate, view",
+      "status": "completed",
+      "blockedBy": [2],
+      "description": "**Goal:** Render a Files panel that lets the operator type a path, list a directory, click into subfolders via breadcrumbs, and preview text/image files.\n\n**Files:**\n- Create: `apps/hub-dashboard/src/components/device-files.tsx`\n- Create: `apps/hub-dashboard/tests/device-files.test.tsx`\n\n**Acceptance Criteria:**\n- Path input + Open button → list entries\n- Breadcrumb navigation\n- Dirs-first sort, then alphabetical\n- Click dir → navigate; click file → viewer (text/image/binary)\n- 4xx error envelope renders in role=alert\n- Keyboard accessible\n\n**Verify:** `pnpm --filter @ahand/hub-dashboard test -- device-files`\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/src/components/device-files.tsx\", \"apps/hub-dashboard/tests/device-files.test.tsx\"], \"verifyCommand\": \"pnpm --filter @ahand/hub-dashboard test -- device-files\", \"acceptanceCriteria\": [\"List happy path works\", \"4xx error envelope renders\", \"breadcrumbs navigate\", \"text/image/binary viewer states\"]}\n```"
+    },
+    {
+      "id": 4,
+      "subject": "Task 4: mkdir / delete / download / upload",
+      "status": "completed",
+      "blockedBy": [3],
+      "description": "**Goal:** Round out the action set: mkdir inline input, delete confirm dialog with recursive toggle, download via Blob, upload <= 1 MiB inline.\n\n**Files:**\n- Modify: `apps/hub-dashboard/src/components/device-files.tsx`\n- Modify: `apps/hub-dashboard/tests/device-files.test.tsx`\n\n**Acceptance Criteria:**\n- New folder action → inline input → mkdir → re-list\n- Delete → role=dialog aria-modal with recursive checkbox → deleteFile → re-list\n- Download → readBinary → Blob → anchor download → revokeObjectURL\n- Upload <=1 MiB → writeFile; >1 MiB → S3-not-implemented alert, no fetch\n\n**Verify:** `pnpm --filter @ahand/hub-dashboard test -- device-files`\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/src/components/device-files.tsx\", \"apps/hub-dashboard/tests/device-files.test.tsx\"], \"verifyCommand\": \"pnpm --filter @ahand/hub-dashboard test -- device-files\", \"acceptanceCriteria\": [\"mkdir happy\", \"delete confirm dialog Cancel\", \"upload >1MiB guard without fetch\", \"download triggers anchor click\"]}\n```"
+    },
+    {
+      "id": 5,
+      "subject": "Task 5: Wire Files tab + CSS styles + final build/test verification",
+      "status": "completed",
+      "blockedBy": [4],
+      "description": "**Goal:** Expose DeviceFiles in the tabbed UI, add matching CSS, confirm Next.js production build is clean.\n\n**Files:**\n- Modify: `apps/hub-dashboard/src/components/device-tabs.tsx`\n- Modify: `apps/hub-dashboard/src/app/globals.css`\n\n**Acceptance Criteria:**\n- Files tab appears when online\n- DeviceFiles renders with deviceId\n- .files-* CSS classes defined\n- All tests pass\n- Next.js production build clean\n- Coverage threshold not breached\n\n**Verify:** `pnpm --filter @ahand/hub-dashboard test && pnpm --filter @ahand/hub-dashboard build`\n\n```json:metadata\n{\"files\": [\"apps/hub-dashboard/src/components/device-tabs.tsx\", \"apps/hub-dashboard/src/app/globals.css\"], \"verifyCommand\": \"pnpm --filter @ahand/hub-dashboard test && pnpm --filter @ahand/hub-dashboard build\", \"acceptanceCriteria\": [\"Files tab wired\", \"CSS classes defined\", \"vitest clean\", \"next build clean\"]}\n```"
+    }
+  ],
+  "lastUpdated": "2026-04-30T00:00:00Z"
+}
