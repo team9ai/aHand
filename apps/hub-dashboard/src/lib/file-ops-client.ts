@@ -1,4 +1,5 @@
 import { Buffer } from "buffer";
+import { buildProxyUrl } from "@/lib/hub-paths";
 import {
   FileRequest,
   FileResponse,
@@ -31,7 +32,7 @@ export class FileOpsError extends Error {
 }
 
 function proxyUrl(deviceId: string): string {
-  return `/api/proxy/api/devices/${encodeURIComponent(deviceId)}/files`;
+  return buildProxyUrl(`/api/devices/${encodeURIComponent(deviceId)}/files`);
 }
 
 function newRequestId(): string {
@@ -71,6 +72,14 @@ async function sendRequest(deviceId: string, req: FileRequest): Promise<FileResp
       }
     }
     throw new FileOpsError(code, message, res.status);
+  }
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().startsWith("application/x-protobuf")) {
+    throw new FileOpsError(
+      "unexpected_response",
+      `Proxy returned ${res.status} with non-protobuf content-type "${contentType}".`,
+      res.status,
+    );
   }
   const raw = new Uint8Array(await res.arrayBuffer());
   const resp = FileResponse.decode(raw);

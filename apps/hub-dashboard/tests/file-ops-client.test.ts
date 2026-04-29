@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Buffer } from "buffer";
 import { FileRequest, FileResponse, FileType } from "@ahandai/proto";
 
 import {
@@ -6,6 +7,9 @@ import {
   listFiles,
   mkdir,
   readText,
+  readBinary,
+  readImage,
+  deleteFile,
   writeFile,
 } from "@/lib/file-ops-client";
 
@@ -131,5 +135,102 @@ describe("file-ops-client", () => {
     expect(e).toBeInstanceOf(Error);
     expect(e.code).toBe("X");
     expect(e.httpStatus).toBe(400);
+  });
+
+  it("readText returns decoded text lines", async () => {
+    const { readText } = await import("@/lib/file-ops-client");
+    respondWith(
+      FileResponse.fromPartial({
+        requestId: "r",
+        readText: {
+          lines: [
+            { content: "hello", lineNumber: 1, truncated: false, remainingBytes: 0 },
+            { content: "world", lineNumber: 2, truncated: false, remainingBytes: 0 },
+          ],
+          stopReason: 4, // STOP_REASON_FILE_END
+          remainingBytes: 0,
+          totalFileBytes: 11,
+          totalLines: 2,
+          detectedEncoding: "utf-8",
+        },
+      }),
+    );
+    const r = await readText(deviceId, { path: "/tmp/a.txt" });
+    expect(r.lines).toHaveLength(2);
+    expect(r.lines[0].content).toBe("hello");
+  });
+
+  it("readBinary returns bytes payload", async () => {
+    const { readBinary } = await import("@/lib/file-ops-client");
+    const payload = new Uint8Array([1, 2, 3, 4]);
+    respondWith(
+      FileResponse.fromPartial({
+        requestId: "r",
+        readBinary: {
+          content: Buffer.from(payload),
+          byteOffset: 0,
+          bytesRead: payload.length,
+          totalFileBytes: payload.length,
+          remainingBytes: 0,
+        },
+      }),
+    );
+    const r = await readBinary(deviceId, { path: "/tmp/a.bin" });
+    expect(r.bytesRead).toBe(4);
+    expect(Array.from(r.content)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("readImage returns image content and format", async () => {
+    const { readImage } = await import("@/lib/file-ops-client");
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    respondWith(
+      FileResponse.fromPartial({
+        requestId: "r",
+        readImage: {
+          content: Buffer.from(png),
+          format: 2, // IMAGE_FORMAT_PNG
+          width: 8,
+          height: 8,
+          originalBytes: 4,
+          outputBytes: 4,
+        },
+      }),
+    );
+    const r = await readImage(deviceId, { path: "/tmp/a.png" });
+    expect(r.format).toBe(2);
+    expect(r.width).toBe(8);
+    expect(Array.from(r.content)).toEqual([0x89, 0x50, 0x4e, 0x47]);
+  });
+
+  it("deleteFile sends a FileDelete request with recursive flag and decodes result", async () => {
+    const { deleteFile } = await import("@/lib/file-ops-client");
+    respondWith(
+      FileResponse.fromPartial({
+        requestId: "r",
+        delete: { path: "/tmp/a", mode: 0, itemsDeleted: 1 },
+      }),
+    );
+    const r = await deleteFile(deviceId, { path: "/tmp/a", recursive: true });
+    expect(r.path).toBe("/tmp/a");
+    expect(r.itemsDeleted).toBe(1);
+
+    const mock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    const body = mock.mock.calls.at(-1)?.[1]?.body as Uint8Array;
+    const decoded = FileRequest.decode(body);
+    expect(decoded.delete?.path).toBe("/tmp/a");
+    expect(decoded.delete?.recursive).toBe(true);
+  });
+
+  it("rejects when the proxy returns 200 with non-protobuf content-type", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response("<html>login</html>", {
+        status: 200,
+        headers: { "content-type": "text/html; charset=utf-8" },
+      }),
+    );
+    await expect(listFiles(deviceId, { path: "/tmp" })).rejects.toMatchObject({
+      code: "unexpected_response",
+      httpStatus: 200,
+    });
   });
 });
