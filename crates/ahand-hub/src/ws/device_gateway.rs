@@ -161,7 +161,7 @@ impl ConnectionRegistry {
         //    while a spawned task hasn't yet issued SUBSCRIBE. The
         //    subscribe_kick call awaits the underlying SUBSCRIBE; the
         //    spawned task only owns the watch loop.
-        let mut kick_sub = match self.outbox.subscribe_kick(&device_id).await {
+        let kick_sub = match self.outbox.subscribe_kick(&device_id).await {
             Ok(sub) => sub,
             Err(err) => {
                 tracing::warn!(
@@ -177,7 +177,11 @@ impl ConnectionRegistry {
             let device_id_inner = device_id.clone();
             let close_tx = close_tx.clone();
             tokio::spawn(async move {
-                if kick_sub.recv.changed().await.is_ok() {
+                let ahand_hub_core::traits::KickSubscription {
+                    recv: mut kick_rx,
+                    _drop_guard,
+                } = kick_sub;
+                if kick_rx.changed().await.is_ok() {
                     tracing::info!(
                         device_id = %device_id_inner,
                         "received kick, signalling close",
