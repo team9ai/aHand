@@ -1,6 +1,10 @@
 # @ahandai/sdk Changelog
 
-## Unreleased
+## 0.2.0 — 2026-04-30
+
+Released alongside `@ahandai/proto@0.2.0`. Both packages are now published
+via CI (`.github/workflows/release-sdk.yml`) on a `release-v<semver>` tag
+push, using npm trusted-publisher OIDC (no long-lived token).
 
 ### Breaking
 
