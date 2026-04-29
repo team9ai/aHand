@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { FileType, ImageFormat, type FileEntry } from "@ahandai/proto";
 import {
   FileOpsError,
@@ -98,6 +98,15 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
   const [pendingDelete, setPendingDelete] = useState<{ name: string; recursive: boolean } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!pendingDelete) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPendingDelete(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [pendingDelete]);
+
   const handleMkdir = useCallback(async () => {
     if (mkdirName === null) return;
     const name = mkdirName.trim();
@@ -146,7 +155,9 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
         document.body.appendChild(a);
         a.click();
         a.remove();
-        URL.revokeObjectURL(url);
+        // Safari drops the download if we revoke synchronously — let the
+        // download dialog attach first.
+        setTimeout(() => URL.revokeObjectURL(url), 0);
       } catch (e) {
         setError(toErrorState(e));
       } finally {
@@ -234,7 +245,12 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
               type="file"
               className="files-upload-input"
               aria-label="Upload file"
-              onChange={(e) => handleUpload(e.target.files?.[0])}
+              disabled={busy !== null}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                handleUpload(file);
+              }}
             />
           </label>
         </div>

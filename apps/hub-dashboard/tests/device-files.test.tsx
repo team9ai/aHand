@@ -227,6 +227,34 @@ describe("DeviceFiles", () => {
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
   });
 
+  it("closes the delete dialog when Escape is pressed", async () => {
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: {
+          entries: [
+            { name: "old.txt", fileType: FileType.FILE_TYPE_FILE, size: 3, modifiedMs: 0 },
+          ],
+          totalCount: 1,
+          hasMore: false,
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<DeviceFiles deviceId="dev-1" />);
+    await user.click(screen.getByRole("button", { name: /^open$/i }));
+    await screen.findByText("old.txt");
+
+    await user.click(screen.getByRole("button", { name: /^delete old\.txt$/i }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // Only the initial list fetch — Esc did not issue a network call.
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+  });
+
   it("rejects uploads larger than 1 MiB without calling the network", async () => {
     stubProto(
       FileResponse.fromPartial({
