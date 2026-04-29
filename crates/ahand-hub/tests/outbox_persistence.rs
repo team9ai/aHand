@@ -5,6 +5,7 @@
 //! key invariants from the design spec.
 
 use std::sync::Arc;
+use std::sync::Once;
 use std::time::Duration;
 
 use ahand_hub::ws::device_gateway::ConnectionRegistry;
@@ -15,6 +16,26 @@ use testcontainers::{
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
+
+/// DEBUG: route `tracing::info!(...)` events from ahand_hub / ahand_hub_store
+/// to stderr so CI captures the full kick/subscribe/release timeline when
+/// `lock_takeover_via_kick` flakes. Without this the calls we just added in
+/// device_gateway::register / outbox_store::{kick,subscribe_kick} vanish and
+/// we have zero signal to diagnose from. Remove with the actual fix once
+/// the root cause is pinned down.
+fn init_debug_logs() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        use tracing_subscriber::{EnvFilter, fmt};
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("ahand_hub=info,ahand_hub_store=info"));
+        let _ = fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .with_target(true)
+            .try_init();
+    });
+}
 
 async fn redis_container() -> anyhow::Result<(ContainerAsync<GenericImage>, String)> {
     let container = GenericImage::new("redis", "7-alpine")
@@ -71,30 +92,67 @@ async fn replay_after_simulated_hub_restart() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn lock_takeover_via_kick() -> anyhow::Result<()> {
+    init_debug_logs();
+    let t0 = tokio::time::Instant::now();
+    eprintln!("[{:>6}ms] test: start", t0.elapsed().as_millis());
+
     let (_redis, url) = redis_container().await?;
+    eprintln!("[{:>6}ms] test: redis ready", t0.elapsed().as_millis());
     let store_a = Arc::new(RedisOutboxStore::new(&url).await?) as Arc<dyn OutboxStore>;
     let store_b = Arc::new(RedisOutboxStore::new(&url).await?) as Arc<dyn OutboxStore>;
     let registry_a = Arc::new(ConnectionRegistry::new(store_a.clone()));
     let registry_b = ConnectionRegistry::new(store_b.clone());
 
+    eprintln!(
+        "[{:>6}ms] test: registry_a.register(dev-2) enter",
+        t0.elapsed().as_millis()
+    );
     let (conn_a, _rx_a, mut close_a) = registry_a.register("dev-2".into(), 0).await?;
+    eprintln!(
+        "[{:>6}ms] test: registry_a.register(dev-2) returned",
+        t0.elapsed().as_millis()
+    );
 
     // In production, the WS handler watches close_rx and on close runs
     // the unregister teardown (which calls release_lock). Simulate that
     // by spawning a task that bridges close_a → unregister.
     let cleanup_registry = registry_a.clone();
+    let t_cleanup = t0;
     let cleanup = tokio::spawn(async move {
+        eprintln!(
+            "[{:>6}ms] cleanup: parked on close_a.changed()",
+            t_cleanup.elapsed().as_millis()
+        );
         let _ = close_a.changed().await;
+        eprintln!(
+            "[{:>6}ms] cleanup: close_a fired, calling unregister",
+            t_cleanup.elapsed().as_millis()
+        );
         cleanup_registry
             .unregister("dev-2", conn_a)
             .await
             .expect("unregister after kick");
+        eprintln!(
+            "[{:>6}ms] cleanup: unregister returned",
+            t_cleanup.elapsed().as_millis()
+        );
     });
 
     // B's register should kick A; A's kick subscriber fires close_a;
     // the cleanup task above unregisters A; B's retry succeeds.
     let started = tokio::time::Instant::now();
-    let (_conn_b, _rx_b, _close_b) = registry_b.register("dev-2".into(), 0).await?;
+    eprintln!(
+        "[{:>6}ms] test: registry_b.register(dev-2) enter",
+        t0.elapsed().as_millis()
+    );
+    let b_result = registry_b.register("dev-2".into(), 0).await;
+    eprintln!(
+        "[{:>6}ms] test: registry_b.register(dev-2) returned {:?} (elapsed {:?})",
+        t0.elapsed().as_millis(),
+        b_result.as_ref().map(|_| "ok"),
+        started.elapsed()
+    );
+    let (_conn_b, _rx_b, _close_b) = b_result?;
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "kick-and-acquire took {:?}, expected <5s",

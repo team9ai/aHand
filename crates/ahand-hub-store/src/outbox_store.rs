@@ -92,20 +92,33 @@ impl OutboxStore for RedisOutboxStore {
 
     async fn kick(&self, device_id: &str, new_session_id: &str) -> Result<()> {
         let mut conn = self.conn.lock().await;
-        let _: i64 = conn
+        // DEBUG: keep the PUBLISH return value so we can see how many
+        // subscribers were actually notified. 0 = the previous holder's
+        // SUBSCRIBE hadn't fully landed on the Redis server; a non-zero
+        // count means the kick reached someone. This is the key signal
+        // for the lock_takeover_via_kick investigation.
+        let delivered: i64 = conn
             .publish(Self::kick_channel(device_id), new_session_id)
             .await
             .map_err(redis_err)?;
+        tracing::info!(
+            device_id = %device_id,
+            new_session_id = %new_session_id,
+            delivered,
+            "outbox kick PUBLISHed"
+        );
         Ok(())
     }
 
     async fn subscribe_kick(&self, device_id: &str) -> Result<KickSubscription> {
         let channel = Self::kick_channel(device_id);
+        tracing::info!(device_id = %device_id, "subscribe_kick: opening pubsub");
         let mut pubsub = self.client.get_async_pubsub().await.map_err(redis_err)?;
         pubsub
             .subscribe(channel.as_str())
             .await
             .map_err(redis_err)?;
+        tracing::info!(device_id = %device_id, "subscribe_kick: SUBSCRIBE acknowledged");
 
         let (tx, rx) = watch::channel(0u64);
 
@@ -114,12 +127,22 @@ impl OutboxStore for RedisOutboxStore {
         // owns the pubsub connection and lives until either:
         //   - the watch receiver is dropped (we exit the loop on send error)
         //   - AbortOnDropHandle::drop fires when KickSubscription is dropped
+        let device_id_inner = device_id.to_string();
         let join = tokio::spawn(async move {
             let mut stream = pubsub.on_message();
             let mut counter: u64 = 0;
             while let Some(_msg) = stream.next().await {
                 counter = counter.wrapping_add(1);
+                tracing::info!(
+                    device_id = %device_id_inner,
+                    counter,
+                    "subscribe_kick: received kick message"
+                );
                 if tx.send(counter).is_err() {
+                    tracing::info!(
+                        device_id = %device_id_inner,
+                        "subscribe_kick: watch receiver dropped, exiting"
+                    );
                     break;
                 }
             }

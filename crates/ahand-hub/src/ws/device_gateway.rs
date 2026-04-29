@@ -79,6 +79,7 @@ impl ConnectionRegistry {
         HubError,
     > {
         let session_id = uuid::Uuid::new_v4().to_string();
+        tracing::info!(device_id = %device_id, session_id = %session_id, "register: start");
 
         // 1) Acquire the lock with a kick-then-retry dance. The kick is
         //    addressed to the *previous* holder, but we publish ours as the
@@ -87,20 +88,29 @@ impl ConnectionRegistry {
             .outbox
             .try_acquire_lock(&device_id, &session_id)
             .await?;
+        tracing::info!(device_id = %device_id, session_id = %session_id, acquired, "register: initial try_acquire_lock");
         if !acquired {
             self.outbox.kick(&device_id, &session_id).await?;
-            for _ in 0..LOCK_ACQUIRE_RETRIES {
+            for attempt in 0..LOCK_ACQUIRE_RETRIES {
                 tokio::time::sleep(LOCK_ACQUIRE_BACKOFF).await;
                 acquired = self
                     .outbox
                     .try_acquire_lock(&device_id, &session_id)
                     .await?;
+                tracing::info!(
+                    device_id = %device_id,
+                    session_id = %session_id,
+                    attempt,
+                    acquired,
+                    "register: retry try_acquire_lock"
+                );
                 if acquired {
                     break;
                 }
             }
         }
         if !acquired {
+            tracing::warn!(device_id = %device_id, session_id = %session_id, "register: lock contention, giving up");
             return Err(HubError::OutboxLockContention(device_id));
         }
 
@@ -175,18 +185,31 @@ impl ConnectionRegistry {
         };
         let kick_task = {
             let device_id_inner = device_id.clone();
+            let session_id_inner = session_id.clone();
             let close_tx = close_tx.clone();
             tokio::spawn(async move {
                 let ahand_hub_core::traits::KickSubscription {
                     recv: mut kick_rx,
                     _drop_guard,
                 } = kick_sub;
+                tracing::info!(
+                    device_id = %device_id_inner,
+                    session_id = %session_id_inner,
+                    "kick_task: parked on kick_rx.changed()"
+                );
                 if kick_rx.changed().await.is_ok() {
                     tracing::info!(
                         device_id = %device_id_inner,
-                        "received kick, signalling close",
+                        session_id = %session_id_inner,
+                        "kick_task: watch changed, signalling close",
                     );
                     let _ = close_tx.send(true);
+                } else {
+                    tracing::info!(
+                        device_id = %device_id_inner,
+                        session_id = %session_id_inner,
+                        "kick_task: watch closed without kick"
+                    );
                 }
             })
         };
