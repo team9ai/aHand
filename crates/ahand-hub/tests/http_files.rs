@@ -11,12 +11,13 @@ mod support;
 use std::time::Duration;
 
 use ahand_protocol::{
-    FileError, FileErrorCode, FileReadText, FileRequest, FileResponse, FileStatResult, FileType,
-    file_request, file_response,
+    FileError, FileErrorCode, FileReadBinary, FileReadBinaryResult, FileReadText, FileRequest,
+    FileResponse, FileStatResult, FileType, FileWrite, FullWrite, file_request, file_response,
+    file_write, full_write,
 };
 use prost::Message;
 
-use support::{TestServer, spawn_test_server};
+use support::{TestServer, spawn_server_with_state, spawn_test_server, test_state_with_s3};
 
 const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 
@@ -453,5 +454,475 @@ async fn file_operation_returns_504_when_device_does_not_respond_within_configur
     // Tidy up: also assert the slot was released, since the timeout
     // path runs `cancel()` via the RAII guard.
     drop(device);
+    server.shutdown().await;
+}
+
+// ── S3 large-file transfer tests ──────────────────────────────────────────
+
+/// `POST /files/upload-url` must reject when the hub has no `[s3]`
+/// config — exposing the route would otherwise return a 500 from the
+/// presigner with an unhelpful error. 503 + `S3_DISABLED` lets clients
+/// degrade gracefully (fall back to inline bytes for small files).
+#[tokio::test]
+async fn upload_url_returns_503_when_s3_disabled() {
+    let server = spawn_test_server().await;
+    let token = dashboard_token(&server).await;
+    let url = format!(
+        "{}/api/devices/device-2/files/upload-url",
+        server.http_base_url()
+    );
+    let response = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 503);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("S3_DISABLED"),
+        "unexpected error body: {body}"
+    );
+    server.shutdown().await;
+}
+
+/// `POST /files/upload-url` must require the same dashboard auth as
+/// `POST /files`. Without a token the route should 401, never leaking a
+/// presigned URL to anonymous callers.
+#[tokio::test]
+async fn upload_url_requires_dashboard_auth() {
+    let state = test_state_with_s3().await;
+    let server = spawn_server_with_state(state).await;
+    let url = format!(
+        "{}/api/devices/device-2/files/upload-url",
+        server.http_base_url()
+    );
+    let response = reqwest::Client::new().post(&url).send().await.unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+    server.shutdown().await;
+}
+
+/// Happy path: with `[s3]` configured against the fake endpoint, the
+/// presigner produces a real URL with the right shape (path-style host,
+/// bucket name, device-scoped object key, `expires_at_ms` populated).
+/// We can't exercise an actual upload without a real bucket, but the
+/// presigner is pure local HMAC, so URL composition is testable.
+#[tokio::test]
+async fn upload_url_returns_200_with_presigned_url_when_s3_configured() {
+    let state = test_state_with_s3().await;
+    let server = spawn_server_with_state(state).await;
+    let token = dashboard_token(&server).await;
+    let url = format!(
+        "{}/api/devices/device-2/files/upload-url",
+        server.http_base_url()
+    );
+    let response = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    let object_key = body.get("object_key").and_then(|v| v.as_str()).unwrap();
+    assert!(
+        object_key.starts_with("file-ops/device-2/"),
+        "object_key should be device-scoped: {object_key}"
+    );
+    let upload_url = body.get("upload_url").and_then(|v| v.as_str()).unwrap();
+    assert!(
+        upload_url.starts_with("http://127.0.0.1:1/"),
+        "upload_url should target the configured endpoint: {upload_url}"
+    );
+    assert!(
+        upload_url.contains("test-bucket"),
+        "upload_url should contain the bucket name in path-style: {upload_url}"
+    );
+    let expires = body
+        .get("expires_at_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(expires > 0, "expires_at_ms should be populated");
+    server.shutdown().await;
+}
+
+/// When the daemon returns a `read_binary` payload larger than the
+/// configured threshold, the hub must enter the swap path: upload the
+/// bytes to S3 and rewrite the response to use a presigned download
+/// URL. Our test config points S3 at an unreachable endpoint, so the
+/// upload itself fails — but the failure code (`S3_UPLOAD_FAILED`)
+/// proves the swap was attempted, which is what we're verifying. A
+/// LocalStack-backed test would round-trip the URL successfully.
+#[tokio::test]
+async fn large_read_binary_response_triggers_s3_upload() {
+    let state = test_state_with_s3().await;
+    let server = spawn_server_with_state(state).await;
+    let token = dashboard_token(&server).await;
+    let mut device = server
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+
+    let req = FileRequest {
+        request_id: "req-large-read".into(),
+        operation: Some(file_request::Operation::ReadBinary(FileReadBinary {
+            path: "/tmp/big.bin".into(),
+            byte_offset: 0,
+            byte_length: 0,
+            max_bytes: None,
+            no_follow_symlink: false,
+        })),
+    };
+    let url = format!("{}/api/devices/device-2/files", server.http_base_url());
+    let body = req.encode_to_vec();
+    let token_clone = token.clone();
+    let http_handle = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token_clone)
+            .header("content-type", PROTOBUF_CONTENT_TYPE)
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    });
+
+    let received = device.recv_file_request().await;
+    assert_eq!(received.request_id, "req-large-read");
+
+    // Reply with content well over the 1 KiB threshold so the swap path
+    // engages.
+    let big = vec![b'X'; 4096];
+    let canned = FileResponse {
+        request_id: received.request_id.clone(),
+        result: Some(file_response::Result::ReadBinary(FileReadBinaryResult {
+            content: big.clone(),
+            byte_offset: 0,
+            bytes_read: big.len() as u64,
+            total_file_bytes: big.len() as u64,
+            remaining_bytes: 0,
+            download_url: None,
+            download_url_expires_ms: None,
+        })),
+    };
+    device.send_file_response(canned).await;
+
+    let resp = http_handle.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 502);
+    let body_json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body_json.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("S3_UPLOAD_FAILED"),
+        "unexpected error body: {body_json}"
+    );
+    drop(device);
+    server.shutdown().await;
+}
+
+/// Small (under-threshold) read responses must pass through unchanged —
+/// no S3 contact, no `download_url` in the proto. This guards against a
+/// regression where the swap path fires for every read.
+#[tokio::test]
+async fn small_read_binary_response_is_not_swapped() {
+    let state = test_state_with_s3().await;
+    let server = spawn_server_with_state(state).await;
+    let token = dashboard_token(&server).await;
+    let mut device = server
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+
+    let req = FileRequest {
+        request_id: "req-small-read".into(),
+        operation: Some(file_request::Operation::ReadBinary(FileReadBinary {
+            path: "/tmp/small.bin".into(),
+            byte_offset: 0,
+            byte_length: 0,
+            max_bytes: None,
+            no_follow_symlink: false,
+        })),
+    };
+    let url = format!("{}/api/devices/device-2/files", server.http_base_url());
+    let body = req.encode_to_vec();
+    let token_clone = token.clone();
+    let http_handle = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token_clone)
+            .header("content-type", PROTOBUF_CONTENT_TYPE)
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    });
+
+    let received = device.recv_file_request().await;
+    let small = b"hello world".to_vec();
+    let canned = FileResponse {
+        request_id: received.request_id.clone(),
+        result: Some(file_response::Result::ReadBinary(FileReadBinaryResult {
+            content: small.clone(),
+            byte_offset: 0,
+            bytes_read: small.len() as u64,
+            total_file_bytes: small.len() as u64,
+            remaining_bytes: 0,
+            download_url: None,
+            download_url_expires_ms: None,
+        })),
+    };
+    device.send_file_response(canned).await;
+
+    let resp = http_handle.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let bytes = resp.bytes().await.unwrap();
+    let decoded = FileResponse::decode(bytes.as_ref()).unwrap();
+    let Some(file_response::Result::ReadBinary(r)) = decoded.result else {
+        panic!("expected ReadBinary result");
+    };
+    assert_eq!(r.content, small);
+    assert!(
+        r.download_url.is_none(),
+        "small reads should not be swapped to S3"
+    );
+    drop(device);
+    server.shutdown().await;
+}
+
+/// `FullWrite { s3_object_key }` must trigger the hub-side download URL
+/// injection: the daemon should observe `s3_download_url` populated in
+/// the request that arrives over the WebSocket. We verify by capturing
+/// the FileRequest on the device side and asserting the URL points at
+/// the configured S3 endpoint.
+#[tokio::test]
+async fn full_write_with_s3_object_key_gets_download_url_injected() {
+    let state = test_state_with_s3().await;
+    let server = spawn_server_with_state(state).await;
+    let token = dashboard_token(&server).await;
+    let mut device = server
+        .attach_bootstrap_device("device-2", "bootstrap-test-token")
+        .await;
+
+    let req = FileRequest {
+        request_id: "req-s3-write".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: "/tmp/from-s3.bin".into(),
+            create_parents: false,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::S3ObjectKey(
+                    "file-ops/device-2/abc.bin".into(),
+                )),
+                s3_download_url: None,
+                s3_download_url_expires_ms: None,
+            })),
+            encoding: None,
+            no_follow_symlink: false,
+        })),
+    };
+    let url = format!("{}/api/devices/device-2/files", server.http_base_url());
+    let body = req.encode_to_vec();
+    let token_clone = token.clone();
+    let http_handle = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&url)
+            .bearer_auth(&token_clone)
+            .header("content-type", PROTOBUF_CONTENT_TYPE)
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+    });
+
+    // Capture and assert on the FileRequest as the daemon sees it.
+    let received = device.recv_file_request().await;
+    let Some(file_request::Operation::Write(w)) = received.operation else {
+        panic!("expected Write operation");
+    };
+    let Some(file_write::Method::FullWrite(fw)) = w.method else {
+        panic!("expected FullWrite method");
+    };
+    let injected_url = fw
+        .s3_download_url
+        .as_deref()
+        .expect("hub should inject s3_download_url");
+    assert!(
+        injected_url.starts_with("http://127.0.0.1:1/"),
+        "injected url should target the configured endpoint: {injected_url}"
+    );
+    assert!(
+        injected_url.contains("file-ops/device-2/abc.bin"),
+        "injected url should embed the original object_key: {injected_url}"
+    );
+    assert!(fw.s3_download_url_expires_ms.unwrap_or(0) > 0);
+
+    // Send a synthetic success response so the HTTP handler returns,
+    // letting the test shut down cleanly.
+    let canned = FileResponse {
+        request_id: received.request_id.clone(),
+        result: Some(file_response::Result::Write(
+            ahand_protocol::FileWriteResult {
+                path: "/tmp/from-s3.bin".into(),
+                action: ahand_protocol::WriteAction::Created as i32,
+                bytes_written: 0,
+                final_size: 0,
+                replacements_made: None,
+            },
+        )),
+    };
+    device.send_file_response(canned).await;
+    let resp = http_handle.await.unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    drop(device);
+    server.shutdown().await;
+}
+
+/// `FullWrite { s3_object_key }` carrying a `..` traversal must be
+/// rejected at the hub. Without this guard, an attacker who could send
+/// arbitrary FullWrite proto could attempt to read other tenants'
+/// objects by crafting a key like `../other-prefix/...`.
+#[tokio::test]
+async fn full_write_with_s3_object_key_rejects_path_traversal() {
+    let state = test_state_with_s3().await;
+    let server = spawn_server_with_state(state).await;
+    let token = dashboard_token(&server).await;
+
+    let req = FileRequest {
+        request_id: "req-traversal".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: "/tmp/traversal.bin".into(),
+            create_parents: false,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::S3ObjectKey(
+                    "file-ops/device-2/../other-tenant/secret.bin".into(),
+                )),
+                s3_download_url: None,
+                s3_download_url_expires_ms: None,
+            })),
+            encoding: None,
+            no_follow_symlink: false,
+        })),
+    };
+    let url = format!("{}/api/devices/device-2/files", server.http_base_url());
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .header("content-type", PROTOBUF_CONTENT_TYPE)
+        .body(req.encode_to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body_json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body_json.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("INVALID_S3_OBJECT_KEY"),
+    );
+    server.shutdown().await;
+}
+
+/// `POST /files/upload-url` must reject a device_id with traversal
+/// characters. Captures the `Path<String>` segment which axum URL-
+/// decodes — a caller passing `device-2%2F..%2Fother` would otherwise
+/// produce an object key that escapes its bucket prefix. We test
+/// both the slash form (axum-decode-dependent) and the no-slash
+/// form (`..` alone, robust against routing-layer changes).
+#[tokio::test]
+async fn upload_url_rejects_device_id_with_traversal() {
+    let state = test_state_with_s3().await;
+    let server = spawn_server_with_state(state).await;
+    let token = dashboard_token(&server).await;
+
+    // Form 1: %2F-encoded slash. Whether this reaches the validator
+    // vs. 404s at the router depends on axum's URL-decoding of path
+    // segments — but if it DOES reach our handler, we want it
+    // rejected by the validator, not silently accepted.
+    let url = format!(
+        "{}/api/devices/device-2%2F..%2Fother/files/upload-url",
+        server.http_base_url()
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    if status == 400 {
+        let body_json: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body_json.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("INVALID_DEVICE_ID"),
+        );
+    } else {
+        // 404 from the router (segment split) is also acceptable —
+        // the request never reached a handler that could mint a URL.
+        assert_eq!(status, 404, "expected 400 or 404, got {status}");
+    }
+
+    // Form 2: literal `..` segment, no slash. This always reaches the
+    // handler because there is no `/` to confuse routing, so the
+    // validator MUST be the thing that rejects it.
+    let url = format!(
+        "{}/api/devices/..%20segment/files/upload-url",
+        server.http_base_url()
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "validator should reject \"..\""
+    );
+    let body_json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body_json.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("INVALID_DEVICE_ID"),
+    );
+
+    server.shutdown().await;
+}
+
+/// `FullWrite { s3_object_key }` must fail-fast at the hub when no
+/// `[s3]` is configured, instead of forwarding a half-baked request to
+/// the daemon. Returns 503 + `S3_DISABLED` matching the upload-url
+/// route's contract.
+#[tokio::test]
+async fn full_write_with_s3_object_key_returns_503_when_s3_disabled() {
+    let server = spawn_test_server().await;
+    let token = dashboard_token(&server).await;
+
+    let req = FileRequest {
+        request_id: "req-s3-no-config".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: "/tmp/no-s3.bin".into(),
+            create_parents: false,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::S3ObjectKey("k".into())),
+                s3_download_url: None,
+                s3_download_url_expires_ms: None,
+            })),
+            encoding: None,
+            no_follow_symlink: false,
+        })),
+    };
+    let url = format!("{}/api/devices/device-2/files", server.http_base_url());
+    let body = req.encode_to_vec();
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&token)
+        .header("content-type", PROTOBUF_CONTENT_TYPE)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 503);
+    let body_json: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body_json.pointer("/error/code").and_then(|v| v.as_str()),
+        Some("S3_DISABLED"),
+    );
     server.shutdown().await;
 }

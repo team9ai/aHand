@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ahand_hub::config::{Config, StoreConfig};
+use ahand_hub::config::{Config, S3Config, StoreConfig};
 use ahand_hub::state::AppState;
 use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::traits::DeviceStore;
@@ -96,6 +96,55 @@ pub fn persistent_test_config(stack: &TestStack) -> Config {
         },
         s3: None,
     }
+}
+
+/// Build a test config with an S3 block. The actual `S3Client` is built
+/// later (see `test_state_with_s3`) with explicit synthetic credentials,
+/// avoiding process-wide env mutation. The endpoint points at an
+/// unreachable port (1) so any real S3 traffic fails fast.
+pub fn test_s3_config() -> S3Config {
+    S3Config {
+        bucket: "test-bucket".into(),
+        region: "us-east-1".into(),
+        endpoint: Some("http://127.0.0.1:1".into()),
+        // Threshold deliberately small so 4KB-ish payloads trigger the
+        // swap path without forcing tests to allocate megabytes.
+        file_transfer_threshold_bytes: 1024,
+        url_expiration_secs: 3600,
+    }
+}
+
+/// Build an `S3Client` against a fake endpoint with explicit synthetic
+/// credentials. Pre-signing is a pure local HMAC computation, so URL
+/// composition is verifiable without a running S3 backend; live
+/// PutObject/GetObject calls error out on connection refused — exactly
+/// what we want when verifying that the swap path was *entered*.
+pub fn build_test_s3_client(cfg: &S3Config) -> ahand_hub::s3::S3Client {
+    use aws_config::BehaviorVersion;
+    use aws_credential_types::Credentials;
+    let endpoint = cfg.endpoint.as_ref().expect("test s3 config has endpoint");
+    let creds = Credentials::new("test", "test", None, None, "ahand-hub-tests");
+    let s3_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .credentials_provider(creds)
+        .region(aws_sdk_s3::config::Region::new(cfg.region.clone()))
+        .endpoint_url(endpoint)
+        .force_path_style(true)
+        .build();
+    ahand_hub::s3::S3Client::from_aws_client(
+        aws_sdk_s3::Client::from_conf(s3_config),
+        &cfg.bucket,
+        cfg.file_transfer_threshold_bytes,
+        cfg.url_expiration_secs,
+    )
+}
+
+pub async fn test_state_with_s3() -> AppState {
+    let mut state = AppState::from_config(test_config())
+        .await
+        .expect("test state should build");
+    state.s3_client = Some(std::sync::Arc::new(build_test_s3_client(&test_s3_config())));
+    state
 }
 
 pub async fn test_state() -> AppState {

@@ -873,10 +873,16 @@ pub async fn control_files(
     // `correlation_id` is a logical-retry hint, surfaced separately
     // for future hub-side dedupe (parity with the browser endpoint).
     let request_id = uuid::Uuid::new_v4().to_string();
-    let proto_request = ahand_protocol::FileRequest {
+    let mut proto_request = ahand_protocol::FileRequest {
         request_id: request_id.clone(),
         operation: Some(operation),
     };
+
+    // Same S3 upload-URL injection the dashboard handler does. Kept at
+    // the caller (not inside file_service::execute) because the
+    // failure modes — 503 S3_DISABLED, 400 INVALID_S3_OBJECT_KEY —
+    // shouldn't collapse into 500 Internal.
+    crate::http::files::maybe_inject_full_write_download_url(&state, &mut proto_request).await?;
 
     // Caller-supplied timeout caps the hub's default but cannot exceed
     // `state.file_request_timeout` (the operator-configured hub-wide

@@ -467,6 +467,13 @@ impl TryFrom<WriteParams> for proto::FileWrite {
                 };
                 Method::FullWrite(proto::FullWrite {
                     source: Some(source),
+                    // Clients go through the control-plane DTO with
+                    // either inline content or a bare s3_object_key.
+                    // The hub (http::files::maybe_inject_full_write_download_url)
+                    // fills in s3_download_url + expires_ms before
+                    // forwarding to the daemon.
+                    s3_download_url: None,
+                    s3_download_url_expires_ms: None,
                 })
             }
             WriteMethod::Append { append } => Method::Append(proto::FileAppend {
