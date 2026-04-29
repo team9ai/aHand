@@ -264,6 +264,12 @@ message FullWrite {
     bytes content = 1;            // small file: direct content
     string s3_object_key = 2;    // large file: confirm S3 upload complete
   }
+  // Hub-injected on the way to the daemon when source is
+  // s3_object_key. The daemon does a plain HTTP GET against this URL
+  // and writes the response body to disk; no AWS SDK on the daemon.
+  // Clients leave these fields empty; the hub fills them in.
+  optional string s3_download_url = 10;
+  optional uint64 s3_download_url_expires_ms = 11;
 }
 
 message FileAppend {
@@ -565,72 +571,99 @@ enum FileErrorCode {
 
 ## Large File S3 Transfer
 
-> **v1 status (post-Round-1 review).** The plumbing for large-file
-> transfer is in place — `S3Client` (`crates/ahand-hub/src/s3.rs`),
-> `S3Config` (`crates/ahand-hub/src/config.rs`), `AppState.s3_client`
-> (`crates/ahand-hub/src/state.rs`), the `FullWrite.s3_object_key`
-> proto field — but the bidirectional flow described in this section
-> (hub generates pre-signed URLs, daemon uploads/downloads, hub
-> replies with `download_url`) is **not wired end-to-end** in this
-> PR. The `POST /files/upload-url` route was deliberately withdrawn
-> in Round 1 because exposing a half-working API surface is worse
-> than not exposing one at all (see `crates/ahand-hub/src/http/files.rs`
-> file-trailing comment block for the rationale and the list of items
-> kept for v2).
->
-> Until v2 lands: large reads return `FILE_ERROR_CODE_TOO_LARGE` once
-> the configured `max_read_bytes` budget is hit, and the daemon
-> rejects writes with a non-empty `FullWrite.s3_object_key` (no
-> upload-url flow). The `needs_upload` and `file_size` fields below
-> are spec-only — they are not present in `proto/ahand/v1/file_ops.proto`
-> and will be added when the flow is wired.
+> **v2 status.** Wired end-to-end. The hub mediates S3 access on both
+> sides so daemons stay S3-unaware (no AWS SDK, no credentials).
+> Implementation lives in `crates/ahand-hub/src/http/files.rs`
+> (`upload_url`, `maybe_swap_large_read_response`,
+> `maybe_inject_full_write_download_url`) and the daemon's
+> `handle_full_write` in `crates/ahandd/src/file_manager/write_ops.rs`
+> which fetches via plain HTTP GET when the hub injects
+> `s3_download_url`. The Round 1 design — daemon negotiates upload URL
+> from the hub via a back-channel — was simplified out: the hub is
+> already the only S3-aware participant, so it just performs the
+> upload itself on the read path.
 
 ### Threshold
 
-Hub-side configuration: `file_transfer_threshold_bytes` (default 1MB). Daemon does not need to know the threshold — hub decides the transfer path.
+Hub-side configuration: `file_transfer_threshold_bytes` (default 1MB). Daemon does not need to know the threshold — the hub decides the transfer path.
 
 ### Read Flow (large file)
 
 ```
 Agent/Dashboard ──FileRequest(read_binary)──→ Hub
 Hub ──FileRequest──→ Daemon
-Daemon: reads file, discovers size > threshold
-  1. Reply FileReadBinaryResult { needs_upload: true, file_size }
-Hub: receives oversized response indicator
-  1. Generate pre-signed upload URL for daemon
-  2. Send upload URL to daemon via dedicated message
-Daemon:
-  1. Upload file content to S3 via pre-signed URL
-  2. Confirm upload complete
-Hub:
-  1. Generate pre-signed download URL
-  2. Reply FileResponse { download_url, expires_ms } to Agent/Dashboard
-Agent/Dashboard: download directly from S3 via download_url
+Daemon: reads file, returns FileResponse with inline content
+Hub: receives FileResponse
+  if content.len() > threshold:
+    1. Upload bytes to S3 (object key: file-ops/{device_id}/read-{uuid}.bin)
+    2. Generate pre-signed GET URL
+    3. Rewrite result: clear content, set download_url + download_url_expires_ms
+  forward to caller
+Agent/Dashboard:
+  if response.download_url is set:
+    fetch directly from S3
+  else:
+    use response.content inline
 ```
 
-Note: Daemon never holds S3 credentials directly. Hub provides pre-signed URLs for both upload and download operations.
+Read-side keys carry a `read-` segment so operators writing S3 lifecycle rules (e.g. shorter expiry on read-side spillover than on write-side staging objects) can target them without affecting the upload-url path.
+
+Daemons return inline content uniformly; the swap is invisible to them. If `[s3]` is unconfigured the hub forwards the response unchanged — large responses still work but use one big WebSocket frame instead of an out-of-band download.
 
 ### Write Flow (large file)
 
 ```
-Agent/Dashboard ──FileRequest(write, large)──→ Hub
-Hub: generate pre-signed upload URL
-  Reply FileResponse { upload_url, expires_ms, object_key }
-Agent/Dashboard: upload content to S3 via upload_url
-Agent/Dashboard ──FileRequest(write, s3_object_key=...)──→ Hub
-Hub ──FileRequest──→ Daemon
-Daemon: download from S3, write to local file
-  Reply FileWriteResult { ... }
+Agent/Dashboard ──POST /files/upload-url──→ Hub
+Hub:
+  if [s3] is unconfigured:
+    return 503 + S3_DISABLED
+  generate pre-signed PUT URL (object key: file-ops/{device_id}/{uuid}.bin)
+  return { object_key, upload_url, expires_at_ms }
+Agent/Dashboard:
+  PUT bytes directly to upload_url
+  send FileRequest(write, FullWrite{ s3_object_key })
+
+Hub: receives FileRequest with FullWrite{s3_object_key}
+  if [s3] is unconfigured:
+    return 503 + S3_DISABLED  (fail fast, daemon would reject anyway)
+  generate pre-signed GET URL for s3_object_key
+  inject FullWrite.s3_download_url + s3_download_url_expires_ms
+  forward to daemon
+Daemon:
+  if FullWrite.s3_download_url is missing:
+    return FILE_ERROR_CODE_UNSPECIFIED  (hub bug or version mismatch)
+  reqwest::get(s3_download_url) → write bytes to local file
+  enforce max_write_bytes against Content-Length AND actual length
+  reply FileWriteResult { ... }
 ```
+
+Daemons never hold S3 credentials. The presigned GET URL is a regular HTTP resource — `reqwest` handles it without any AWS-specific code.
 
 ### Protocol Support
 
 ```protobuf
-message FileTransferUrl {
-  string url = 1;
-  uint64 expires_ms = 2;
-  string object_key = 3;         // S3 key (passed back in write confirmation)
+message FullWrite {
+  oneof source {
+    bytes content = 1;
+    string s3_object_key = 2;
+  }
+  // Hub-injected before forwarding; populated only when source is
+  // s3_object_key. Clients leave these empty.
+  optional string s3_download_url = 10;
+  optional uint64 s3_download_url_expires_ms = 11;
 }
+
+// Read-side fallback fields on FileReadBinaryResult / FileReadImageResult:
+//   optional string download_url = 10;
+//   optional uint64 download_url_expires_ms = 11;
+```
+
+The legacy `FileTransferUrl` message is no longer used by the wire protocol — the JSON body of `POST /files/upload-url` carries the same data:
+
+```json
+{ "object_key": "file-ops/<device_id>/<uuid>.bin",
+  "upload_url": "https://...",
+  "expires_at_ms": 1714400000000 }
 ```
 
 ## Security Model

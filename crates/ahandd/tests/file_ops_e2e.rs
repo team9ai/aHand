@@ -236,6 +236,7 @@ async fn e2e_write() {
             no_follow_symlink: false,
             method: Some(file_write::Method::FullWrite(FullWrite {
                 source: Some(full_write::Source::Content(b"payload".to_vec())),
+                ..Default::default()
             })),
         })),
     };

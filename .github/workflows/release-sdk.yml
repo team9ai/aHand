@@ -1,0 +1,105 @@
+name: Release @ahandai/sdk + @ahandai/proto
+
+# Publishes both npm packages in lockstep.
+#
+# Two trigger modes:
+#  - push of a `release-v<semver>` tag (normal release path)
+#  - manual workflow_dispatch (for dry-runs or ad-hoc re-publishes)
+#
+# The tag version MUST match the `version` field in BOTH packages'
+# package.json. This prevents accidental releases from a mis-tagged
+# commit. When triggered manually from workflow_dispatch, the job
+# skips the tag check; dry_run=true then verifies the publish-time
+# contents without touching the npm registry.
+#
+# Auth uses npm trusted publishers via OIDC — no NPM_TOKEN secret.
+# Each package MUST be configured on npmjs.com:
+#   Package settings → Publishing access → Trusted publisher
+#     Organization / user: team9ai
+#     Repository:          aHand
+#     Workflow filename:   release-sdk.yml
+#     Environment:         (empty)
+#
+# Publish order is proto → sdk because sdk depends on @ahandai/proto
+# via `workspace:*`; pnpm rewrites the dependency to the concrete
+# version at publish time, so proto must already exist on the registry
+# when sdk is published.
+
+on:
+  push:
+    tags:
+      - 'release-v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (skip actual npm publish)'
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write   # Required for npm trusted-publisher OIDC + --provenance
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify tag version matches package.json versions
+        if: startsWith(github.ref, 'refs/tags/release-v')
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#release-v}"
+          PROTO_VERSION=$(node -p "require('./packages/proto-ts/package.json').version")
+          SDK_VERSION=$(node -p "require('./packages/sdk/package.json').version")
+          echo "tag=$TAG_VERSION proto=$PROTO_VERSION sdk=$SDK_VERSION"
+          if [ "$TAG_VERSION" != "$PROTO_VERSION" ]; then
+            echo "::error::Tag $TAG_VERSION does not match @ahandai/proto version $PROTO_VERSION"
+            exit 1
+          fi
+          if [ "$TAG_VERSION" != "$SDK_VERSION" ]; then
+            echo "::error::Tag $TAG_VERSION does not match @ahandai/sdk version $SDK_VERSION"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build @ahandai/proto
+        run: pnpm -F @ahandai/proto build
+
+      - name: Build @ahandai/sdk
+        run: pnpm -F @ahandai/sdk build
+
+      - name: Test @ahandai/sdk
+        run: pnpm -F @ahandai/sdk test
+
+      # ── Dry-run path (workflow_dispatch with dry_run=true) ─────────────
+      - name: Dry-run publish @ahandai/proto
+        if: ${{ inputs.dry_run == true }}
+        run: pnpm -F @ahandai/proto publish --access public --no-git-checks --dry-run
+
+      - name: Dry-run publish @ahandai/sdk
+        if: ${{ inputs.dry_run == true }}
+        run: pnpm -F @ahandai/sdk publish --access public --no-git-checks --dry-run
+
+      # ── Real publish path (tag push, or manual with dry_run=false) ─────
+      - name: Publish @ahandai/proto
+        if: ${{ inputs.dry_run != true }}
+        run: pnpm -F @ahandai/proto publish --access public --no-git-checks --provenance
+        env:
+          NPM_CONFIG_PROVENANCE: 'true'
+
+      - name: Publish @ahandai/sdk
+        if: ${{ inputs.dry_run != true }}
+        run: pnpm -F @ahandai/sdk publish --access public --no-git-checks --provenance
+        env:
+          NPM_CONFIG_PROVENANCE: 'true'

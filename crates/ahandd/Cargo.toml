@@ -52,6 +52,15 @@ glob = "0.3"
 trash = "5"
 encoding_rs = "0.8"
 chardetng = "0.1"
+# Used by `file_manager::io_safe` to drive *at syscalls (openat2, mkdirat,
+# renameat, symlinkat, fchmodat, fdopendir, …) for the race-proof file
+# operations introduced by the R10 TOCTOU fix. The `fs` feature gates the
+# `nix::fcntl` and `nix::sys::stat` modules we need; the `dir` feature
+# exposes `nix::dir::Dir` for fdopendir-based recursive walks. Pinned to
+# 0.28 because that is the minimum that ships an `openat2`/`OpenHow`
+# wrapper, and it is already present in the workspace lock as a
+# transitive dep so deduplicates cleanly.
+nix = { version = "0.28", features = ["fs", "dir"] }
 
 [features]
 # Dev-only escape hatch for the manual TCP-keepalive smoke test in
@@ -65,3 +74,7 @@ disable-ws-ping = []
 
 [dev-dependencies]
 tempfile = "3"
+# Used by tests/file_ops_s3_write.rs to spin up a tiny HTTP server that
+# stands in for an S3 endpoint. Pulled at test-time only; the daemon
+# binary continues to use plain `reqwest` against presigned URLs.
+axum.workspace = true

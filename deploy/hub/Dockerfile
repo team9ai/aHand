@@ -40,6 +40,9 @@ COPY crates crates
 COPY proto proto
 
 RUN pnpm install --frozen-lockfile
+# hub-dashboard imports @ahandai/proto, which exposes its types via dist/.
+# Build proto-ts first so the dashboard's next build can resolve it.
+RUN pnpm --filter @ahandai/proto build
 RUN pnpm --filter @ahand/hub-dashboard build
 
 FROM node:${NODE_VERSION} AS dashboard

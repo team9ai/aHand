@@ -23,7 +23,7 @@ async fn disabled_enqueue_returns_ok_without_persisting() {
     let webhook = Webhook::disabled();
     assert!(!webhook.is_enabled());
     webhook
-        .enqueue_online("device-1", Some("user-1"))
+        .enqueue_online("device-1", Some("user-1"), &[])
         .await
         .unwrap();
     webhook.enqueue_offline("device-1", None).await.unwrap();
@@ -32,7 +32,7 @@ async fn disabled_enqueue_returns_ok_without_persisting() {
         .await
         .unwrap();
     webhook
-        .enqueue_registered("device-1", Some("user-1"))
+        .enqueue_registered("device-1", Some("user-1"), &[])
         .await
         .unwrap();
     webhook.enqueue_revoked("device-1", None).await.unwrap();
@@ -48,7 +48,7 @@ async fn enabled_enqueue_persists_and_notifies() {
     drop(handle);
 
     webhook
-        .enqueue_online("device-1", Some("user-1"))
+        .enqueue_online("device-1", Some("user-1"), &[])
         .await
         .unwrap();
     webhook
@@ -99,4 +99,132 @@ async fn payload_skips_external_user_id_when_absent() {
 async fn disabled_webhook_has_no_store() {
     let webhook = Webhook::disabled();
     assert!(webhook.store().is_none());
+}
+
+#[tokio::test]
+async fn online_event_serializes_capabilities() {
+    let store: Arc<dyn ahand_hub_store::webhook_delivery_store::WebhookDeliveryStore> =
+        Arc::new(MemoryWebhookDeliveryStore::new());
+    let (webhook, handle) = Webhook::new(store.clone(), noop_config());
+    drop(handle);
+
+    let caps = vec!["exec".to_string(), "browser-playwright-cli".to_string()];
+    webhook
+        .enqueue_online("device-1", Some("user-1"), &caps)
+        .await
+        .unwrap();
+
+    let rows = store.lease_due(chrono::Utc::now(), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let payload: WebhookPayload = serde_json::from_value(rows[0].payload.clone()).unwrap();
+    assert_eq!(payload.event_type, "device.online");
+    assert_eq!(
+        payload.data["capabilities"],
+        serde_json::json!(["exec", "browser-playwright-cli"])
+    );
+}
+
+#[tokio::test]
+async fn registered_event_serializes_capabilities() {
+    let store: Arc<dyn ahand_hub_store::webhook_delivery_store::WebhookDeliveryStore> =
+        Arc::new(MemoryWebhookDeliveryStore::new());
+    let (webhook, handle) = Webhook::new(store.clone(), noop_config());
+    drop(handle);
+
+    let caps = vec!["exec".to_string(), "browser-playwright-cli".to_string()];
+    webhook
+        .enqueue_registered("device-2", Some("user-2"), &caps)
+        .await
+        .unwrap();
+
+    let rows = store.lease_due(chrono::Utc::now(), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let payload: WebhookPayload = serde_json::from_value(rows[0].payload.clone()).unwrap();
+    assert_eq!(payload.event_type, "device.registered");
+    assert_eq!(
+        payload.data["capabilities"],
+        serde_json::json!(["exec", "browser-playwright-cli"])
+    );
+}
+
+#[tokio::test]
+async fn online_event_serializes_empty_capabilities_when_none_declared() {
+    let store: Arc<dyn ahand_hub_store::webhook_delivery_store::WebhookDeliveryStore> =
+        Arc::new(MemoryWebhookDeliveryStore::new());
+    let (webhook, handle) = Webhook::new(store.clone(), noop_config());
+    drop(handle);
+
+    webhook.enqueue_online("device-3", None, &[]).await.unwrap();
+
+    let rows = store.lease_due(chrono::Utc::now(), 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let payload: WebhookPayload = serde_json::from_value(rows[0].payload.clone()).unwrap();
+    assert_eq!(payload.event_type, "device.online");
+    assert_eq!(payload.data["capabilities"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn heartbeat_data_unaffected_by_capabilities_change() {
+    // Regression guard: heartbeat must not carry capabilities.
+    let store: Arc<dyn ahand_hub_store::webhook_delivery_store::WebhookDeliveryStore> =
+        Arc::new(MemoryWebhookDeliveryStore::new());
+    let (webhook, handle) = Webhook::new(store.clone(), noop_config());
+    drop(handle);
+
+    webhook
+        .enqueue_heartbeat("device-1", None, 42, 90)
+        .await
+        .unwrap();
+
+    let rows = store.lease_due(chrono::Utc::now(), 10).await.unwrap();
+    let payload: WebhookPayload = serde_json::from_value(rows[0].payload.clone()).unwrap();
+    assert_eq!(payload.event_type, "device.heartbeat");
+    assert!(
+        payload.data.get("capabilities").is_none(),
+        "heartbeat must not include capabilities: {:?}",
+        payload.data
+    );
+}
+
+#[tokio::test]
+async fn offline_event_unaffected_by_capabilities_change() {
+    // Regression guard: offline must not carry capabilities.
+    let store: Arc<dyn ahand_hub_store::webhook_delivery_store::WebhookDeliveryStore> =
+        Arc::new(MemoryWebhookDeliveryStore::new());
+    let (webhook, handle) = Webhook::new(store.clone(), noop_config());
+    drop(handle);
+
+    webhook
+        .enqueue_offline("device-1", Some("user-1"))
+        .await
+        .unwrap();
+
+    let rows = store.lease_due(chrono::Utc::now(), 10).await.unwrap();
+    let payload: WebhookPayload = serde_json::from_value(rows[0].payload.clone()).unwrap();
+    assert_eq!(payload.event_type, "device.offline");
+    assert!(
+        payload.data.get("capabilities").is_none(),
+        "offline must not include capabilities: {:?}",
+        payload.data
+    );
+}
+
+#[tokio::test]
+async fn revoked_event_unaffected_by_capabilities_change() {
+    // Regression guard: revoked must not carry capabilities.
+    let store: Arc<dyn ahand_hub_store::webhook_delivery_store::WebhookDeliveryStore> =
+        Arc::new(MemoryWebhookDeliveryStore::new());
+    let (webhook, handle) = Webhook::new(store.clone(), noop_config());
+    drop(handle);
+
+    webhook.enqueue_revoked("device-1", None).await.unwrap();
+
+    let rows = store.lease_due(chrono::Utc::now(), 10).await.unwrap();
+    let payload: WebhookPayload = serde_json::from_value(rows[0].payload.clone()).unwrap();
+    assert_eq!(payload.event_type, "device.revoked");
+    assert!(
+        payload.data.get("capabilities").is_none(),
+        "revoked must not include capabilities: {:?}",
+        payload.data
+    );
 }
