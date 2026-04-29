@@ -25,7 +25,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Determine env
         run: |
           if [ "${{ github.ref }}" = "refs/heads/main" ]; then
@@ -37,7 +37,7 @@ jobs:
             echo "ECS_CLUSTER=openclaw-hive-dev" >> "$GITHUB_ENV"
             echo "SERVICE_NAME=ahand-hub-dev" >> "$GITHUB_ENV"
           fi
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::471112576951:role/GitHubActionsAhandHubDeploy
           aws-region: ${{ env.AWS_REGION }}
