@@ -26,13 +26,42 @@
   `Uint8Array`. Supports `AbortSignal`. Lazy `getAuthToken()` semantics
   matching `spawn()`.
 - **`BrowserParams` / `BrowserResult`** — new public types for the above.
+- **`CloudClient.files(params)`** — new method posting to
+  `POST /api/control/files`. Single request-response that dispatches one
+  of 14 file operations (`stat`, `list`, `glob`, `read_text`,
+  `read_binary`, `read_image`, `write`, `edit`, `delete`, `chmod`,
+  `mkdir`, `copy`, `move`, `create_symlink`) to a connected device.
+  Daemon-level errors (e.g. `not_found`, `policy_denied`) come back
+  inside the resolved `FileResult` envelope (`success: false` plus an
+  `error` field); hub-level errors (auth, offline, timeout, rate limit)
+  are thrown as `CloudClientError`. Same lazy `getAuthToken()` semantics
+  as `browser()`. Supports `AbortSignal` and `correlationId` for
+  forward-compat with hub-side dedupe.
+- **`FileOperation` / `FileParams` / `FileResult` / `FileErrorPayload`** —
+  new public types for the above. `params` and `result` are typed as
+  `Record<string, unknown>` / `unknown`: per-op shapes are documented in
+  the JSDoc and consumers cast to their own per-op types as needed.
 - **`"timeout"` `CloudClientErrorCode`** — HTTP 504 from the hub now maps
   to this code (was previously folded into `server_error`). Existing
   `spawn()` consumers are unaffected because `spawn()` surfaces hub
   timeouts via SSE error events, not HTTP status.
-- **Strict response shape validation** — `browser()` rejects malformed
-  hub responses (null / non-object root, missing or non-boolean `success`)
-  with `CloudClientError("server_error", ...)`. Same for response-body
+- **`"device_offline"` `CloudClientErrorCode`** — HTTP 409 with body
+  `{error:{code:"DEVICE_OFFLINE"}}` (returned by the files endpoint when
+  a known device is not currently connected) maps to this code. Other
+  409s fall through to `bad_request`. Existing `spawn()` / `browser()`
+  consumers are unaffected because neither endpoint returns 409.
+- **`"policy_denied"` `CloudClientErrorCode`** — HTTP 403 with body
+  `{error:{code:"POLICY_DENIED"}}` maps to this code. The hub elevates
+  daemon-side `policy_denied` file errors to a hub-level 403 (other
+  daemon errors like `not_found` / `io` stay inside the
+  `success: false` body) so consumers can branch on
+  `err.code === "policy_denied"` without inspecting the response
+  envelope. Plain 403 + `FORBIDDEN` / `NOT_DEVICE_OWNER` still maps
+  to `forbidden`.
+- **Strict response shape validation** — `browser()` and `files()`
+  reject malformed hub responses (null / non-object root, array root,
+  missing or non-boolean `success`) with
+  `CloudClientError("server_error", ...)`. Same for response-body
   parse failures: `SyntaxError → server_error`, `AbortError → abort`,
   other → `network`.
 

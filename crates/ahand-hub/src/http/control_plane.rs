@@ -8,6 +8,7 @@
 //!   * `GET  /api/control/jobs/{id}/stream` — SSE event stream
 //!   * `POST /api/control/jobs/{id}/cancel` — best-effort cancel
 //!   * `POST /api/control/browser`         — synchronous browser command
+//!   * `POST /api/control/files`           — synchronous file operation
 //!
 //! Auth: **control-plane JWT** (`token_type = ControlPlane`) only —
 //! device JWTs are rejected by [`verify_control_plane_jwt`]. The JWT's
@@ -63,6 +64,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/control/jobs/{id}/stream", get(stream_job))
         .route("/api/control/jobs/{id}/cancel", post(cancel_job))
         .route("/api/control/browser", post(browser_command_control))
+        .route("/api/control/files", post(control_files))
         .layer(middleware::from_fn_with_state(
             state,
             require_control_plane_jwt,
@@ -740,4 +742,200 @@ pub async fn browser_command_control(
         binary_mime,
         duration_ms,
     }))
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// `POST /api/control/files` — synchronous worker-side file operation.
+//
+// Wire-format twin of the dashboard `POST /api/devices/{device_id}/files`
+// handler with three differences:
+//   1. Auth is via control-plane JWT (mounted under the same middleware
+//      that protects `/api/control/jobs`), and ownership is checked
+//      against `claims.external_user_id == device.external_user_id`.
+//   2. The body is JSON (matching the browser endpoint's symmetry
+//      decision), not raw protobuf — see `http::control_files_dto` for
+//      the schema.
+//   3. The response includes a `duration_ms` field measuring elapsed
+//      time from request start to service return — same as
+//      `/api/control/browser`, so SDK callers can observe round-trip
+//      latency.
+//
+// Both endpoints share `file_service::execute()` and the same hub-error
+// mapper `http::files::map_service_error`, so hub-level error codes
+// and HTTP statuses match the dashboard endpoint byte-for-byte.
+// Daemon-side errors (e.g. NOT_FOUND, POLICY_DENIED) come back as HTTP
+// 200 with `success: false` plus an `error.code` field — the dashboard
+// returns the same information inside its protobuf envelope, just in a
+// different format.
+// ──────────────────────────────────────────────────────────────────────
+
+use crate::file_service::{self, FileServiceError};
+use crate::http::control_files_dto::{self, ControlFilesRequest, ControlFilesResponse, DtoError};
+use crate::http::files::map_service_error as map_file_service_error;
+
+/// Default file-op timeout when the SDK doesn't pass one. Matches the
+/// browser endpoint default and is bounded by `state.file_request_timeout`
+/// (the hub-side hard ceiling) — the smaller of the two wins.
+const DEFAULT_FILE_TIMEOUT_MS: u64 = 30_000;
+
+pub async fn control_files(
+    Extension(claims): Extension<ControlPlaneJwtClaims>,
+    State(state): State<AppState>,
+    body: Result<Json<ControlFilesRequest>, JsonRejection>,
+) -> ApiResult<Json<ControlFilesResponse>> {
+    if claims.scope != "jobs:execute" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT scope does not permit this action",
+        ));
+    }
+
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
+
+    // Per-user rate-limit BEFORE any DB / WS work, mirroring the jobs
+    // and browser handlers. A storm of bogus POSTs from one tenant
+    // can't DOS the device store or burn WS dispatch slots for other
+    // tenants.
+    if state
+        .control_rate_limiter
+        .check_key(&claims.external_user_id)
+        .is_err()
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Rate limit exceeded for this user",
+        ));
+    }
+
+    if body.device_id.is_empty() {
+        return Err(ApiError::validation("device_id must not be empty"));
+    }
+    if body.operation.is_empty() {
+        return Err(ApiError::validation("operation must not be empty"));
+    }
+
+    // Ownership check: the device must exist AND be owned by the
+    // calling user. Mirrors `browser_command_control` — 403 (not 404)
+    // on mismatch, since the JWT has already authenticated and the
+    // caller can prove their own user id from the JWT they minted.
+    let device = state
+        .devices
+        .find_by_id(&body.device_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("device store: {e}")))?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "DEVICE_NOT_FOUND",
+                format!("Device {} not found", body.device_id),
+            )
+        })?;
+    if device.external_user_id.as_deref() != Some(claims.external_user_id.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "NOT_DEVICE_OWNER",
+            format!("Caller does not own device {}", body.device_id),
+        ));
+    }
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&body.device_id)
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT does not grant access to this device",
+        ));
+    }
+
+    // Build the protobuf request. JSON parsing errors (unknown op,
+    // missing required field, malformed param) map to 400.
+    let operation = control_files_dto::build_request_operation(&body.operation, body.params)
+        .map_err(|e| match e {
+            DtoError::UnknownOperation(op) => ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "UNKNOWN_OPERATION",
+                format!(
+                    "operation '{op}' is not one of: stat, list, glob, read_text, \
+                         read_binary, read_image, write, edit, delete, chmod, mkdir, \
+                         copy, move, create_symlink"
+                ),
+            ),
+            DtoError::InvalidParams { op, message } => ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_PARAMS",
+                format!("invalid params for operation '{op}': {message}"),
+            ),
+        })?;
+
+    // Always mint a fresh request_id at the hub level — the wire-level
+    // `correlation_id` is a logical-retry hint, surfaced separately
+    // for future hub-side dedupe (parity with the browser endpoint).
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let proto_request = ahand_protocol::FileRequest {
+        request_id: request_id.clone(),
+        operation: Some(operation),
+    };
+
+    // Caller-supplied timeout caps the hub's default but cannot exceed
+    // `state.file_request_timeout` (the operator-configured hub-wide
+    // ceiling, plumbed from `Config::file_request_timeout_ms`).
+    let requested_ms = body
+        .timeout_ms
+        .unwrap_or(DEFAULT_FILE_TIMEOUT_MS)
+        .max(1_000);
+    let ceiling_ms = state
+        .file_request_timeout
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let effective_ms = requested_ms.min(ceiling_ms.max(1_000));
+    let timeout = std::time::Duration::from_millis(effective_ms);
+
+    let started = std::time::Instant::now();
+    let response = file_service::execute(&state, &device.id, proto_request, timeout)
+        .await
+        .map_err(|err| match err {
+            // Surface the same wire-level errors the dashboard does so
+            // the SDK gets a single contract to teach.
+            FileServiceError::AtCapacity
+            | FileServiceError::Duplicate { .. }
+            | FileServiceError::DeviceOffline { .. }
+            | FileServiceError::Timeout { .. }
+            | FileServiceError::ChannelClosed
+            | FileServiceError::Internal(_) => map_file_service_error(err),
+        })?;
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+
+    // Elevate daemon-side `policy_denied` to a hub-level HTTP 403 with
+    // code `POLICY_DENIED`. Spec mandate: operationally, a refused
+    // path is a different category than a missing file or an I/O
+    // error — the caller can't fix it by retrying / falling back, so
+    // surface it at the HTTP layer where typed-error consumers (the
+    // SDK's `policy_denied` `CloudClientErrorCode`) can branch on it
+    // without having to inspect the JSON envelope. Other daemon-level
+    // errors (`not_found`, `io`, `encoding`, ...) stay inside the
+    // success:false body — those ARE typically things callers want
+    // to handle gracefully.
+    if let Some(ahand_protocol::file_response::Result::Error(file_err)) = &response.result
+        && file_err.code == ahand_protocol::FileErrorCode::PolicyDenied as i32
+    {
+        let message = if file_err.message.is_empty() {
+            format!(
+                "Daemon refused operation by policy on path {}",
+                file_err.path
+            )
+        } else {
+            file_err.message.clone()
+        };
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "POLICY_DENIED",
+            message,
+        ));
+    }
+
+    let envelope =
+        control_files_dto::build_response_envelope(response, &body.operation, duration_ms);
+    Ok(Json(envelope))
 }
