@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import { FileType, type FileEntry } from "@ahandai/proto";
+import { FileType, ImageFormat, type FileEntry } from "@ahandai/proto";
 import {
   FileOpsError,
   listFiles,
@@ -10,7 +10,7 @@ import {
 } from "@/lib/file-ops-client";
 
 interface ViewerState {
-  kind: "text" | "image" | "binary";
+  kind: "text" | "image" | "binary" | "loading";
   path: string;
   text?: string;
   imageSrc?: string;
@@ -57,7 +57,7 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
   const openFile = useCallback(
     async (entryPath: string, entryName: string) => {
       setError(null);
-      setViewer({ kind: "text", path: entryPath, text: "Loading..." });
+      setViewer({ kind: "loading", path: entryPath });
       if (isImage(entryName)) {
         try {
           const r = await readImage(deviceId, { path: entryPath });
@@ -65,10 +65,6 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
           const src = `data:${mime};base64,${uint8ToBase64(r.content)}`;
           setViewer({ kind: "image", path: entryPath, imageSrc: src, imageMime: mime });
         } catch (e) {
-          if (e instanceof FileOpsError && e.code === "FILE_ERROR_CODE_ENCODING") {
-            setViewer({ kind: "binary", path: entryPath });
-            return;
-          }
           setViewer(null);
           setError(toErrorState(e));
         }
@@ -77,12 +73,16 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
       try {
         const r = await readText(deviceId, { path: entryPath });
         const joined = r.lines.map((l) => l.content).join("\n");
-        setViewer({ kind: "text", path: entryPath, text: joined });
-      } catch (e) {
-        if (e instanceof FileOpsError && e.code === "FILE_ERROR_CODE_ENCODING") {
+        // Daemon decodes even binary files via chardetng and returns text,
+        // so a proto-level ENCODING error is never what we want to check.
+        // NUL bytes in the joined string are the strongest client-side signal
+        // that the file is not really text.
+        if (joined.includes("\0")) {
           setViewer({ kind: "binary", path: entryPath });
           return;
         }
+        setViewer({ kind: "text", path: entryPath, text: joined });
+      } catch (e) {
         setViewer(null);
         setError(toErrorState(e));
       }
@@ -158,7 +158,7 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
                 </span>
                 <span className="files-entry-name">{e.name}</span>
                 <span className="files-entry-size">
-                  {e.fileType === FileType.FILE_TYPE_REGULAR ? humanSize(e.size) : ""}
+                  {e.fileType === FileType.FILE_TYPE_FILE ? humanSize(e.size) : ""}
                 </span>
                 <span className="files-entry-time">{formatMtime(e.modifiedMs)}</span>
               </button>
@@ -179,6 +179,9 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
               Close
             </button>
           </div>
+          {viewer.kind === "loading" && (
+            <p className="files-viewer-loading">Loading...</p>
+          )}
           {viewer.kind === "text" && (
             <pre className="files-viewer-text">{viewer.text}</pre>
           )}
@@ -210,7 +213,7 @@ function typeLabel(t: FileType): "DIR" | "FILE" | "LNK" | "OTHER" {
   switch (t) {
     case FileType.FILE_TYPE_DIRECTORY:
       return "DIR";
-    case FileType.FILE_TYPE_REGULAR:
+    case FileType.FILE_TYPE_FILE:
       return "FILE";
     case FileType.FILE_TYPE_SYMLINK:
       return "LNK";
@@ -258,11 +261,11 @@ function isImage(name: string): boolean {
   return /\.(png|jpe?g|gif|webp|bmp|ico|svg)$/i.test(name);
 }
 
-function imageMimeFor(fmt: number): string {
+function imageMimeFor(fmt: ImageFormat): string {
   switch (fmt) {
-    case 1: return "image/jpeg";
-    case 2: return "image/png";
-    case 3: return "image/webp";
+    case ImageFormat.IMAGE_FORMAT_JPEG: return "image/jpeg";
+    case ImageFormat.IMAGE_FORMAT_PNG: return "image/png";
+    case ImageFormat.IMAGE_FORMAT_WEBP: return "image/webp";
     default: return "image/png";
   }
 }
