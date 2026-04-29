@@ -29,7 +29,7 @@
       "format": "date-time"
     },
     "data": {
-      "description": "Event-specific payload. Empty object for online/offline/registered/revoked; carries cadence telemetry for heartbeat.",
+      "description": "Event-specific payload. Carries capabilities array for online/registered; empty object for offline/revoked; carries cadence telemetry for heartbeat.",
       "type": "object"
     }
   },
@@ -52,8 +52,24 @@
           "eventType": {
             "enum": [
               "device.online",
+              "device.registered"
+            ]
+          }
+        },
+        "required": ["eventType"]
+      },
+      "then": {
+        "properties": {
+          "data": { "$ref": "#/$defs/OnlineRegisteredData" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "enum": [
               "device.offline",
-              "device.registered",
               "device.revoked"
             ]
           }
@@ -95,8 +111,25 @@
       "pattern": "^[0-9a-f]{64}$"
     },
 
+    "OnlineRegisteredData": {
+      "description": "Payload for device.online and device.registered events. Contains the daemon-declared capability list from the most recent Hello. The array is always present but may be empty when capabilities are unknown at pre-registration time (admin path). `additionalProperties: true` so future fields don't break existing consumers.",
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["capabilities"],
+      "properties": {
+        "capabilities": {
+          "description": "Daemon-declared capability identifiers (e.g. [\"exec\", \"browser\"]). Empty array when the daemon has not declared capabilities or the event was triggered by the admin pre-register path.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+
     "EmptyData": {
-      "description": "Empty object — emitted for non-heartbeat lifecycle events. Schema is `{}` (no properties allowed).",
+      "description": "Empty object — emitted for offline/revoked lifecycle events. Schema is `{}` (no properties allowed).",
       "type": "object",
       "additionalProperties": false
     },

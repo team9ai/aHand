@@ -12,6 +12,7 @@ pub struct TestStack {
     pub jobs: ahand_hub_store::job_store::PgJobStore,
     pub audit: ahand_hub_store::audit_store::PgAuditStore,
     pub presence: ahand_hub_store::presence_store::RedisPresenceStore,
+    pub outbox: ahand_hub_store::outbox_store::RedisOutboxStore,
     database_url: String,
     redis_url: String,
     _postgres: ManagedContainer,
@@ -52,6 +53,7 @@ impl TestStack {
         let redis_url = format!("redis://127.0.0.1:{redis_port}");
         let redis_connection = ahand_hub_store::redis::connect_redis(&redis_url).await?;
         let presence = ahand_hub_store::presence_store::RedisPresenceStore::new(redis_connection);
+        let outbox = ahand_hub_store::outbox_store::RedisOutboxStore::new(&redis_url).await?;
 
         Ok(Self {
             devices: ahand_hub_store::device_store::PgDeviceStore::with_presence(
@@ -61,6 +63,7 @@ impl TestStack {
             jobs: ahand_hub_store::job_store::PgJobStore::new(postgres_pool.clone()),
             audit: ahand_hub_store::audit_store::PgAuditStore::new(postgres_pool),
             presence,
+            outbox,
             database_url,
             redis_url,
             _postgres: postgres,

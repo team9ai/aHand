@@ -74,3 +74,106 @@ pub trait AuditStore: Send + Sync {
         Ok(0)
     }
 }
+
+// ── Outbox persistence (hub→device durable buffer + multi-replica fencing) ──
+
+/// Wrapper around a [`tokio::task::JoinHandle`] that aborts the underlying
+/// task when dropped. Used by [`KickSubscription`] so downstream impls
+/// don't each have to remember to abort their background reader task.
+pub struct AbortOnDropHandle(tokio::task::JoinHandle<()>);
+
+impl AbortOnDropHandle {
+    pub fn new(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self(handle)
+    }
+}
+
+impl Drop for AbortOnDropHandle {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Subscription handle returned by [`OutboxStore::subscribe_kick`]. The
+/// receiver value increments whenever a kick is published on the device's
+/// channel. Drop releases the underlying Pub/Sub connection and aborts the
+/// background reader task.
+pub struct KickSubscription {
+    pub recv: tokio::sync::watch::Receiver<u64>,
+    pub _drop_guard: AbortOnDropHandle,
+}
+
+/// Per-device durable outbox.
+///
+/// Implementations:
+/// * `RedisOutboxStore` (production) — Redis Streams + Lua scripts + Pub/Sub.
+/// * `InMemoryOutboxStore` (tests, `StoreConfig::Memory`) — in-process state.
+///
+/// All methods are `&self` and async; implementations are expected to be
+/// `Arc`-shared across tasks. `session_id` is a UUID generated per WS
+/// connection and acts as the fencing token: every fenced operation aborts
+/// with [`HubError::Unauthorized`] if the lock value does not match.
+#[async_trait]
+pub trait OutboxStore: Send + Sync + 'static {
+    /// Atomically `SET lock:device:{id} {session_id} NX EX <ttl>`. Returns
+    /// `true` on success, `false` if another session already holds the lock.
+    async fn try_acquire_lock(&self, device_id: &str, session_id: &str) -> Result<bool>;
+
+    /// Best-effort `PUBLISH kick:{device_id} <new_session_id>`. Failures
+    /// are logged but not propagated; the lease will eventually expire.
+    async fn kick(&self, device_id: &str, new_session_id: &str) -> Result<()>;
+
+    /// Subscribe to `kick:{device_id}`. The returned watch receiver ticks
+    /// (value increments) each time a kick arrives.
+    async fn subscribe_kick(&self, device_id: &str) -> Result<KickSubscription>;
+
+    /// Renew lease: Lua-checked `EXPIRE` — only renews if the current value
+    /// equals `session_id`. Returns `false` if the lock was lost.
+    async fn renew_lock(&self, device_id: &str, session_id: &str) -> Result<bool>;
+
+    /// Release lock: Lua-checked `DEL` — only deletes if value matches.
+    /// Idempotent.
+    async fn release_lock(&self, device_id: &str, session_id: &str) -> Result<()>;
+
+    /// Reconcile the per-device seq counter against the device's
+    /// `Hello.last_ack`:
+    ///
+    /// * If `seq:{id} >= last_ack`: trim acked entries with
+    ///   `XTRIM outbox:{id} MINID 0-{last_ack+1}` and return `current_seq`.
+    /// * If `seq:{id} < last_ack`: **bootstrap path** — the device has a
+    ///   higher last_ack than anything the store has ever seen, which is
+    ///   exactly the wedged-after-restart case for fresh deploys carrying
+    ///   this code. Set `seq:{id} = last_ack`, `DEL outbox:{id}`, return
+    ///   `last_ack`.
+    ///
+    /// Both branches keep the keys alive for 30d via `EXPIRE`. The fence
+    /// is checked via the lock script; callers must hold the lock.
+    async fn reconcile_on_hello(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        last_ack: u64,
+    ) -> Result<u64>;
+
+    /// Read all unacked frames for replay: `XRANGE outbox:{id} (0-{last_ack} +`.
+    async fn unacked_frames(&self, device_id: &str, last_ack: u64) -> Result<Vec<Vec<u8>>>;
+
+    /// Reserve the next seq atomically: fence + `INCR seq:{id}`. Returns
+    /// the assigned seq. Callers then mutate `envelope.seq`, encode, and
+    /// call [`Self::xadd_frame`].
+    async fn fenced_incr_seq(&self, device_id: &str, session_id: &str) -> Result<u64>;
+
+    /// Append the encoded frame to the stream: fence + `XADD outbox:{id}
+    /// 0-{seq} frame <bytes>` + `MAXLEN ~ 10000` + `EXPIRE 30d`.
+    async fn xadd_frame(
+        &self,
+        device_id: &str,
+        session_id: &str,
+        seq: u64,
+        frame: Vec<u8>,
+    ) -> Result<()>;
+
+    /// Trim acked frames: `XTRIM outbox:{id} MINID 0-{ack+1}`. Fire-and-forget
+    /// from the caller's perspective; failure is logged but not surfaced.
+    async fn observe_ack(&self, device_id: &str, ack: u64) -> Result<()>;
+}
