@@ -1108,6 +1108,12 @@ input {
 .files-badge-dir {
   color: var(--accent);
 }
+.files-entry-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
 .files-entry-size,
 .files-entry-time {
   color: var(--muted);
