@@ -219,6 +219,9 @@ describe("file-ops-client", () => {
     const decoded = FileRequest.decode(body);
     expect(decoded.delete?.path).toBe("/tmp/a");
     expect(decoded.delete?.recursive).toBe(true);
+    // Default-0 is DELETE_MODE_TRASH on the daemon; the client MUST send
+    // DELETE_MODE_PERMANENT (1) since the UI button says "Delete".
+    expect(decoded.delete?.mode).toBe(1);
   });
 
   it("rejects when the proxy returns 200 with non-protobuf content-type", async () => {

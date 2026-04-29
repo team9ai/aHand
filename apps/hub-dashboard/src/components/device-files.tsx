@@ -27,18 +27,45 @@ interface ErrorState {
   message: string;
 }
 
+interface DebugEntry {
+  id: number;
+  op: string;
+  path: string;
+  latencyMs: number;
+  status: "ok" | "error";
+  detail: string;
+  ts: number;
+}
+
+let debugSeq = 0;
+
 export function DeviceFiles({ deviceId }: { deviceId: string }) {
   const [path, setPath] = useState("/tmp");
   const [entries, setEntries] = useState<FileEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<ErrorState | null>(null);
   const [viewer, setViewer] = useState<ViewerState | null>(null);
+  const [debugLog, setDebugLog] = useState<DebugEntry[]>([]);
+  const [showDebug, setShowDebug] = useState(false);
+
+  const recordDebug = useCallback(
+    (entry: Omit<DebugEntry, "id" | "ts">) => {
+      setDebugLog((prev) => {
+        const next: DebugEntry = { ...entry, id: debugSeq++, ts: Date.now() };
+        // Keep the last 20 entries — enough to eyeball recent activity
+        // without unbounded memory growth on long operator sessions.
+        return [next, ...prev].slice(0, 20);
+      });
+    },
+    [],
+  );
 
   const openDirectory = useCallback(
     async (target: string) => {
       setLoading(true);
       setError(null);
       setViewer(null);
+      const started = performance.now();
       try {
         const result = await listFiles(deviceId, { path: target });
         const sorted = [...result.entries].sort((a, b) => {
@@ -49,29 +76,58 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
         });
         setEntries(sorted);
         setPath(target);
+        recordDebug({
+          op: "list",
+          path: target,
+          latencyMs: Math.round(performance.now() - started),
+          status: "ok",
+          detail: `${result.entries.length} entries`,
+        });
       } catch (e) {
         setEntries(null);
         setError(toErrorState(e));
+        recordDebug({
+          op: "list",
+          path: target,
+          latencyMs: Math.round(performance.now() - started),
+          status: "error",
+          detail: toErrorState(e).code,
+        });
       } finally {
         setLoading(false);
       }
     },
-    [deviceId],
+    [deviceId, recordDebug],
   );
 
   const openFile = useCallback(
     async (entryPath: string, entryName: string) => {
       setError(null);
       setViewer({ kind: "loading", path: entryPath });
+      const started = performance.now();
       if (isImage(entryName)) {
         try {
           const r = await readImage(deviceId, { path: entryPath });
           const mime = imageMimeFor(r.format);
           const src = `data:${mime};base64,${uint8ToBase64(r.content)}`;
           setViewer({ kind: "image", path: entryPath, imageSrc: src, imageMime: mime });
+          recordDebug({
+            op: "read_image",
+            path: entryPath,
+            latencyMs: Math.round(performance.now() - started),
+            status: "ok",
+            detail: `${r.width}x${r.height}, ${r.outputBytes}B`,
+          });
         } catch (e) {
           setViewer(null);
           setError(toErrorState(e));
+          recordDebug({
+            op: "read_image",
+            path: entryPath,
+            latencyMs: Math.round(performance.now() - started),
+            status: "error",
+            detail: toErrorState(e).code,
+          });
         }
         return;
       }
@@ -82,17 +138,32 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
         // so a proto-level ENCODING error is never what we want to check.
         // NUL bytes in the joined string are the strongest client-side signal
         // that the file is not really text.
-        if (joined.includes("\0")) {
-          setViewer({ kind: "binary", path: entryPath });
-          return;
-        }
-        setViewer({ kind: "text", path: entryPath, text: joined });
+        const binary = joined.includes("\0");
+        setViewer(
+          binary
+            ? { kind: "binary", path: entryPath }
+            : { kind: "text", path: entryPath, text: joined },
+        );
+        recordDebug({
+          op: "read_text",
+          path: entryPath,
+          latencyMs: Math.round(performance.now() - started),
+          status: "ok",
+          detail: binary ? "binary (NUL)" : `${r.lines.length} lines`,
+        });
       } catch (e) {
         setViewer(null);
         setError(toErrorState(e));
+        recordDebug({
+          op: "read_text",
+          path: entryPath,
+          latencyMs: Math.round(performance.now() - started),
+          status: "error",
+          detail: toErrorState(e).code,
+        });
       }
     },
-    [deviceId],
+    [deviceId, recordDebug],
   );
 
   const [mkdirName, setMkdirName] = useState<string | null>(null);
@@ -114,39 +185,73 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
     if (!name) return;
     setBusy("mkdir");
     setError(null);
+    const target = joinPath(path, name);
+    const started = performance.now();
     try {
-      await mkdir(deviceId, { path: joinPath(path, name), recursive: true });
+      const r = await mkdir(deviceId, { path: target, recursive: true });
       setMkdirName(null);
       await openDirectory(path);
+      recordDebug({
+        op: "mkdir",
+        path: target,
+        latencyMs: Math.round(performance.now() - started),
+        status: "ok",
+        detail: r.alreadyExisted ? "already existed" : "created",
+      });
     } catch (e) {
       setError(toErrorState(e));
+      recordDebug({
+        op: "mkdir",
+        path: target,
+        latencyMs: Math.round(performance.now() - started),
+        status: "error",
+        detail: toErrorState(e).code,
+      });
     } finally {
       setBusy(null);
     }
-  }, [mkdirName, deviceId, path, openDirectory]);
+  }, [mkdirName, deviceId, path, openDirectory, recordDebug]);
 
   const handleDelete = useCallback(async () => {
     if (!pendingDelete) return;
     const { name, recursive } = pendingDelete;
     setBusy("delete");
     setError(null);
+    const target = joinPath(path, name);
+    const started = performance.now();
     try {
-      await deleteFile(deviceId, { path: joinPath(path, name), recursive });
+      const r = await deleteFile(deviceId, { path: target, recursive });
       setPendingDelete(null);
       await openDirectory(path);
+      recordDebug({
+        op: "delete",
+        path: target,
+        latencyMs: Math.round(performance.now() - started),
+        status: "ok",
+        detail: `${r.itemsDeleted} items`,
+      });
     } catch (e) {
       setError(toErrorState(e));
+      recordDebug({
+        op: "delete",
+        path: target,
+        latencyMs: Math.round(performance.now() - started),
+        status: "error",
+        detail: toErrorState(e).code,
+      });
     } finally {
       setBusy(null);
     }
-  }, [pendingDelete, deviceId, path, openDirectory]);
+  }, [pendingDelete, deviceId, path, openDirectory, recordDebug]);
 
   const handleDownload = useCallback(
     async (name: string) => {
       setBusy(`download:${name}`);
       setError(null);
+      const target = joinPath(path, name);
+      const started = performance.now();
       try {
-        const r = await readBinary(deviceId, { path: joinPath(path, name) });
+        const r = await readBinary(deviceId, { path: target });
         const view = new Uint8Array(r.content);
         const blob = new Blob([view], { type: "application/octet-stream" });
         const url = URL.createObjectURL(blob);
@@ -162,13 +267,27 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
         // Safari drops the download if we revoke synchronously — let the
         // download dialog attach first.
         setTimeout(() => URL.revokeObjectURL(url), 0);
+        recordDebug({
+          op: "download",
+          path: target,
+          latencyMs: Math.round(performance.now() - started),
+          status: "ok",
+          detail: `${r.bytesRead}B${r.remainingBytes > 0 ? ` (+${r.remainingBytes}B left)` : ""}`,
+        });
       } catch (e) {
         setError(toErrorState(e));
+        recordDebug({
+          op: "download",
+          path: target,
+          latencyMs: Math.round(performance.now() - started),
+          status: "error",
+          detail: toErrorState(e).code,
+        });
       } finally {
         setBusy(null);
       }
     },
-    [deviceId, path],
+    [deviceId, path, recordDebug],
   );
 
   const handleUpload = useCallback(
@@ -176,6 +295,12 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
       if (!file) return;
       setBusy("upload");
       setError(null);
+      // Strip any directory separators from the browser-provided filename so
+      // a malicious user-agent can't trick the UI into writing outside the
+      // current directory. The daemon's file_policy is still authoritative,
+      // but the displayed target path should match what actually happens.
+      const target = joinPath(path, basename(file.name));
+      const started = performance.now();
       try {
         if (file.size > MAX_INLINE_WRITE_BYTES) {
           throw new FileOpsError(
@@ -185,22 +310,29 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
           );
         }
         const bytes = new Uint8Array(await file.arrayBuffer());
-        // Strip any directory separators from the browser-provided filename so
-        // a malicious user-agent can't trick the UI into writing outside the
-        // current directory. The daemon's file_policy is still authoritative,
-        // but the displayed target path should match what actually happens.
-        await writeFile(deviceId, {
-          path: joinPath(path, basename(file.name)),
-          content: bytes,
-        });
+        const r = await writeFile(deviceId, { path: target, content: bytes });
         await openDirectory(path);
+        recordDebug({
+          op: "upload",
+          path: target,
+          latencyMs: Math.round(performance.now() - started),
+          status: "ok",
+          detail: `${r.bytesWritten}B written`,
+        });
       } catch (e) {
         setError(toErrorState(e));
+        recordDebug({
+          op: "upload",
+          path: target,
+          latencyMs: Math.round(performance.now() - started),
+          status: "error",
+          detail: toErrorState(e).code,
+        });
       } finally {
         setBusy(null);
       }
     },
-    [deviceId, path, openDirectory],
+    [deviceId, path, openDirectory, recordDebug],
   );
 
   const crumbs = useMemo(() => buildBreadcrumbs(path), [path]);
@@ -250,7 +382,11 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
           >
             New folder
           </button>
-          <label className="files-btn files-upload-label">
+          <label
+            className={`files-btn files-upload-label${
+              busy !== null ? " files-btn-disabled" : ""
+            }`}
+          >
             Upload file
             <input
               type="file"
@@ -393,9 +529,11 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
             className="files-dialog"
             role="dialog"
             aria-modal="true"
-            aria-label={`Delete ${pendingDelete.name}`}
+            aria-labelledby="files-dialog-title"
           >
-            <h3 className="files-dialog-title">Delete {pendingDelete.name}?</h3>
+            <h3 id="files-dialog-title" className="files-dialog-title">
+              Delete {pendingDelete.name}?
+            </h3>
             <label className="files-dialog-option">
               <input
                 type="checkbox"
@@ -429,6 +567,49 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
           </div>
         </div>
       )}
+
+      <div className="files-debug">
+        <button
+          type="button"
+          className="files-btn files-btn-sm"
+          onClick={() => setShowDebug((v) => !v)}
+          aria-expanded={showDebug}
+        >
+          {showDebug ? "Hide" : "Show"} debug ({debugLog.length})
+        </button>
+        {showDebug && (
+          <div className="files-debug-panel" aria-label="Files debug log">
+            {debugLog.length === 0 ? (
+              <div className="files-debug-empty">No ops recorded yet.</div>
+            ) : (
+              <table className="files-debug-table">
+                <thead>
+                  <tr>
+                    <th>When</th>
+                    <th>Op</th>
+                    <th>Path</th>
+                    <th>Latency</th>
+                    <th>Status</th>
+                    <th>Detail</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {debugLog.map((d) => (
+                    <tr key={d.id} className={`files-debug-${d.status}`}>
+                      <td>{formatMtime(d.ts)}</td>
+                      <td>{d.op}</td>
+                      <td className="files-debug-path">{d.path}</td>
+                      <td>{d.latencyMs}ms</td>
+                      <td>{d.status}</td>
+                      <td>{d.detail}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

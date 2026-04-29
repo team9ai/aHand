@@ -465,4 +465,84 @@ describe("DeviceFiles", () => {
 
     clickSpy.mockRestore();
   });
+
+  it("navigates to a parent directory when a breadcrumb is clicked", async () => {
+    // First list: /var/log
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: {
+          entries: [
+            { name: "syslog", fileType: FileType.FILE_TYPE_FILE, size: 0, modifiedMs: 0 },
+          ],
+          totalCount: 1,
+          hasMore: false,
+        },
+      }),
+    );
+    // Second list (after clicking "var" crumb): /var
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: {
+          entries: [
+            { name: "log", fileType: FileType.FILE_TYPE_DIRECTORY, size: 0, modifiedMs: 0 },
+          ],
+          totalCount: 1,
+          hasMore: false,
+        },
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<DeviceFiles deviceId="dev-1" />);
+    await user.clear(screen.getByLabelText(/path/i));
+    await user.type(screen.getByLabelText(/path/i), "/var/log");
+    await user.click(screen.getByRole("button", { name: /^open$/i }));
+    await screen.findByText("syslog");
+
+    // Click the "var" breadcrumb.
+    const nav = screen.getByRole("navigation", { name: /breadcrumbs/i });
+    await user.click(within(nav).getByRole("button", { name: /^var$/i }));
+
+    // After the second fetch resolves, /var's entry ("log") should appear.
+    expect(await screen.findByText("log")).toBeInTheDocument();
+
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    // 2 list calls: /var/log, then /var.
+    expect(fetchMock.mock.calls).toHaveLength(2);
+    const parentBody = fetchMock.mock.calls[1][1].body as Uint8Array;
+    const parentReq = FileRequest.decode(parentBody);
+    expect(parentReq.list?.path).toBe("/var");
+  });
+
+  it("records debug entries for successful ops and exposes them via the panel", async () => {
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: {
+          entries: [
+            { name: "a.txt", fileType: FileType.FILE_TYPE_FILE, size: 0, modifiedMs: 0 },
+          ],
+          totalCount: 1,
+          hasMore: false,
+        },
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<DeviceFiles deviceId="dev-1" />);
+    await user.click(screen.getByRole("button", { name: /^open$/i }));
+    await screen.findByText("a.txt");
+
+    // Debug toggle starts at 1 entry (the list call we just made).
+    const toggle = screen.getByRole("button", { name: /show debug/i });
+    expect(toggle).toHaveTextContent("(1)");
+    await user.click(toggle);
+
+    // Panel shows the operation row.
+    const panel = await screen.findByLabelText(/files debug log/i);
+    expect(within(panel).getByText("list")).toBeInTheDocument();
+    expect(within(panel).getByText(/1 entries/i)).toBeInTheDocument();
+  });
 });

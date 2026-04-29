@@ -24,6 +24,7 @@ export function DeviceTabs({
     <article className="surface-panel device-tabs-panel">
       <div className="device-tabs-header">
         <button
+          type="button"
           className={`device-tab ${tab === "jobs" ? "device-tab-active" : ""}`}
           onClick={() => setTab("jobs")}
         >
@@ -31,6 +32,7 @@ export function DeviceTabs({
         </button>
         {online && (
           <button
+            type="button"
             className={`device-tab ${tab === "terminal" ? "device-tab-active" : ""}`}
             onClick={() => setTab("terminal")}
           >
@@ -39,6 +41,7 @@ export function DeviceTabs({
         )}
         {hasBrowser && (
           <button
+            type="button"
             className={`device-tab ${tab === "browser" ? "device-tab-active" : ""}`}
             onClick={() => setTab("browser")}
           >
@@ -47,6 +50,7 @@ export function DeviceTabs({
         )}
         {online && (
           <button
+            type="button"
             className={`device-tab ${tab === "files" ? "device-tab-active" : ""}`}
             onClick={() => setTab("files")}
           >
