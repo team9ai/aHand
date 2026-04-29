@@ -85,6 +85,7 @@ fn print_check(report: &CheckReport) {
                 tried.join(", ")
             ),
         ),
+        // TODO(task-2): proper failure rendering with ErrorCode-based hints; stub is debug-only
         CheckStatus::Failed { code, message } => (
             "[\u{2717}]",
             format!(
