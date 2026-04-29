@@ -33,6 +33,9 @@ fn make_progress_printer() -> impl Fn(ProgressEvent) + Send + Sync + 'static {
         | Phase::Verifying => {
             println!("  {}", event.message);
         }
+        Phase::Log => {
+            println!("  {}", event.message);
+        }
     }
 }
 
@@ -62,6 +65,9 @@ fn print_summary(reports: &[browser_setup::CheckReport]) {
                     report.label,
                     tried.join(", ")
                 );
+            }
+            CheckStatus::Failed { code, message } => {
+                println!("  {}: failed ({code:?}): {message}", report.label);
             }
         }
     }

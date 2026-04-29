@@ -85,6 +85,13 @@ fn print_check(report: &CheckReport) {
                 tried.join(", ")
             ),
         ),
+        CheckStatus::Failed { code, message } => (
+            "[\u{2717}]",
+            format!(
+                "{:<17} failed ({code:?}): {message}",
+                format!("{}:", report.label)
+            ),
+        ),
     };
     println!("{marker} {line}");
 }

@@ -197,6 +197,7 @@ fn emit(progress: &(dyn Fn(ProgressEvent) + Send + Sync), phase: Phase, message:
         phase,
         message,
         percent: None,
+        stream: None,
     });
 }
 
