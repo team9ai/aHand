@@ -4,9 +4,13 @@ import { useCallback, useMemo, useState } from "react";
 import { FileType, ImageFormat, type FileEntry } from "@ahandai/proto";
 import {
   FileOpsError,
+  deleteFile,
   listFiles,
+  mkdir,
+  readBinary,
   readImage,
   readText,
+  writeFile,
 } from "@/lib/file-ops-client";
 
 interface ViewerState {
@@ -90,6 +94,93 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
     [deviceId],
   );
 
+  const [mkdirName, setMkdirName] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<{ name: string; recursive: boolean } | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const handleMkdir = useCallback(async () => {
+    if (mkdirName === null) return;
+    const name = mkdirName.trim();
+    if (!name) return;
+    setBusy("mkdir");
+    setError(null);
+    try {
+      await mkdir(deviceId, { path: joinPath(path, name), recursive: true });
+      setMkdirName(null);
+      await openDirectory(path);
+    } catch (e) {
+      setError(toErrorState(e));
+    } finally {
+      setBusy(null);
+    }
+  }, [mkdirName, deviceId, path, openDirectory]);
+
+  const handleDelete = useCallback(async () => {
+    if (!pendingDelete) return;
+    const { name, recursive } = pendingDelete;
+    setBusy("delete");
+    setError(null);
+    try {
+      await deleteFile(deviceId, { path: joinPath(path, name), recursive });
+      setPendingDelete(null);
+      await openDirectory(path);
+    } catch (e) {
+      setError(toErrorState(e));
+    } finally {
+      setBusy(null);
+    }
+  }, [pendingDelete, deviceId, path, openDirectory]);
+
+  const handleDownload = useCallback(
+    async (name: string) => {
+      setBusy(`download:${name}`);
+      setError(null);
+      try {
+        const r = await readBinary(deviceId, { path: joinPath(path, name) });
+        const view = new Uint8Array(r.content);
+        const blob = new Blob([view], { type: "application/octet-stream" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = name;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        setError(toErrorState(e));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [deviceId, path],
+  );
+
+  const handleUpload = useCallback(
+    async (file: File | null | undefined) => {
+      if (!file) return;
+      setBusy("upload");
+      setError(null);
+      try {
+        if (file.size > 1_048_576) {
+          throw new FileOpsError(
+            "content_too_large",
+            "Uploads larger than 1 MiB require the S3 path, which is not implemented yet.",
+            0,
+          );
+        }
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        await writeFile(deviceId, { path: joinPath(path, file.name), content: bytes });
+        await openDirectory(path);
+      } catch (e) {
+        setError(toErrorState(e));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [deviceId, path, openDirectory],
+  );
+
   const crumbs = useMemo(() => buildBreadcrumbs(path), [path]);
 
   return (
@@ -128,6 +219,54 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
             </button>
           ))}
         </nav>
+        <div className="files-actions-row">
+          <button
+            type="button"
+            className="files-btn"
+            onClick={() => setMkdirName("")}
+            disabled={busy !== null}
+          >
+            New folder
+          </button>
+          <label className="files-btn files-upload-label">
+            Upload file
+            <input
+              type="file"
+              className="files-upload-input"
+              aria-label="Upload file"
+              onChange={(e) => handleUpload(e.target.files?.[0])}
+            />
+          </label>
+        </div>
+        {mkdirName !== null && (
+          <div className="files-form-row">
+            <label className="files-label" htmlFor="files-mkdir-input">
+              Folder name
+            </label>
+            <input
+              id="files-mkdir-input"
+              className="files-input"
+              value={mkdirName}
+              onChange={(e) => setMkdirName(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleMkdir()}
+            />
+            <button
+              type="button"
+              className="files-btn files-btn-primary"
+              onClick={handleMkdir}
+              disabled={busy === "mkdir"}
+            >
+              Create
+            </button>
+            <button
+              type="button"
+              className="files-btn"
+              onClick={() => setMkdirName(null)}
+            >
+              Cancel
+            </button>
+          </div>
+        )}
       </div>
 
       {error && (
@@ -162,6 +301,28 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
                 </span>
                 <span className="files-entry-time">{formatMtime(e.modifiedMs)}</span>
               </button>
+              <div className="files-entry-actions">
+                {e.fileType === FileType.FILE_TYPE_FILE && (
+                  <button
+                    type="button"
+                    className="files-btn files-btn-sm"
+                    onClick={() => handleDownload(e.name)}
+                    disabled={busy === `download:${e.name}`}
+                    aria-label={`Download ${e.name}`}
+                  >
+                    Download
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="files-btn files-btn-sm files-btn-danger"
+                  onClick={() => setPendingDelete({ name: e.name, recursive: false })}
+                  disabled={busy === "delete"}
+                  aria-label={`Delete ${e.name}`}
+                >
+                  Delete
+                </button>
+              </div>
             </li>
           ))}
         </ul>
@@ -197,6 +358,48 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
               Binary file — use Download to save it locally.
             </p>
           )}
+        </div>
+      )}
+      {pendingDelete && (
+        <div className="files-dialog-backdrop">
+          <div
+            className="files-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Delete ${pendingDelete.name}`}
+          >
+            <h3 className="files-dialog-title">Delete {pendingDelete.name}?</h3>
+            <label className="files-dialog-option">
+              <input
+                type="checkbox"
+                checked={pendingDelete.recursive}
+                onChange={(e) =>
+                  setPendingDelete({
+                    name: pendingDelete.name,
+                    recursive: e.target.checked,
+                  })
+                }
+              />
+              Recursive (delete contents)
+            </label>
+            <div className="files-dialog-actions">
+              <button
+                type="button"
+                className="files-btn"
+                onClick={() => setPendingDelete(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="files-btn files-btn-danger"
+                onClick={handleDelete}
+                disabled={busy === "delete"}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -110,7 +110,7 @@ describe("DeviceFiles", () => {
     const user = userEvent.setup();
     render(<DeviceFiles deviceId="dev-1" />);
     await user.click(screen.getByRole("button", { name: /open/i }));
-    const entry = await screen.findByRole("button", { name: /data\.bin/i });
+    const entry = await screen.findByRole("button", { name: /^file data\.bin$/i });
     await user.click(entry);
 
     expect(await screen.findByText(/binary file/i)).toBeInTheDocument();
@@ -148,11 +148,103 @@ describe("DeviceFiles", () => {
     const user = userEvent.setup();
     render(<DeviceFiles deviceId="dev-1" />);
     await user.click(screen.getByRole("button", { name: /open/i }));
-    const entry = await screen.findByRole("button", { name: /pic\.png/i });
+    const entry = await screen.findByRole("button", { name: /^file pic\.png$/i });
     await user.click(entry);
 
     const img = await screen.findByAltText("/tmp/pic.png");
     expect(img).toBeInstanceOf(HTMLImageElement);
     expect(img.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+  });
+
+  it("creates a new directory via mkdir", async () => {
+    // Initial list: empty dir.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: { entries: [], totalCount: 0, hasMore: false },
+      }),
+    );
+    // mkdir result.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        mkdir: { path: "/tmp/newfolder", alreadyExisted: false },
+      }),
+    );
+    // Re-list after mkdir: newfolder now present.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: {
+          entries: [
+            { name: "newfolder", fileType: FileType.FILE_TYPE_DIRECTORY, size: 0, modifiedMs: 0 },
+          ],
+          totalCount: 1,
+          hasMore: false,
+        },
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<DeviceFiles deviceId="dev-1" />);
+    await user.click(screen.getByRole("button", { name: /^open$/i }));
+    await screen.findByText(/empty directory/i);
+
+    await user.click(screen.getByRole("button", { name: /new folder/i }));
+    const nameInput = await screen.findByLabelText(/folder name/i);
+    await user.type(nameInput, "newfolder");
+    await user.click(screen.getByRole("button", { name: /^create$/i }));
+
+    expect(await screen.findByText("newfolder")).toBeInTheDocument();
+  });
+
+  it("shows a confirm dialog before delete and respects Cancel", async () => {
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: {
+          entries: [
+            { name: "old.txt", fileType: FileType.FILE_TYPE_FILE, size: 3, modifiedMs: 0 },
+          ],
+          totalCount: 1,
+          hasMore: false,
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<DeviceFiles deviceId="dev-1" />);
+    await user.click(screen.getByRole("button", { name: /^open$/i }));
+    await screen.findByText("old.txt");
+
+    await user.click(screen.getByRole("button", { name: /^delete old\.txt$/i }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent(/delete/i);
+    expect(screen.getByLabelText(/recursive/i)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /^cancel$/i }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // Only the initial list fetch — no delete call.
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+  });
+
+  it("rejects uploads larger than 1 MiB without calling the network", async () => {
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: { entries: [], totalCount: 0, hasMore: false },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<DeviceFiles deviceId="dev-1" />);
+    await user.click(screen.getByRole("button", { name: /^open$/i }));
+    await screen.findByText(/empty directory/i);
+
+    const big = new File([new Uint8Array(1_048_577)], "big.bin", { type: "application/octet-stream" });
+    const uploadInput = screen.getByLabelText(/upload file/i) as HTMLInputElement;
+    await user.upload(uploadInput, big);
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/S3/i);
+    expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
   });
 });
