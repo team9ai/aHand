@@ -279,6 +279,7 @@ fn emit(progress: &(dyn Fn(ProgressEvent) + Send + Sync), phase: Phase, message:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
 
@@ -286,6 +287,7 @@ mod tests {
     // spawn_npm_with_progress tests
     // ---------------------------------------------------------------------------
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_npm_install_forwards_stdout_stderr_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -353,6 +355,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_npm_install_surfaces_nonzero_exit_in_bail() {
         let dir = tempfile::tempdir().unwrap();
