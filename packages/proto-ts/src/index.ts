@@ -51,13 +51,6 @@ export {
   FileMkdir,
   FileMkdirResult,
   ImageFormat,
-  DeleteMode,
   WriteAction,
   fileErrorCodeToJSON,
-  fileTypeToJSON,
-} from "./generated/ahand/v1/file_ops.ts";
-
-export type {
-  FileRequest as FileRequestMsg,
-  FileResponse as FileResponseMsg,
 } from "./generated/ahand/v1/file_ops.ts";
