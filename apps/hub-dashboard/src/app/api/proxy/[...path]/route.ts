@@ -47,3 +47,46 @@ export async function GET(
     headers: response.headers,
   });
 }
+
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> },
+) {
+  const { path } = await params;
+  const session = request.cookies.get("ahand_hub_session")?.value ?? "";
+  const baseUrl = process.env.AHAND_HUB_BASE_URL;
+
+  if (!session) {
+    return dashboardErrorResponse("unauthorized", "Sign in required.", 401);
+  }
+
+  if (!baseUrl) {
+    return dashboardErrorResponse("hub_unavailable", "Unable to reach the hub right now.", 503);
+  }
+
+  const upstream = new URL(path.join("/"), `${baseUrl.replace(/\/?$/, "/")}`);
+  upstream.search = request.nextUrl.search;
+
+  let response: Response;
+  try {
+    const bodyBuffer = await request.arrayBuffer();
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${session}`,
+      "content-type": request.headers.get("content-type") ?? "application/octet-stream",
+      accept: request.headers.get("accept") ?? "application/octet-stream",
+    };
+    response = await fetch(upstream.toString(), {
+      method: "POST",
+      headers,
+      body: bodyBuffer,
+      cache: "no-store",
+    });
+  } catch {
+    return dashboardErrorResponse("hub_unavailable", "Unable to reach the hub right now.", 503);
+  }
+
+  return new NextResponse(response.body, {
+    status: response.status,
+    headers: response.headers,
+  });
+}
