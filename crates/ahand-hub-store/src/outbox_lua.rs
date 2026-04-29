@@ -48,7 +48,7 @@ pub const RECONCILE_ON_HELLO: &str = r#"
 -- ARGV[2] = last_ack (decimal)
 -- ARGV[3] = retention_secs
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-  return redis.error_reply('NOT_OWNER')
+  return redis.error_reply('NOT_OWNER stale session')
 end
 local current = tonumber(redis.call('GET', KEYS[2])) or 0
 local last_ack = tonumber(ARGV[2])
@@ -70,7 +70,7 @@ pub const FENCED_INCR_SEQ: &str = r#"
 -- ARGV[1] = session_id
 -- ARGV[2] = retention_secs
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-  return redis.error_reply('NOT_OWNER')
+  return redis.error_reply('NOT_OWNER stale session')
 end
 local seq = redis.call('INCR', KEYS[2])
 redis.call('EXPIRE', KEYS[2], ARGV[2])
@@ -86,7 +86,7 @@ pub const FENCED_XADD: &str = r#"
 -- ARGV[4] = max_buffer (decimal)
 -- ARGV[5] = retention_secs
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
-  return redis.error_reply('NOT_OWNER')
+  return redis.error_reply('NOT_OWNER stale session')
 end
 local id = '0-' .. ARGV[2]
 redis.call('XADD', KEYS[2], 'MAXLEN', '~', ARGV[4], id, 'frame', ARGV[3])
@@ -137,6 +137,18 @@ impl OutboxScripts {
             fenced_incr_seq: Script::new(FENCED_INCR_SEQ),
             fenced_xadd: Script::new(FENCED_XADD),
             bounded_observe_ack: Script::new(BOUNDED_OBSERVE_ACK),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn not_owner_errors_use_custom_code_with_detail() {
+        for script in [RECONCILE_ON_HELLO, FENCED_INCR_SEQ, FENCED_XADD] {
+            assert!(script.contains("redis.error_reply('NOT_OWNER "));
         }
     }
 }

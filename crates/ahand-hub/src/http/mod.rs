@@ -10,6 +10,7 @@ pub mod api_error;
 pub mod audit;
 pub mod auth;
 pub mod browser;
+pub mod control_files_dto;
 pub mod control_plane;
 pub mod devices;
 pub mod files;

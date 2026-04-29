@@ -116,7 +116,7 @@ async fn pre_register(
     // correctness problem.
     if let Err(err) = state
         .webhook
-        .enqueue_registered(&device.id, Some(&req.external_user_id))
+        .enqueue_registered(&device.id, Some(&req.external_user_id), &[])
         .await
     {
         tracing::warn!(
