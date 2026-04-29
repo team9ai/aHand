@@ -63,7 +63,10 @@ fn redis_err(err: redis::RedisError) -> HubError {
 }
 
 fn map_redis_err(err: redis::RedisError) -> HubError {
-    if err.code() == Some("NOT_OWNER") {
+    let not_owner_detail = err
+        .detail()
+        .is_some_and(|detail| detail == "NOT_OWNER" || detail.starts_with("NOT_OWNER "));
+    if err.code() == Some("NOT_OWNER") || not_owner_detail {
         HubError::Unauthorized
     } else {
         HubError::Internal(err.to_string())
@@ -258,5 +261,21 @@ impl OutboxStore for RedisOutboxStore {
             .await
             .map_err(redis_err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_not_owner_response_detail_to_unauthorized() {
+        let err = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "NOT_OWNER".to_string(),
+        ));
+
+        assert!(matches!(map_redis_err(err), HubError::Unauthorized));
     }
 }
