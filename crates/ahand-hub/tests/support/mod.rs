@@ -213,7 +213,7 @@ pub async fn test_state_with_browser_device() -> AppState {
             ),
             hostname: "seeded-device".into(),
             os: "linux".into(),
-            capabilities: vec!["exec".into(), "browser".into()],
+            capabilities: vec!["exec".into(), "browser-playwright-cli".into()],
             version: Some("0.1.2".into()),
             auth_method: "ed25519".into(),
             external_user_id: None,
@@ -726,7 +726,7 @@ pub fn signed_hello_with_browser(device_id: &str, challenge_nonce: &[u8]) -> Env
         version: "0.1.2".into(),
         hostname: "devbox".into(),
         os: "linux".into(),
-        capabilities: vec!["exec".into(), "browser".into()],
+        capabilities: vec!["exec".into(), "browser-playwright-cli".into()],
         last_ack: 0,
         auth: None,
     };

@@ -1,3 +1,22 @@
+//! DEPRECATED (temporarily retained).
+//!
+//! This endpoint was designed to let the hub proxy browser-automation
+//! requests to a device's ahandd directly, over a dedicated control-
+//! plane path. As of 2026-04-29, the team9 platform switched to a
+//! simpler model: agents drive browsers by calling `playwright-cli`
+//! via the standard `run_command` shell tool, guided by an injected
+//! SKILL.md (see the `browser-playwright-cli` skill folder in
+//! team9-agent-pi). The `browser-playwright-cli` device capability
+//! (reported by ahandd when `[browser].enabled = true`) signals that
+//! the device has playwright-cli installed; agents should interpret
+//! that as "you can shell out to playwright-cli", not as "you should
+//! call /api/control/browser".
+//!
+//! This endpoint is kept only to unblock a future, non-playwright-cli
+//! browser backend (e.g. native WebView / chromedp) that may benefit
+//! from a direct control-plane path. Do NOT add new callers here
+//! without revisiting that decision.
+
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, State};
 use axum::http::StatusCode;

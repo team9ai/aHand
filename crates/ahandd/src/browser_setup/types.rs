@@ -22,6 +22,13 @@ pub enum CheckStatus {
     },
     /// Applies to the browser check: none of the known browsers were found.
     NoneDetected { tried: Vec<String> },
+    /// An install step ran and failed. Only produced by the mutating
+    /// (`run_all` / `run_step`) paths; `inspect_*` never returns this.
+    Failed {
+        code: ErrorCode,
+        /// Full `anyhow::Error` stringification — for the log drawer.
+        message: String,
+    },
 }
 
 /// Where a detected component comes from.
@@ -73,7 +80,11 @@ pub struct ProgressEvent {
     pub phase: Phase,
     pub message: String,
     /// Percent complete (0-100), only populated for measurable operations.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub percent: Option<u8>,
+    /// Set when `phase == Log`, absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<LogStream>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -85,6 +96,44 @@ pub enum Phase {
     Installing,
     Verifying,
     Done,
+    /// A raw log line from the running step. Check `ProgressEvent.stream`
+    /// to disambiguate stdout / stderr / synthesized info messages.
+    /// `message` carries the line content (no trailing newline);
+    /// `percent` is always `None`.
+    Log,
+}
+
+/// Which stream a log line originated from. `Info` is synthesized by
+/// Rust code; `Stdout`/`Stderr` are forwarded verbatim from child
+/// processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+    Info,
+}
+
+/// Machine-readable classification of an install-step failure.
+/// Attached to `CheckStatus::Failed` (and to the terminal
+/// `ProgressEvent` for the failing step) so the UI can pick a
+/// targeted help popover without pattern-matching English prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    /// npm / install path returned EACCES. Remedy: chown / sudo.
+    PermissionDenied,
+    /// npm / download could not reach the registry.
+    Network,
+    /// No Chrome / Edge detected on the system.
+    NoSystemBrowser,
+    /// Node.js / npm not on PATH. Remedy: run the node step first.
+    NodeMissing,
+    /// Installed version did not match the pinned playwright-cli
+    /// version. Remedy: retry with `force=true`.
+    VersionMismatch,
+    /// Catch-all for unclassified install errors.
+    Unknown,
 }
 
 /// A detected system browser.
@@ -157,6 +206,7 @@ mod tests {
             phase: Phase::Downloading,
             message: "Downloading tarball".into(),
             percent: Some(42),
+            stream: None,
         };
         let actual = serde_json::to_value(&event).unwrap();
         assert_eq!(
@@ -175,6 +225,111 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&BrowserKind::Edge).unwrap(),
             json!("edge")
+        );
+    }
+
+    #[test]
+    fn progress_event_serializes_log_phase_with_stream() {
+        let event = ProgressEvent {
+            step: "playwright",
+            phase: Phase::Log,
+            message: "npm warn deprecated foo@1.2.3".into(),
+            percent: None,
+            stream: Some(LogStream::Stderr),
+        };
+        let actual = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            actual,
+            json!({
+                "step": "playwright",
+                "phase": "log",
+                "message": "npm warn deprecated foo@1.2.3",
+                "stream": "stderr"
+            })
+        );
+    }
+
+    #[test]
+    fn progress_event_omits_stream_when_none() {
+        let event = ProgressEvent {
+            step: "node",
+            phase: Phase::Starting,
+            message: "Starting Node install".into(),
+            percent: None,
+            stream: None,
+        };
+        let actual = serde_json::to_value(&event).unwrap();
+        assert!(
+            actual.as_object().unwrap().get("stream").is_none(),
+            "stream field should be absent when None: {actual}"
+        );
+    }
+
+    #[test]
+    fn progress_event_omits_percent_when_none() {
+        let event = ProgressEvent {
+            step: "node",
+            phase: Phase::Done,
+            message: "".into(),
+            percent: None,
+            stream: None,
+        };
+        let actual = serde_json::to_value(&event).unwrap();
+        assert!(
+            actual.as_object().unwrap().get("percent").is_none(),
+            "percent field should be absent when None: {actual}"
+        );
+    }
+
+    #[test]
+    fn log_stream_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(LogStream::Stdout).unwrap(),
+            json!("stdout")
+        );
+        assert_eq!(
+            serde_json::to_value(LogStream::Stderr).unwrap(),
+            json!("stderr")
+        );
+        assert_eq!(
+            serde_json::to_value(LogStream::Info).unwrap(),
+            json!("info")
+        );
+    }
+
+    #[test]
+    fn error_code_serializes_each_variant() {
+        let cases = [
+            (ErrorCode::PermissionDenied, "permission_denied"),
+            (ErrorCode::Network, "network"),
+            (ErrorCode::NoSystemBrowser, "no_system_browser"),
+            (ErrorCode::NodeMissing, "node_missing"),
+            (ErrorCode::VersionMismatch, "version_mismatch"),
+            (ErrorCode::Unknown, "unknown"),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(variant).unwrap(),
+                json!(expected),
+                "variant {variant:?} should serialize as {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_status_failed_serializes_with_tag() {
+        let status = CheckStatus::Failed {
+            code: ErrorCode::PermissionDenied,
+            message: "EACCES: /foo/bar".into(),
+        };
+        let actual = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            actual,
+            json!({
+                "kind": "failed",
+                "code": "permission_denied",
+                "message": "EACCES: /foo/bar"
+            })
         );
     }
 }

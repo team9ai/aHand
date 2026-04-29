@@ -374,6 +374,66 @@ impl Config {
         Ok(())
     }
 
+    /// Toggle the `[browser].enabled` flag in memory and persist to `path`.
+    /// Returns the *previous* value (`false` when `[browser]` or
+    /// `[browser].enabled` was absent). Writes atomically: content goes
+    /// to `{path}.tmp`, then `rename` into place. All other fields on
+    /// `BrowserConfig` and all sibling sections are preserved.
+    pub fn set_browser_enabled(&mut self, path: &Path, enabled: bool) -> anyhow::Result<bool> {
+        // Resolve previous value. None (section absent) and Some(false)
+        // both collapse to `false` — matching the consumer intuition
+        // that "unset == off".
+        let prev = self
+            .browser
+            .as_ref()
+            .and_then(|bc| bc.enabled)
+            .unwrap_or(false);
+
+        // Mutate in memory. Insert a default BrowserConfig if missing.
+        let bc = self.browser.get_or_insert_with(BrowserConfig::default);
+        bc.enabled = Some(enabled);
+
+        // Atomic write: serialize, write-to-tmp, rename.
+        self.save_atomic(path)?;
+        Ok(prev)
+    }
+
+    /// Serialize to `{path}.tmp`, fsync, rename to `path`. Leaves no
+    /// `.tmp` file behind on success; best-effort cleanup on failure.
+    fn save_atomic(&self, path: &Path) -> anyhow::Result<()> {
+        let tmp_path = path.with_extension(
+            path.extension()
+                .map(|e| format!("{}.tmp", e.to_string_lossy()))
+                .unwrap_or_else(|| "tmp".into()),
+        );
+        let content = toml::to_string_pretty(self)?;
+
+        // Write + fsync the temp file
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp_path)
+                .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", tmp_path.display()))?;
+            f.write_all(content.as_bytes())
+                .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", tmp_path.display()))?;
+            f.sync_all()
+                .map_err(|e| anyhow::anyhow!("failed to fsync {}: {e}", tmp_path.display()))?;
+        }
+
+        // Rename (atomic on POSIX; on Windows `rename` fails if target exists,
+        // so on Windows we'd need a different strategy — but ahandd is
+        // Unix-only for now, so this is sufficient).
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            // Best-effort cleanup of the tmp file
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(anyhow::anyhow!(
+                "failed to rename {} → {}: {e}",
+                tmp_path.display(),
+                path.display(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn device_id(&self) -> String {
         self.device_id.clone().unwrap_or_else(uuid_v4)
     }
@@ -474,7 +534,10 @@ mod tilde_tests {
     fn expand_tilde_with_no_home_dir_passes_non_tilde_patterns_through() {
         // Patterns without a leading tilde shouldn't care whether HOME is
         // set — they're absolute or relative and need no expansion.
-        assert_eq!(expand_tilde_with("/etc/passwd", None).unwrap(), "/etc/passwd");
+        assert_eq!(
+            expand_tilde_with("/etc/passwd", None).unwrap(),
+            "/etc/passwd"
+        );
         assert_eq!(expand_tilde_with("./rel", None).unwrap(), "./rel");
         assert_eq!(
             expand_tilde_with("/tmp/~backup", None).unwrap(),
@@ -614,9 +677,136 @@ path_allowlist = ["/etc/passwd", "/var/log/**"]
         let err = Config::load(&path).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.to_lowercase().contains("no such file")
-                || msg.to_lowercase().contains("not found"),
+            msg.to_lowercase().contains("no such file") || msg.to_lowercase().contains("not found"),
             "expected NotFound IO error, got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_browser_enabled_true_then_false_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Start with a minimal valid config
+        std::fs::write(
+            &path,
+            r#"
+[hub]
+bootstrap_token = "tok-abc123"
+        "#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.browser_config().enabled, None);
+
+        // Flip on
+        let prev = cfg.set_browser_enabled(&path, true).unwrap();
+        assert!(
+            !prev,
+            "previous value before set: Option::None maps to false"
+        );
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.browser_config().enabled, Some(true));
+
+        // Hub section preserved
+        assert_eq!(
+            reloaded
+                .hub
+                .as_ref()
+                .and_then(|h| h.bootstrap_token.as_deref()),
+            Some("tok-abc123")
+        );
+
+        // Flip off
+        let mut cfg2 = reloaded;
+        let prev2 = cfg2.set_browser_enabled(&path, false).unwrap();
+        assert!(prev2);
+        let reloaded2 = Config::load(&path).unwrap();
+        assert_eq!(reloaded2.browser_config().enabled, Some(false));
+    }
+
+    #[test]
+    fn set_browser_enabled_preserves_sibling_browser_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(
+            &path,
+            r#"
+[browser]
+binary_path = "/custom/playwright-cli"
+default_timeout_ms = 45000
+allowed_domains = ["example.com", "example.org"]
+        "#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.browser_config().enabled, None);
+
+        cfg.set_browser_enabled(&path, true).unwrap();
+
+        let reloaded = Config::load(&path).unwrap();
+        let bc = reloaded.browser_config();
+        assert_eq!(bc.enabled, Some(true));
+        assert_eq!(bc.binary_path.as_deref(), Some("/custom/playwright-cli"));
+        assert_eq!(bc.default_timeout_ms, Some(45000));
+        assert_eq!(bc.allowed_domains, vec!["example.com", "example.org"]);
+    }
+
+    #[test]
+    fn set_browser_enabled_inserts_section_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Config with no [browser] section at all
+        std::fs::write(&path, "[hub]\nurl = \"https://hub.example.com\"\n").unwrap();
+
+        let mut cfg = Config::load(&path).unwrap();
+        assert!(cfg.browser.is_none(), "precondition: no browser section");
+
+        let prev = cfg.set_browser_enabled(&path, true).unwrap();
+        assert!(!prev);
+
+        let reloaded = Config::load(&path).unwrap();
+        assert!(reloaded.browser.is_some());
+        assert_eq!(reloaded.browser_config().enabled, Some(true));
+    }
+
+    #[test]
+    fn set_browser_enabled_no_op_still_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[browser]\nenabled = true\n").unwrap();
+
+        let mut cfg = Config::load(&path).unwrap();
+        let prev = cfg.set_browser_enabled(&path, true).unwrap();
+        assert!(prev);
+        // File still exists, contains enabled=true
+        assert!(path.exists());
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.browser_config().enabled, Some(true));
+    }
+
+    #[test]
+    fn set_browser_enabled_atomic_no_tmp_leaks_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "").unwrap();
+
+        let mut cfg = Config::load(&path).unwrap();
+        cfg.set_browser_enabled(&path, true).unwrap();
+
+        let tmp_path = dir.path().join("config.toml.tmp");
+        assert!(
+            !tmp_path.exists(),
+            "tmp file should not be left behind after successful write"
         );
     }
 }
