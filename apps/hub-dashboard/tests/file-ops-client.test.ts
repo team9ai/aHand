@@ -138,8 +138,7 @@ describe("file-ops-client", () => {
   });
 
   it("readText returns decoded text lines", async () => {
-    const { readText } = await import("@/lib/file-ops-client");
-    respondWith(
+respondWith(
       FileResponse.fromPartial({
         requestId: "r",
         readText: {
@@ -161,8 +160,7 @@ describe("file-ops-client", () => {
   });
 
   it("readBinary returns bytes payload", async () => {
-    const { readBinary } = await import("@/lib/file-ops-client");
-    const payload = new Uint8Array([1, 2, 3, 4]);
+const payload = new Uint8Array([1, 2, 3, 4]);
     respondWith(
       FileResponse.fromPartial({
         requestId: "r",
@@ -181,8 +179,7 @@ describe("file-ops-client", () => {
   });
 
   it("readImage returns image content and format", async () => {
-    const { readImage } = await import("@/lib/file-ops-client");
-    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
     respondWith(
       FileResponse.fromPartial({
         requestId: "r",
@@ -203,8 +200,7 @@ describe("file-ops-client", () => {
   });
 
   it("deleteFile sends a FileDelete request with recursive flag and decodes result", async () => {
-    const { deleteFile } = await import("@/lib/file-ops-client");
-    respondWith(
+respondWith(
       FileResponse.fromPartial({
         requestId: "r",
         delete: { path: "/tmp/a", mode: 0, itemsDeleted: 1 },
