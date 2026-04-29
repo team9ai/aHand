@@ -92,6 +92,10 @@ pub async fn inspect(name: &str) -> Option<CheckReport> {
 }
 
 /// Run all install steps. `force` reinstalls even if already present.
+///
+/// **Progress-callback note:** `Phase::Done` is emitted even on failure
+/// (see `wrap_failure`); use the `Result` return value, not the callback,
+/// to determine success.
 pub async fn run_all(
     force: bool,
     progress: impl Fn(ProgressEvent) + Send + Sync + 'static,
@@ -121,6 +125,10 @@ pub async fn run_all(
 
 /// Run a single install step. Valid names: `node`, `playwright`.
 /// Returns an error for `playwright` if Node is not already installed.
+///
+/// **Progress-callback note:** `Phase::Done` is emitted even on failure
+/// (see `wrap_failure`); use the `Result` return value, not the callback,
+/// to determine success.
 pub async fn run_step(
     name: &str,
     force: bool,
@@ -158,6 +166,12 @@ pub async fn run_step(
 /// Build a `FailedStepReport`, emit a terminal `ProgressEvent::Done`, and
 /// attach the report to the error via `.context(...)`. Called by
 /// `run_all` / `run_step` on any `ensure()` failure.
+///
+/// `Phase::Done` is emitted here on the failure path as well as in
+/// `node::ensure` / `playwright::ensure` on success. Progress-callback
+/// consumers CANNOT infer success vs. failure from the `Done` event alone
+/// — they must inspect the `Result` from `run_all` / `run_step`. Use
+/// `err.downcast_ref::<FailedStepReport>()` to get the classified report.
 fn wrap_failure(
     err: anyhow::Error,
     name: &'static str,
