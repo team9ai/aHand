@@ -108,7 +108,7 @@ async fn online_event_serializes_capabilities() {
     let (webhook, handle) = Webhook::new(store.clone(), noop_config());
     drop(handle);
 
-    let caps = vec!["exec".to_string(), "browser".to_string()];
+    let caps = vec!["exec".to_string(), "browser-playwright-cli".to_string()];
     webhook
         .enqueue_online("device-1", Some("user-1"), &caps)
         .await
@@ -120,7 +120,7 @@ async fn online_event_serializes_capabilities() {
     assert_eq!(payload.event_type, "device.online");
     assert_eq!(
         payload.data["capabilities"],
-        serde_json::json!(["exec", "browser"])
+        serde_json::json!(["exec", "browser-playwright-cli"])
     );
 }
 
@@ -131,7 +131,7 @@ async fn registered_event_serializes_capabilities() {
     let (webhook, handle) = Webhook::new(store.clone(), noop_config());
     drop(handle);
 
-    let caps = vec!["exec".to_string(), "browser".to_string()];
+    let caps = vec!["exec".to_string(), "browser-playwright-cli".to_string()];
     webhook
         .enqueue_registered("device-2", Some("user-2"), &caps)
         .await
@@ -143,7 +143,7 @@ async fn registered_event_serializes_capabilities() {
     assert_eq!(payload.event_type, "device.registered");
     assert_eq!(
         payload.data["capabilities"],
-        serde_json::json!(["exec", "browser"])
+        serde_json::json!(["exec", "browser-playwright-cli"])
     );
 }
 

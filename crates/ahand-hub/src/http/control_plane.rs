@@ -567,21 +567,24 @@ impl IntoResponse for ControlError {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// `POST /api/control/browser` — synchronous worker-side browser command.
+// `POST /api/control/browser` — DEPRECATED (temporarily retained).
 //
-// Wire-format twin of the dashboard `POST /api/browser` handler with
-// two differences:
-//   1. Auth is via control-plane JWT (mounted under the same middleware
-//      that protects `/api/control/jobs`), and ownership is checked
-//      against `claims.external_user_id == device.external_user_id`.
-//   2. The response includes a `duration_ms` field measuring elapsed
-//      time from request start to service return — the SDK surfaces
-//      this so callers can observe round-trip latency.
+// This endpoint was designed to let the hub proxy browser-automation
+// requests to a device's ahandd directly, over a dedicated control-
+// plane path. As of 2026-04-29, the team9 platform switched to a
+// simpler model: agents drive browsers by calling `playwright-cli`
+// via the standard `run_command` shell tool, guided by an injected
+// SKILL.md (see the `browser-playwright-cli` skill folder in
+// team9-agent-pi). The `browser-playwright-cli` device capability
+// (reported by ahandd when `[browser].enabled = true`) signals that
+// the device has playwright-cli installed; agents should interpret
+// that as "you can shell out to playwright-cli", not as "you should
+// call /api/control/browser".
 //
-// Both endpoints share `browser_service::execute()` (refactored in
-// Task 8) and the same error mapper `http::browser::map_service_error`,
-// so error codes and HTTP statuses are byte-for-byte identical to the
-// dashboard endpoint.
+// This endpoint is kept only to unblock a future, non-playwright-cli
+// browser backend (e.g. native WebView / chromedp) that may benefit
+// from a direct control-plane path. Do NOT add new callers here
+// without revisiting that decision.
 // ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]

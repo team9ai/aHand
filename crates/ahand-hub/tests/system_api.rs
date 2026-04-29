@@ -197,7 +197,7 @@ async fn create_device_preregisters_device_and_returns_bootstrap_data() {
                 "id": "device-9",
                 "hostname": "edge-box",
                 "os": "linux",
-                "capabilities": ["exec", "browser"],
+                "capabilities": ["exec", "browser-playwright-cli"],
                 "version": "0.1.2"
             }),
         )
@@ -310,7 +310,7 @@ async fn device_token_can_read_only_its_own_device_record() {
             public_key: None,
             hostname: "edge-box".into(),
             os: "linux".into(),
-            capabilities: vec!["exec".into(), "browser".into()],
+            capabilities: vec!["exec".into(), "browser-playwright-cli".into()],
             version: Some("0.1.2".into()),
             auth_method: "bootstrap".into(),
             external_user_id: None,
@@ -406,7 +406,7 @@ async fn create_device_rejects_duplicate_device_ids() {
                 "id": "device-9",
                 "hostname": "replacement-box",
                 "os": "linux",
-                "capabilities": ["browser"],
+                "capabilities": ["browser-playwright-cli"],
                 "version": "9.9.9"
             }),
         )

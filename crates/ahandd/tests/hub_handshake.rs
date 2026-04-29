@@ -52,8 +52,11 @@ async fn build_hello_envelope_includes_file_capability_when_enabled() {
         payload.capabilities
     );
     assert!(
-        !payload.capabilities.iter().any(|c| c == "browser"),
-        "capabilities must NOT contain 'browser' when browser_enabled=false"
+        !payload
+            .capabilities
+            .iter()
+            .any(|c| c == "browser-playwright-cli"),
+        "capabilities must NOT contain 'browser-playwright-cli' when browser_enabled=false"
     );
 }
 
