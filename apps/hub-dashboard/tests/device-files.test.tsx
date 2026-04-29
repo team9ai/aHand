@@ -40,7 +40,7 @@ describe("DeviceFiles", () => {
         requestId: "r",
         list: {
           entries: [
-            { name: "readme.txt", fileType: FileType.FILE_TYPE_REGULAR, size: 12, modifiedMs: 0 },
+            { name: "readme.txt", fileType: FileType.FILE_TYPE_FILE, size: 12, modifiedMs: 0 },
             { name: "src", fileType: FileType.FILE_TYPE_DIRECTORY, size: 0, modifiedMs: 0 },
           ],
           totalCount: 2,

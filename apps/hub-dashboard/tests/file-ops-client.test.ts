@@ -42,7 +42,7 @@ describe("file-ops-client", () => {
           entries: [
             {
               name: "hello.txt",
-              fileType: FileType.FILE_TYPE_REGULAR,
+              fileType: FileType.FILE_TYPE_FILE,
               size: 42,
               modifiedMs: 1_700_000_000_000,
             },
