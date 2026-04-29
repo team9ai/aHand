@@ -66,6 +66,40 @@ describe("POST /api/proxy/*", () => {
     expect(response.headers.get("content-type")).toBe("application/x-protobuf");
   });
 
+  it("strips upstream set-cookie from the proxied response", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(new Uint8Array([0x01]), {
+        status: 200,
+        headers: {
+          "content-type": "application/x-protobuf",
+          "set-cookie": "hub_plant=evil; Path=/; HttpOnly",
+        },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { POST: proxyPost } = await import("@/app/api/proxy/[...path]/route");
+    const request = new NextRequest(
+      "http://localhost/api/proxy/api/devices/dev-1/files",
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-protobuf",
+          cookie: "ahand_hub_session=session-token",
+        },
+        body: new Uint8Array([0x00]),
+      },
+    );
+
+    const response = await proxyPost(request, {
+      params: Promise.resolve({ path: ["api", "devices", "dev-1", "files"] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toBeNull();
+    expect(response.headers.get("content-type")).toBe("application/x-protobuf");
+  });
+
   it("returns 401 JSON envelope when session cookie is missing", async () => {
     const { POST: proxyPost } = await import("@/app/api/proxy/[...path]/route");
     const request = new NextRequest("http://localhost/api/proxy/api/devices/x/files", {

@@ -85,8 +85,18 @@ export async function POST(
     return dashboardErrorResponse("hub_unavailable", "Unable to reach the hub right now.", 503);
   }
 
+  // Allowlist upstream response headers to avoid silently relaying
+  // set-cookie or other sensitive headers onto the dashboard origin.
+  // GET deliberately keeps full passthrough because SSE resume needs it;
+  // POST is a mutation path where a leaked Set-Cookie would be a silent
+  // session-injection primitive.
+  const forwardedHeaders = new Headers();
+  for (const key of ["content-type", "content-length", "cache-control", "etag"]) {
+    const value = response.headers.get(key);
+    if (value) forwardedHeaders.set(key, value);
+  }
   return new NextResponse(response.body, {
     status: response.status,
-    headers: response.headers,
+    headers: forwardedHeaders,
   });
 }
