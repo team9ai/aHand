@@ -1,6 +1,6 @@
 {
   "name": "@ahandai/proto",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "ts-proto generated types for ahand protocol",
   "type": "module",
   "main": "dist/index.js",
