@@ -4,6 +4,7 @@ import { useState } from "react";
 import { DeviceJobsPanel } from "./device-jobs-panel";
 import { DeviceTerminal } from "./device-terminal";
 import { DeviceBrowser } from "./device-browser";
+import { DeviceFiles } from "./device-files";
 
 export function DeviceTabs({
   deviceId,
@@ -15,7 +16,7 @@ export function DeviceTabs({
   capabilities: string[];
 }) {
   const hasBrowser = online && capabilities.includes("browser");
-  const [tab, setTab] = useState<"jobs" | "terminal" | "browser">(
+  const [tab, setTab] = useState<"jobs" | "terminal" | "browser" | "files">(
     hasBrowser ? "browser" : online ? "terminal" : "jobs",
   );
 
@@ -44,6 +45,14 @@ export function DeviceTabs({
             Browser
           </button>
         )}
+        {online && (
+          <button
+            className={`device-tab ${tab === "files" ? "device-tab-active" : ""}`}
+            onClick={() => setTab("files")}
+          >
+            Files
+          </button>
+        )}
       </div>
 
       {tab === "jobs" && (
@@ -58,6 +67,12 @@ export function DeviceTabs({
 
       {tab === "browser" && hasBrowser && (
         <DeviceBrowser deviceId={deviceId} />
+      )}
+
+      {tab === "files" && online && (
+        <div className="device-tab-content">
+          <DeviceFiles deviceId={deviceId} />
+        </div>
       )}
     </article>
   );

@@ -956,3 +956,246 @@ input {
   max-height: 300px;
   overflow-y: auto;
 }
+
+/* ---- Files tab ---- */
+.files-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px;
+}
+.files-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.files-form-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.files-label {
+  min-width: 96px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.files-input {
+  flex: 1 1 320px;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-soft);
+  color: var(--text);
+}
+.files-actions-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.files-breadcrumbs {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--muted);
+}
+.files-breadcrumb {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 6px;
+}
+.files-breadcrumb:hover,
+.files-breadcrumb:focus-visible {
+  background: var(--surface-soft);
+  outline: none;
+}
+.files-btn {
+  padding: 6px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface-soft);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.files-btn:hover:not(:disabled) {
+  background: rgba(148, 163, 184, 0.16);
+}
+.files-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.files-btn-primary {
+  background: var(--accent-strong);
+  color: #0b111b;
+  border-color: var(--accent-strong);
+}
+.files-btn-sm {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.files-btn-danger {
+  color: #fca5a5;
+  border-color: rgba(252, 165, 165, 0.4);
+}
+.files-upload-label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}
+.files-upload-input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.files-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.files-empty {
+  padding: 16px;
+  color: var(--muted);
+  text-align: center;
+}
+.files-entry {
+  display: flex;
+  gap: 8px;
+  padding: 6px 12px;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+}
+.files-entry:last-child {
+  border-bottom: none;
+}
+.files-entry-btn {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 52px 1fr auto auto;
+  gap: 12px;
+  align-items: center;
+  background: none;
+  border: none;
+  color: var(--text);
+  cursor: pointer;
+  padding: 4px 0;
+  text-align: left;
+}
+.files-entry-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  border-radius: 6px;
+}
+.files-badge {
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--surface-soft);
+  color: var(--muted);
+  text-align: center;
+}
+.files-badge-dir {
+  color: var(--accent);
+}
+.files-entry-size,
+.files-entry-time {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.files-entry-actions {
+  display: flex;
+  gap: 4px;
+}
+.files-error {
+  border: 1px solid rgba(252, 165, 165, 0.4);
+  background: rgba(252, 165, 165, 0.08);
+  color: #fecaca;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 13px;
+}
+.files-viewer {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--surface-soft);
+}
+.files-viewer-header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.files-viewer-path {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--muted);
+  word-break: break-all;
+}
+.files-viewer-text {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  max-height: 60vh;
+  overflow: auto;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.files-viewer-image {
+  max-width: 100%;
+  max-height: 60vh;
+  display: block;
+  margin: 0 auto;
+}
+.files-viewer-binary,
+.files-viewer-loading {
+  color: var(--muted);
+  font-size: 13px;
+}
+.files-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(8, 15, 29, 0.6);
+  display: grid;
+  place-items: center;
+  z-index: 50;
+}
+.files-dialog {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  width: min(420px, 90vw);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.files-dialog-title {
+  margin: 0;
+  font-size: 16px;
+}
+.files-dialog-option {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+  color: var(--muted);
+}
+.files-dialog-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
