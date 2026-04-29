@@ -10,6 +10,7 @@ import {
   FileReadImageResult,
   FileReadBinaryResult,
   FileWriteResult,
+  DeleteMode,
   fileErrorCodeToJSON,
 } from "@ahandai/proto";
 
@@ -18,7 +19,7 @@ if (typeof globalThis.Buffer === "undefined") {
   (globalThis as { Buffer: typeof Buffer }).Buffer = Buffer;
 }
 
-const MAX_INLINE_WRITE_BYTES = 1_048_576;
+export const MAX_INLINE_WRITE_BYTES = 1_048_576;
 
 export class FileOpsError extends Error {
   readonly code: string;
@@ -183,7 +184,10 @@ export async function readBinary(
       path: args.path,
       byteOffset: 0,
       byteLength: 0,
-      maxBytes: args.maxBytes ?? MAX_INLINE_WRITE_BYTES,
+      // Only pass maxBytes if the caller explicitly set one; otherwise let the
+      // daemon use its policy budget. Previously we defaulted to 1 MiB which
+      // silently truncated downloads of larger files with no user indication.
+      maxBytes: args.maxBytes,
       noFollowSymlink: false,
     },
   });
@@ -225,7 +229,10 @@ export async function deleteFile(
     delete: {
       path: args.path,
       recursive: args.recursive ?? false,
-      mode: 0, // DELETE_MODE_UNSPECIFIED — daemon picks safe default
+      // Proto enum has only TRASH (0) and PERMANENT (1); the default-0-wire
+      // value would silently route through the daemon's trash path. The UI
+      // button says "Delete" (not "Move to Trash"), so send PERMANENT.
+      mode: DeleteMode.DELETE_MODE_PERMANENT,
       noFollowSymlink: false,
     },
   });

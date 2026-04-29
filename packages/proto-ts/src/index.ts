@@ -53,5 +53,6 @@ export {
   FileMkdirResult,
   ImageFormat,
   WriteAction,
+  DeleteMode,
   fileErrorCodeToJSON,
 } from "./generated/ahand/v1/file_ops.ts";

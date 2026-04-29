@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { FileType, ImageFormat, type FileEntry } from "@ahandai/proto";
 import {
   FileOpsError,
+  MAX_INLINE_WRITE_BYTES,
   deleteFile,
   listFiles,
   mkdir,
@@ -151,7 +152,10 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
-        a.download = name;
+        // Force the suggested filename to a basename so a listing entry whose
+        // name somehow contains slashes cannot trick the browser into writing
+        // outside the user's intended download folder.
+        a.download = basename(name);
         document.body.appendChild(a);
         a.click();
         a.remove();
@@ -173,15 +177,22 @@ export function DeviceFiles({ deviceId }: { deviceId: string }) {
       setBusy("upload");
       setError(null);
       try {
-        if (file.size > 1_048_576) {
+        if (file.size > MAX_INLINE_WRITE_BYTES) {
           throw new FileOpsError(
             "content_too_large",
-            "Uploads larger than 1 MiB require the S3 path, which is not implemented yet.",
+            `Uploads larger than ${MAX_INLINE_WRITE_BYTES} bytes require the S3 path, which is not implemented yet.`,
             0,
           );
         }
         const bytes = new Uint8Array(await file.arrayBuffer());
-        await writeFile(deviceId, { path: joinPath(path, file.name), content: bytes });
+        // Strip any directory separators from the browser-provided filename so
+        // a malicious user-agent can't trick the UI into writing outside the
+        // current directory. The daemon's file_policy is still authoritative,
+        // but the displayed target path should match what actually happens.
+        await writeFile(deviceId, {
+          path: joinPath(path, basename(file.name)),
+          content: bytes,
+        });
         await openDirectory(path);
       } catch (e) {
         setError(toErrorState(e));
@@ -476,8 +487,16 @@ function buildBreadcrumbs(p: string): { label: string; path: string }[] {
   return crumbs;
 }
 
+// Only formats the Rust image crate can decode on the daemon side. Adding
+// others (svg/gif/bmp/ico) just routes them through readImage → proto error →
+// error banner, which is a worse UX than falling back to the binary viewer.
 function isImage(name: string): boolean {
-  return /\.(png|jpe?g|gif|webp|bmp|ico|svg)$/i.test(name);
+  return /\.(png|jpe?g|webp)$/i.test(name);
+}
+
+function basename(name: string): string {
+  const parts = name.split(/[\\/]/);
+  return parts[parts.length - 1] || "download";
 }
 
 function imageMimeFor(fmt: ImageFormat): string {

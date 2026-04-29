@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Buffer } from "buffer";
-import { FileResponse, FileType } from "@ahandai/proto";
+import { FileRequest, FileResponse, FileType } from "@ahandai/proto";
 
 import { DeviceFiles } from "@/components/device-files";
 
@@ -274,5 +274,195 @@ describe("DeviceFiles", () => {
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent(/S3/i);
     expect((globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+  });
+
+  it("deletes an entry after confirm and re-lists the directory", async () => {
+    // Initial list: one file.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: {
+          entries: [
+            { name: "old.txt", fileType: FileType.FILE_TYPE_FILE, size: 3, modifiedMs: 0 },
+          ],
+          totalCount: 1,
+          hasMore: false,
+        },
+      }),
+    );
+    // delete response.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        delete: { path: "/tmp/old.txt", mode: 1, itemsDeleted: 1 },
+      }),
+    );
+    // Re-list: now empty.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: { entries: [], totalCount: 0, hasMore: false },
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<DeviceFiles deviceId="dev-1" />);
+    await user.click(screen.getByRole("button", { name: /^open$/i }));
+    await screen.findByText("old.txt");
+
+    await user.click(screen.getByRole("button", { name: /^delete old\.txt$/i }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    // Click the Delete button INSIDE the dialog (aria-label is "Delete old.txt"
+    // on the entry button; the dialog's Delete button has text "Delete").
+    const dialog = screen.getByRole("dialog");
+    const dialogDelete = within(dialog).getByRole("button", { name: /^delete$/i });
+    await user.click(dialogDelete);
+
+    expect(await screen.findByText(/empty directory/i)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+
+    // 3 network calls: initial list + delete + re-list.
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    expect(fetchMock.mock.calls).toHaveLength(3);
+    // The second call was the delete — decode its body to verify the
+    // PERMANENT mode (value 1) is sent, not TRASH (0).
+    const deleteBody = fetchMock.mock.calls[1][1].body as Uint8Array;
+    const deleteReq = FileRequest.decode(deleteBody);
+    expect(deleteReq.delete?.path).toBe("/tmp/old.txt");
+    expect(deleteReq.delete?.mode).toBe(1); // DELETE_MODE_PERMANENT
+  });
+
+  it("uploads a small file, posts FullWrite.content, and re-lists", async () => {
+    // Initial list: empty.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: { entries: [], totalCount: 0, hasMore: false },
+      }),
+    );
+    // write response.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        write: { path: "/tmp/note.txt", action: 0, bytesWritten: 5, finalSize: 5 },
+      }),
+    );
+    // Re-list: file now present.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: {
+          entries: [
+            { name: "note.txt", fileType: FileType.FILE_TYPE_FILE, size: 5, modifiedMs: 0 },
+          ],
+          totalCount: 1,
+          hasMore: false,
+        },
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(<DeviceFiles deviceId="dev-1" />);
+    await user.click(screen.getByRole("button", { name: /^open$/i }));
+    await screen.findByText(/empty directory/i);
+
+    // Directory-traversal filename — the component must strip to basename
+    // before sending the target path.
+    const smallBytes = new Uint8Array([1, 2, 3, 4, 5]);
+    const small = new File([smallBytes], "../../evil.txt", {
+      type: "application/octet-stream",
+    });
+    // jsdom's File implementation does not provide arrayBuffer(); shim it.
+    Object.defineProperty(small, "arrayBuffer", {
+      value: async () => smallBytes.buffer.slice(
+        smallBytes.byteOffset,
+        smallBytes.byteOffset + smallBytes.byteLength,
+      ),
+    });
+    const uploadInput = screen.getByLabelText(/upload file/i) as HTMLInputElement;
+    await user.upload(uploadInput, small);
+
+    expect(await screen.findByText("note.txt")).toBeInTheDocument();
+
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    // 3 calls: initial list + write + re-list.
+    expect(fetchMock.mock.calls).toHaveLength(3);
+    const writeBody = fetchMock.mock.calls[1][1].body as Uint8Array;
+    const writeReq = FileRequest.decode(writeBody);
+    // basename("../../evil.txt") → "evil.txt"; joined with "/tmp" → "/tmp/evil.txt"
+    expect(writeReq.write?.path).toBe("/tmp/evil.txt");
+    expect(writeReq.write?.createParents).toBe(true);
+    expect(writeReq.write?.fullWrite?.content).toBeDefined();
+  });
+
+  it("downloads a file by calling readBinary and triggering an anchor click", async () => {
+    // Initial list: one file.
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        list: {
+          entries: [
+            { name: "log.txt", fileType: FileType.FILE_TYPE_FILE, size: 4, modifiedMs: 0 },
+          ],
+          totalCount: 1,
+          hasMore: false,
+        },
+      }),
+    );
+    // readBinary response.
+    const payload = Buffer.from(new Uint8Array([0x68, 0x69, 0x21, 0x0a])); // "hi!\n"
+    stubProto(
+      FileResponse.fromPartial({
+        requestId: "r",
+        readBinary: {
+          content: payload,
+          byteOffset: 0,
+          bytesRead: 4,
+          totalFileBytes: 4,
+          remainingBytes: 0,
+        },
+      }),
+    );
+
+    // jsdom doesn't implement URL.createObjectURL / revokeObjectURL; stub them.
+    const createObjectURL = vi.fn(() => "blob:mock-url");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL,
+      revokeObjectURL,
+    });
+
+    // Spy on anchor click so we can verify the download was triggered.
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+
+    const user = userEvent.setup();
+    render(<DeviceFiles deviceId="dev-1" />);
+    await user.click(screen.getByRole("button", { name: /^open$/i }));
+    await screen.findByText("log.txt");
+
+    await user.click(screen.getByRole("button", { name: /^download log\.txt$/i }));
+
+    // Anchor click fired → download triggered.
+    await vi.waitFor(() => {
+      expect(clickSpy).toHaveBeenCalled();
+    });
+    expect(createObjectURL).toHaveBeenCalled();
+    // revokeObjectURL is scheduled via setTimeout(0) — flush the task.
+    await vi.waitFor(() => {
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
+    });
+
+    // 2 network calls: initial list + readBinary.
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    expect(fetchMock.mock.calls).toHaveLength(2);
+    const readBody = fetchMock.mock.calls[1][1].body as Uint8Array;
+    const readReq = FileRequest.decode(readBody);
+    expect(readReq.readBinary?.path).toBe("/tmp/log.txt");
+    // maxBytes must NOT be clamped to the 1 MiB write cap — should be unset
+    // so the daemon uses its policy budget and we never silently truncate.
+    expect(readReq.readBinary?.maxBytes ?? 0).toBe(0);
+
+    clickSpy.mockRestore();
   });
 });
