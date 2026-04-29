@@ -43,6 +43,7 @@ export {
   FileReadImage,
   FileReadImageResult,
   FileWrite,
+  FileWriteResult,
   FullWrite,
   FileDelete,
   FileDeleteResult,
