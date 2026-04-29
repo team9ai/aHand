@@ -138,6 +138,7 @@ dependencies = [
  "hex",
  "image",
  "libc",
+ "nix",
  "portable-pty",
  "prost",
  "rand 0.8.5",
