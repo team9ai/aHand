@@ -24,7 +24,7 @@ pub use ahand_protocol::SessionMode;
 use crate::ahand_client::{self, ClientReporter, ConnectOutcome};
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
-use crate::config::{BrowserConfig, Config, HubConfig};
+use crate::config::{BrowserConfig, Config, FilePolicyConfig, HubConfig};
 use crate::device_identity::DeviceIdentity;
 use crate::registry::JobRegistry;
 use crate::session::SessionManager;
@@ -447,11 +447,19 @@ fn build_inner_config(cfg: &DaemonConfig, identity_path: &Path) -> Config {
                     .max(1),
             ),
         }),
-        // FilePolicy is opt-in; library callers (which are the consumers
-        // of this builder) don't expose file-policy config yet, so leave
-        // it as None — `FileManager::new(&FilePolicyConfig::default())`
-        // produces a disabled manager that refuses every FileRequest.
-        file_policy: None,
+        // Embedded library consumers currently don't expose a file-policy
+        // surface. Keep the Mac app path functional by defaulting embedded
+        // daemons to a permissive policy; callers that need tighter controls
+        // should get an explicit builder option next.
+        file_policy: Some(permissive_embedded_file_policy()),
+    }
+}
+
+fn permissive_embedded_file_policy() -> FilePolicyConfig {
+    FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec!["/**".to_string()],
+        ..FilePolicyConfig::default()
     }
 }
 

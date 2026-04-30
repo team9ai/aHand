@@ -334,21 +334,15 @@ async fn daemon_responds_to_file_request_through_ahand_client_glue() {
     // and we assert the daemon responds with a FileResponse envelope
     // (via `ahand_client.rs::handle_file_request → file_mgr.handle →
     // BufferedEnvelopeSender → WebSocket → mock`).
-    //
-    // `public_api::spawn` constructs the FileManager from the inner
-    // config's `file_policy: None`, which produces a *disabled*
-    // FileManager. That's the right shape for this test: the
-    // disabled-manager path is the early-return at handle_file_request
-    // line 1218-1226 — we don't need an enabled policy to validate
-    // that envelope decode → dispatch → response encode is wired up.
-    // The reply will be a `PolicyDenied` error envelope, which is
-    // exactly what the disabled-manager contract promises.
-    use ahand_protocol::{FileRequest, FileStat, file_request};
+    use ahand_protocol::{FileRequest, FileStat, FileType, file_request};
 
+    let file_tmp = TempDir::new().unwrap();
+    let probe = file_tmp.path().join("probe.txt");
+    std::fs::write(&probe, "ok").unwrap();
     let stat_req = FileRequest {
         request_id: "glue-test-1".into(),
         operation: Some(file_request::Operation::Stat(FileStat {
-            path: "/tmp/dummy".into(),
+            path: probe.to_string_lossy().into_owned(),
             no_follow_symlink: false,
         })),
     };
@@ -376,22 +370,14 @@ async fn daemon_responds_to_file_request_through_ahand_client_glue() {
     .expect("daemon should reply to FileRequest within 5s");
 
     assert_eq!(got_response.request_id, "glue-test-1");
-    // Disabled manager → PolicyDenied error envelope. The point of
-    // this test is the wiring (envelope decode + dispatch + response
-    // encode), not the manager's policy decision — so any structured
-    // FileError suffices to prove the glue works end-to-end.
     use ahand_protocol::file_response;
     match got_response.result {
-        Some(file_response::Result::Error(err)) => {
-            assert_eq!(
-                err.code,
-                ahand_protocol::FileErrorCode::PolicyDenied as i32,
-                "expected PolicyDenied from a disabled FileManager, got: {:?}",
-                err
-            );
+        Some(file_response::Result::Stat(stat)) => {
+            assert_eq!(stat.file_type, FileType::File as i32);
+            assert_eq!(stat.size, 2);
         }
         other => panic!(
-            "expected FileResponse::Error from disabled FileManager, got: {:?}",
+            "expected FileResponse::Stat from default library file policy, got: {:?}",
             other
         ),
     }
