@@ -50,8 +50,18 @@ jobs:
 
       - uses: actions/setup-node@v6
         with:
-          node-version: 20
+          # 22.14+ + npm CLI 11.5.1+ are required by npm trusted-publisher
+          # OIDC. Earlier setups produced misleading PUT 404s after a
+          # successful sigstore provenance signing — npm rejects the
+          # registry auth and returns 404 instead of 401 for security.
+          node-version: 24
           registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify tool versions
+        run: |
+          node --version
+          npm --version
+          # Trusted-publisher OIDC requires npm CLI >= 11.5.1.
 
       - name: Verify tag version matches package.json versions
         if: startsWith(github.ref, 'refs/tags/release-v')
@@ -92,14 +102,32 @@ jobs:
         run: pnpm -F @ahandai/sdk publish --access public --no-git-checks --dry-run
 
       # ── Real publish path (tag push, or manual with dry_run=false) ─────
-      - name: Publish @ahandai/proto
+      #
+      # Final publish goes through the npm CLI (not pnpm) because npm is
+      # the official OIDC trusted-publisher exchange implementation. pnpm's
+      # publish wrapper does not perform the npm/registry token exchange
+      # needed by trusted publishers — it only signs sigstore provenance,
+      # which is necessary but not sufficient. (See npm/cli#8678.)
+      #
+      # We still use `pnpm pack` to produce the tarball, because it
+      # rewrites `workspace:*` dependencies into concrete versions
+      # (verified locally: sdk's @ahandai/proto: workspace:* becomes
+      # @ahandai/proto: 0.2.0 in the tarball's package.json). `npm publish`
+      # alone would fail because npm does not recognize `workspace:*`.
+      - name: Pack + publish @ahandai/proto
         if: ${{ inputs.dry_run != true }}
-        run: pnpm -F @ahandai/proto publish --access public --no-git-checks --provenance
+        working-directory: packages/proto-ts
+        run: |
+          pnpm pack
+          npm publish ./ahandai-proto-*.tgz --access public --provenance
         env:
           NPM_CONFIG_PROVENANCE: 'true'
 
-      - name: Publish @ahandai/sdk
+      - name: Pack + publish @ahandai/sdk
         if: ${{ inputs.dry_run != true }}
-        run: pnpm -F @ahandai/sdk publish --access public --no-git-checks --provenance
+        working-directory: packages/sdk
+        run: |
+          pnpm pack
+          npm publish ./ahandai-sdk-*.tgz --access public --provenance
         env:
           NPM_CONFIG_PROVENANCE: 'true'
