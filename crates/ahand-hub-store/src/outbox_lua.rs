@@ -47,6 +47,9 @@ pub const RECONCILE_ON_HELLO: &str = r#"
 -- ARGV[1] = session_id
 -- ARGV[2] = last_ack (decimal)
 -- ARGV[3] = retention_secs
+-- Returns {branch, seq} where branch=1 ⇒ bootstrap path fired
+-- (server lost state; trusted device's last_ack as the seq floor),
+-- branch=0 ⇒ normal path (trim or no-op).
 if redis.call('GET', KEYS[1]) ~= ARGV[1] then
   return redis.error_reply('NOT_OWNER stale session')
 end
@@ -56,12 +59,12 @@ if last_ack > current then
   redis.call('SET', KEYS[2], last_ack)
   redis.call('DEL', KEYS[3])
   redis.call('EXPIRE', KEYS[2], ARGV[3])
-  return last_ack
+  return {1, last_ack}
 end
 if last_ack > 0 then
   redis.call('XTRIM', KEYS[3], 'MINID', '0-' .. (last_ack + 1))
 end
-return current
+return {0, current}
 "#;
 
 pub const FENCED_INCR_SEQ: &str = r#"
