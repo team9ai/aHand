@@ -491,6 +491,18 @@ export class CloudClient {
    * response into camelCase + `Uint8Array` for binary payloads, and
    * resolves with a `BrowserResult`. Errors map to the same taxonomy
    * as `spawn()` (401→`unauthorized`, 504→`timeout`, etc).
+   *
+   * @deprecated As of 2026-04-30 this method has no live callers. It
+   * was used by team9-agent-pi's `AhandBackend.browser()`, which was
+   * deleted (team9ai/agent-pi#104) when browser automation migrated
+   * to the SKILL model — agents now drive `playwright-cli` via
+   * `run_command` against the device's installed binary instead of
+   * routing through the hub. The underlying hub endpoint
+   * `/api/control/browser` is retained behind a deprecation banner;
+   * see `crates/ahand-hub/src/http/browser.rs`. Do NOT add new
+   * callers without revisiting that decision; if a future non-
+   * playwright backend needs browser dispatch, design the new
+   * pathway end-to-end rather than reviving this one.
    */
   async browser(params: BrowserParams): Promise<BrowserResult> {
     if (params.signal?.aborted) {

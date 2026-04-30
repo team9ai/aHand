@@ -84,6 +84,7 @@ dependencies = [
  "sqlx",
  "testcontainers",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

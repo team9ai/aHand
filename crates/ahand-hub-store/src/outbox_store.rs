@@ -165,7 +165,7 @@ impl OutboxStore for RedisOutboxStore {
         last_ack: u64,
     ) -> Result<u64> {
         let mut conn = self.conn.lock().await;
-        let returned: u64 = self
+        let result: (i64, u64) = self
             .scripts
             .reconcile_on_hello
             .key(Self::lock_key(device_id))
@@ -177,7 +177,16 @@ impl OutboxStore for RedisOutboxStore {
             .invoke_async(&mut *conn)
             .await
             .map_err(map_redis_err)?;
-        Ok(returned)
+        let (branch, seq) = result;
+        if branch == 1 {
+            tracing::warn!(
+                device_id = %device_id,
+                last_ack = last_ack,
+                seq_floor = seq,
+                "outbox bootstrap: device's last_ack exceeded server's max issued seq; trusted device's value as the new seq floor (any in-flight server-issued frames before this point have been dropped)",
+            );
+        }
+        Ok(seq)
     }
 
     async fn unacked_frames(&self, device_id: &str, last_ack: u64) -> Result<Vec<Vec<u8>>> {
