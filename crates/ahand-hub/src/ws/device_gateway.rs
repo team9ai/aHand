@@ -161,7 +161,7 @@ impl ConnectionRegistry {
         //    while a spawned task hasn't yet issued SUBSCRIBE. The
         //    subscribe_kick call awaits the underlying SUBSCRIBE; the
         //    spawned task only owns the watch loop.
-        let mut kick_sub = match self.outbox.subscribe_kick(&device_id).await {
+        let kick_sub = match self.outbox.subscribe_kick(&device_id).await {
             Ok(sub) => sub,
             Err(err) => {
                 tracing::warn!(
@@ -177,7 +177,11 @@ impl ConnectionRegistry {
             let device_id_inner = device_id.clone();
             let close_tx = close_tx.clone();
             tokio::spawn(async move {
-                if kick_sub.recv.changed().await.is_ok() {
+                let ahand_hub_core::traits::KickSubscription {
+                    recv: mut kick_rx,
+                    _drop_guard,
+                } = kick_sub;
+                if kick_rx.changed().await.is_ok() {
                     tracing::info!(
                         device_id = %device_id_inner,
                         "received kick, signalling close",
@@ -455,7 +459,13 @@ impl ConnectionRegistry {
 pub async fn handle_device_socket(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| async move {
         if let Err(err) = run_device_socket(socket, state).await {
-            tracing::warn!(error = %err, "device socket ended with error");
+            // {:?} dumps the full anyhow cause chain. The outermost
+            // message is often a generic InvalidToken; the offending
+            // wire value (e.g. job_id="01KQ...") is attached deeper
+            // by the originating call site. Without the chain, the
+            // operator can't tell which envelope killed the connection
+            // and has to redeploy with extra logging.
+            tracing::warn!(error = ?err, "device socket ended with error");
         }
     })
 }
@@ -570,7 +580,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
             };
             if let Err(err) = state
                 .webhook
-                .enqueue_registered(&envelope.device_id, external_user_id.as_deref())
+                .enqueue_registered(&envelope.device_id, external_user_id.as_deref(), &hello.capabilities)
                 .await
             {
                 tracing::warn!(
@@ -647,7 +657,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         };
         if let Err(err) = state
             .webhook
-            .enqueue_online(&device_id, online_external_user_id.as_deref())
+            .enqueue_online(&device_id, online_external_user_id.as_deref(), &hello.capabilities)
             .await
         {
             tracing::warn!(
@@ -852,7 +862,23 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                             .observe_inbound(&device_id, envelope.seq, envelope.ack)
                             .await?;
                     } else {
-                        state.jobs.handle_device_frame(&device_id, &frame).await?;
+                        // Tag the payload variant onto the error chain.
+                        // If JobRuntime bails (e.g. JobStore::get hits a
+                        // non-UUID job_id), the operator-facing log will
+                        // show both `payload_variant=JobFinished` and
+                        // the inner `job_id="..."`, so they can trace
+                        // the killing envelope without redeploying.
+                        let payload_variant = envelope_payload_variant_name(&envelope.payload);
+                        state
+                            .jobs
+                            .handle_device_frame(&device_id, &frame)
+                            .await
+                            .map_err(|e| {
+                                e.context(format!(
+                                    "handle_device_frame: payload_variant={payload_variant}, seq={}, ack={}",
+                                    envelope.seq, envelope.ack
+                                ))
+                            })?;
                     }
                 }
                 WsMessage::Ping(payload) => {
@@ -921,6 +947,38 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
     }
 
     run_result
+}
+
+fn envelope_payload_variant_name(p: &Option<ahand_protocol::envelope::Payload>) -> &'static str {
+    use ahand_protocol::envelope::Payload::*;
+    match p {
+        None => "<none>",
+        Some(HelloChallenge(_)) => "HelloChallenge",
+        Some(Hello(_)) => "Hello",
+        Some(JobRequest(_)) => "JobRequest",
+        Some(JobEvent(_)) => "JobEvent",
+        Some(JobFinished(_)) => "JobFinished",
+        Some(JobRejected(_)) => "JobRejected",
+        Some(CancelJob(_)) => "CancelJob",
+        Some(ApprovalRequest(_)) => "ApprovalRequest",
+        Some(ApprovalResponse(_)) => "ApprovalResponse",
+        Some(PolicyQuery(_)) => "PolicyQuery",
+        Some(PolicyState(_)) => "PolicyState",
+        Some(PolicyUpdate(_)) => "PolicyUpdate",
+        Some(SetSessionMode(_)) => "SetSessionMode",
+        Some(SessionState(_)) => "SessionState",
+        Some(SessionQuery(_)) => "SessionQuery",
+        Some(BrowserRequest(_)) => "BrowserRequest",
+        Some(BrowserResponse(_)) => "BrowserResponse",
+        Some(HelloAccepted(_)) => "HelloAccepted",
+        Some(UpdateCommand(_)) => "UpdateCommand",
+        Some(UpdateStatus(_)) => "UpdateStatus",
+        Some(StdinChunk(_)) => "StdinChunk",
+        Some(TerminalResize(_)) => "TerminalResize",
+        Some(Heartbeat(_)) => "Heartbeat",
+        Some(FileRequest(_)) => "FileRequest",
+        Some(FileResponse(_)) => "FileResponse",
+    }
 }
 
 /// Publish any job-related envelope received from a daemon to the

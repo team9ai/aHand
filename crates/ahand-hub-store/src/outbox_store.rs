@@ -63,7 +63,10 @@ fn redis_err(err: redis::RedisError) -> HubError {
 }
 
 fn map_redis_err(err: redis::RedisError) -> HubError {
-    if err.code() == Some("NOT_OWNER") {
+    let not_owner_detail = err
+        .detail()
+        .is_some_and(|detail| detail == "NOT_OWNER" || detail.starts_with("NOT_OWNER "));
+    if err.code() == Some("NOT_OWNER") || not_owner_detail {
         HubError::Unauthorized
     } else {
         HubError::Internal(err.to_string())
@@ -162,7 +165,7 @@ impl OutboxStore for RedisOutboxStore {
         last_ack: u64,
     ) -> Result<u64> {
         let mut conn = self.conn.lock().await;
-        let returned: u64 = self
+        let result: (i64, u64) = self
             .scripts
             .reconcile_on_hello
             .key(Self::lock_key(device_id))
@@ -174,7 +177,16 @@ impl OutboxStore for RedisOutboxStore {
             .invoke_async(&mut *conn)
             .await
             .map_err(map_redis_err)?;
-        Ok(returned)
+        let (branch, seq) = result;
+        if branch == 1 {
+            tracing::warn!(
+                device_id = %device_id,
+                last_ack = last_ack,
+                seq_floor = seq,
+                "outbox bootstrap: device's last_ack exceeded server's max issued seq; trusted device's value as the new seq floor (any in-flight server-issued frames before this point have been dropped)",
+            );
+        }
+        Ok(seq)
     }
 
     async fn unacked_frames(&self, device_id: &str, last_ack: u64) -> Result<Vec<Vec<u8>>> {
@@ -258,5 +270,21 @@ impl OutboxStore for RedisOutboxStore {
             .await
             .map_err(redis_err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_not_owner_response_detail_to_unauthorized() {
+        let err = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "NOT_OWNER".to_string(),
+        ));
+
+        assert!(matches!(map_redis_err(err), HubError::Unauthorized));
     }
 }

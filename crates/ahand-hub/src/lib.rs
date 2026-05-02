@@ -5,6 +5,7 @@ pub mod browser_service;
 pub mod config;
 pub mod control_jobs;
 pub mod events;
+pub mod file_service;
 pub mod http;
 pub mod output_stream;
 pub mod pending_file_requests;

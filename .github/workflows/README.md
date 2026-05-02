@@ -102,7 +102,7 @@ For cross-compilation targets, add `cross: true` and update `Cross.toml`.
 - **Node version**: Pinned to 20 in admin and browser workflows.
 - **Rust toolchain**: Uses `dtolnay/rust-toolchain@stable`.
 - **Checksums**: Each workflow generates its own `checksums-{component}.txt` using `shasum -a 256`.
-- **GitHub Release**: Created automatically via `softprops/action-gh-release@v2`. Multiple workflows can upload to the same release (if tags match), or create separate releases (current setup).
+- **GitHub Release**: Created automatically via `softprops/action-gh-release@v3`. Multiple workflows can upload to the same release (if tags match), or create separate releases (current setup).
 
 ## Local Release Build
 

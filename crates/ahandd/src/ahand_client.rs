@@ -310,11 +310,10 @@ async fn connect_with_auth(
     let tcp = connect_tcp_with_keepalive(url)
         .await
         .map_err(ConnectError::Session)?;
-    let (ws_stream, _) =
-        tokio_tungstenite::client_async_tls_with_config(url, tcp, None, None)
-            .await
-            .map_err(anyhow::Error::from)
-            .map_err(ConnectError::Session)?;
+    let (ws_stream, _) = tokio_tungstenite::client_async_tls_with_config(url, tcp, None, None)
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(ConnectError::Session)?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let challenge = recv_hello_challenge(&mut stream).await?;
@@ -769,7 +768,13 @@ pub fn build_hello_envelope(
     let signed_at_ms = identity.next_hello_signed_at_ms();
     let mut capabilities = vec!["exec".to_string()];
     if browser_enabled {
-        capabilities.push("browser".to_string());
+        // Device-reported capability name binds to the concrete
+        // implementation. Format: `browser-<backend>`. Currently only
+        // playwright-cli is supported. A future non-playwright backend
+        // (e.g. native WebView, chromedp) would report `browser-<that>`
+        // instead; worker-side `deriveCaps` in team9-agent-pi maps all
+        // legacy / future variants to the same HostCapability.
+        capabilities.push("browser-playwright-cli".to_string());
     }
     if file_enabled {
         capabilities.push("file".to_string());
@@ -1092,6 +1097,12 @@ async fn handle_browser_request<T>(
     }
 
     // Session mode check using a synthetic JobRequest.
+    // `tool: "browser"` here is the proto field that routes the request
+    // to the daemon's browser handler. It is NOT the same as the
+    // device-advertised capability string (see the block above where we
+    // push "browser-playwright-cli"). This proto field stays unchanged
+    // for wire-compat with the deprecated /api/control/browser endpoint;
+    // see that endpoint's module-level deprecation banner.
     let synthetic_req = ahand_protocol::JobRequest {
         job_id: req.request_id.clone(),
         tool: "browser".to_string(),
@@ -1335,7 +1346,12 @@ async fn handle_file_request<T>(
 
     // Both the Allow+dangerous and NeedsApproval branches fall through here.
     let (approval_req, approval_rx) = approval_mgr
-        .submit(synthetic_req, caller_uid, approval_reason, previous_refusals)
+        .submit(
+            synthetic_req,
+            caller_uid,
+            approval_reason,
+            previous_refusals,
+        )
         .await;
 
     // Send ApprovalRequest to cloud via WS and broadcast to IPC clients.
@@ -1650,12 +1666,14 @@ mod tests {
                 "TCP_KEEPIDLE must be 30s",
             );
             assert_eq!(
-                sock.keepalive_interval().expect("read keepalive probe interval"),
+                sock.keepalive_interval()
+                    .expect("read keepalive probe interval"),
                 std::time::Duration::from_secs(10),
                 "TCP_KEEPINTVL must be 10s",
             );
             assert_eq!(
-                sock.keepalive_retries().expect("read keepalive retry count"),
+                sock.keepalive_retries()
+                    .expect("read keepalive retry count"),
                 3,
                 "TCP_KEEPCNT must be 3",
             );

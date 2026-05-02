@@ -110,7 +110,16 @@ impl OutboxStore for InMemoryOutboxStore {
             return Err(HubError::Unauthorized);
         }
         if last_ack > entry.seq {
-            // Bootstrap path
+            // Bootstrap path: server lost state, trust the device's
+            // last_ack as the new seq floor. Logged at WARN so operators
+            // can see post-deploy how many devices fell into this branch
+            // (matches the RedisOutboxStore log line for symmetry).
+            tracing::warn!(
+                device_id = %device_id,
+                last_ack = last_ack,
+                seq_floor = last_ack,
+                "outbox bootstrap: device's last_ack exceeded server's max issued seq; trusted device's value as the new seq floor (any in-flight server-issued frames before this point have been dropped)",
+            );
             entry.seq = last_ack;
             entry.buffer.clear();
             return Ok(last_ack);

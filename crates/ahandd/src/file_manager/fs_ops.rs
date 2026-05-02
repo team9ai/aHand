@@ -13,10 +13,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use ahand_protocol::{
-    file_chmod, DeleteMode, FileChmod, FileChmodResult, FileCopy, FileCopyResult,
-    FileCreateSymlink, FileCreateSymlinkResult, FileDelete, FileDeleteResult, FileEntry, FileError,
-    FileErrorCode, FileGlob, FileGlobResult, FileList, FileListResult, FileMkdir, FileMkdirResult,
-    FileMove, FileMoveResult, FileStat, FileStatResult, FileType, UnixPermission,
+    DeleteMode, FileChmod, FileChmodResult, FileCopy, FileCopyResult, FileCreateSymlink,
+    FileCreateSymlinkResult, FileDelete, FileDeleteResult, FileEntry, FileError, FileErrorCode,
+    FileGlob, FileGlobResult, FileList, FileListResult, FileMkdir, FileMkdirResult, FileMove,
+    FileMoveResult, FileStat, FileStatResult, FileType, UnixPermission, file_chmod,
 };
 
 use super::file_error;
@@ -306,10 +306,21 @@ pub async fn handle_glob(
 }
 
 /// Create a directory (and optionally parents). Respects `mode` on Unix.
-pub async fn handle_mkdir(
-    req: &FileMkdir,
-    resolved: &Path,
-) -> Result<FileMkdirResult, FileError> {
+///
+/// On Unix, the actual `mkdirat` (or chained mkdirat for `recursive=true`)
+/// is routed through [`super::io_safe`] so the kernel resolves the parent
+/// chain through dirfds the policy has just validated, rather than
+/// re-walking the path string. That closes the R10 TOCTOU window where an
+/// attacker could swap an ancestor for a symlink between
+/// `policy.check_path` and the syscall and redirect the new directory
+/// outside the allowlist.
+///
+/// On Windows there is no equivalent API; the syscall stays path-based and
+/// the race window remains. Daemon deployments on Windows assume a
+/// single-tenant host where this attacker class is out of model. The
+/// existing post-create verification still catches the case after the
+/// fact.
+pub async fn handle_mkdir(req: &FileMkdir, resolved: &Path) -> Result<FileMkdirResult, FileError> {
     if tokio::fs::try_exists(resolved).await.unwrap_or(false) {
         // Enforce "must be a directory" when the path exists.
         let metadata = tokio::fs::symlink_metadata(resolved)
@@ -328,25 +339,55 @@ pub async fn handle_mkdir(
         });
     }
 
-    if req.recursive {
-        tokio::fs::create_dir_all(resolved)
-            .await
-            .map_err(|e| io_to_file_error(e, resolved))?;
-    } else {
-        tokio::fs::create_dir(resolved)
-            .await
-            .map_err(|e| io_to_file_error(e, resolved))?;
-    }
-
     #[cfg(unix)]
-    if let Some(mode) = req.mode {
-        let perms = std::fs::Permissions::from_mode(mode);
-        tokio::fs::set_permissions(resolved, perms)
-            .await
-            .map_err(|e| io_to_file_error(e, resolved))?;
+    {
+        let resolved_owned = resolved.to_path_buf();
+        let mode = req.mode;
+        let recursive = req.recursive;
+        tokio::task::spawn_blocking(move || -> Result<(), FileError> {
+            // mkdirat applies umask, so we always pass the protocol mode
+            // (or 0o755 default) to the create call AND then explicitly
+            // re-chmod via fchmodat when the request specifies a mode —
+            // matching the legacy "create_dir + set_permissions" sequence.
+            let create_mode = mode.unwrap_or(0o755);
+            if recursive {
+                super::io_safe::safe_mkdirp(&resolved_owned, create_mode)
+                    .map_err(|e| super::io_safe::io_to_file_error(e, &resolved_owned))?;
+            } else {
+                let handle = super::io_safe::safe_open_parent_dirfd_for(&resolved_owned)?;
+                super::io_safe::mkdirat(&handle.fd, &handle.basename, create_mode)
+                    .map_err(|e| super::io_safe::io_to_file_error(e, &resolved_owned))?;
+            }
+            if let Some(explicit_mode) = mode {
+                // Re-open the parent dirfd safely (still race-proof) and
+                // chmod the leaf. We don't reuse the fd from above because
+                // for recursive=true we never held one to the parent.
+                let handle = super::io_safe::safe_open_parent_dirfd_for(&resolved_owned)?;
+                super::io_safe::fchmodat(&handle.fd, &handle.basename, explicit_mode)
+                    .map_err(|e| super::io_safe::io_to_file_error(e, &resolved_owned))?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            file_error(
+                FileErrorCode::Io,
+                &req.path,
+                format!("mkdir join error: {e}"),
+            )
+        })??;
     }
     #[cfg(not(unix))]
     {
+        if req.recursive {
+            tokio::fs::create_dir_all(resolved)
+                .await
+                .map_err(|e| io_to_file_error(e, resolved))?;
+        } else {
+            tokio::fs::create_dir(resolved)
+                .await
+                .map_err(|e| io_to_file_error(e, resolved))?;
+        }
         // On non-Unix platforms, `mode` is advisory and silently ignored.
         let _ = req.mode;
     }
@@ -600,6 +641,28 @@ async fn count_recursive(path: &Path) -> u32 {
 
 // ── Copy / Move / Symlink ──────────────────────────────────────────────────
 
+/// Copy from `source_resolved` to `dest_resolved`. Files and directories
+/// (with `req.recursive`) are both supported.
+///
+/// On Unix the **outermost** copy syscall — the file write for a single-file
+/// copy, or the destination top-level mkdir for a recursive copy — runs
+/// through dirfds opened safely from each side's parent (see
+/// [`super::io_safe`]). That closes the R10 TOCTOU window where an attacker
+/// could swap an ancestor of source or destination for a symlink between
+/// `policy.check_path` and the syscall.
+///
+/// **Recursive copy residual:** the inner walk inside the destination
+/// subtree remains path-based — every `entry.path()` op re-resolves the
+/// path. After the safe top-level mkdirat the destination leaf inode is
+/// pinned at the validated location, so an attacker would need to swap a
+/// **subdirectory** of the leaf (which we just created or about to create)
+/// during a microsecond window to redirect a sub-write. This is bounded
+/// to attacker-writable subtrees and is documented (rather than fully
+/// eliminated) in this round; the cost of an fd-based recursive walker
+/// using `fdopendir` + `*at` for every nested entry was judged
+/// disproportionate next to the `verify_post_create` belt-and-suspenders
+/// already in place. See `io_safe::safe_open_parent_dirfd_for` for the
+/// part of the race that **is** closed.
 pub async fn handle_copy(
     req: &FileCopy,
     source_resolved: &Path,
@@ -627,9 +690,7 @@ pub async fn handle_copy(
         }
         copy_dir_recursive(source_resolved, dest_resolved).await?
     } else {
-        tokio::fs::copy(source_resolved, dest_resolved)
-            .await
-            .map_err(|e| io_to_file_error(e, dest_resolved))?;
+        copy_single_file(source_resolved, dest_resolved, req.overwrite).await?;
         1
     };
 
@@ -640,12 +701,87 @@ pub async fn handle_copy(
     })
 }
 
+/// Single-file copy. On Unix this is fully fd-based — both source and
+/// destination flow through safely-opened parent dirfds, then the bytes
+/// move through `OwnedFd`-wrapped `std::fs::File` handles. On Windows it
+/// falls back to `tokio::fs::copy` (race-prone, daemon assumes
+/// single-tenant host).
+async fn copy_single_file(source: &Path, dest: &Path, overwrite: bool) -> Result<(), FileError> {
+    #[cfg(unix)]
+    {
+        let source = source.to_path_buf();
+        let dest = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<(), FileError> {
+            // Open source parent + leaf with NOFOLLOW. NOFOLLOW on the
+            // leaf protects against a symlink-leaf swap; the parent walk
+            // protects against ancestor swaps. If source is itself a
+            // symlink the legacy `tokio::fs::copy` would have followed
+            // it; we deliberately reject here, because a symlink leaf
+            // means the policy validated the link but the read would
+            // have landed on the target — exactly the bug class this
+            // PR addresses. Callers who want symlink-following copy
+            // should resolve the source themselves first.
+            let src_handle = super::io_safe::safe_open_parent_dirfd_for(&source)?;
+            let src_fd = super::io_safe::openat_read_nofollow(&src_handle.fd, &src_handle.basename)
+                .map_err(|e| super::io_safe::io_to_file_error(e, &source))?;
+            let dst_handle = super::io_safe::safe_open_parent_dirfd_for(&dest)?;
+            // truncate when overwriting; exclusive when not (so a race
+            // that creates dest between try_exists and openat surfaces
+            // as AlreadyExists rather than silently overwriting).
+            let dst_fd = super::io_safe::openat_create_write(
+                &dst_handle.fd,
+                &dst_handle.basename,
+                overwrite,
+                !overwrite,
+                0o644,
+            )
+            .map_err(|e| super::io_safe::io_to_file_error(e, &dest))?;
+
+            // Move bytes. std::fs::File::from(OwnedFd) is a zero-cost
+            // conversion; std::io::copy then chooses the best kernel
+            // copy primitive (sendfile / copy_file_range on Linux).
+            let mut src_file = std::fs::File::from(src_fd);
+            let mut dst_file = std::fs::File::from(dst_fd);
+            std::io::copy(&mut src_file, &mut dst_file).map_err(|e| io_to_file_error(e, &dest))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| file_error(FileErrorCode::Io, "", format!("copy join error: {e}")))??;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::copy(source, dest)
+            .await
+            .map_err(|e| io_to_file_error(e, dest))?;
+        Ok(())
+    }
+}
+
 async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u32, FileError> {
     let src = src.to_path_buf();
     let dst = dst.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<u32, FileError> {
         let mut count = 0u32;
-        std::fs::create_dir_all(&dst).map_err(|e| io_to_file_error(e, &dst))?;
+        // Create the destination chain through `safe_mkdirp` on Unix —
+        // each component is opened with O_NOFOLLOW so an attacker cannot
+        // redirect the top-level dest creation by swapping an ancestor
+        // for a symlink during the race window. EEXIST on the leaf is
+        // tolerated (overwrite case).
+        //
+        // The inner `copy_dir_sync` walk is path-based; see the
+        // residual-race note in `handle_copy`'s docstring. Bounded to
+        // the validated subtree and covered by `verify_post_create`'s
+        // RemoveTreeAll cleanup.
+        #[cfg(unix)]
+        {
+            super::io_safe::safe_mkdirp(&dst, 0o755)
+                .map_err(|e| super::io_safe::io_to_file_error(e, &dst))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir_all(&dst).map_err(|e| io_to_file_error(e, &dst))?;
+        }
         copy_dir_sync(&src, &dst, &mut count)?;
         Ok(count)
     })
@@ -676,8 +812,7 @@ fn copy_dir_sync(src: &Path, dst: &Path, count: &mut u32) -> Result<(), FileErro
             #[cfg(unix)]
             {
                 let target = std::fs::read_link(&from).map_err(|e| io_to_file_error(e, &from))?;
-                std::os::unix::fs::symlink(&target, &to)
-                    .map_err(|e| io_to_file_error(e, &to))?;
+                std::os::unix::fs::symlink(&target, &to).map_err(|e| io_to_file_error(e, &to))?;
                 *count += 1;
             }
         }
@@ -685,6 +820,18 @@ fn copy_dir_sync(src: &Path, dst: &Path, count: &mut u32) -> Result<(), FileErro
     Ok(())
 }
 
+/// Move (`rename(2)`) source onto destination. Same-filesystem rename is
+/// the fast path; cross-fs `EXDEV` falls back to `cross_device_move_fallback`
+/// which copies-then-removes.
+///
+/// On Unix we route the rename through [`super::io_safe::renameat`] using
+/// dirfds opened safely from each side's parent. That closes the R10
+/// TOCTOU window where an attacker could swap an ancestor of either path
+/// for a symlink and redirect the rename outside the allowlist. The
+/// cross-device fallback path stays path-based — it has its own race
+/// window, but a) it runs only when a same-fs rename returned EXDEV, so
+/// the source is still in place (no data-loss compounding), and b) the
+/// existing post-create verifier already covers it.
 pub async fn handle_move(
     req: &FileMove,
     source_resolved: &Path,
@@ -698,11 +845,16 @@ pub async fn handle_move(
         ));
     }
 
-    // Try rename first (fast path, same filesystem). Fall back to copy+delete
-    // on cross-device renames.
-    match tokio::fs::rename(source_resolved, dest_resolved).await {
-        Ok(_) => {}
-        Err(e) if is_cross_device_error(&e) => {
+    // Same-fs rename via renameat through safely-opened parent dirfds
+    // (Unix), or path-based tokio rename on non-Unix. The "outcome"
+    // enum keeps the safe-open failure path (PolicyDenied — the R10
+    // case we care about) distinct from the rename's own io::Error
+    // (which the caller inspects for EXDEV → cross-device fallback).
+    // Wrapping safe-open errors in io::Error and unpacking them later
+    // would lose the policy-denied code.
+    match rename_safely(source_resolved, dest_resolved).await? {
+        RenameOutcome::Done => {}
+        RenameOutcome::CrossDevice => {
             tracing::info!(
                 source = %source_resolved.display(),
                 destination = %dest_resolved.display(),
@@ -710,13 +862,56 @@ pub async fn handle_move(
             );
             cross_device_move_fallback(req, source_resolved, dest_resolved).await?;
         }
-        Err(e) => return Err(io_to_file_error(e, source_resolved)),
     }
 
     Ok(FileMoveResult {
         source: source_resolved.to_string_lossy().into_owned(),
         destination: dest_resolved.to_string_lossy().into_owned(),
     })
+}
+
+/// Result of the same-fs rename attempt. EXDEV is split out from
+/// `Done`/error so the caller can opt into the cross-device fallback
+/// without re-deriving the EXDEV detection.
+enum RenameOutcome {
+    Done,
+    CrossDevice,
+}
+
+/// Same-filesystem rename, dirfd-routed on Unix. Failures from the
+/// safe-open layer propagate as [`FileError`] (carrying their original
+/// code — typically `PolicyDenied`); rename's own non-EXDEV io errors
+/// are mapped via [`io_to_file_error`].
+async fn rename_safely(source: &Path, dest: &Path) -> Result<RenameOutcome, FileError> {
+    #[cfg(unix)]
+    {
+        let source = source.to_path_buf();
+        let dest = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<RenameOutcome, FileError> {
+            let src_handle = super::io_safe::safe_open_parent_dirfd_for(&source)?;
+            let dst_handle = super::io_safe::safe_open_parent_dirfd_for(&dest)?;
+            match super::io_safe::renameat(
+                &src_handle.fd,
+                &src_handle.basename,
+                &dst_handle.fd,
+                &dst_handle.basename,
+            ) {
+                Ok(()) => Ok(RenameOutcome::Done),
+                Err(e) if is_cross_device_error(&e) => Ok(RenameOutcome::CrossDevice),
+                Err(e) => Err(io_to_file_error(e, &source)),
+            }
+        })
+        .await
+        .map_err(|e| file_error(FileErrorCode::Io, "", format!("rename join error: {e}")))?
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::fs::rename(source, dest).await {
+            Ok(()) => Ok(RenameOutcome::Done),
+            Err(e) if is_cross_device_error(&e) => Ok(RenameOutcome::CrossDevice),
+            Err(e) => Err(io_to_file_error(e, source)),
+        }
+    }
 }
 
 /// Cross-filesystem move payload. Extracted from `handle_move` so the
@@ -779,15 +974,36 @@ fn is_cross_device_error(e: &io::Error) -> bool {
     }
 }
 
+/// Create a symlink at `link_resolved` pointing at `req.target`.
+///
+/// On Unix the actual `symlinkat` runs through [`super::io_safe`] using a
+/// dirfd opened safely for the link's parent — the kernel does not re-walk
+/// the link path during the syscall, closing the R10 TOCTOU window. The
+/// target string is stored verbatim; whether it resolves to an
+/// allowlisted path is the dispatch layer's concern (see
+/// `policy.check_path` for the link's parent + `R2` for the target).
 pub async fn handle_create_symlink(
     req: &FileCreateSymlink,
     link_resolved: &Path,
 ) -> Result<FileCreateSymlinkResult, FileError> {
     #[cfg(unix)]
     {
-        tokio::fs::symlink(&req.target, link_resolved)
-            .await
-            .map_err(|e| io_to_file_error(e, link_resolved))?;
+        let link = link_resolved.to_path_buf();
+        let target = req.target.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), FileError> {
+            let handle = super::io_safe::safe_open_parent_dirfd_for(&link)?;
+            super::io_safe::symlinkat(std::ffi::OsStr::new(&target), &handle.fd, &handle.basename)
+                .map_err(|e| super::io_safe::io_to_file_error(e, &link))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            file_error(
+                FileErrorCode::Io,
+                &req.link_path,
+                format!("symlink join error: {e}"),
+            )
+        })??;
     }
     #[cfg(not(unix))]
     {
@@ -805,10 +1021,7 @@ pub async fn handle_create_symlink(
 
 // ── Chmod ──────────────────────────────────────────────────────────────────
 
-pub async fn handle_chmod(
-    req: &FileChmod,
-    resolved: &Path,
-) -> Result<FileChmodResult, FileError> {
+pub async fn handle_chmod(req: &FileChmod, resolved: &Path) -> Result<FileChmodResult, FileError> {
     let Some(permission) = &req.permission else {
         return Err(file_error(
             FileErrorCode::Unspecified,
@@ -817,8 +1030,7 @@ pub async fn handle_chmod(
         ));
     };
 
-    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink)
-        .await?;
+    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink).await?;
 
     match permission {
         file_chmod::Permission::Unix(unix) => {
@@ -882,34 +1094,49 @@ async fn set_unix_mode(path: &Path, mode: u32, recursive: bool) -> Result<u32, F
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<u32, FileError> {
         let mut count = 0u32;
-        set_unix_mode_sync(&path, mode, recursive, &mut count)?;
+        // R10 (this PR): the *leaf* chmod is the one the policy layer
+        // gated. Routing it through `safe_open_parent_dirfd_for` +
+        // `fchmodat` closes the TOCTOU race against an attacker swapping
+        // an ancestor of the leaf for a symlink between
+        // `policy.check_path` and the syscall. Once the leaf has been
+        // chmod'd (and, for recursive=true, only after we've descended
+        // into it), the inner walk operates on entries returned by
+        // `read_dir` of the validated leaf — bounded to the validated
+        // subtree, which keeps the inner-race window from escalating
+        // beyond what the attacker already controls.
+        let handle = super::io_safe::safe_open_parent_dirfd_for(&path)?;
+        super::io_safe::fchmodat(&handle.fd, &handle.basename, mode)
+            .map_err(|e| super::io_safe::io_to_file_error(e, &path))?;
+        count += 1;
+        if recursive {
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|e| io_to_file_error(e, &path))?;
+            if metadata.is_dir() {
+                set_unix_mode_recursive(&path, mode, &mut count)?;
+            }
+        }
         Ok(count)
     })
     .await
     .map_err(|e| file_error(FileErrorCode::Io, "", format!("chmod join error: {e}")))?
 }
 
+/// Recursive descent inside an already-validated leaf directory.
+/// Path-based — see the parent docstring for why the inner race is bounded.
 #[cfg(unix)]
-fn set_unix_mode_sync(
-    path: &Path,
-    mode: u32,
-    recursive: bool,
-    count: &mut u32,
-) -> Result<(), FileError> {
+fn set_unix_mode_recursive(path: &Path, mode: u32, count: &mut u32) -> Result<(), FileError> {
     let perms = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, perms).map_err(|e| io_to_file_error(e, path))?;
-    *count += 1;
-    if recursive {
-        let metadata = std::fs::symlink_metadata(path).map_err(|e| io_to_file_error(e, path))?;
-        if metadata.is_dir() {
-            for entry in std::fs::read_dir(path).map_err(|e| io_to_file_error(e, path))? {
-                let entry = entry.map_err(|e| io_to_file_error(e, path))?;
-                let ty = entry.file_type().map_err(|e| io_to_file_error(e, path))?;
-                if ty.is_symlink() {
-                    continue; // Don't follow symlinks.
-                }
-                set_unix_mode_sync(&entry.path(), mode, recursive, count)?;
-            }
+    for entry in std::fs::read_dir(path).map_err(|e| io_to_file_error(e, path))? {
+        let entry = entry.map_err(|e| io_to_file_error(e, path))?;
+        let ty = entry.file_type().map_err(|e| io_to_file_error(e, path))?;
+        if ty.is_symlink() {
+            continue; // Don't follow symlinks.
+        }
+        let child = entry.path();
+        std::fs::set_permissions(&child, perms.clone()).map_err(|e| io_to_file_error(e, &child))?;
+        *count += 1;
+        if ty.is_dir() {
+            set_unix_mode_recursive(&child, mode, count)?;
         }
     }
     Ok(())
@@ -1056,8 +1283,16 @@ mod tests {
     #[tokio::test]
     async fn cross_device_move_fallback_moves_a_single_file() {
         let dir = tempfile::TempDir::new().unwrap();
-        let src = dir.path().join("source.txt");
-        let dst = dir.path().join("dest.txt");
+        // Production code always passes canonicalized paths into the
+        // copy/move fallback (the dispatch layer routes through
+        // `policy.check_path` first). On macOS `tempfile`'s `/var/...`
+        // root resolves to `/private/var/...` only after canonicalize,
+        // and the new dirfd-based safe-open path refuses to traverse
+        // the `/var` symlink. Canonicalize here so the test exercises
+        // the same precondition production has.
+        let dir_canonical = dir.path().canonicalize().unwrap();
+        let src = dir_canonical.join("source.txt");
+        let dst = dir_canonical.join("dest.txt");
         std::fs::write(&src, b"payload").unwrap();
 
         let req = move_req(&src, &dst, false);
@@ -1075,8 +1310,11 @@ mod tests {
     #[tokio::test]
     async fn cross_device_move_fallback_moves_a_directory_tree() {
         let dir = tempfile::TempDir::new().unwrap();
-        let src = dir.path().join("src_tree");
-        let dst = dir.path().join("dst_tree");
+        // See note in the single-file fallback test above for why we
+        // canonicalize the temp root before deriving paths.
+        let dir_canonical = dir.path().canonicalize().unwrap();
+        let src = dir_canonical.join("src_tree");
+        let dst = dir_canonical.join("dst_tree");
         std::fs::create_dir(&src).unwrap();
         std::fs::create_dir(src.join("nested")).unwrap();
         std::fs::write(src.join("a.txt"), b"a").unwrap();

@@ -18,7 +18,10 @@ module "ahand_hub" {
   vpc_id                         = var.vpc_id
   subnet_ids                     = var.subnet_ids
   traefik_security_group_id      = var.traefik_security_group_id
-  gateway_public_url             = "https://gateway.team9.ai"
+  # Prod team9 gateway is published at api.team9.ai (Railway public domain).
+  # gateway.team9.ai does not resolve — the hub's outbound WEBHOOK_URL is
+  # built from this value and posts events to ${gateway_public_url}/api/v1/ahand/hub-webhook.
+  gateway_public_url             = "https://api.team9.ai"
   redis_mode                     = "create"
 }
 

@@ -11,8 +11,9 @@
 //! Only the `ahand-cloud` connection mode is supported here — the
 //! `openclaw-gateway` path remains CLI-only for now.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{broadcast, oneshot, watch};
@@ -23,7 +24,7 @@ pub use ahand_protocol::SessionMode;
 use crate::ahand_client::{self, ClientReporter, ConnectOutcome};
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
-use crate::config::{BrowserConfig, Config, HubConfig};
+use crate::config::{BrowserConfig, Config, FilePolicyConfig, HubConfig};
 use crate::device_identity::DeviceIdentity;
 use crate::registry::JobRegistry;
 use crate::session::SessionManager;
@@ -206,6 +207,37 @@ pub struct DaemonHandle {
     device_id: String,
 }
 
+static ACTIVE_DAEMONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+#[derive(Debug)]
+struct ActiveDaemonGuard {
+    key: String,
+}
+
+impl Drop for ActiveDaemonGuard {
+    fn drop(&mut self) {
+        let mut active = active_daemons()
+            .lock()
+            .expect("active daemon registry poisoned");
+        active.remove(&self.key);
+    }
+}
+
+fn active_daemons() -> &'static Mutex<HashSet<String>> {
+    ACTIVE_DAEMONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn reserve_active_daemon(hub_url: &str, device_id: &str) -> anyhow::Result<ActiveDaemonGuard> {
+    let key = format!("{hub_url}\0{device_id}");
+    let mut active = active_daemons()
+        .lock()
+        .expect("active daemon registry poisoned");
+    if !active.insert(key.clone()) {
+        anyhow::bail!("ahandd daemon already running for hub URL {hub_url} and device {device_id}");
+    }
+    Ok(ActiveDaemonGuard { key })
+}
+
 impl DaemonHandle {
     /// Request a graceful shutdown and wait for the inner task to finish.
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
@@ -258,6 +290,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         config.device_id,
         identity.device_id()
     );
+    let active_guard = reserve_active_daemon(&config.hub_url, &device_id)?;
 
     let (status_tx, status_rx) = watch::channel(DaemonStatus::Connecting);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -287,6 +320,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         Arc::new(StatusReporter::new(reporter_status_tx, reporter_device_id));
 
     let join = tokio::spawn(async move {
+        let _active_guard = active_guard;
         let run_fut = ahand_client::run_with_reporter(
             inner_config,
             device_id_for_task,
@@ -413,11 +447,19 @@ fn build_inner_config(cfg: &DaemonConfig, identity_path: &Path) -> Config {
                     .max(1),
             ),
         }),
-        // FilePolicy is opt-in; library callers (which are the consumers
-        // of this builder) don't expose file-policy config yet, so leave
-        // it as None — `FileManager::new(&FilePolicyConfig::default())`
-        // produces a disabled manager that refuses every FileRequest.
-        file_policy: None,
+        // Embedded library consumers currently don't expose a file-policy
+        // surface. Keep the Mac app path functional by defaulting embedded
+        // daemons to a permissive policy; callers that need tighter controls
+        // should get an explicit builder option next.
+        file_policy: Some(permissive_embedded_file_policy()),
+    }
+}
+
+fn permissive_embedded_file_policy() -> FilePolicyConfig {
+    FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec!["/**".to_string()],
+        ..FilePolicyConfig::default()
     }
 }
 

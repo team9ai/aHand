@@ -84,6 +84,7 @@ dependencies = [
  "sqlx",
  "testcontainers",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -125,6 +126,7 @@ version = "0.1.2"
 dependencies = [
  "ahand-protocol",
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "chardetng",
  "clap",
@@ -138,6 +140,7 @@ dependencies = [
  "hex",
  "image",
  "libc",
+ "nix",
  "portable-pty",
  "prost",
  "rand 0.8.5",

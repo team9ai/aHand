@@ -13,4 +13,8 @@ export type {
   CloudClientErrorCode,
   BrowserParams,
   BrowserResult,
+  FileOperation,
+  FileParams,
+  FileResult,
+  FileErrorPayload,
 } from "./cloud-client.ts";

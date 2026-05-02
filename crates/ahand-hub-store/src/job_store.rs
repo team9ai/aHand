@@ -54,8 +54,14 @@ impl JobStore for PgJobStore {
     }
 
     async fn get(&self, job_id: &str) -> Result<Option<Job>> {
-        let parsed =
-            Uuid::parse_str(job_id).map_err(|err| HubError::InvalidToken(err.to_string()))?;
+        let parsed = Uuid::parse_str(job_id).map_err(|err| {
+            // Include the offending job_id so the upstream WS-close
+            // log shows what the daemon actually sent. uuid crate's
+            // own message only carries the byte position, which is
+            // useless for tracing the origin (e.g. is this a ULID
+            // from /api/control/jobs replayed across hub restarts?).
+            HubError::InvalidToken(format!("{err}: job_id={job_id:?}"))
+        })?;
         let row = sqlx::query(
             r#"
             SELECT id, device_id, tool, args, cwd, env, timeout_ms, interactive, status, exit_code, error,
@@ -98,8 +104,14 @@ impl JobStore for PgJobStore {
         job_id: &str,
         status: JobStatus,
     ) -> Result<Option<JobStatus>> {
-        let parsed =
-            Uuid::parse_str(job_id).map_err(|err| HubError::InvalidToken(err.to_string()))?;
+        let parsed = Uuid::parse_str(job_id).map_err(|err| {
+            // Include the offending job_id so the upstream WS-close
+            // log shows what the daemon actually sent. uuid crate's
+            // own message only carries the byte position, which is
+            // useless for tracing the origin (e.g. is this a ULID
+            // from /api/control/jobs replayed across hub restarts?).
+            HubError::InvalidToken(format!("{err}: job_id={job_id:?}"))
+        })?;
         let mut tx = self
             .pool
             .begin()
@@ -176,8 +188,14 @@ impl JobStore for PgJobStore {
         error: &str,
         output_summary: &str,
     ) -> Result<()> {
-        let parsed =
-            Uuid::parse_str(job_id).map_err(|err| HubError::InvalidToken(err.to_string()))?;
+        let parsed = Uuid::parse_str(job_id).map_err(|err| {
+            // Include the offending job_id so the upstream WS-close
+            // log shows what the daemon actually sent. uuid crate's
+            // own message only carries the byte position, which is
+            // useless for tracing the origin (e.g. is this a ULID
+            // from /api/control/jobs replayed across hub restarts?).
+            HubError::InvalidToken(format!("{err}: job_id={job_id:?}"))
+        })?;
         let result = sqlx::query(
             r#"
             UPDATE jobs

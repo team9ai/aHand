@@ -143,7 +143,13 @@ pub async fn execute(
     }
 
     // 2. Capability check.
-    if !device.capabilities.iter().any(|c| c == "browser") {
+    if !device
+        .capabilities
+        .iter()
+        .any(|c| c == "browser-playwright-cli")
+    {
+        // (If we add non-playwright backends later, extend this check to
+        //  accept any capability starting with "browser-".)
         return Err(BrowserServiceError::CapabilityMissing {
             device_id: input.device_id.clone(),
         });

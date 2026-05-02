@@ -10,6 +10,7 @@ pub mod api_error;
 pub mod audit;
 pub mod auth;
 pub mod browser;
+pub mod control_files_dto;
 pub mod control_plane;
 pub mod devices;
 pub mod files;
@@ -40,6 +41,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/devices/{device_id}/files",
             post(files::file_operation),
+        )
+        .route(
+            "/api/devices/{device_id}/files/upload-url",
+            post(files::upload_url),
         )
         .route("/api/jobs", get(jobs::list_jobs).post(jobs::create_job))
         .route("/api/jobs/{job_id}", get(jobs::get_job))

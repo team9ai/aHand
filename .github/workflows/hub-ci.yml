@@ -53,17 +53,23 @@ jobs:
   dashboard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Build shared TS packages
+        # proto-ts exposes its types via dist/ (main/types point there).
+        # hub-dashboard now imports @ahandai/proto, so the package needs to
+        # be built before lint / test / build can resolve it.
+        run: pnpm --filter @ahandai/proto build
 
       - name: Lint hub dashboard
         run: pnpm --filter @ahand/hub-dashboard lint
@@ -77,7 +83,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
@@ -111,7 +117,7 @@ jobs:
   compose:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Validate hub compose file
         env:

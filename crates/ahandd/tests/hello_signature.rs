@@ -45,10 +45,10 @@ const EXPECTED_PUBLIC_KEY: [u8; 32] = [
 ];
 
 const EXPECTED_SIGNATURE: [u8; 64] = [
-    8, 101, 211, 64, 221, 185, 208, 10, 111, 185, 219, 189, 198, 38, 253, 197, 84, 136, 38, 216,
-    20, 108, 238, 78, 203, 88, 204, 171, 110, 31, 41, 3, 43, 0, 155, 160, 112, 26, 176, 45, 154,
-    224, 111, 109, 242, 69, 163, 203, 218, 228, 33, 145, 86, 121, 158, 245, 30, 63, 169, 127, 251,
-    208, 242, 4,
+    203, 148, 148, 167, 190, 153, 29, 172, 215, 184, 212, 117, 122, 29, 218, 200, 124, 19, 97, 11,
+    120, 209, 62, 11, 201, 47, 175, 155, 175, 4, 112, 180, 104, 238, 235, 100, 227, 194, 252, 198,
+    244, 175, 82, 212, 110, 105, 165, 11, 40, 4, 41, 231, 32, 154, 29, 6, 0, 137, 244, 103, 94, 11,
+    211, 1,
 ];
 
 fn fixture_hello() -> Hello {
@@ -56,7 +56,7 @@ fn fixture_hello() -> Hello {
         version: FIXTURE_VERSION.into(),
         hostname: FIXTURE_HOSTNAME.into(),
         os: FIXTURE_OS.into(),
-        capabilities: vec!["exec".into(), "browser".into()],
+        capabilities: vec!["exec".into(), "browser-playwright-cli".into()],
         last_ack: FIXTURE_LAST_ACK,
         auth: None,
     }

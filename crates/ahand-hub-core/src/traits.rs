@@ -177,3 +177,42 @@ pub trait OutboxStore: Send + Sync + 'static {
     /// from the caller's perspective; failure is logged but not surfaced.
     async fn observe_ack(&self, device_id: &str, ack: u64) -> Result<()>;
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_handle_aborts_task() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let task_dropped = Arc::new(AtomicBool::new(false));
+        let drop_flag = DropFlag(Arc::clone(&task_dropped));
+        let handle = tokio::spawn(async move {
+            let _drop_flag = drop_flag;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        started_rx.await.unwrap();
+        let guard = AbortOnDropHandle::new(handle);
+        drop(guard);
+        tokio::task::yield_now().await;
+
+        assert!(task_dropped.load(Ordering::SeqCst));
+    }
+}

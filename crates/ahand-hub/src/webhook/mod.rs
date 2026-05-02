@@ -166,17 +166,22 @@ impl Webhook {
         self.inner.is_some()
     }
 
-    /// Enqueue a `device.online` event. Noops when disabled.
+    /// Enqueue a `device.online` event. `capabilities` is the daemon-declared
+    /// capability list from the most recent Hello (e.g. `["exec", "browser"]`).
+    /// Noops when disabled.
     pub async fn enqueue_online(
         &self,
         device_id: &str,
         external_user_id: Option<&str>,
+        capabilities: &[String],
     ) -> anyhow::Result<()> {
         self.enqueue_typed(
             "device.online",
             device_id,
             external_user_id,
-            serde_json::json!({}),
+            serde_json::json!({
+                "capabilities": capabilities,
+            }),
         )
         .await
     }
@@ -220,18 +225,23 @@ impl Webhook {
     }
 
     /// Enqueue a `device.registered` event. Emitted the first time a
-    /// daemon's hello lands against a pre-registered device row. Noops
-    /// when disabled.
+    /// daemon's hello lands against a pre-registered device row.
+    /// `capabilities` is the daemon-declared capability list from the Hello
+    /// (e.g. `["exec", "browser"]`); pass `&[]` when caps are unknown at
+    /// the time of pre-registration (admin path). Noops when disabled.
     pub async fn enqueue_registered(
         &self,
         device_id: &str,
         external_user_id: Option<&str>,
+        capabilities: &[String],
     ) -> anyhow::Result<()> {
         self.enqueue_typed(
             "device.registered",
             device_id,
             external_user_id,
-            serde_json::json!({}),
+            serde_json::json!({
+                "capabilities": capabilities,
+            }),
         )
         .await
     }
