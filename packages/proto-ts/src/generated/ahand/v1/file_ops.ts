@@ -541,7 +541,18 @@ export interface FileWrite {
 
 export interface FullWrite {
   content?: Buffer | undefined;
-  s3ObjectKey?: string | undefined;
+  s3ObjectKey?:
+    | string
+    | undefined;
+  /**
+   * Hub-injected presigned GET URL when source is s3_object_key.
+   * Daemons fetch the bytes via plain HTTP GET against this URL and
+   * write them to disk. Clients leave these empty — the hub fills them
+   * in before forwarding the FileRequest to the daemon. This keeps S3
+   * credentials hub-side: the daemon never speaks to S3 directly.
+   */
+  s3DownloadUrl?: string | undefined;
+  s3DownloadUrlExpiresMs?: number | undefined;
 }
 
 export interface FileAppend {
@@ -747,6 +758,14 @@ export interface FileError {
   path: string;
 }
 
+/**
+ * Deprecated: not used on the wire as of the v2 large-file flow.
+ * The same data now arrives as the JSON body of
+ * `POST /api/devices/{id}/files/upload-url`. Kept for forward-
+ * compatibility / clients that still reference the type name.
+ *
+ * @deprecated
+ */
 export interface FileTransferUrl {
   url: string;
   expiresMs: number;
@@ -3281,7 +3300,7 @@ export const FileWrite: MessageFns<FileWrite> = {
 };
 
 function createBaseFullWrite(): FullWrite {
-  return { content: undefined, s3ObjectKey: undefined };
+  return { content: undefined, s3ObjectKey: undefined, s3DownloadUrl: undefined, s3DownloadUrlExpiresMs: undefined };
 }
 
 export const FullWrite: MessageFns<FullWrite> = {
@@ -3291,6 +3310,12 @@ export const FullWrite: MessageFns<FullWrite> = {
     }
     if (message.s3ObjectKey !== undefined) {
       writer.uint32(18).string(message.s3ObjectKey);
+    }
+    if (message.s3DownloadUrl !== undefined) {
+      writer.uint32(82).string(message.s3DownloadUrl);
+    }
+    if (message.s3DownloadUrlExpiresMs !== undefined) {
+      writer.uint32(88).uint64(message.s3DownloadUrlExpiresMs);
     }
     return writer;
   },
@@ -3318,6 +3343,22 @@ export const FullWrite: MessageFns<FullWrite> = {
           message.s3ObjectKey = reader.string();
           continue;
         }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.s3DownloadUrl = reader.string();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.s3DownloadUrlExpiresMs = longToNumber(reader.uint64());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -3335,6 +3376,16 @@ export const FullWrite: MessageFns<FullWrite> = {
         : isSet(object.s3_object_key)
         ? globalThis.String(object.s3_object_key)
         : undefined,
+      s3DownloadUrl: isSet(object.s3DownloadUrl)
+        ? globalThis.String(object.s3DownloadUrl)
+        : isSet(object.s3_download_url)
+        ? globalThis.String(object.s3_download_url)
+        : undefined,
+      s3DownloadUrlExpiresMs: isSet(object.s3DownloadUrlExpiresMs)
+        ? globalThis.Number(object.s3DownloadUrlExpiresMs)
+        : isSet(object.s3_download_url_expires_ms)
+        ? globalThis.Number(object.s3_download_url_expires_ms)
+        : undefined,
     };
   },
 
@@ -3346,6 +3397,12 @@ export const FullWrite: MessageFns<FullWrite> = {
     if (message.s3ObjectKey !== undefined) {
       obj.s3ObjectKey = message.s3ObjectKey;
     }
+    if (message.s3DownloadUrl !== undefined) {
+      obj.s3DownloadUrl = message.s3DownloadUrl;
+    }
+    if (message.s3DownloadUrlExpiresMs !== undefined) {
+      obj.s3DownloadUrlExpiresMs = Math.round(message.s3DownloadUrlExpiresMs);
+    }
     return obj;
   },
 
@@ -3356,6 +3413,8 @@ export const FullWrite: MessageFns<FullWrite> = {
     const message = createBaseFullWrite();
     message.content = object.content ?? undefined;
     message.s3ObjectKey = object.s3ObjectKey ?? undefined;
+    message.s3DownloadUrl = object.s3DownloadUrl ?? undefined;
+    message.s3DownloadUrlExpiresMs = object.s3DownloadUrlExpiresMs ?? undefined;
     return message;
   },
 };
