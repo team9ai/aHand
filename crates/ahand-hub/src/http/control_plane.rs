@@ -956,7 +956,12 @@ pub async fn control_files(
     // the caller (not inside file_service::execute) because the
     // failure modes — 503 S3_DISABLED, 400 INVALID_S3_OBJECT_KEY —
     // shouldn't collapse into 500 Internal.
-    crate::http::files::maybe_inject_full_write_download_url(&state, &mut proto_request).await?;
+    crate::http::files::maybe_inject_full_write_download_url_for_device(
+        &state,
+        &body.device_id,
+        &mut proto_request,
+    )
+    .await?;
 
     // Caller-supplied timeout caps the hub's default but cannot exceed
     // `state.file_request_timeout` (the operator-configured hub-wide
