@@ -1484,6 +1484,69 @@ async fn cancelled_finish_reports_cancelled_error_code() {
 }
 
 #[tokio::test]
+async fn create_job_timeout_streams_error_and_sends_cancel() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-dev-timeout", "user-cp").await;
+    let token = mint_cp_jwt(&server, "user-cp");
+
+    let resp = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "cp-dev-timeout",
+            "tool": "sleep",
+            "args": ["10"],
+            "timeoutMs": 50,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let job_id = body["jobId"].as_str().unwrap().to_string();
+
+    let received = recv_job_request(&mut device).await;
+    assert_eq!(received.job_id, job_id);
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/stream",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stream_task = tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        let mut body = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            body.push_str(&String::from_utf8_lossy(&chunk));
+            if body.contains("event: error") {
+                break;
+            }
+        }
+        body
+    });
+
+    let cancel = tokio::time::timeout(Duration::from_secs(1), recv_cancel(&mut device))
+        .await
+        .expect("expected timeout cancel envelope");
+    assert_eq!(cancel.job_id, job_id);
+
+    let body = tokio::time::timeout(Duration::from_secs(1), stream_task)
+        .await
+        .expect("expected timeout SSE event")
+        .unwrap();
+    assert!(body.contains("event: error"));
+    assert!(body.contains(r#""code":"timeout""#));
+    assert!(server.state().control_jobs.get(&job_id).is_none());
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn stderr_and_progress_with_message_render_correctly() {
     // Covers the stderr + progress SSE render branches explicitly.
     // (Progress-with-message is reserved for future use but we

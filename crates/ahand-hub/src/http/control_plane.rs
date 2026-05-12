@@ -236,7 +236,43 @@ async fn create_job(
         return Err(ControlError::DeviceOffline);
     }
 
+    spawn_control_job_timeout(state.clone(), job_id.clone(), device.id.clone(), timeout_ms);
+
     Ok((StatusCode::ACCEPTED, Json(CreateJobResponse { job_id })))
+}
+
+fn spawn_control_job_timeout(state: AppState, job_id: String, device_id: String, timeout_ms: u64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(timeout_ms.max(1))).await;
+        let Some(channels) = state.control_jobs.get(&job_id) else {
+            return;
+        };
+        if channels.device_id != device_id {
+            return;
+        }
+        drop(channels);
+
+        let cancel = ahand_protocol::Envelope {
+            device_id: device_id.clone(),
+            msg_id: format!("control-timeout-{job_id}"),
+            ts_ms: now_ms(),
+            payload: Some(ahand_protocol::envelope::Payload::CancelJob(
+                ahand_protocol::CancelJob {
+                    job_id: job_id.clone(),
+                },
+            )),
+            ..Default::default()
+        };
+        let _ = state.connections.send_envelope(&device_id, cancel).await;
+
+        state.control_jobs.finalize(
+            &job_id,
+            ControlJobEvent::Error {
+                code: "timeout".into(),
+                message: format!("job timed out after {timeout_ms}ms"),
+            },
+        );
+    });
 }
 
 // NOTE: Late-joiner clients — those connecting AFTER the job's terminal

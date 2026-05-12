@@ -198,7 +198,9 @@ impl JobRuntime {
         match envelope.payload {
             Some(ahand_protocol::envelope::Payload::JobEvent(event)) => {
                 let Some(job) = self.job_for_device(device_id, &event.job_id).await? else {
-                    anyhow::bail!("job {} not found", event.job_id);
+                    return self
+                        .observe_stale_job_frame(device_id, seq, ack, &event.job_id, "JobEvent")
+                        .await;
                 };
                 self.clear_disconnect_task(&event.job_id);
                 if is_terminal_status(job.status) {
@@ -261,7 +263,15 @@ impl JobRuntime {
             }
             Some(ahand_protocol::envelope::Payload::JobFinished(finished)) => {
                 let Some(job) = self.job_for_device(device_id, &finished.job_id).await? else {
-                    anyhow::bail!("job {} not found", finished.job_id);
+                    return self
+                        .observe_stale_job_frame(
+                            device_id,
+                            seq,
+                            ack,
+                            &finished.job_id,
+                            "JobFinished",
+                        )
+                        .await;
                 };
                 self.clear_disconnect_task(&finished.job_id);
                 if is_terminal_status(job.status) {
@@ -307,7 +317,15 @@ impl JobRuntime {
             }
             Some(ahand_protocol::envelope::Payload::JobRejected(rejected)) => {
                 let Some(job) = self.job_for_device(device_id, &rejected.job_id).await? else {
-                    anyhow::bail!("job {} not found", rejected.job_id);
+                    return self
+                        .observe_stale_job_frame(
+                            device_id,
+                            seq,
+                            ack,
+                            &rejected.job_id,
+                            "JobRejected",
+                        )
+                        .await;
                 };
                 self.clear_disconnect_task(&rejected.job_id);
                 if is_terminal_status(job.status) {
@@ -402,6 +420,23 @@ impl JobRuntime {
             anyhow::bail!("job {job_id} does not belong to connected device {device_id}");
         }
         Ok(Some(job))
+    }
+
+    async fn observe_stale_job_frame(
+        &self,
+        device_id: &str,
+        seq: u64,
+        ack: u64,
+        job_id: &str,
+        payload_variant: &'static str,
+    ) -> anyhow::Result<()> {
+        tracing::warn!(
+            device_id,
+            job_id,
+            payload_variant,
+            "dropping stale job frame for unknown dashboard job"
+        );
+        self.connections.observe_inbound(device_id, seq, ack).await
     }
 
     async fn transition_job(
@@ -1248,6 +1283,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.status, JobStatus::Sent);
+    }
+
+    #[tokio::test]
+    async fn unknown_job_finished_from_device_frame_is_observed_and_ignored() {
+        let (runtime, connections, _jobs, _audit) = build_runtime().await;
+        let _transport = attach_live_connection(&connections, "device-1").await;
+        let stale_job_id = uuid::Uuid::new_v4().to_string();
+
+        let frame = ahand_protocol::Envelope {
+            device_id: "device-1".into(),
+            seq: 9,
+            payload: Some(ahand_protocol::envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: stale_job_id,
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        runtime
+            .handle_device_frame("device-1", &frame)
+            .await
+            .unwrap();
+
+        assert!(connections.has_seen_inbound("device-1", 9));
     }
 
     #[tokio::test]
