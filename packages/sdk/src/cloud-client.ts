@@ -191,6 +191,17 @@ export interface FileResult {
   durationMs: number;
 }
 
+export interface FileUploadUrlParams {
+  deviceId: string;
+  signal?: AbortSignal;
+}
+
+export interface FileUploadUrlResult {
+  objectKey: string;
+  uploadUrl: string;
+  expiresAtMs: number;
+}
+
 /**
  * Parameters for a single `browser()` invocation. Maps to the hub's
  * `POST /api/control/browser` request body (snake_case wire format).
@@ -744,6 +755,86 @@ export class CloudClient {
       result: json.result === null ? undefined : json.result,
       error,
       durationMs: typeof json.duration_ms === "number" ? json.duration_ms : 0,
+    };
+  }
+
+  /**
+   * `POST /api/control/files/upload-url`. Requests a control-plane
+   * object-storage upload URL for the given device and decodes the
+   * snake_case hub response into camelCase.
+   */
+  async createFileUploadUrl(
+    params: FileUploadUrlParams,
+  ): Promise<FileUploadUrlResult> {
+    if (params.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted before request");
+    }
+
+    const fetchImpl = this.fetchImpl();
+    const token = await this.opts.getAuthToken();
+    if (params.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
+
+    let res: Response;
+    try {
+      res = await fetchImpl(`${this.opts.hubUrl}/api/control/files/upload-url`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ device_id: params.deviceId }),
+        signal: params.signal,
+      });
+    } catch (err) {
+      throw this.normalizeFetchError(err);
+    }
+    if (!res.ok) throw await toTypedHttpError(res);
+
+    let json: {
+      object_key?: unknown;
+      upload_url?: unknown;
+      expires_at_ms?: unknown;
+    };
+    try {
+      json = (await res.json()) as typeof json;
+    } catch (e: unknown) {
+      if (isAbortError(e)) {
+        throw new CloudClientError(
+          "abort",
+          "file upload URL request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw new CloudClientError("network", String(e), { cause: e });
+    }
+
+    if (
+      json === null ||
+      typeof json !== "object" ||
+      Array.isArray(json) ||
+      typeof json.object_key !== "string" ||
+      typeof json.upload_url !== "string" ||
+      typeof json.expires_at_ms !== "number"
+    ) {
+      throw new CloudClientError(
+        "server_error",
+        "Hub response malformed: expected object_key, upload_url, and expires_at_ms",
+      );
+    }
+
+    return {
+      objectKey: json.object_key,
+      uploadUrl: json.upload_url,
+      expiresAtMs: json.expires_at_ms,
     };
   }
 
