@@ -85,7 +85,7 @@ pub async fn inspect_all() -> Vec<CheckReport> {
 pub async fn inspect(name: &str) -> Option<CheckReport> {
     match name {
         "node" => Some(node::inspect().await),
-        "playwright" => Some(playwright::inspect().await),
+        "playwright" | "browser-playwright-cli" => Some(playwright::inspect().await),
         "browser" => Some(inspect_browser()),
         _ => None,
     }
@@ -123,8 +123,10 @@ pub async fn run_all(
     Ok(vec![node_report, playwright_report, browser_report])
 }
 
-/// Run a single install step. Valid names: `node`, `playwright`.
-/// Returns an error for `playwright` if Node is not already installed.
+/// Run a single install step. Valid names: `node`, `playwright`,
+/// `browser-playwright-cli`, plus non-installable plugin ids for diagnostics.
+/// Returns an error for `playwright`/`browser-playwright-cli` if Node is not
+/// already installed.
 ///
 /// **Progress-callback note:** `Phase::Done` is emitted even on failure
 /// (see `wrap_failure`); use the `Result` return value, not the callback,
@@ -140,26 +142,31 @@ pub async fn run_step(
             Ok(r) => Ok(r),
             Err(e) => Err(wrap_failure(e, "node", "Node.js", progress_ref)),
         },
-        "playwright" => {
+        "playwright" | "browser-playwright-cli" => {
             let node_status = node::inspect().await;
             if !matches!(node_status.status, CheckStatus::Ok { .. }) {
                 bail!(
-                    "playwright step requires node to be installed first. \
+                    "browser-playwright-cli requires node to be installed first. \
                      Run `ahandd browser-init --step node` first, or \
-                     `ahandd browser-init` for all steps."
+                     `ahandd plugin install browser-playwright-cli`."
                 );
             }
             match playwright::ensure(force, progress_ref).await {
                 Ok(r) => Ok(r),
                 Err(e) => Err(wrap_failure(
                     e,
-                    "playwright",
+                    "browser-playwright-cli",
                     "playwright-cli",
                     progress_ref,
                 )),
             }
         }
-        other => bail!("unknown step `{other}`. Valid steps: node, playwright"),
+        "shell" | "file" | "python" => {
+            bail!("plugin `{name}` does not have an install step in this release")
+        }
+        other => bail!(
+            "unknown step `{other}`. Valid install steps: node, playwright, browser-playwright-cli"
+        ),
     }
 }
 
@@ -268,6 +275,23 @@ mod tests {
         assert!(inspect("playwright").await.is_some());
         assert!(inspect("browser").await.is_some());
         assert!(inspect("nothing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inspect_accepts_plugin_id_aliases() {
+        assert!(inspect("node").await.is_some());
+        assert!(inspect("playwright").await.is_some());
+        assert!(inspect("browser-playwright-cli").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_step_rejects_file_plugin_because_it_has_no_installer() {
+        let progress = |_: ProgressEvent| {};
+        let err = run_step("file", false, progress)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not have an install step"));
     }
 
     #[test]
