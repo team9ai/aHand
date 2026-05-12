@@ -194,7 +194,16 @@ pub async fn upload_url(
     Path(device_id): Path<String>,
 ) -> ApiResult<Json<UploadUrlResponse>> {
     auth.require_dashboard_access()?;
-    validate_device_id_for_s3_key(&device_id)?;
+    Ok(Json(
+        create_upload_url_for_device(&state, &device_id).await?,
+    ))
+}
+
+pub(crate) async fn create_upload_url_for_device(
+    state: &AppState,
+    device_id: &str,
+) -> ApiResult<UploadUrlResponse> {
+    validate_device_id_for_s3_key(device_id)?;
 
     let Some(s3) = state.s3_client.as_ref() else {
         return Err(ApiError::new(
@@ -213,11 +222,11 @@ pub async fn upload_url(
         )
     })?;
 
-    Ok(Json(UploadUrlResponse {
+    Ok(UploadUrlResponse {
         object_key: presigned.object_key,
         upload_url: presigned.url,
         expires_at_ms: presigned.expires_at_ms,
-    }))
+    })
 }
 
 /// Inspect a `FileResponse` produced by the daemon. If it carries inline

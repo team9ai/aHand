@@ -89,6 +89,68 @@ fn mint_cp_jwt_with_scope(external_user_id: &str, scope: &str) -> String {
 }
 
 #[tokio::test]
+async fn control_files_upload_url_requires_auth() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{}/api/control/files/upload-url",
+            server.http_base_url()
+        ))
+        .json(&serde_json::json!({ "device_id": "device-2" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_files_upload_url_rejects_wrong_owner() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let device = attach_owned_device(&server, "cf-upload-owner", "owner-a").await;
+    let token = mint_cp_jwt("owner-b");
+
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{}/api/control/files/upload-url",
+            server.http_base_url()
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "device_id": "cf-upload-owner" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+    drop(device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_files_upload_url_returns_s3_disabled_without_s3() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let device = attach_owned_device(&server, "cf-upload-s3", "owner-a").await;
+    let token = mint_cp_jwt("owner-a");
+
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{}/api/control/files/upload-url",
+            server.http_base_url()
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "device_id": "cf-upload-s3" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "S3_DISABLED");
+    drop(device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn control_files_401_without_auth_header() {
     let server = spawn_server_with_state(support::test_state().await).await;
 
