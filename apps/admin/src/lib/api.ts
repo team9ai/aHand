@@ -89,6 +89,9 @@ export type PluginStatus =
   | "failed"
   | "blocked";
 
+export type HostPlatform = "darwin" | "linux" | "windows";
+export type HostArch = "arm64" | "x64";
+
 export type HostResourceValue =
   | { kind: "executable"; name: string; path: string; version?: string }
   | { kind: "directory"; name: string; path: string }
@@ -107,8 +110,8 @@ export interface InstalledPluginResource {
 
 export interface HostResourceSnapshot {
   runtimeVersion: string;
-  platform: string;
-  arch: string;
+  platform: HostPlatform;
+  arch: HostArch;
   plugins: InstalledPluginResource[];
 }
 
