@@ -1168,6 +1168,25 @@ describe("CloudClient.files", () => {
     ).rejects.toMatchObject({ code: "unauthorized", httpStatus: 401 });
   });
 
+  it("bad: upload-url HTTP 503 S3_DISABLED → CloudClientError(s3_disabled)", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          { error: { code: "S3_DISABLED", message: "S3 uploads are not configured" } },
+          503,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1" }),
+    ).rejects.toMatchObject({
+      code: "s3_disabled",
+      httpStatus: 503,
+      message: "S3 uploads are not configured",
+    });
+  });
+
   it("happy: POSTs /api/control/files with snake_case body + Bearer auth", async () => {
     const { fn, calls } = mockFetch([
       () =>

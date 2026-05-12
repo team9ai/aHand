@@ -261,7 +261,8 @@ export type CloudClientErrorCode =
   | "network"
   | "timeout"
   | "device_offline"
-  | "policy_denied";
+  | "policy_denied"
+  | "s3_disabled";
 
 /**
  * Typed error raised by `CloudClient`. Use `.code` to discriminate,
@@ -361,6 +362,8 @@ async function toTypedHttpError(res: Response): Promise<CloudClientError> {
       code = "device_offline";
     } else if (res.status === 403 && body?.error?.code === "POLICY_DENIED") {
       code = "policy_denied";
+    } else if (res.status === 503 && body?.error?.code === "S3_DISABLED") {
+      code = "s3_disabled";
     }
   } catch {
     // Body wasn't JSON — keep the status-based message.
