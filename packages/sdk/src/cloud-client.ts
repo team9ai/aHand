@@ -470,7 +470,7 @@ export class CloudClient {
         signal: p.signal,
       });
     } catch (err) {
-      throw this.normalizeFetchError(err);
+      throw this.normalizeFetchError(err, p.signal);
     }
     if (!postRes.ok) throw await toTypedHttpError(postRes);
 
@@ -555,7 +555,7 @@ export class CloudClient {
         signal: params.signal,
       });
     } catch (err) {
-      throw this.normalizeFetchError(err);
+      throw this.normalizeFetchError(err, params.signal);
     }
     if (!res.ok) throw await toTypedHttpError(res);
 
@@ -687,7 +687,7 @@ export class CloudClient {
         signal: params.signal,
       });
     } catch (err) {
-      throw this.normalizeFetchError(err);
+      throw this.normalizeFetchError(err, params.signal);
     }
     if (!res.ok) throw await toTypedHttpError(res);
 
@@ -791,7 +791,7 @@ export class CloudClient {
         signal: params.signal,
       });
     } catch (err) {
-      throw this.normalizeFetchError(err);
+      throw this.normalizeFetchError(err, params.signal);
     }
     if (!res.ok) throw await toTypedHttpError(res);
 
@@ -884,7 +884,7 @@ export class CloudClient {
         },
       );
     } catch (err) {
-      throw this.normalizeFetchError(err);
+      throw this.normalizeFetchError(err, p.signal);
     }
     if (!streamRes.ok) throw await toTypedHttpError(streamRes);
     if (!streamRes.body) {
@@ -905,7 +905,7 @@ export class CloudClient {
         try {
           chunk = await reader.read();
         } catch (err) {
-          throw this.normalizeFetchError(err);
+          throw this.normalizeFetchError(err, p.signal);
         }
         const { done, value } = chunk;
         if (done) {
@@ -1037,8 +1037,11 @@ export class CloudClient {
    * surface as `abort`; everything else as `network` with the original
    * error attached as `cause`.
    */
-  private normalizeFetchError(err: unknown): CloudClientError {
-    if (isAbortError(err)) {
+  private normalizeFetchError(
+    err: unknown,
+    signal?: AbortSignal,
+  ): CloudClientError {
+    if (signal?.aborted || isAbortError(err)) {
       return new CloudClientError("abort", "Aborted", { cause: err });
     }
     const message = err instanceof Error ? err.message : String(err);
