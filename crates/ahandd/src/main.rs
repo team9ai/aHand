@@ -10,6 +10,7 @@ mod file_manager;
 mod ipc;
 mod openclaw;
 mod outbox;
+mod plugin_runtime;
 mod policy;
 mod registry;
 mod session;

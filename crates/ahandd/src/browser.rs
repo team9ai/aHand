@@ -414,23 +414,20 @@ impl BrowserManager {
     }
 
     fn binary_path(&self) -> PathBuf {
-        match &self.config.binary_path {
-            Some(p) => PathBuf::from(p),
-            None => {
-                // Prefer the aHand-managed Node.js installation
-                let ahand_path = dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
-                    .join(".ahand")
-                    .join("node")
-                    .join("bin")
-                    .join("playwright-cli");
-                if ahand_path.exists() {
-                    ahand_path
-                } else {
-                    PathBuf::from("playwright-cli") // fallback to PATH
-                }
-            }
+        let managed = crate::plugin_runtime::RuntimeDirs::new()
+            .ok()
+            .map(|dirs| dirs.playwright_cli_bin());
+        Self::resolve_binary_path(self.config.binary_path.as_deref(), managed)
+    }
+
+    fn resolve_binary_path(configured: Option<&str>, managed: Option<PathBuf>) -> PathBuf {
+        if let Some(path) = configured {
+            return PathBuf::from(path);
         }
+
+        managed
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| PathBuf::from("playwright-cli"))
     }
 
     fn build_cli_args(
@@ -460,10 +457,9 @@ impl BrowserManager {
     fn build_env_vars(&self) -> Vec<(String, String)> {
         let mut envs = Vec::new();
 
-        // Prepend our locally-installed Node.js to PATH so playwright-cli
-        // can find dependencies.
-        if let Some(home) = dirs::home_dir() {
-            let node_bin_dir = home.join(".ahand").join("node").join("bin");
+        // Prepend the managed Node.js runtime to PATH so playwright-cli can find node.
+        if let Ok(runtime) = crate::plugin_runtime::RuntimeDirs::new() {
+            let node_bin_dir = runtime.node_dir().join("bin");
             if node_bin_dir.is_dir() {
                 let system_path = std::env::var("PATH").unwrap_or_default();
                 envs.push((
@@ -863,5 +859,35 @@ mod tests {
         assert!(!is_download_complete(Path::new("/tmp/file.crdownload")));
         assert!(!is_download_complete(Path::new("/tmp/file.part")));
         assert!(!is_download_complete(Path::new("/tmp/file.tmp")));
+    }
+
+    #[test]
+    fn binary_path_uses_explicit_config() {
+        let managed = PathBuf::from("/tmp/managed/playwright-cli");
+        let resolved =
+            BrowserManager::resolve_binary_path(Some("/custom/playwright-cli"), Some(managed));
+
+        assert_eq!(resolved, PathBuf::from("/custom/playwright-cli"));
+    }
+
+    #[test]
+    fn binary_path_uses_existing_managed_runtime_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("playwright-cli");
+        std::fs::write(&managed, "").unwrap();
+
+        let resolved = BrowserManager::resolve_binary_path(None, Some(managed.clone()));
+
+        assert_eq!(resolved, managed);
+    }
+
+    #[test]
+    fn binary_path_falls_back_to_path_when_managed_cli_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let managed = dir.path().join("missing-playwright-cli");
+
+        let resolved = BrowserManager::resolve_binary_path(None, Some(managed));
+
+        assert_eq!(resolved, PathBuf::from("playwright-cli"));
     }
 }
