@@ -13,30 +13,62 @@ pub async fn get_host_resource() -> anyhow::Result<HostResourceSnapshot> {
     let registry = builtin_registry()?;
     let runtime = RuntimeDirs::new()?;
     let node_report = crate::browser_setup::node::inspect().await;
-    let node_is_ok = matches!(node_report.status, CheckStatus::Ok { .. });
+    let shell_candidate = shell_path();
+    let mut dependency_statuses = BTreeMap::new();
+    dependency_statuses.insert(
+        "shell".to_string(),
+        shell_status_from_path(&shell_candidate),
+    );
+    if let Some(manifest) = registry.get("node") {
+        dependency_statuses.insert(
+            "node".to_string(),
+            node_resource(manifest, &runtime, &node_report).status,
+        );
+    }
 
     let mut plugins = Vec::new();
     for manifest in registry.manifests() {
         plugins.push(match manifest.id.as_str() {
-            "shell" => shell_resource(manifest),
+            "shell" => shell_resource_from_path(manifest, shell_candidate.clone()),
             "file" => file_resource(manifest),
             "node" => node_resource(manifest, &runtime, &node_report),
             "python" => python_resource(manifest, &runtime).await,
-            "browser-playwright-cli" => browser_playwright_resource(manifest, node_is_ok).await,
+            "browser-playwright-cli" => {
+                browser_playwright_resource(manifest, &dependency_statuses).await
+            }
             _ => manifest_resource(manifest, PluginStatus::Missing, BTreeMap::new()),
         });
     }
 
     Ok(HostResourceSnapshot {
         runtime_version: env!("CARGO_PKG_VERSION").to_string(),
-        platform: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
+        platform: host_platform(),
+        arch: host_arch(),
         plugins,
     })
 }
 
-fn shell_resource(manifest: &PluginManifest) -> InstalledPluginResource {
-    shell_resource_from_path(manifest, shell_path())
+fn host_platform() -> String {
+    normalize_platform(std::env::consts::OS).to_string()
+}
+
+fn normalize_platform(platform: &str) -> &str {
+    match platform {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+fn host_arch() -> String {
+    normalize_arch(std::env::consts::ARCH).to_string()
+}
+
+fn normalize_arch(arch: &str) -> &str {
+    match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    }
 }
 
 fn shell_path() -> String {
@@ -62,7 +94,7 @@ fn shell_path() -> String {
 }
 
 fn shell_resource_from_path(manifest: &PluginManifest, shell: String) -> InstalledPluginResource {
-    if !Path::new(&shell).is_file() {
+    if shell_status_from_path(&shell) != PluginStatus::Installed {
         return manifest_resource(manifest, PluginStatus::Missing, BTreeMap::new());
     }
 
@@ -77,6 +109,34 @@ fn shell_resource_from_path(manifest: &PluginManifest, shell: String) -> Install
     );
 
     manifest_resource(manifest, PluginStatus::Installed, resources)
+}
+
+fn shell_status_from_path(shell: &str) -> PluginStatus {
+    if is_executable_file(Path::new(shell)) {
+        PluginStatus::Installed
+    } else {
+        PluginStatus::Missing
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn file_resource(manifest: &PluginManifest) -> InstalledPluginResource {
@@ -148,9 +208,9 @@ async fn python_resource(
 
 async fn browser_playwright_resource(
     manifest: &PluginManifest,
-    node_is_ok: bool,
+    dependency_statuses: &BTreeMap<String, PluginStatus>,
 ) -> InstalledPluginResource {
-    if !node_is_ok {
+    if !dependencies_installed(manifest, dependency_statuses) {
         return manifest_resource(manifest, PluginStatus::Blocked, BTreeMap::new());
     }
 
@@ -172,6 +232,16 @@ async fn browser_playwright_resource(
     };
 
     manifest_resource(manifest, status, resources)
+}
+
+fn dependencies_installed(
+    manifest: &PluginManifest,
+    dependency_statuses: &BTreeMap<String, PluginStatus>,
+) -> bool {
+    manifest
+        .dependencies
+        .iter()
+        .all(|dependency| dependency_statuses.get(dependency) == Some(&PluginStatus::Installed))
 }
 
 fn manifest_resource(
@@ -242,6 +312,15 @@ mod tests {
         }
     }
 
+    fn manifest_with_dependencies(id: &str, dependencies: &[&str]) -> PluginManifest {
+        let mut manifest = manifest(id);
+        manifest.dependencies = dependencies
+            .iter()
+            .map(|dependency| dependency.to_string())
+            .collect();
+        manifest
+    }
+
     #[tokio::test]
     async fn snapshot_contains_first_party_plugins() {
         let snapshot = get_host_resource().await.unwrap();
@@ -274,6 +353,15 @@ mod tests {
                 .as_ref()
                 .is_some_and(|prompt| prompt.contains("browser automation"))
         );
+    }
+
+    #[test]
+    fn platform_and_arch_use_public_host_resource_vocabulary() {
+        assert_eq!(normalize_platform("macos"), "darwin");
+        assert_eq!(normalize_platform("linux"), "linux");
+        assert_eq!(normalize_platform("windows"), "windows");
+        assert_eq!(normalize_arch("aarch64"), "arm64");
+        assert_eq!(normalize_arch("x86_64"), "x64");
     }
 
     #[test]
@@ -310,6 +398,22 @@ mod tests {
         assert!(plugin.resources.is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shell_resource_missing_when_candidate_is_not_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let shell = dir.path().join("shell");
+        std::fs::write(&shell, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let plugin = shell_resource_from_path(&manifest("shell"), path_to_string(shell));
+
+        assert_eq!(plugin.status, PluginStatus::Missing);
+        assert!(plugin.resources.is_empty());
+    }
+
     #[test]
     fn shell_resource_missing_when_candidate_is_absent() {
         let dir = tempfile::tempdir().unwrap();
@@ -318,6 +422,20 @@ mod tests {
         let plugin = shell_resource_from_path(&manifest("shell"), path_to_string(missing));
 
         assert_eq!(plugin.status, PluginStatus::Missing);
+        assert!(plugin.resources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn browser_plugin_blocks_when_shell_dependency_is_missing() {
+        let manifest = manifest_with_dependencies("browser-playwright-cli", &["shell", "node"]);
+        let dependency_statuses = BTreeMap::from([
+            ("shell".to_string(), PluginStatus::Missing),
+            ("node".to_string(), PluginStatus::Installed),
+        ]);
+
+        let plugin = browser_playwright_resource(&manifest, &dependency_statuses).await;
+
+        assert_eq!(plugin.status, PluginStatus::Blocked);
         assert!(plugin.resources.is_empty());
     }
 }

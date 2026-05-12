@@ -7,10 +7,12 @@ pub struct RuntimeDirs {
 
 impl RuntimeDirs {
     pub fn new() -> anyhow::Result<Self> {
-        let cache = dirs::cache_dir()
-            .ok_or_else(|| anyhow::anyhow!("cannot determine user cache directory"))?;
+        let home =
+            dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
         Ok(Self::from_root(
-            cache.join("ahand-runtimes").join("ahand-primary-runtime"),
+            home.join(".cache")
+                .join("ahand-runtimes")
+                .join("ahand-primary-runtime"),
         ))
     }
 
@@ -82,6 +84,19 @@ mod tests {
             std::path::PathBuf::from(
                 "/tmp/cache/ahand-primary-runtime/dependencies/node/bin/playwright-cli"
             )
+        );
+    }
+
+    #[test]
+    fn runtime_dirs_new_uses_dot_cache_runtime_root() {
+        let home = dirs::home_dir().unwrap();
+        let dirs = RuntimeDirs::new().unwrap();
+
+        assert_eq!(
+            dirs.root,
+            home.join(".cache")
+                .join("ahand-runtimes")
+                .join("ahand-primary-runtime")
         );
     }
 }
