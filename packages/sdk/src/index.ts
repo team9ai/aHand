@@ -17,4 +17,6 @@ export type {
   FileParams,
   FileResult,
   FileErrorPayload,
+  FileUploadUrlParams,
+  FileUploadUrlResult,
 } from "./cloud-client.ts";
