@@ -576,13 +576,6 @@ export class CloudClient {
       // gateway swapped in an HTML 502 page with a 200 status). Both
       // need to surface as proper `CloudClientError`s so callers don't
       // see a raw `SyntaxError` / `AbortError` leaking through.
-      if (isAbortError(e)) {
-        throw new CloudClientError(
-          "abort",
-          "browser request aborted during response read",
-          { cause: e },
-        );
-      }
       if (e instanceof SyntaxError) {
         throw new CloudClientError(
           "server_error",
@@ -590,7 +583,7 @@ export class CloudClient {
           { cause: e },
         );
       }
-      throw new CloudClientError("network", String(e), { cause: e });
+      throw this.normalizeFetchError(e, params.signal);
     }
 
     // Strict shape check: a missing or non-boolean `success` field
@@ -705,13 +698,6 @@ export class CloudClient {
       // Same defensive read as `browser()`: aborted-mid-body and
       // non-JSON responses both need to surface as proper
       // `CloudClientError`s.
-      if (isAbortError(e)) {
-        throw new CloudClientError(
-          "abort",
-          "files request aborted during response read",
-          { cause: e },
-        );
-      }
       if (e instanceof SyntaxError) {
         throw new CloudClientError(
           "server_error",
@@ -719,7 +705,7 @@ export class CloudClient {
           { cause: e },
         );
       }
-      throw new CloudClientError("network", String(e), { cause: e });
+      throw this.normalizeFetchError(e, params.signal);
     }
 
     // Strict shape check — same rationale as `browser()`. A non-object
@@ -803,13 +789,6 @@ export class CloudClient {
     try {
       json = (await res.json()) as typeof json;
     } catch (e: unknown) {
-      if (isAbortError(e)) {
-        throw new CloudClientError(
-          "abort",
-          "file upload URL request aborted during response read",
-          { cause: e },
-        );
-      }
       if (e instanceof SyntaxError) {
         throw new CloudClientError(
           "server_error",
@@ -817,7 +796,7 @@ export class CloudClient {
           { cause: e },
         );
       }
-      throw new CloudClientError("network", String(e), { cause: e });
+      throw this.normalizeFetchError(e, params.signal);
     }
 
     if (
