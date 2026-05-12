@@ -17,4 +17,13 @@ export type {
   FileParams,
   FileResult,
   FileErrorPayload,
+  ReadFileMode,
+  ReadFileImageFormat,
+  ReadFileParams,
+  ReadFilePosition,
+  ReadFileTextLine,
+  ReadFileTextResult,
+  ReadFileBinaryResult,
+  ReadFileImageResult,
+  ReadFileResult,
 } from "./cloud-client.ts";

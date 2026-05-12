@@ -1481,6 +1481,234 @@ describe("CloudClient.files", () => {
   });
 });
 
+describe("CloudClient.readFile", () => {
+  it("happy: text mode sends read_text params and returns line-numbered content", async () => {
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            request_id: "r-text",
+            operation: "read_text",
+            success: true,
+            result: {
+              lines: [
+                { content: "line 3", line_number: 3, truncated: false, remaining_bytes: 0 },
+                { content: "line 4", line_number: 4, truncated: false, remaining_bytes: 0 },
+              ],
+              stop_reason: "max_lines",
+              start_pos: { line: 3, byte_in_file: 14, byte_in_line: 0 },
+              end_pos: { line: 4, byte_in_file: 28, byte_in_line: 7 },
+              remaining_bytes: 7,
+              total_file_bytes: 35,
+              total_lines: 5,
+              detected_encoding: "utf-8",
+            },
+            duration_ms: 4,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const result = await client.readFile({
+      deviceId: "d",
+      path: "/tmp/a.txt",
+      mode: "text",
+      startLine: 2,
+      maxLine: 2,
+      maxSize: 5000,
+      maxLineWidth: 120,
+      encoding: "utf-8",
+    });
+
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body).toEqual({
+      device_id: "d",
+      operation: "read_text",
+      params: {
+        path: "/tmp/a.txt",
+        start: { start_line: 3 },
+        max_lines: 2,
+        max_bytes: 5000,
+        max_line_width: 120,
+        encoding: "utf-8",
+        line_numbers: true,
+        no_follow_symlink: false,
+      },
+    });
+    expect(result).toEqual({
+      kind: "text",
+      path: "/tmp/a.txt",
+      requestId: "r-text",
+      operation: "read_text",
+      content: "3 | line 3\n4 | line 4",
+      lines: [
+        { content: "line 3", lineNumber: 3, truncated: false, remainingBytes: 0 },
+        { content: "line 4", lineNumber: 4, truncated: false, remainingBytes: 0 },
+      ],
+      stopReason: "max_lines",
+      start: { line: 3, byteInFile: 14, byteInLine: 0 },
+      end: { line: 4, byteInFile: 28, byteInLine: 7 },
+      remainingBytes: 7,
+      totalBytes: 35,
+      totalLines: 5,
+      detectedEncoding: "utf-8",
+      truncated: true,
+      cursor: "startLine=4",
+      durationMs: 4,
+    });
+  });
+
+  it("happy: auto routes image extensions to read_image and decodes bytes", async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            request_id: "r-img",
+            operation: "read_image",
+            success: true,
+            result: {
+              content_b64: png.toString("base64"),
+              format: "original",
+              width: 10,
+              height: 8,
+              original_bytes: 7,
+              output_bytes: 7,
+              download_url: null,
+              download_url_expires_ms: null,
+            },
+            duration_ms: 3,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const result = await client.readFile({ deviceId: "d", path: "/tmp/pic.png" });
+
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body.operation).toBe("read_image");
+    expect(body.params).toEqual({
+      path: "/tmp/pic.png",
+      output_format: "original",
+      no_follow_symlink: false,
+    });
+    expect(result.kind).toBe("image");
+    if (result.kind !== "image") throw new Error("expected image result");
+    expect(result.mime).toBe("image/png");
+    expect(Buffer.from(result.data)).toEqual(png);
+    expect(result.width).toBe(10);
+    expect(result.height).toBe(8);
+  });
+
+  it("happy: auto falls back to read_binary when text decoding fails", async () => {
+    const bytes = Buffer.from([0, 1, 2, 3]);
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            request_id: "r-text",
+            operation: "read_text",
+            success: false,
+            error: { code: "encoding", message: "not valid text", path: "/tmp/blob" },
+            duration_ms: 2,
+          },
+          200,
+        ),
+      () =>
+        jsonResponse(
+          {
+            request_id: "r-bin",
+            operation: "read_binary",
+            success: true,
+            result: {
+              content_b64: bytes.toString("base64"),
+              byte_offset: 0,
+              bytes_read: 4,
+              total_file_bytes: 4,
+              remaining_bytes: 0,
+              download_url: null,
+              download_url_expires_ms: null,
+            },
+            duration_ms: 3,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const result = await client.readFile({ deviceId: "d", path: "/tmp/blob" });
+
+    expect(JSON.parse(calls[0].init?.body as string).operation).toBe("read_text");
+    expect(JSON.parse(calls[1].init?.body as string).operation).toBe("read_binary");
+    expect(result.kind).toBe("binary");
+    if (result.kind !== "binary") throw new Error("expected binary result");
+    expect(Buffer.from(result.data)).toEqual(bytes);
+    expect(result.totalBytes).toBe(4);
+    expect(result.remainingBytes).toBe(0);
+  });
+
+  it("happy: auto routes pdf paths to binary until pdf extraction exists", async () => {
+    const bytes = Buffer.from("%PDF-1.7\n");
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            request_id: "r-pdf",
+            operation: "read_binary",
+            success: true,
+            result: {
+              content_b64: bytes.toString("base64"),
+              byte_offset: 0,
+              bytes_read: bytes.byteLength,
+              total_file_bytes: bytes.byteLength,
+              remaining_bytes: 0,
+              download_url: null,
+              download_url_expires_ms: null,
+            },
+            duration_ms: 3,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const result = await client.readFile({ deviceId: "d", path: "/tmp/report.pdf" });
+
+    expect(JSON.parse(calls[0].init?.body as string).operation).toBe("read_binary");
+    expect(result.kind).toBe("binary");
+    if (result.kind !== "binary") throw new Error("expected binary result");
+    expect(result.mime).toBe("application/pdf");
+    expect(Buffer.from(result.data)).toEqual(bytes);
+  });
+
+  it("bad: daemon errors in explicit mode become CloudClientError with file code detail", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            request_id: "r-nf",
+            operation: "read_text",
+            success: false,
+            error: { code: "not_found", message: "missing", path: "/tmp/missing" },
+            duration_ms: 1,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.readFile({ deviceId: "d", path: "/tmp/missing", mode: "text" }),
+    ).rejects.toMatchObject({
+      code: "not_found",
+      jobErrorCode: "not_found",
+      jobErrorMessage: "missing",
+    });
+  });
+});
+
 describe("CloudClientError", () => {
   it("exposes expected properties", () => {
     const err = new CloudClientError("forbidden", "msg", {

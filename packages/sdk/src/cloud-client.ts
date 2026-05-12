@@ -191,6 +191,114 @@ export interface FileResult {
   durationMs: number;
 }
 
+export type ReadFileMode = "auto" | "text" | "image" | "binary";
+
+export type ReadFileImageFormat = "original" | "jpeg" | "png" | "webp";
+
+export interface ReadFileParams {
+  deviceId: string;
+  path: string;
+  mode?: ReadFileMode;
+  /** Zero-based byte cursor. Cannot be used with startLine. */
+  startIndex?: number;
+  /** Zero-based line cursor for text reads. Cannot be used with startIndex. */
+  startLine?: number;
+  /** Text max_bytes / binary max_bytes, depending on mode. */
+  maxSize?: number;
+  /** Text max_lines. */
+  maxLine?: number;
+  /** Text max_line_width; 0 disables per-line truncation daemon-side. */
+  maxLineWidth?: number;
+  encoding?: string;
+  /** Binary byte_offset. Defaults to 0. */
+  byteOffset?: number;
+  /** Binary byte_length. 0 means read to EOF subject to maxSize. */
+  byteLength?: number;
+  /** Image longest-edge convenience. Maps to max_width and max_height. */
+  maxEdge?: number;
+  maxWidth?: number;
+  maxHeight?: number;
+  maxBytes?: number;
+  quality?: number;
+  imageFormat?: ReadFileImageFormat;
+  noFollowSymlink?: boolean;
+  timeoutMs?: number;
+  correlationId?: string;
+  signal?: AbortSignal;
+}
+
+export interface ReadFilePosition {
+  line: number;
+  byteInFile: number;
+  byteInLine: number;
+}
+
+export interface ReadFileTextLine {
+  content: string;
+  lineNumber: number;
+  truncated: boolean;
+  remainingBytes: number;
+}
+
+export interface ReadFileTextResult {
+  kind: "text";
+  path: string;
+  requestId: string;
+  operation: "read_text";
+  content: string;
+  lines: ReadFileTextLine[];
+  stopReason:
+    | "unspecified"
+    | "max_lines"
+    | "max_bytes"
+    | "target_end"
+    | "file_end"
+    | "error";
+  start: ReadFilePosition | null;
+  end: ReadFilePosition | null;
+  remainingBytes: number;
+  totalBytes: number;
+  totalLines: number;
+  detectedEncoding: string;
+  truncated: boolean;
+  cursor?: string;
+  durationMs: number;
+}
+
+export interface ReadFileBinaryResult {
+  kind: "binary";
+  path: string;
+  requestId: string;
+  operation: "read_binary";
+  data: Uint8Array;
+  mime: string;
+  byteOffset: number;
+  bytesRead: number;
+  totalBytes: number;
+  remainingBytes: number;
+  durationMs: number;
+}
+
+export interface ReadFileImageResult {
+  kind: "image";
+  path: string;
+  requestId: string;
+  operation: "read_image";
+  data: Uint8Array;
+  mime: string;
+  format: ReadFileImageFormat;
+  width: number;
+  height: number;
+  originalBytes: number;
+  outputBytes: number;
+  durationMs: number;
+}
+
+export type ReadFileResult =
+  | ReadFileTextResult
+  | ReadFileBinaryResult
+  | ReadFileImageResult;
+
 /**
  * Parameters for a single `browser()` invocation. Maps to the hub's
  * `POST /api/control/browser` request body (snake_case wire format).
@@ -404,6 +512,366 @@ function isSseComment(raw: string): boolean {
     if (!line.startsWith(":")) return false;
   }
   return sawNonEmpty;
+}
+
+const IMAGE_PATH_RE = /\.(?:png|jpe?g|webp|gif|bmp|tiff?|avif|heic|heif)$/i;
+const PDF_PATH_RE = /\.pdf(?:[?#].*)?$/i;
+
+interface ReadTextWireResult {
+  lines: TextLineWire[];
+  stop_reason:
+    | "unspecified"
+    | "max_lines"
+    | "max_bytes"
+    | "target_end"
+    | "file_end"
+    | "error";
+  start_pos: PositionInfoWire | null;
+  end_pos: PositionInfoWire | null;
+  remaining_bytes: number;
+  total_file_bytes: number;
+  total_lines: number;
+  detected_encoding: string;
+}
+
+interface TextLineWire {
+  content: string;
+  line_number: number;
+  truncated: boolean;
+  remaining_bytes: number;
+}
+
+interface PositionInfoWire {
+  line: number;
+  byte_in_file: number;
+  byte_in_line: number;
+}
+
+interface ReadBinaryWireResult {
+  content_b64?: string;
+  byte_offset: number;
+  bytes_read: number;
+  total_file_bytes: number;
+  remaining_bytes: number;
+  download_url?: string | null;
+  download_url_expires_ms?: number | null;
+}
+
+interface ReadImageWireResult {
+  content_b64?: string;
+  format: ReadFileImageFormat;
+  width: number;
+  height: number;
+  original_bytes: number;
+  output_bytes: number;
+  download_url?: string | null;
+  download_url_expires_ms?: number | null;
+}
+
+const READ_TEXT_STOP_REASONS = [
+  "unspecified",
+  "max_lines",
+  "max_bytes",
+  "target_end",
+  "file_end",
+  "error",
+] as const;
+
+const READ_IMAGE_FORMATS = ["original", "jpeg", "png", "webp"] as const;
+
+function isRecord(x: unknown): x is Record<string, unknown> {
+  return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+function requireReadTextWireResult(x: unknown): ReadTextWireResult {
+  if (!isRecord(x)) {
+    throw malformedFilePayload("read_text", "result is not an object");
+  }
+  if (!Array.isArray(x.lines) || !x.lines.every(isTextLineWire)) {
+    throw malformedFilePayload("read_text", "lines has invalid shape");
+  }
+  if (
+    typeof x.stop_reason !== "string" ||
+    !(READ_TEXT_STOP_REASONS as readonly string[]).includes(x.stop_reason)
+  ) {
+    throw malformedFilePayload("read_text", "stop_reason has invalid shape");
+  }
+  if (x.start_pos !== null && x.start_pos !== undefined && !isPositionInfoWire(x.start_pos)) {
+    throw malformedFilePayload("read_text", "start_pos has invalid shape");
+  }
+  if (x.end_pos !== null && x.end_pos !== undefined && !isPositionInfoWire(x.end_pos)) {
+    throw malformedFilePayload("read_text", "end_pos has invalid shape");
+  }
+  if (typeof x.remaining_bytes !== "number") {
+    throw malformedFilePayload("read_text", "remaining_bytes has invalid shape");
+  }
+  if (typeof x.total_file_bytes !== "number") {
+    throw malformedFilePayload("read_text", "total_file_bytes has invalid shape");
+  }
+  if (typeof x.total_lines !== "number") {
+    throw malformedFilePayload("read_text", "total_lines has invalid shape");
+  }
+  if (typeof x.detected_encoding !== "string") {
+    throw malformedFilePayload("read_text", "detected_encoding has invalid shape");
+  }
+  return x as unknown as ReadTextWireResult;
+}
+
+function isTextLineWire(x: unknown): x is TextLineWire {
+  if (!isRecord(x)) return false;
+  return (
+    typeof x.content === "string" &&
+    typeof x.line_number === "number" &&
+    typeof x.truncated === "boolean" &&
+    typeof x.remaining_bytes === "number"
+  );
+}
+
+function isPositionInfoWire(x: unknown): x is PositionInfoWire {
+  if (!isRecord(x)) return false;
+  return (
+    typeof x.line === "number" &&
+    typeof x.byte_in_file === "number" &&
+    typeof x.byte_in_line === "number"
+  );
+}
+
+function requireReadBinaryWireResult(x: unknown): ReadBinaryWireResult {
+  if (!isRecord(x)) {
+    throw malformedFilePayload("read_binary", "result is not an object");
+  }
+  if (x.content_b64 !== undefined && typeof x.content_b64 !== "string") {
+    throw malformedFilePayload("read_binary", "content_b64 has invalid shape");
+  }
+  if (typeof x.byte_offset !== "number") {
+    throw malformedFilePayload("read_binary", "byte_offset has invalid shape");
+  }
+  if (typeof x.bytes_read !== "number") {
+    throw malformedFilePayload("read_binary", "bytes_read has invalid shape");
+  }
+  if (typeof x.total_file_bytes !== "number") {
+    throw malformedFilePayload("read_binary", "total_file_bytes has invalid shape");
+  }
+  if (typeof x.remaining_bytes !== "number") {
+    throw malformedFilePayload("read_binary", "remaining_bytes has invalid shape");
+  }
+  if (x.download_url !== null && x.download_url !== undefined && typeof x.download_url !== "string") {
+    throw malformedFilePayload("read_binary", "download_url has invalid shape");
+  }
+  return x as unknown as ReadBinaryWireResult;
+}
+
+function requireReadImageWireResult(x: unknown): ReadImageWireResult {
+  if (!isRecord(x)) {
+    throw malformedFilePayload("read_image", "result is not an object");
+  }
+  if (x.content_b64 !== undefined && typeof x.content_b64 !== "string") {
+    throw malformedFilePayload("read_image", "content_b64 has invalid shape");
+  }
+  if (
+    typeof x.format !== "string" ||
+    !(READ_IMAGE_FORMATS as readonly string[]).includes(x.format)
+  ) {
+    throw malformedFilePayload("read_image", "format has invalid shape");
+  }
+  if (typeof x.width !== "number" || typeof x.height !== "number") {
+    throw malformedFilePayload("read_image", "dimensions have invalid shape");
+  }
+  if (typeof x.original_bytes !== "number" || typeof x.output_bytes !== "number") {
+    throw malformedFilePayload("read_image", "byte counts have invalid shape");
+  }
+  if (x.download_url !== null && x.download_url !== undefined && typeof x.download_url !== "string") {
+    throw malformedFilePayload("read_image", "download_url has invalid shape");
+  }
+  return x as unknown as ReadImageWireResult;
+}
+
+function malformedFilePayload(operation: string, reason: string): CloudClientError {
+  return new CloudClientError(
+    "server_error",
+    `Hub returned malformed ${operation} payload: ${reason}`,
+  );
+}
+
+function textPositionFromWire(p: PositionInfoWire | null): ReadFilePosition | null {
+  if (!p) return null;
+  return {
+    line: p.line,
+    byteInFile: p.byte_in_file,
+    byteInLine: p.byte_in_line,
+  };
+}
+
+function textCursorFromWire(r: ReadTextWireResult): string | undefined {
+  if (r.remaining_bytes <= 0 || !r.end_pos) return undefined;
+  if (r.stop_reason === "max_lines") {
+    return `startLine=${r.end_pos.line}`;
+  }
+  return `startIndex=${r.end_pos.byte_in_file}`;
+}
+
+function fileErrorCodeToClientCode(code: string): CloudClientErrorCode {
+  switch (code) {
+    case "not_found":
+      return "not_found";
+    case "permission_denied":
+      return "forbidden";
+    case "policy_denied":
+      return "policy_denied";
+    default:
+      return "bad_request";
+  }
+}
+
+function throwFileResultError(operation: FileOperation, result: FileResult): never {
+  const err = result.error;
+  const fileCode = err?.code || "unspecified";
+  const message = err?.message || `${operation} failed`;
+  const pathSuffix = err?.path ? ` (path: ${err.path})` : "";
+  throw new CloudClientError(
+    fileErrorCodeToClientCode(fileCode),
+    `${operation} failed: [${fileCode}] ${message}${pathSuffix}`,
+    { jobErrorCode: fileCode, jobErrorMessage: message },
+  );
+}
+
+function buildReadTextParams(p: ReadFileParams): Record<string, unknown> {
+  if (p.startIndex !== undefined && p.startLine !== undefined) {
+    throw new CloudClientError(
+      "bad_request",
+      "readFile startIndex and startLine cannot both be provided",
+    );
+  }
+  const params: Record<string, unknown> = {
+    path: p.path,
+    line_numbers: true,
+    no_follow_symlink: p.noFollowSymlink ?? false,
+  };
+  if (p.startIndex !== undefined) params.start = { start_byte: p.startIndex };
+  if (p.startLine !== undefined) params.start = { start_line: p.startLine + 1 };
+  if (p.maxLine !== undefined) params.max_lines = p.maxLine;
+  if (p.maxSize !== undefined) params.max_bytes = p.maxSize;
+  if (p.maxLineWidth !== undefined) params.max_line_width = p.maxLineWidth;
+  if (p.encoding !== undefined && p.encoding.length > 0) params.encoding = p.encoding;
+  return params;
+}
+
+function buildReadBinaryParams(p: ReadFileParams): Record<string, unknown> {
+  return {
+    path: p.path,
+    byte_offset: p.byteOffset ?? p.startIndex ?? 0,
+    byte_length: p.byteLength ?? 0,
+    max_bytes: p.maxBytes ?? p.maxSize,
+    no_follow_symlink: p.noFollowSymlink ?? false,
+  };
+}
+
+function buildReadImageParams(p: ReadFileParams): Record<string, unknown> {
+  const params: Record<string, unknown> = {
+    path: p.path,
+    output_format: p.imageFormat ?? "original",
+    no_follow_symlink: p.noFollowSymlink ?? false,
+  };
+  if (p.maxEdge !== undefined) {
+    params.max_width = p.maxEdge;
+    params.max_height = p.maxEdge;
+  }
+  if (p.maxWidth !== undefined) params.max_width = p.maxWidth;
+  if (p.maxHeight !== undefined) params.max_height = p.maxHeight;
+  if (p.maxBytes !== undefined || p.maxSize !== undefined) {
+    params.max_bytes = p.maxBytes ?? p.maxSize;
+  }
+  if (p.quality !== undefined) params.quality = p.quality;
+  return params;
+}
+
+function mimeFromPath(path: string): string {
+  const normalized = path.split(/[?#]/, 1)[0].toLowerCase();
+  if (normalized.endsWith(".pdf")) return "application/pdf";
+  if (normalized.endsWith(".png")) return "image/png";
+  if (normalized.endsWith(".jpg") || normalized.endsWith(".jpeg")) return "image/jpeg";
+  if (normalized.endsWith(".webp")) return "image/webp";
+  if (normalized.endsWith(".gif")) return "image/gif";
+  if (normalized.endsWith(".bmp")) return "image/bmp";
+  if (normalized.endsWith(".tif") || normalized.endsWith(".tiff")) return "image/tiff";
+  return "application/octet-stream";
+}
+
+function sniffImageMime(data: Uint8Array): string | null {
+  if (data.length >= 4 && data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
+    return "image/png";
+  }
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return "image/jpeg";
+  }
+  if (
+    data.length >= 12 &&
+    data[0] === 0x52 &&
+    data[1] === 0x49 &&
+    data[2] === 0x46 &&
+    data[3] === 0x46 &&
+    data[8] === 0x57 &&
+    data[9] === 0x45 &&
+    data[10] === 0x42 &&
+    data[11] === 0x50
+  ) {
+    return "image/webp";
+  }
+  if (data.length >= 3 && data[0] === 0x47 && data[1] === 0x49 && data[2] === 0x46) {
+    return "image/gif";
+  }
+  return null;
+}
+
+function imageMime(format: ReadFileImageFormat, data: Uint8Array, path: string): string {
+  switch (format) {
+    case "jpeg":
+      return "image/jpeg";
+    case "png":
+      return "image/png";
+    case "webp":
+      return "image/webp";
+    case "original":
+    default:
+      return sniffImageMime(data) ?? mimeFromPath(path);
+  }
+}
+
+function normalizeTextReadResult(path: string, result: FileResult): ReadFileTextResult {
+  const r = requireReadTextWireResult(result.result);
+  const lines = r.lines.map((line) => ({
+    content: line.content,
+    lineNumber: line.line_number,
+    truncated: line.truncated,
+    remainingBytes: line.remaining_bytes,
+  }));
+  const content = lines
+    .map((line) => {
+      const suffix = line.truncated
+        ? ` [line truncated; ${line.remainingBytes} bytes remaining]`
+        : "";
+      return `${line.lineNumber} | ${line.content}${suffix}`;
+    })
+    .join("\n");
+  const cursor = textCursorFromWire(r);
+  return {
+    kind: "text",
+    path,
+    requestId: result.requestId,
+    operation: "read_text",
+    content,
+    lines,
+    stopReason: r.stop_reason,
+    start: textPositionFromWire(r.start_pos),
+    end: textPositionFromWire(r.end_pos),
+    remainingBytes: r.remaining_bytes,
+    totalBytes: r.total_file_bytes,
+    totalLines: r.total_lines,
+    detectedEncoding: r.detected_encoding,
+    truncated: cursor !== undefined || lines.some((line) => line.truncated),
+    ...(cursor ? { cursor } : {}),
+    durationMs: result.durationMs,
+  };
 }
 
 export class CloudClient {
@@ -745,6 +1213,172 @@ export class CloudClient {
       error,
       durationMs: typeof json.duration_ms === "number" ? json.duration_ms : 0,
     };
+  }
+
+  /**
+   * High-level file read helper that chooses the right ahand file op and
+   * returns a typed, decoded result. `mode: "auto"` is intentionally owned by
+   * the SDK so consumers don't need to know whether a path should go through
+   * `read_text`, `read_image`, or `read_binary`.
+   *
+   * Auto routing today:
+   * - image-looking paths (`.png`, `.jpg`, `.webp`, etc.) -> `read_image`
+   * - `.pdf` paths -> `read_binary` (PDF text extraction is a future read kind)
+   * - everything else -> `read_text`, falling back to `read_binary` only when
+   *   the daemon reports a text encoding failure
+   */
+  async readFile(params: ReadFileParams): Promise<ReadFileResult> {
+    const mode = params.mode ?? "auto";
+    switch (mode) {
+      case "text":
+        return this.readTextFile(params);
+      case "image":
+        return this.readImageFile(params);
+      case "binary":
+        return this.readBinaryFile(params);
+      case "auto":
+        if (IMAGE_PATH_RE.test(params.path)) {
+          return this.readImageFile(params);
+        }
+        if (PDF_PATH_RE.test(params.path)) {
+          return this.readBinaryFile(params);
+        }
+        return this.readAutoTextThenBinary(params);
+      default:
+        throw new CloudClientError(
+          "bad_request",
+          `Unsupported readFile mode: ${String(mode)}`,
+        );
+    }
+  }
+
+  private async readAutoTextThenBinary(
+    params: ReadFileParams,
+  ): Promise<ReadFileResult> {
+    const textResult = await this.dispatchReadText(params);
+    if (textResult.success) {
+      return normalizeTextReadResult(params.path, textResult);
+    }
+    if (textResult.error?.code === "encoding") {
+      return this.readBinaryFile(params);
+    }
+    throwFileResultError("read_text", textResult);
+  }
+
+  private async readTextFile(params: ReadFileParams): Promise<ReadFileTextResult> {
+    const result = await this.dispatchReadText(params);
+    if (!result.success) throwFileResultError("read_text", result);
+    return normalizeTextReadResult(params.path, result);
+  }
+
+  private async dispatchReadText(params: ReadFileParams): Promise<FileResult> {
+    return this.files({
+      deviceId: params.deviceId,
+      operation: "read_text",
+      params: buildReadTextParams(params),
+      timeoutMs: params.timeoutMs,
+      correlationId: params.correlationId,
+      signal: params.signal,
+    });
+  }
+
+  private async readBinaryFile(
+    params: ReadFileParams,
+  ): Promise<ReadFileBinaryResult> {
+    const result = await this.files({
+      deviceId: params.deviceId,
+      operation: "read_binary",
+      params: buildReadBinaryParams(params),
+      timeoutMs: params.timeoutMs,
+      correlationId: params.correlationId,
+      signal: params.signal,
+    });
+    if (!result.success) throwFileResultError("read_binary", result);
+    const r = requireReadBinaryWireResult(result.result);
+    const data = await this.readWireBytes(
+      "read_binary",
+      r.content_b64,
+      r.download_url,
+      params.signal,
+    );
+    return {
+      kind: "binary",
+      path: params.path,
+      requestId: result.requestId,
+      operation: "read_binary",
+      data,
+      mime: mimeFromPath(params.path),
+      byteOffset: r.byte_offset,
+      bytesRead: r.bytes_read,
+      totalBytes: r.total_file_bytes,
+      remainingBytes: r.remaining_bytes,
+      durationMs: result.durationMs,
+    };
+  }
+
+  private async readImageFile(params: ReadFileParams): Promise<ReadFileImageResult> {
+    const result = await this.files({
+      deviceId: params.deviceId,
+      operation: "read_image",
+      params: buildReadImageParams(params),
+      timeoutMs: params.timeoutMs,
+      correlationId: params.correlationId,
+      signal: params.signal,
+    });
+    if (!result.success) throwFileResultError("read_image", result);
+    const r = requireReadImageWireResult(result.result);
+    const data = await this.readWireBytes(
+      "read_image",
+      r.content_b64,
+      r.download_url,
+      params.signal,
+    );
+    return {
+      kind: "image",
+      path: params.path,
+      requestId: result.requestId,
+      operation: "read_image",
+      data,
+      mime: imageMime(r.format, data, params.path),
+      format: r.format,
+      width: r.width,
+      height: r.height,
+      originalBytes: r.original_bytes,
+      outputBytes: r.output_bytes,
+      durationMs: result.durationMs,
+    };
+  }
+
+  private async readWireBytes(
+    operation: "read_binary" | "read_image",
+    contentB64: string | undefined,
+    downloadUrl: string | null | undefined,
+    signal: AbortSignal | undefined,
+  ): Promise<Uint8Array> {
+    if (typeof downloadUrl === "string" && downloadUrl.length > 0) {
+      let res: Response;
+      try {
+        res = await this.fetchImpl()(downloadUrl, { signal });
+      } catch (err) {
+        throw this.normalizeFetchError(err);
+      }
+      if (!res.ok) {
+        throw new CloudClientError(
+          "server_error",
+          `${operation} download_url fetch failed: ${res.status} ${res.statusText}`.trim(),
+          { httpStatus: res.status },
+        );
+      }
+      try {
+        return new Uint8Array(await res.arrayBuffer());
+      } catch (err) {
+        throw this.normalizeFetchError(err);
+      }
+    }
+    if (typeof contentB64 !== "string") {
+      throw malformedFilePayload(operation, "missing content_b64 and download_url");
+    }
+    return Buffer.from(contentB64, "base64") as Uint8Array;
   }
 
   /** `POST /api/control/jobs/{id}/cancel`. Returns 202 with no body. */
