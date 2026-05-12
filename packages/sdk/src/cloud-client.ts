@@ -314,7 +314,10 @@ interface ParsedSseEvent {
  * parse the hub's `{error: {code, message}}` envelope for a useful
  * message; falls back to the HTTP status text on parse failure.
  */
-async function toTypedHttpError(res: Response): Promise<CloudClientError> {
+async function toTypedHttpError(
+  res: Response,
+  signal?: AbortSignal,
+): Promise<CloudClientError> {
   let code: CloudClientErrorCode;
   switch (res.status) {
     case 400:
@@ -365,7 +368,10 @@ async function toTypedHttpError(res: Response): Promise<CloudClientError> {
     } else if (res.status === 503 && body?.error?.code === "S3_DISABLED") {
       code = "s3_disabled";
     }
-  } catch {
+  } catch (e: unknown) {
+    if (signal?.aborted || isAbortError(e)) {
+      return new CloudClientError("abort", "Aborted", { cause: e });
+    }
     // Body wasn't JSON — keep the status-based message.
   }
   return new CloudClientError(code, message, { httpStatus: res.status });
@@ -472,7 +478,7 @@ export class CloudClient {
     } catch (err) {
       throw this.normalizeFetchError(err, p.signal);
     }
-    if (!postRes.ok) throw await toTypedHttpError(postRes);
+    if (!postRes.ok) throw await toTypedHttpError(postRes, p.signal);
 
     const postJson = (await postRes.json()) as { jobId?: string };
     const jobId = postJson.jobId;
@@ -557,7 +563,7 @@ export class CloudClient {
     } catch (err) {
       throw this.normalizeFetchError(err, params.signal);
     }
-    if (!res.ok) throw await toTypedHttpError(res);
+    if (!res.ok) throw await toTypedHttpError(res, params.signal);
 
     let json: {
       success?: boolean;
@@ -682,7 +688,7 @@ export class CloudClient {
     } catch (err) {
       throw this.normalizeFetchError(err, params.signal);
     }
-    if (!res.ok) throw await toTypedHttpError(res);
+    if (!res.ok) throw await toTypedHttpError(res, params.signal);
 
     let json: {
       request_id?: string;
@@ -779,7 +785,7 @@ export class CloudClient {
     } catch (err) {
       throw this.normalizeFetchError(err, params.signal);
     }
-    if (!res.ok) throw await toTypedHttpError(res);
+    if (!res.ok) throw await toTypedHttpError(res, params.signal);
 
     let json: {
       object_key?: unknown;
@@ -865,7 +871,7 @@ export class CloudClient {
     } catch (err) {
       throw this.normalizeFetchError(err, p.signal);
     }
-    if (!streamRes.ok) throw await toTypedHttpError(streamRes);
+    if (!streamRes.ok) throw await toTypedHttpError(streamRes, p.signal);
     if (!streamRes.body) {
       throw new CloudClientError(
         "server_error",

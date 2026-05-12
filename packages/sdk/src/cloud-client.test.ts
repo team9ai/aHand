@@ -1187,6 +1187,28 @@ describe("CloudClient.files", () => {
     });
   });
 
+  it("bad: upload-url error body read rejection with aborted signal reason → CloudClientError(abort)", async () => {
+    const ctrl = new AbortController();
+    const abortReason = new Error("custom abort reason");
+    const fn = vi.fn(async () => {
+      const res = new Response("{}", {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      });
+      return Object.assign(res, {
+        json: async () => {
+          ctrl.abort(abortReason);
+          throw ctrl.signal.reason;
+        },
+      });
+    }) as unknown as typeof fetch;
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1", signal: ctrl.signal }),
+    ).rejects.toMatchObject({ code: "abort" });
+  });
+
   it("bad: upload-url fetch rejection with aborted signal reason → CloudClientError(abort)", async () => {
     const ctrl = new AbortController();
     const abortReason = new Error("custom abort reason");
