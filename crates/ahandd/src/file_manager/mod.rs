@@ -8,6 +8,7 @@ pub mod binary_read;
 pub mod fs_ops;
 #[cfg(unix)]
 pub mod io_safe;
+pub mod pdf_read;
 pub mod policy;
 pub mod text_read;
 pub mod write_ops;
@@ -341,6 +342,18 @@ impl FileManager {
                 .await?;
                 Ok(file_response::Result::ReadImage(result))
             }
+            file_request::Operation::ReadPdf(req) => {
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
+                let result = pdf_read::handle_read_pdf(
+                    req,
+                    checked.resolved_path.as_path(),
+                    self.policy.max_read_bytes(),
+                )
+                .await?;
+                Ok(file_response::Result::ReadPdf(result))
+            }
             file_request::Operation::Write(req) => {
                 let checked = self
                     .policy
@@ -541,6 +554,7 @@ fn collect_request_paths(req: &FileRequest) -> Vec<(String, bool, bool)> {
         Operation::ReadText(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
         Operation::ReadBinary(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
         Operation::ReadImage(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
+        Operation::ReadPdf(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
         Operation::Write(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
         Operation::Edit(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
         Operation::Delete(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
@@ -827,14 +841,6 @@ pub(super) async fn reject_if_final_component_is_symlink(
         }
     }
     Ok(())
-}
-
-fn unimplemented_error(path: &str) -> FileError {
-    file_error(
-        FileErrorCode::Unspecified,
-        path,
-        "operation not yet implemented",
-    )
 }
 
 #[cfg(test)]

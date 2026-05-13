@@ -1649,23 +1649,35 @@ describe("CloudClient.readFile", () => {
     expect(result.remainingBytes).toBe(0);
   });
 
-  it("happy: auto routes pdf paths to binary until pdf extraction exists", async () => {
-    const bytes = Buffer.from("%PDF-1.7\n");
+  it("happy: auto routes pdf paths to read_pdf and decodes metadata, images, and text", async () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
     const { fn, calls } = mockFetch([
       () =>
         jsonResponse(
           {
             request_id: "r-pdf",
-            operation: "read_binary",
+            operation: "read_pdf",
             success: true,
             result: {
-              content_b64: bytes.toString("base64"),
-              byte_offset: 0,
-              bytes_read: bytes.byteLength,
-              total_file_bytes: bytes.byteLength,
-              remaining_bytes: 0,
-              download_url: null,
-              download_url_expires_ms: null,
+              mode: "auto",
+              metadata: {
+                path: "/tmp/report.pdf",
+                total_file_bytes: 12345,
+                total_pages: 7,
+              },
+              page_range: { start_page: 1, end_page: 5 },
+              raw_content_b64: null,
+              images: [
+                {
+                  page_number: 1,
+                  content_b64: png.toString("base64"),
+                  format: "png",
+                  width: 320,
+                  height: 240,
+                  output_bytes: png.byteLength,
+                },
+              ],
+              text_pages: [{ page_number: 1, content: "Page 1 text" }],
             },
             duration_ms: 3,
           },
@@ -1676,11 +1688,73 @@ describe("CloudClient.readFile", () => {
 
     const result = await client.readFile({ deviceId: "d", path: "/tmp/report.pdf" });
 
-    expect(JSON.parse(calls[0].init?.body as string).operation).toBe("read_binary");
-    expect(result.kind).toBe("binary");
-    if (result.kind !== "binary") throw new Error("expected binary result");
-    expect(result.mime).toBe("application/pdf");
-    expect(Buffer.from(result.data)).toEqual(bytes);
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body.operation).toBe("read_pdf");
+    expect(body.params).toEqual({
+      path: "/tmp/report.pdf",
+      mode: "auto",
+      no_follow_symlink: false,
+    });
+    expect(result.kind).toBe("pdf");
+    if (result.kind !== "pdf") throw new Error("expected pdf result");
+    expect(result.metadata).toEqual({
+      path: "/tmp/report.pdf",
+      totalBytes: 12345,
+      totalPages: 7,
+    });
+    expect(result.pageRange).toEqual({ startPage: 1, endPage: 5 });
+    expect(result.images).toHaveLength(1);
+    expect(result.images[0].mime).toBe("image/png");
+    expect(Buffer.from(result.images[0].data)).toEqual(png);
+    expect(result.textPages).toEqual([{ pageNumber: 1, content: "Page 1 text" }]);
+  });
+
+  it("happy: readPdf imgs sends a 1-based page range", async () => {
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            request_id: "r-pdf-imgs",
+            operation: "read_pdf",
+            success: true,
+            result: {
+              mode: "imgs",
+              metadata: {
+                path: "/tmp/report.pdf",
+                total_file_bytes: 100,
+                total_pages: 10,
+              },
+              page_range: { start_page: 2, end_page: 3 },
+              raw_content_b64: null,
+              images: [],
+              text_pages: [],
+            },
+            duration_ms: 6,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const result = await client.readPdf({
+      deviceId: "d",
+      path: "/tmp/report.pdf",
+      mode: "imgs",
+      pages: "2-3",
+    });
+
+    expect(JSON.parse(calls[0].init?.body as string)).toMatchObject({
+      device_id: "d",
+      operation: "read_pdf",
+      params: {
+        path: "/tmp/report.pdf",
+        mode: "imgs",
+        page_range: { start_page: 2, end_page: 3 },
+        no_follow_symlink: false,
+      },
+    });
+    expect(result.mode).toBe("imgs");
+    expect(result.pageRange).toEqual({ startPage: 2, endPage: 3 });
   });
 
   it("bad: daemon errors in explicit mode become CloudClientError with file code detail", async () => {

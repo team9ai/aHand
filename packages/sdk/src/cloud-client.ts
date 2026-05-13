@@ -80,7 +80,7 @@ export interface SpawnResult {
 }
 
 /**
- * The 14 file operations the daemon supports. Each name maps 1:1 to a
+ * File operations the daemon supports. Each name maps 1:1 to a
  * variant of the protobuf `FileRequest.operation` oneof; the hub
  * translates the JSON request body into the right proto variant. Use
  * the per-op shape below to fill `FileParams.params`.
@@ -92,6 +92,7 @@ export type FileOperation =
   | "read_text"
   | "read_binary"
   | "read_image"
+  | "read_pdf"
   | "write"
   | "edit"
   | "delete"
@@ -118,6 +119,7 @@ export type FileOperation =
  *   * `stat`:         `{ path: "/tmp/x", no_follow_symlink?: boolean }`
  *   * `list`:         `{ path: "/tmp", max_results?, offset?, include_hidden? }`
  *   * `read_text`:    `{ path, start?: { start_line: 1 }, max_lines?, line_numbers? }`
+ *   * `read_pdf`:     `{ path, mode?: "auto" | "metadata" | "raw" | "imgs" | "text", page_range? }`
  *   * `write` (full): `{ path, create_parents?, full_write: { content: "..." } }`
  *   * `delete`:       `{ path, recursive?, mode?: "trash" | "permanent" }`
  */
@@ -192,6 +194,8 @@ export interface FileResult {
 }
 
 export type ReadFileMode = "auto" | "text" | "image" | "binary";
+
+export type ReadPdfMode = "auto" | "metadata" | "raw" | "imgs" | "text";
 
 export type ReadFileImageFormat = "original" | "jpeg" | "png" | "webp";
 
@@ -294,10 +298,63 @@ export interface ReadFileImageResult {
   durationMs: number;
 }
 
+export interface ReadPdfMetadata {
+  path: string;
+  totalBytes: number;
+  totalPages: number;
+}
+
+export interface ReadPdfPageRange {
+  startPage: number;
+  endPage: number;
+}
+
+export interface ReadPdfPageImage {
+  pageNumber: number;
+  data: Uint8Array;
+  mime: string;
+  format: ReadFileImageFormat;
+  width: number;
+  height: number;
+  outputBytes: number;
+}
+
+export interface ReadPdfPageText {
+  pageNumber: number;
+  content: string;
+}
+
+export interface ReadPdfParams {
+  deviceId: string;
+  path: string;
+  mode?: ReadPdfMode;
+  /** 1-based page range, e.g. "1-5" or { startPage: 1, endPage: 5 }. */
+  pages?: string | ReadPdfPageRange;
+  noFollowSymlink?: boolean;
+  timeoutMs?: number;
+  correlationId?: string;
+  signal?: AbortSignal;
+}
+
+export interface ReadFilePdfResult {
+  kind: "pdf";
+  path: string;
+  requestId: string;
+  operation: "read_pdf";
+  mode: ReadPdfMode;
+  metadata: ReadPdfMetadata;
+  pageRange: ReadPdfPageRange | null;
+  raw?: { data: Uint8Array; mime: "application/pdf"; totalBytes: number };
+  images: ReadPdfPageImage[];
+  textPages: ReadPdfPageText[];
+  durationMs: number;
+}
+
 export type ReadFileResult =
   | ReadFileTextResult
   | ReadFileBinaryResult
-  | ReadFileImageResult;
+  | ReadFileImageResult
+  | ReadFilePdfResult;
 
 /**
  * Parameters for a single `browser()` invocation. Maps to the hub's
@@ -568,6 +625,40 @@ interface ReadImageWireResult {
   download_url_expires_ms?: number | null;
 }
 
+interface ReadPdfMetadataWire {
+  path: string;
+  total_file_bytes: number;
+  total_pages: number;
+}
+
+interface ReadPdfPageRangeWire {
+  start_page: number;
+  end_page: number;
+}
+
+interface ReadPdfPageImageWire {
+  page_number: number;
+  content_b64: string;
+  format: ReadFileImageFormat;
+  width: number;
+  height: number;
+  output_bytes: number;
+}
+
+interface ReadPdfPageTextWire {
+  page_number: number;
+  content: string;
+}
+
+interface ReadPdfWireResult {
+  mode: ReadPdfMode;
+  metadata: ReadPdfMetadataWire;
+  page_range?: ReadPdfPageRangeWire | null;
+  raw_content_b64?: string | null;
+  images: ReadPdfPageImageWire[];
+  text_pages: ReadPdfPageTextWire[];
+}
+
 const READ_TEXT_STOP_REASONS = [
   "unspecified",
   "max_lines",
@@ -578,6 +669,7 @@ const READ_TEXT_STOP_REASONS = [
 ] as const;
 
 const READ_IMAGE_FORMATS = ["original", "jpeg", "png", "webp"] as const;
+const READ_PDF_MODES = ["auto", "metadata", "raw", "imgs", "text"] as const;
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null && !Array.isArray(x);
@@ -686,6 +778,74 @@ function requireReadImageWireResult(x: unknown): ReadImageWireResult {
   return x as unknown as ReadImageWireResult;
 }
 
+function requireReadPdfWireResult(x: unknown): ReadPdfWireResult {
+  if (!isRecord(x)) {
+    throw malformedFilePayload("read_pdf", "result is not an object");
+  }
+  if (
+    typeof x.mode !== "string" ||
+    !(READ_PDF_MODES as readonly string[]).includes(x.mode)
+  ) {
+    throw malformedFilePayload("read_pdf", "mode has invalid shape");
+  }
+  if (!isReadPdfMetadataWire(x.metadata)) {
+    throw malformedFilePayload("read_pdf", "metadata has invalid shape");
+  }
+  if (
+    x.page_range !== null &&
+    x.page_range !== undefined &&
+    !isReadPdfPageRangeWire(x.page_range)
+  ) {
+    throw malformedFilePayload("read_pdf", "page_range has invalid shape");
+  }
+  if (
+    x.raw_content_b64 !== null &&
+    x.raw_content_b64 !== undefined &&
+    typeof x.raw_content_b64 !== "string"
+  ) {
+    throw malformedFilePayload("read_pdf", "raw_content_b64 has invalid shape");
+  }
+  if (!Array.isArray(x.images) || !x.images.every(isReadPdfPageImageWire)) {
+    throw malformedFilePayload("read_pdf", "images has invalid shape");
+  }
+  if (!Array.isArray(x.text_pages) || !x.text_pages.every(isReadPdfPageTextWire)) {
+    throw malformedFilePayload("read_pdf", "text_pages has invalid shape");
+  }
+  return x as unknown as ReadPdfWireResult;
+}
+
+function isReadPdfMetadataWire(x: unknown): x is ReadPdfMetadataWire {
+  if (!isRecord(x)) return false;
+  return (
+    typeof x.path === "string" &&
+    typeof x.total_file_bytes === "number" &&
+    typeof x.total_pages === "number"
+  );
+}
+
+function isReadPdfPageRangeWire(x: unknown): x is ReadPdfPageRangeWire {
+  if (!isRecord(x)) return false;
+  return typeof x.start_page === "number" && typeof x.end_page === "number";
+}
+
+function isReadPdfPageImageWire(x: unknown): x is ReadPdfPageImageWire {
+  if (!isRecord(x)) return false;
+  return (
+    typeof x.page_number === "number" &&
+    typeof x.content_b64 === "string" &&
+    typeof x.format === "string" &&
+    (READ_IMAGE_FORMATS as readonly string[]).includes(x.format) &&
+    typeof x.width === "number" &&
+    typeof x.height === "number" &&
+    typeof x.output_bytes === "number"
+  );
+}
+
+function isReadPdfPageTextWire(x: unknown): x is ReadPdfPageTextWire {
+  if (!isRecord(x)) return false;
+  return typeof x.page_number === "number" && typeof x.content === "string";
+}
+
 function malformedFilePayload(operation: string, reason: string): CloudClientError {
   return new CloudClientError(
     "server_error",
@@ -785,6 +945,46 @@ function buildReadImageParams(p: ReadFileParams): Record<string, unknown> {
   return params;
 }
 
+function normalizePdfPageRange(pages: ReadPdfParams["pages"]): Record<string, number> | undefined {
+  if (pages === undefined) return undefined;
+  if (typeof pages !== "string") {
+    return { start_page: pages.startPage, end_page: pages.endPage };
+  }
+
+  const trimmed = pages.trim();
+  if (!trimmed) {
+    throw new CloudClientError("bad_request", "readPdf pages cannot be empty");
+  }
+  if (!/^\d+(?:-\d+)?$/.test(trimmed)) {
+    throw new CloudClientError("bad_request", `Invalid readPdf pages: ${pages}`);
+  }
+  const dash = trimmed.indexOf("-");
+  if (dash === -1) {
+    const page = Number.parseInt(trimmed, 10);
+    if (!Number.isInteger(page) || page < 1) {
+      throw new CloudClientError("bad_request", `Invalid readPdf pages: ${pages}`);
+    }
+    return { start_page: page, end_page: page };
+  }
+  const start = Number.parseInt(trimmed.slice(0, dash), 10);
+  const end = Number.parseInt(trimmed.slice(dash + 1), 10);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) {
+    throw new CloudClientError("bad_request", `Invalid readPdf pages: ${pages}`);
+  }
+  return { start_page: start, end_page: end };
+}
+
+function buildReadPdfParams(p: ReadPdfParams): Record<string, unknown> {
+  const params: Record<string, unknown> = {
+    path: p.path,
+    mode: p.mode ?? "auto",
+    no_follow_symlink: p.noFollowSymlink ?? false,
+  };
+  const pageRange = normalizePdfPageRange(p.pages);
+  if (pageRange) params.page_range = pageRange;
+  return params;
+}
+
 function mimeFromPath(path: string): string {
   const normalized = path.split(/[?#]/, 1)[0].toLowerCase();
   if (normalized.endsWith(".pdf")) return "application/pdf";
@@ -870,6 +1070,56 @@ function normalizeTextReadResult(path: string, result: FileResult): ReadFileText
     detectedEncoding: r.detected_encoding,
     truncated: cursor !== undefined || lines.some((line) => line.truncated),
     ...(cursor ? { cursor } : {}),
+    durationMs: result.durationMs,
+  };
+}
+
+function normalizePdfReadResult(path: string, result: FileResult): ReadFilePdfResult {
+  const r = requireReadPdfWireResult(result.result);
+  const metadata: ReadPdfMetadata = {
+    path: r.metadata.path || path,
+    totalBytes: r.metadata.total_file_bytes,
+    totalPages: r.metadata.total_pages,
+  };
+  const pageRange = r.page_range
+    ? { startPage: r.page_range.start_page, endPage: r.page_range.end_page }
+    : null;
+  const raw =
+    typeof r.raw_content_b64 === "string" && r.raw_content_b64.length > 0
+      ? {
+          data: Buffer.from(r.raw_content_b64, "base64") as Uint8Array,
+          mime: "application/pdf" as const,
+          totalBytes: metadata.totalBytes,
+        }
+      : undefined;
+  const images = r.images.map((img) => {
+    const data = Buffer.from(img.content_b64, "base64") as Uint8Array;
+    return {
+      pageNumber: img.page_number,
+      data,
+      mime: imageMime(img.format, data, path),
+      format: img.format,
+      width: img.width,
+      height: img.height,
+      outputBytes: img.output_bytes,
+    };
+  });
+  const textPages = r.text_pages.map((page) => ({
+    pageNumber: page.page_number,
+    content: page.content,
+  }));
+
+  return {
+    kind: "pdf",
+    path,
+    requestId: result.requestId,
+    operation: "read_pdf",
+    mode: r.mode,
+    metadata,
+    pageRange,
+    ...(raw ? { raw } : {}),
+    images,
+    textPages,
     durationMs: result.durationMs,
   };
 }
@@ -1223,7 +1473,7 @@ export class CloudClient {
    *
    * Auto routing today:
    * - image-looking paths (`.png`, `.jpg`, `.webp`, etc.) -> `read_image`
-   * - `.pdf` paths -> `read_binary` (PDF text extraction is a future read kind)
+   * - `.pdf` paths -> `read_pdf` (metadata + first 5 pages by default)
    * - everything else -> `read_text`, falling back to `read_binary` only when
    *   the daemon reports a text encoding failure
    */
@@ -1241,7 +1491,15 @@ export class CloudClient {
           return this.readImageFile(params);
         }
         if (PDF_PATH_RE.test(params.path)) {
-          return this.readBinaryFile(params);
+          return this.readPdf({
+            deviceId: params.deviceId,
+            path: params.path,
+            mode: "auto",
+            noFollowSymlink: params.noFollowSymlink,
+            timeoutMs: params.timeoutMs,
+            correlationId: params.correlationId,
+            signal: params.signal,
+          });
         }
         return this.readAutoTextThenBinary(params);
       default:
@@ -1250,6 +1508,19 @@ export class CloudClient {
           `Unsupported readFile mode: ${String(mode)}`,
         );
     }
+  }
+
+  async readPdf(params: ReadPdfParams): Promise<ReadFilePdfResult> {
+    const result = await this.files({
+      deviceId: params.deviceId,
+      operation: "read_pdf",
+      params: buildReadPdfParams(params),
+      timeoutMs: params.timeoutMs,
+      correlationId: params.correlationId,
+      signal: params.signal,
+    });
+    if (!result.success) throwFileResultError("read_pdf", result);
+    return normalizePdfReadResult(params.path, result);
   }
 
   private async readAutoTextThenBinary(
