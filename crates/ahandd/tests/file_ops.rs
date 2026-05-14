@@ -10,10 +10,10 @@ use std::time::Duration;
 use ahand_protocol::{
     ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy, FileCreateSymlink, FileDelete,
     FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary,
-    FileReadImage, FileReadText, FileRequest, FileStat, FileType, FileWrite, FullWrite,
-    ImageFormat, LineCol, LineRangeReplace, StopReason, StringReplace, UnixPermission, WriteAction,
-    file_chmod, file_edit, file_position, file_read_text, file_request, file_response, file_write,
-    full_write,
+    FileReadImage, FileReadPdf, FileReadPdfMode, FileReadText, FileRequest, FileStat, FileType,
+    FileWrite, FullWrite, ImageFormat, LineCol, LineRangeReplace, PdfPageRange, StopReason,
+    StringReplace, UnixPermission, WriteAction, file_chmod, file_edit, file_position,
+    file_read_text, file_request, file_response, file_write, full_write,
 };
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
@@ -135,6 +135,92 @@ fn expect_read_image(resp: ahand_protocol::FileResponse) -> ahand_protocol::File
         Some(file_response::Result::ReadImage(r)) => r,
         other => panic!("expected read_image result, got {other:?}"),
     }
+}
+
+fn expect_read_pdf(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileReadPdfResult {
+    match resp.result {
+        Some(file_response::Result::ReadPdf(r)) => r,
+        other => panic!("expected read_pdf result, got {other:?}"),
+    }
+}
+
+fn wrap_read_pdf(req: FileReadPdf) -> FileRequest {
+    FileRequest {
+        request_id: "pdf".into(),
+        operation: Some(file_request::Operation::ReadPdf(req)),
+    }
+}
+
+fn pdf_escape_text(text: &str) -> String {
+    text.replace('\\', r"\\")
+        .replace('(', r"\(")
+        .replace(')', r"\)")
+}
+
+fn write_test_pdf(path: &Path, pages: usize) {
+    assert!(pages > 0);
+    let mut objects: Vec<(usize, String)> = Vec::new();
+    let kids = (0..pages)
+        .map(|idx| format!("{} 0 R", 4 + idx * 2))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    objects.push((1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()));
+    objects.push((
+        2,
+        format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids, pages),
+    ));
+    objects.push((
+        3,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ));
+
+    for page_idx in 0..pages {
+        let page_no = page_idx + 1;
+        let page_obj = 4 + page_idx * 2;
+        let content_obj = page_obj + 1;
+        let text = pdf_escape_text(&format!("Page {} alpha beta", page_no));
+        let stream = format!("BT /F1 18 Tf 40 150 Td ({}) Tj ET", text);
+        objects.push((
+            page_obj,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] \
+                 /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+                content_obj
+            ),
+        ));
+        objects.push((
+            content_obj,
+            format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                stream.len(),
+                stream
+            ),
+        ));
+    }
+
+    objects.sort_by_key(|(id, _)| *id);
+    let max_id = objects.last().map(|(id, _)| *id).unwrap();
+    let mut out = String::from("%PDF-1.4\n");
+    let mut offsets = vec![0usize; max_id + 1];
+    for (id, body) in objects {
+        offsets[id] = out.len();
+        out.push_str(&format!("{} 0 obj\n{}\nendobj\n", id, body));
+    }
+
+    let xref_offset = out.len();
+    out.push_str(&format!("xref\n0 {}\n", max_id + 1));
+    out.push_str("0000000000 65535 f \n");
+    for offset in offsets.iter().take(max_id + 1).skip(1) {
+        out.push_str(&format!("{:010} 00000 n \n", offset));
+    }
+    out.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        max_id + 1,
+        xref_offset
+    ));
+
+    fs::write(path, out).expect("failed to write test PDF");
 }
 
 fn expect_write(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileWriteResult {
@@ -1336,6 +1422,154 @@ async fn read_image_max_bytes_unreachable_returns_too_large() {
     let resp = mgr.handle(&req).await;
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+}
+
+// ── FileReadPdf tests ──────────────────────────────────────────────────────
+
+fn read_pdf_request(path: &Path, mode: FileReadPdfMode, range: Option<(u32, u32)>) -> FileReadPdf {
+    FileReadPdf {
+        path: path.to_string_lossy().into_owned(),
+        mode: mode as i32,
+        page_range: range.map(|(start_page, end_page)| PdfPageRange {
+            start_page,
+            end_page,
+        }),
+        no_follow_symlink: false,
+    }
+}
+
+#[tokio::test]
+async fn read_pdf_metadata_returns_total_pages_and_bytes() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 6);
+    let size = fs::metadata(&file).unwrap().len();
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Metadata,
+            None,
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Metadata as i32);
+    let metadata = result.metadata.expect("metadata should be populated");
+    assert_eq!(metadata.total_pages, 6);
+    assert_eq!(metadata.total_file_bytes, size);
+    assert!(result.images.is_empty());
+    assert!(result.text_pages.is_empty());
+    assert!(result.raw_content.is_empty());
+}
+
+#[tokio::test]
+async fn read_pdf_text_returns_page_separated_text_for_range() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 6);
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Text,
+            Some((2, 4)),
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Text as i32);
+    assert_eq!(result.metadata.unwrap().total_pages, 6);
+    assert_eq!(result.text_pages.len(), 3);
+    assert_eq!(result.text_pages[0].page_number, 2);
+    assert!(result.text_pages[0].content.contains("Page 2 alpha beta"));
+    assert_eq!(result.text_pages[2].page_number, 4);
+    assert!(result.text_pages[2].content.contains("Page 4 alpha beta"));
+    assert!(result.images.is_empty());
+}
+
+#[tokio::test]
+async fn read_pdf_imgs_returns_rendered_images_for_range() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 6);
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Imgs,
+            Some((2, 3)),
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Imgs as i32);
+    assert_eq!(result.images.len(), 2);
+    assert_eq!(result.images[0].page_number, 2);
+    assert_eq!(result.images[0].format, ImageFormat::Png as i32);
+    assert!(result.images[0].width > 0);
+    assert!(result.images[0].height > 0);
+    assert!(
+        result.images[0]
+            .content
+            .starts_with(&[0x89, b'P', b'N', b'G'])
+    );
+    assert_eq!(result.images[1].page_number, 3);
+    assert!(result.text_pages.is_empty());
+}
+
+#[tokio::test]
+async fn read_pdf_auto_defaults_to_first_five_pages_with_images_and_text() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 6);
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Auto,
+            None,
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Auto as i32);
+    assert_eq!(result.metadata.unwrap().total_pages, 6);
+    assert_eq!(result.images.len(), 5);
+    assert_eq!(result.text_pages.len(), 5);
+    assert_eq!(result.images[0].page_number, 1);
+    assert_eq!(result.images[4].page_number, 5);
+    assert!(result.text_pages[4].content.contains("Page 5 alpha beta"));
+}
+
+#[tokio::test]
+async fn read_pdf_raw_rejects_page_range_and_returns_pdf_bytes() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 2);
+
+    let bad_resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Raw,
+            Some((1, 1)),
+        )))
+        .await;
+    let err = expect_error(bad_resp);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Raw,
+            None,
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Raw as i32);
+    assert_eq!(result.metadata.unwrap().total_pages, 2);
+    assert!(result.raw_content.starts_with(b"%PDF-"));
 }
 
 // ── FileWrite tests ────────────────────────────────────────────────────────
