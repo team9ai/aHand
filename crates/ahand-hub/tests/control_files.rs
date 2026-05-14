@@ -167,10 +167,8 @@ async fn control_files_upload_url_returns_s3_disabled_without_s3() {
 async fn control_files_write_rejects_upload_key_for_unscoped_device() {
     let server = spawn_server_with_state(support::test_state_with_s3().await).await;
     let device = attach_owned_device(&server, "cf-upload-scope-b", "owner-scope").await;
-    let token = mint_cp_jwt_with_device_ids(
-        "owner-scope",
-        Some(vec!["cf-upload-scope-b".to_string()]),
-    );
+    let token =
+        mint_cp_jwt_with_device_ids("owner-scope", Some(vec!["cf-upload-scope-b".to_string()]));
 
     let res = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
