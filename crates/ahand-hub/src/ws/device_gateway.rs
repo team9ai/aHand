@@ -787,6 +787,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     let envelope = ahand_protocol::Envelope::decode(frame.as_ref())?;
                     if state.connections.has_seen_inbound(&device_id, envelope.seq) {
                         state.connections.observe_ack(&device_id, envelope.ack).await?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
                     } else if let Some(ahand_protocol::envelope::Payload::Heartbeat(ref hb)) =
                         envelope.payload
                     {
@@ -798,6 +799,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                             .connections
                             .observe_inbound(&device_id, envelope.seq, envelope.ack)
                             .await?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
                         let ttl = state
                             .device_expected_heartbeat_secs
                             .saturating_mul(3);
@@ -851,16 +853,17 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                             );
                         }
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
                     } else if dispatch_control_plane_event(&state, &envelope) {
-                        // The envelope's job_id was registered in the
-                        // control-plane tracker — the tee has already
-                        // published the event to SSE subscribers.
-                        // Skip JobRuntime (which would bail on an
-                        // unknown job id) and just advance seq/ack.
+                        // The control-plane tracker handled the frame, or
+                        // the job id is a stale non-dashboard id that must
+                        // not fall into JobRuntime's UUID-backed store.
+                        // Skip JobRuntime and just advance seq/ack.
                         state
                             .connections
                             .observe_inbound(&device_id, envelope.seq, envelope.ack)
                             .await?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
                     } else {
                         // Tag the payload variant onto the error chain.
                         // If JobRuntime bails (e.g. JobStore::get hits a
@@ -879,6 +882,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                                     envelope.seq, envelope.ack
                                 ))
                             })?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
                     }
                 }
                 WsMessage::Ping(payload) => {
@@ -981,15 +985,36 @@ fn envelope_payload_variant_name(p: &Option<ahand_protocol::envelope::Payload>) 
     }
 }
 
+fn queue_ack_only(
+    control_tx: &mpsc::UnboundedSender<WsMessage>,
+    device_id: &str,
+    ack: u64,
+) -> anyhow::Result<()> {
+    if ack == 0 {
+        return Ok(());
+    }
+
+    let envelope = ahand_protocol::Envelope {
+        device_id: device_id.into(),
+        msg_id: format!("ack-{ack}"),
+        ts_ms: now_ms(),
+        ack,
+        ..Default::default()
+    };
+    control_tx
+        .send(WsMessage::Binary(envelope.encode_to_vec().into()))
+        .map_err(|_| anyhow::anyhow!("device ack queue closed"))
+}
+
 /// Publish any job-related envelope received from a daemon to the
-/// control-plane tracker, if the `job_id` is known to it.
+/// control-plane tracker, if the `job_id` is known to it, or consume a
+/// stale non-dashboard job frame so it can be acked without killing the WS.
 ///
-/// Returns `true` if the envelope targeted a control-plane job (and
-/// was therefore handled here) — the caller should then skip
-/// [`crate::http::jobs::JobRuntime::handle_device_frame`] to avoid
-/// the "job not found" bail-out that would kill the WS. Returns
-/// `false` otherwise (not job-related, or a dashboard / JobRuntime
-/// job id the caller still needs to process).
+/// Returns `true` if the envelope was handled here — the caller should then
+/// skip [`crate::http::jobs::JobRuntime::handle_device_frame`] to avoid the
+/// UUID-backed runtime trying to parse a control-plane ULID. Returns `false`
+/// otherwise (not job-related, or a dashboard / JobRuntime job id the caller
+/// still needs to process).
 fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Envelope) -> bool {
     let Some(payload) = envelope.payload.as_ref() else {
         return false;
@@ -997,7 +1022,7 @@ fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Env
     match payload {
         ahand_protocol::envelope::Payload::JobEvent(event) => {
             if state.control_jobs.get(&event.job_id).is_none() {
-                return false;
+                return consume_unknown_non_dashboard_job_id(&event.job_id, "JobEvent");
             }
             let Some(kind) = event.event.as_ref() else {
                 return true;
@@ -1027,7 +1052,7 @@ fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Env
         }
         ahand_protocol::envelope::Payload::JobFinished(finished) => {
             let Some(channels) = state.control_jobs.get(&finished.job_id) else {
-                return false;
+                return consume_unknown_non_dashboard_job_id(&finished.job_id, "JobFinished");
             };
             let duration_ms = channels
                 .started_at
@@ -1062,7 +1087,7 @@ fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Env
         }
         ahand_protocol::envelope::Payload::JobRejected(rejected) => {
             if state.control_jobs.get(&rejected.job_id).is_none() {
-                return false;
+                return consume_unknown_non_dashboard_job_id(&rejected.job_id, "JobRejected");
             }
             state.control_jobs.finalize(
                 &rejected.job_id,
@@ -1077,14 +1102,31 @@ fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Env
     }
 }
 
+fn consume_unknown_non_dashboard_job_id(job_id: &str, payload_variant: &'static str) -> bool {
+    if uuid::Uuid::parse_str(job_id).is_ok() {
+        return false;
+    }
+
+    tracing::warn!(
+        job_id = %job_id,
+        payload_variant,
+        "dropping stale non-dashboard job frame"
+    );
+    true
+}
+
 fn issue_hello_challenge() -> ahand_protocol::HelloChallenge {
     ahand_protocol::HelloChallenge {
         nonce: uuid::Uuid::new_v4().into_bytes().to_vec(),
-        issued_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
+        issued_at_ms: now_ms(),
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn send_handshake_close(

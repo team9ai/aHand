@@ -11,6 +11,7 @@ message FileRequest {
     FileReadText read_text = 10;
     FileReadBinary read_binary = 11;
     FileReadImage read_image = 12;
+    FileReadPdf read_pdf = 24;
     FileWrite write = 13;
     FileEdit edit = 14;
     FileDelete delete = 15;
@@ -33,6 +34,7 @@ message FileResponse {
     FileReadTextResult read_text = 10;
     FileReadBinaryResult read_binary = 11;
     FileReadImageResult read_image = 12;
+    FileReadPdfResult read_pdf = 24;
     FileWriteResult write = 13;
     FileEditResult edit = 14;
     FileDeleteResult delete = 15;
@@ -167,6 +169,57 @@ message FileReadImageResult {
   uint64 output_bytes = 6;
   optional string download_url = 10;
   optional uint64 download_url_expires_ms = 11;
+}
+
+// ── PDF Reading ─────────────────────────────────────────────────
+
+enum FileReadPdfMode {
+  FILE_READ_PDF_MODE_AUTO = 0;
+  FILE_READ_PDF_MODE_METADATA = 1;
+  FILE_READ_PDF_MODE_RAW = 2;
+  FILE_READ_PDF_MODE_IMGS = 3;
+  FILE_READ_PDF_MODE_TEXT = 4;
+}
+
+message PdfPageRange {
+  uint32 start_page = 1;          // 1-based, inclusive
+  uint32 end_page = 2;            // 1-based, inclusive
+}
+
+message FileReadPdf {
+  string path = 1;
+  FileReadPdfMode mode = 2;       // default auto
+  optional PdfPageRange page_range = 3;
+  bool no_follow_symlink = 4;
+}
+
+message PdfMetadata {
+  string path = 1;
+  uint64 total_file_bytes = 2;
+  uint32 total_pages = 3;
+}
+
+message PdfPageImage {
+  uint32 page_number = 1;         // 1-based
+  bytes content = 2;
+  ImageFormat format = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+  uint64 output_bytes = 6;
+}
+
+message PdfPageText {
+  uint32 page_number = 1;         // 1-based
+  string content = 2;
+}
+
+message FileReadPdfResult {
+  FileReadPdfMode mode = 1;
+  optional PdfMetadata metadata = 2;
+  optional PdfPageRange page_range = 3;
+  bytes raw_content = 4;
+  repeated PdfPageImage images = 5;
+  repeated PdfPageText text_pages = 6;
 }
 
 // ── Write & Edit ───────────────────────────────────────────────
