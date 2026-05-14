@@ -51,6 +51,10 @@ impl BrowserManager {
         self.config.enabled.unwrap_or(false)
     }
 
+    pub fn has_system_browser(&self) -> bool {
+        self.resolve_executable_path().is_some()
+    }
+
     /// Resolve the downloads directory (for download/pdf output files).
     fn downloads_dir(&self, session_id: &str) -> PathBuf {
         let base = match &self.config.downloads_dir {

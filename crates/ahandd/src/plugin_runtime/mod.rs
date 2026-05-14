@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod capability;
 
 pub mod builtin;
@@ -7,6 +8,7 @@ pub mod registry;
 pub mod resource;
 pub mod runtime_dir;
 
+pub use activation::{ActivationConfig, build_router, router_from_plugins};
 pub use capability::{
     CapabilityEntry, CapabilityKind, CapabilityRemediation, CapabilityRouter, CapabilityState,
     CapabilityUnavailable,
