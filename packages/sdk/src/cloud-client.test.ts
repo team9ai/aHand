@@ -1107,6 +1107,144 @@ describe("CloudClient.browser", () => {
 });
 
 describe("CloudClient.files", () => {
+  it("happy: POSTs /api/control/files/upload-url with snake_case body + Bearer auth", async () => {
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            object_key: "uploads/dev-1/file.bin",
+            upload_url: "https://storage.test/upload",
+            expires_at_ms: 1_789_000_000_000,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const r = await client.createFileUploadUrl({ deviceId: "dev-1" });
+
+    expect(calls[0].url).toBe("https://hub.test/api/control/files/upload-url");
+    expect(calls[0].init?.method).toBe("POST");
+    expect(calls[0].init?.headers).toMatchObject({
+      Authorization: "Bearer test-token",
+      "Content-Type": "application/json",
+    });
+    expect(JSON.parse(calls[0].init?.body as string)).toEqual({
+      device_id: "dev-1",
+    });
+    expect(r).toEqual({
+      objectKey: "uploads/dev-1/file.bin",
+      uploadUrl: "https://storage.test/upload",
+      expiresAtMs: 1_789_000_000_000,
+    });
+  });
+
+  it("bad: upload-url malformed payload → CloudClientError(server_error)", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            object_key: "uploads/dev-1/file.bin",
+            upload_url: "https://storage.test/upload",
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1" }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("bad: upload-url HTTP 401 → CloudClientError(unauthorized)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ error: { code: "UNAUTHORIZED", message: "no token" } }, 401),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1" }),
+    ).rejects.toMatchObject({ code: "unauthorized", httpStatus: 401 });
+  });
+
+  it("bad: upload-url HTTP 503 S3_DISABLED → CloudClientError(s3_disabled)", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          { error: { code: "S3_DISABLED", message: "S3 uploads are not configured" } },
+          503,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1" }),
+    ).rejects.toMatchObject({
+      code: "s3_disabled",
+      httpStatus: 503,
+      message: "S3 uploads are not configured",
+    });
+  });
+
+  it("bad: upload-url error body read rejection with aborted signal reason → CloudClientError(abort)", async () => {
+    const ctrl = new AbortController();
+    const abortReason = new Error("custom abort reason");
+    const fn = vi.fn(async () => {
+      const res = new Response("{}", {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      });
+      return Object.assign(res, {
+        json: async () => {
+          ctrl.abort(abortReason);
+          throw ctrl.signal.reason;
+        },
+      });
+    }) as unknown as typeof fetch;
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1", signal: ctrl.signal }),
+    ).rejects.toMatchObject({ code: "abort" });
+  });
+
+  it("bad: upload-url fetch rejection with aborted signal reason → CloudClientError(abort)", async () => {
+    const ctrl = new AbortController();
+    const abortReason = new Error("custom abort reason");
+    const fn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      ctrl.abort(abortReason);
+      throw (init?.signal as AbortSignal).reason;
+    }) as unknown as typeof fetch;
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1", signal: ctrl.signal }),
+    ).rejects.toMatchObject({ code: "abort" });
+  });
+
+  it("bad: upload-url body read rejection with aborted signal reason → CloudClientError(abort)", async () => {
+    const ctrl = new AbortController();
+    const abortReason = new Error("custom abort reason");
+    const fn = vi.fn(async () => {
+      const res = new Response("{}", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+      return Object.assign(res, {
+        json: async () => {
+          ctrl.abort(abortReason);
+          throw ctrl.signal.reason;
+        },
+      });
+    }) as unknown as typeof fetch;
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1", signal: ctrl.signal }),
+    ).rejects.toMatchObject({ code: "abort" });
+  });
+
   it("happy: POSTs /api/control/files with snake_case body + Bearer auth", async () => {
     const { fn, calls } = mockFetch([
       () =>

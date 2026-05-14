@@ -17,6 +17,8 @@ export type {
   FileParams,
   FileResult,
   FileErrorPayload,
+  FileUploadUrlParams,
+  FileUploadUrlResult,
   ReadFileMode,
   ReadPdfMode,
   ReadFileImageFormat,
