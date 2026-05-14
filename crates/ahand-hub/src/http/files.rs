@@ -213,7 +213,7 @@ pub(crate) async fn create_upload_url_for_device(
         ));
     };
 
-    let object_key = build_upload_object_key(&device_id);
+    let object_key = build_upload_object_key(device_id);
     let presigned = s3.generate_upload_url(&object_key).await.map_err(|err| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
