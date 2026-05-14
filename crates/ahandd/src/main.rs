@@ -368,6 +368,7 @@ async fn main() -> anyhow::Result<()> {
                         approval_broadcast_tx.clone(),
                         device_id.clone(),
                         Arc::clone(&browser_mgr),
+                        Arc::clone(&file_mgr),
                     ));
 
                     tokio::select! {
@@ -429,6 +430,7 @@ async fn main() -> anyhow::Result<()> {
                         approval_broadcast_tx.clone(),
                         device_id.clone(),
                         Arc::clone(&browser_mgr),
+                        Arc::clone(&file_mgr),
                     ));
 
                     tokio::select! {

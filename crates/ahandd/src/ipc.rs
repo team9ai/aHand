@@ -11,6 +11,8 @@ use tracing::{error, info, warn};
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::executor;
+use crate::file_manager::FileManager;
+use crate::plugin_runtime::{CapabilityKind, CapabilityUnavailable};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::RunStore;
@@ -27,6 +29,7 @@ pub async fn serve_ipc(
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     device_id: String,
     browser_mgr: Arc<BrowserManager>,
+    file_mgr: Arc<FileManager>,
 ) -> anyhow::Result<()> {
     // Remove stale socket file if it exists.
     let _ = std::fs::remove_file(&socket_path);
@@ -62,10 +65,12 @@ pub async fn serve_ipc(
                 let bcast = approval_broadcast_tx.clone();
                 let did = device_id.clone();
                 let bmgr = Arc::clone(&browser_mgr);
+                let fmgr = Arc::clone(&file_mgr);
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_ipc_conn(stream, reg, st, smgr, amgr, bcast, did, caller_uid, bmgr)
-                            .await
+                    if let Err(e) = handle_ipc_conn(
+                        stream, reg, st, smgr, amgr, bcast, did, caller_uid, bmgr, fmgr,
+                    )
+                    .await
                     {
                         warn!(error = %e, "IPC connection error");
                     }
@@ -89,6 +94,7 @@ async fn handle_ipc_conn(
     device_id: String,
     caller_uid: String,
     browser_mgr: Arc<BrowserManager>,
+    file_mgr: Arc<FileManager>,
 ) -> anyhow::Result<()> {
     let (reader, writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
@@ -162,6 +168,42 @@ async fn handle_ipc_conn(
 
         match envelope.payload {
             Some(envelope::Payload::JobRequest(req)) => {
+                let capability_router =
+                    match crate::plugin_runtime::build_router(&browser_mgr, &file_mgr).await {
+                        Ok(router) => router,
+                        Err(err) => {
+                            warn!(
+                                job_id = %req.job_id,
+                                tool = %req.tool,
+                                error = %err,
+                                "IPC: job rejected because host resources could not be inspected"
+                            );
+                            let _ = tx.send(job_capability_rejection_envelope(
+                                &device_id,
+                                &req,
+                                format!(
+                                    "exec capability unavailable: failed to inspect host resources: {err}"
+                                ),
+                            ));
+                            continue;
+                        }
+                    };
+                if let Err(unavailable) = capability_router.ensure(CapabilityKind::Exec) {
+                    let reason = unavailable.to_protocol_message();
+                    warn!(
+                        job_id = %req.job_id,
+                        tool = %req.tool,
+                        reason = %reason,
+                        "IPC: job rejected by capability router"
+                    );
+                    let _ = tx.send(job_capability_rejection_envelope(
+                        &device_id,
+                        &req,
+                        reason,
+                    ));
+                    continue;
+                }
+
                 // Idempotency check.
                 match registry.is_known(&req.job_id).await {
                     IsKnown::Running => {
@@ -369,18 +411,40 @@ async fn handle_ipc_conn(
                     "IPC: received browser request"
                 );
 
-                if !browser_mgr.is_enabled() {
+                let capability_router =
+                    match crate::plugin_runtime::build_router(&browser_mgr, &file_mgr).await {
+                        Ok(router) => router,
+                        Err(err) => {
+                            let resp_env = Envelope {
+                                device_id: device_id.clone(),
+                                msg_id: new_msg_id(),
+                                ts_ms: now_ms(),
+                                payload: Some(envelope::Payload::BrowserResponse(
+                                    BrowserResponse {
+                                        request_id: req.request_id.clone(),
+                                        session_id: req.session_id.clone(),
+                                        success: false,
+                                        error: format!(
+                                            "browser capability unavailable: failed to inspect host resources: {err}"
+                                        ),
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            };
+                            let _ = tx.send(resp_env);
+                            continue;
+                        }
+                    };
+
+                if let Err(unavailable) = capability_router.ensure(CapabilityKind::Browser) {
                     let resp_env = Envelope {
                         device_id: device_id.clone(),
                         msg_id: new_msg_id(),
                         ts_ms: now_ms(),
-                        payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
-                            request_id: req.request_id.clone(),
-                            session_id: req.session_id.clone(),
-                            success: false,
-                            error: "browser capabilities not enabled".to_string(),
-                            ..Default::default()
-                        })),
+                        payload: Some(envelope::Payload::BrowserResponse(
+                            browser_unavailable_response(&req, &unavailable),
+                        )),
                         ..Default::default()
                     };
                     let _ = tx.send(resp_env);
@@ -454,6 +518,36 @@ async fn handle_ipc_conn(
     Ok(())
 }
 
+fn job_capability_rejection_envelope(
+    device_id: &str,
+    req: &ahand_protocol::JobRequest,
+    reason: String,
+) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::JobRejected(JobRejected {
+            job_id: req.job_id.clone(),
+            reason,
+        })),
+        ..Default::default()
+    }
+}
+
+fn browser_unavailable_response(
+    req: &ahand_protocol::BrowserRequest,
+    unavailable: &CapabilityUnavailable,
+) -> BrowserResponse {
+    BrowserResponse {
+        request_id: req.request_id.clone(),
+        session_id: req.session_id.clone(),
+        success: false,
+        error: unavailable.to_protocol_message(),
+        ..Default::default()
+    }
+}
+
 /// Read a length-prefixed frame: [4 bytes big-endian u32 length][N bytes payload].
 async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<Vec<u8>> {
     let len = reader.read_u32().await? as usize;
@@ -493,4 +587,66 @@ fn new_msg_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!("ipc-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ipc_browser_unavailable_response_preserves_ids() {
+        let req = ahand_protocol::BrowserRequest {
+            request_id: "ipc-browser-req-1".to_string(),
+            session_id: "ipc-browser-session-1".to_string(),
+            action: "navigate".to_string(),
+            ..Default::default()
+        };
+        let unavailable = crate::plugin_runtime::CapabilityUnavailable {
+            capability: crate::plugin_runtime::CapabilityKind::Browser,
+            plugin_id: "browser-playwright-cli".to_string(),
+            status: crate::plugin_runtime::PluginStatus::Blocked,
+            reason: "dependency node is missing".to_string(),
+            remediation: crate::plugin_runtime::CapabilityRemediation::InstallPlugin {
+                plugin_id: "browser-playwright-cli".to_string(),
+            },
+        };
+
+        let resp = browser_unavailable_response(&req, &unavailable);
+
+        assert_eq!(resp.request_id, "ipc-browser-req-1");
+        assert_eq!(resp.session_id, "ipc-browser-session-1");
+        assert!(!resp.success);
+        assert!(
+            resp.error
+                .contains("install plugin browser-playwright-cli through the host plugin installer")
+        );
+    }
+
+    #[test]
+    fn ipc_job_capability_rejection_preserves_job_id() {
+        let req = ahand_protocol::JobRequest {
+            job_id: "ipc-job-1".to_string(),
+            tool: "shell".to_string(),
+            ..Default::default()
+        };
+
+        let env = job_capability_rejection_envelope(
+            "device-1",
+            &req,
+            "exec capability unavailable: host shell unavailable".to_string(),
+        );
+
+        assert_eq!(env.device_id, "device-1");
+        match env.payload {
+            Some(envelope::Payload::JobRejected(rejected)) => {
+                assert_eq!(rejected.job_id, "ipc-job-1");
+                assert!(
+                    rejected
+                        .reason
+                        .contains("exec capability unavailable: host shell unavailable")
+                );
+            }
+            other => panic!("expected JobRejected envelope, got {other:?}"),
+        }
+    }
 }
