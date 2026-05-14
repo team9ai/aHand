@@ -20,6 +20,7 @@ use crate::device_identity::DeviceIdentity;
 use crate::executor::{self, EnvelopeSink as _};
 use crate::file_manager::FileManager;
 use crate::outbox::{Outbox, prepare_outbound};
+use crate::plugin_runtime::{CapabilityKind, CapabilityUnavailable};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::{Direction, RunStore};
@@ -529,6 +530,8 @@ async fn connect_with_auth(
                     store,
                     approval_mgr,
                     approval_broadcast_tx,
+                    browser_mgr,
+                    file_mgr,
                 )
                 .await;
             }
@@ -556,8 +559,16 @@ async fn connect_with_auth(
                 handle_session_query(device_id, session_mgr, &query, &tx).await;
             }
             Some(envelope::Payload::BrowserRequest(req)) => {
-                handle_browser_request(device_id, caller_uid, &req, &tx, session_mgr, browser_mgr)
-                    .await;
+                handle_browser_request(
+                    device_id,
+                    caller_uid,
+                    &req,
+                    &tx,
+                    session_mgr,
+                    browser_mgr,
+                    file_mgr,
+                )
+                .await;
             }
             Some(envelope::Payload::FileRequest(req)) => {
                 handle_file_request(
@@ -566,6 +577,7 @@ async fn connect_with_auth(
                     req,
                     &tx,
                     session_mgr,
+                    browser_mgr,
                     file_mgr,
                     approval_mgr,
                     approval_broadcast_tx,
@@ -850,6 +862,59 @@ pub fn hello_auth_modes(bootstrap_token: Option<&str>) -> Vec<HelloAuthMode> {
     modes
 }
 
+fn reject_job_for_capability_error<T>(
+    device_id: &str,
+    req: &ahand_protocol::JobRequest,
+    tx: &T,
+    reason: String,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    warn!(
+        job_id = %req.job_id,
+        tool = %req.tool,
+        reason = %reason,
+        "job rejected by capability router"
+    );
+    let reject_env = Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::JobRejected(JobRejected {
+            job_id: req.job_id.clone(),
+            reason,
+        })),
+        ..Default::default()
+    };
+    let _ = tx.send(reject_env);
+}
+
+fn browser_unavailable_response(
+    req: &ahand_protocol::BrowserRequest,
+    unavailable: &CapabilityUnavailable,
+) -> BrowserResponse {
+    BrowserResponse {
+        request_id: req.request_id.clone(),
+        session_id: req.session_id.clone(),
+        success: false,
+        error: unavailable.to_protocol_message(),
+        ..Default::default()
+    }
+}
+
+fn file_unavailable_response(
+    req: &ahand_protocol::FileRequest,
+    path: &str,
+    unavailable: &CapabilityUnavailable,
+) -> ahand_protocol::FileResponse {
+    crate::file_manager::error_response(
+        req.request_id.clone(),
+        ahand_protocol::FileErrorCode::PolicyDenied,
+        path,
+        &unavailable.to_protocol_message(),
+    )
+}
+
 /// Handle an incoming JobRequest with idempotency + session mode check.
 #[allow(clippy::too_many_arguments)]
 async fn handle_job_request<T>(
@@ -862,9 +927,28 @@ async fn handle_job_request<T>(
     store: &Option<Arc<RunStore>>,
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
+    browser_mgr: &Arc<BrowserManager>,
+    file_mgr: &Arc<FileManager>,
 ) where
     T: crate::executor::EnvelopeSink,
 {
+    let capability_router = match crate::plugin_runtime::build_router(browser_mgr, file_mgr).await {
+        Ok(router) => router,
+        Err(err) => {
+            reject_job_for_capability_error(
+                device_id,
+                &req,
+                tx,
+                format!("exec capability unavailable: failed to inspect host resources: {err}"),
+            );
+            return;
+        }
+    };
+    if let Err(unavailable) = capability_router.ensure(CapabilityKind::Exec) {
+        reject_job_for_capability_error(device_id, &req, tx, unavailable.to_protocol_message());
+        return;
+    }
+
     // Idempotency check.
     match registry.is_known(&req.job_id).await {
         IsKnown::Running => {
@@ -1096,6 +1180,7 @@ async fn handle_browser_request<T>(
     tx: &T,
     session_mgr: &Arc<SessionManager>,
     browser_mgr: &Arc<BrowserManager>,
+    file_mgr: &Arc<FileManager>,
 ) where
     T: crate::executor::EnvelopeSink,
 {
@@ -1106,18 +1191,36 @@ async fn handle_browser_request<T>(
         "received browser request"
     );
 
-    if !browser_mgr.is_enabled() {
+    let capability_router = match crate::plugin_runtime::build_router(browser_mgr, file_mgr).await {
+        Ok(router) => router,
+        Err(err) => {
+            let resp_env = Envelope {
+                device_id: device_id.to_string(),
+                msg_id: new_msg_id(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
+                    request_id: req.request_id.clone(),
+                    session_id: req.session_id.clone(),
+                    success: false,
+                    error: format!(
+                        "browser capability unavailable: failed to inspect host resources: {err}"
+                    ),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let _ = tx.send(resp_env);
+            return;
+        }
+    };
+    if let Err(unavailable) = capability_router.ensure(CapabilityKind::Browser) {
         let resp_env = Envelope {
             device_id: device_id.to_string(),
             msg_id: new_msg_id(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
-                request_id: req.request_id.clone(),
-                session_id: req.session_id.clone(),
-                success: false,
-                error: "browser capabilities not enabled".to_string(),
-                ..Default::default()
-            })),
+            payload: Some(envelope::Payload::BrowserResponse(
+                browser_unavailable_response(req, &unavailable),
+            )),
             ..Default::default()
         };
         let _ = tx.send(resp_env);
@@ -1230,6 +1333,7 @@ async fn handle_file_request<T>(
     req: ahand_protocol::FileRequest,
     tx: &T,
     session_mgr: &Arc<SessionManager>,
+    browser_mgr: &Arc<BrowserManager>,
     file_mgr: &Arc<FileManager>,
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
@@ -1263,12 +1367,23 @@ async fn handle_file_request<T>(
     // field hiding behind a generic "PolicyDenied" message.
     let req_paths_joined = file_mgr.request_paths(&req).join(", ");
 
-    if !file_mgr.is_enabled() {
-        send_file_response(crate::file_manager::error_response(
-            req.request_id.clone(),
-            ahand_protocol::FileErrorCode::PolicyDenied,
+    let capability_router = match crate::plugin_runtime::build_router(browser_mgr, file_mgr).await {
+        Ok(router) => router,
+        Err(err) => {
+            send_file_response(crate::file_manager::error_response(
+                req.request_id.clone(),
+                ahand_protocol::FileErrorCode::PolicyDenied,
+                &req_paths_joined,
+                &format!("file capability unavailable: failed to inspect host resources: {err}"),
+            ));
+            return;
+        }
+    };
+    if let Err(unavailable) = capability_router.ensure(CapabilityKind::File) {
+        send_file_response(file_unavailable_response(
+            &req,
             &req_paths_joined,
-            "file operations are not enabled on this daemon",
+            &unavailable,
         ));
         return;
     }
@@ -1663,6 +1778,68 @@ mod tests {
             capabilities,
             vec!["exec", "file", "browser-playwright-cli"]
         );
+    }
+
+    #[test]
+    fn browser_unavailable_response_preserves_ids_and_install_hint() {
+        let req = ahand_protocol::BrowserRequest {
+            request_id: "browser-req-1".to_string(),
+            session_id: "browser-session-1".to_string(),
+            action: "navigate".to_string(),
+            ..Default::default()
+        };
+        let unavailable = crate::plugin_runtime::CapabilityUnavailable {
+            capability: crate::plugin_runtime::CapabilityKind::Browser,
+            plugin_id: "browser-playwright-cli".to_string(),
+            status: crate::plugin_runtime::PluginStatus::Blocked,
+            reason: "dependency node is missing".to_string(),
+            remediation: crate::plugin_runtime::CapabilityRemediation::InstallPlugin {
+                plugin_id: "browser-playwright-cli".to_string(),
+            },
+        };
+
+        let resp = super::browser_unavailable_response(&req, &unavailable);
+
+        assert_eq!(resp.request_id, "browser-req-1");
+        assert_eq!(resp.session_id, "browser-session-1");
+        assert!(!resp.success);
+        assert!(resp.error.contains("browser capability unavailable"));
+        assert!(
+            resp.error
+                .contains("install plugin browser-playwright-cli through the host plugin installer")
+        );
+    }
+
+    #[test]
+    fn file_unavailable_response_preserves_request_id_and_path() {
+        let req = ahand_protocol::FileRequest {
+            request_id: "file-req-1".to_string(),
+            ..Default::default()
+        };
+        let unavailable = crate::plugin_runtime::CapabilityUnavailable {
+            capability: crate::plugin_runtime::CapabilityKind::File,
+            plugin_id: "file".to_string(),
+            status: crate::plugin_runtime::PluginStatus::Blocked,
+            reason: "host configuration disabled file operations".to_string(),
+            remediation: crate::plugin_runtime::CapabilityRemediation::HostConfiguration {
+                message: "enable file operations in host configuration".to_string(),
+            },
+        };
+
+        let resp = super::file_unavailable_response(&req, "notes.txt", &unavailable);
+
+        assert_eq!(resp.request_id, "file-req-1");
+        match resp.result {
+            Some(ahand_protocol::file_response::Result::Error(err)) => {
+                assert_eq!(err.code, ahand_protocol::FileErrorCode::PolicyDenied as i32);
+                assert_eq!(err.path, "notes.txt");
+                assert!(
+                    err.message
+                        .contains("file capability unavailable: host configuration disabled")
+                );
+            }
+            other => panic!("expected file error response, got {other:?}"),
+        }
     }
 
     /// Spinning up a real `spawn(...)` daemon and reaching into its private
