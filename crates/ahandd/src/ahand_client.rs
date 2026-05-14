@@ -321,12 +321,18 @@ async fn connect_with_auth(
     info!(last_ack, "connected, sending Hello");
 
     // Send Hello envelope — Hello is NOT stamped (seq=0), it's a connection signal.
-    let hello = build_hello_envelope(
+    let capability_router = crate::plugin_runtime::build_router(browser_mgr, file_mgr)
+        .await
+        .map_err(ConnectError::Session)?;
+    let hello = build_hello_envelope_with_capabilities(
         device_id,
         identity,
         last_ack,
-        browser_mgr.is_enabled(),
-        file_mgr.is_enabled(),
+        capability_router
+            .active_wire_capabilities()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         &challenge.nonce,
         match auth_mode {
             HelloAuthMode::Ed25519 => None,
@@ -765,7 +771,6 @@ pub fn build_hello_envelope(
     challenge_nonce: &[u8],
     bearer_token: Option<String>,
 ) -> Envelope {
-    let signed_at_ms = identity.next_hello_signed_at_ms();
     let mut capabilities = vec!["exec".to_string()];
     if browser_enabled {
         // Device-reported capability name binds to the concrete
@@ -780,11 +785,30 @@ pub fn build_hello_envelope(
         capabilities.push("file".to_string());
     }
 
+    build_hello_envelope_with_capabilities(
+        device_id,
+        identity,
+        last_ack,
+        capabilities,
+        challenge_nonce,
+        bearer_token,
+    )
+}
+
+pub fn build_hello_envelope_with_capabilities(
+    device_id: &str,
+    identity: &DeviceIdentity,
+    last_ack: u64,
+    capabilities: Vec<String>,
+    challenge_nonce: &[u8],
+    bearer_token: Option<String>,
+) -> Envelope {
+    let signed_at_ms = identity.next_hello_signed_at_ms();
     let mut hello = Hello {
         version: env!("CARGO_PKG_VERSION").to_string(),
         hostname: gethostname::gethostname().to_string_lossy().to_string(),
         os: std::env::consts::OS.to_string(),
-        capabilities,
+        capabilities: hello_capabilities_from_wire_names(capabilities),
         last_ack,
         auth: None,
     };
@@ -812,6 +836,10 @@ pub fn build_hello_envelope(
         payload: Some(envelope::Payload::Hello(hello)),
         ..Default::default()
     }
+}
+
+fn hello_capabilities_from_wire_names(capabilities: Vec<String>) -> Vec<String> {
+    capabilities
 }
 
 pub fn hello_auth_modes(bootstrap_token: Option<&str>) -> Vec<HelloAuthMode> {
@@ -1620,7 +1648,22 @@ mod tests {
     use super::{
         BufferedEnvelopeSender, ConnectError, OutboundFrame, QueuedEnvelope,
         classify_hello_accepted_message, connect_tcp_with_keepalive,
+        hello_capabilities_from_wire_names,
     };
+
+    #[test]
+    fn hello_capabilities_preserve_router_order_and_names() {
+        let capabilities = hello_capabilities_from_wire_names(vec![
+            "exec".to_string(),
+            "file".to_string(),
+            "browser-playwright-cli".to_string(),
+        ]);
+
+        assert_eq!(
+            capabilities,
+            vec!["exec", "file", "browser-playwright-cli"]
+        );
+    }
 
     /// Spinning up a real `spawn(...)` daemon and reaching into its private
     /// TcpStream just to read getsockopt would mean exposing the socket
