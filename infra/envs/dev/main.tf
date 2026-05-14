@@ -30,6 +30,10 @@ output "task_role_arn" {
   value = module.ahand_hub.task_role_arn
 }
 
+output "file_ops_bucket_name" {
+  value = module.ahand_hub.file_ops_bucket_name
+}
+
 output "traefik_lb_dns_name" {
   description = "Configure Cloudflare CNAME ahand-hub.dev.team9.ai → this value (DNS-only, gray cloud)"
   value       = data.aws_lb.traefik.dns_name

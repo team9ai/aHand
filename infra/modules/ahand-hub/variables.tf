@@ -81,7 +81,27 @@ variable "existing_redis_cluster_id" {
   default     = null
 }
 
+variable "s3_file_transfer_threshold_bytes" {
+  description = "Hub file size threshold above which file operations spill through S3"
+  type        = number
+  default     = 1048576
+}
+
+variable "s3_url_expiration_secs" {
+  description = "Expiration in seconds for hub-generated presigned S3 URLs"
+  type        = number
+  default     = 3600
+}
+
+variable "s3_file_ops_lifecycle_days" {
+  description = "Days to keep staged file-ops objects before S3 lifecycle expiration"
+  type        = number
+  default     = 7
+}
+
 locals {
+  file_ops_bucket_name = "ahand-hub-${var.env}"
+
   common_tags = {
     Environment = var.env
     Service     = "ahand-hub"
