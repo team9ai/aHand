@@ -158,14 +158,21 @@ fn browser_entry(plugins: &[InstalledPluginResource], config: ActivationConfig) 
     }
 }
 
-fn first_missing_dependency(plugins: &[InstalledPluginResource], plugin_id: &str) -> Option<String> {
+fn first_missing_dependency(
+    plugins: &[InstalledPluginResource],
+    plugin_id: &str,
+) -> Option<String> {
     let plugin = plugins.iter().find(|plugin| plugin.id == plugin_id)?;
     plugin.dependencies.iter().find_map(|dependency| {
         let status = plugin_status(plugins, dependency).unwrap_or(PluginStatus::Missing);
         if status == PluginStatus::Installed {
             None
         } else {
-            Some(format!("dependency {} is {}", dependency, status_word(status)))
+            Some(format!(
+                "dependency {} is {}",
+                dependency,
+                status_word(status)
+            ))
         }
     })
 }

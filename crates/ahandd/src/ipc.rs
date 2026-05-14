@@ -168,26 +168,28 @@ async fn handle_ipc_conn(
 
         match envelope.payload {
             Some(envelope::Payload::JobRequest(req)) => {
-                let capability_router =
-                    match crate::plugin_runtime::build_router(&browser_mgr, &file_mgr).await {
-                        Ok(router) => router,
-                        Err(err) => {
-                            warn!(
-                                job_id = %req.job_id,
-                                tool = %req.tool,
-                                error = %err,
-                                "IPC: job rejected because host resources could not be inspected"
-                            );
-                            let _ = tx.send(job_capability_rejection_envelope(
-                                &device_id,
-                                &req,
-                                format!(
-                                    "exec capability unavailable: failed to inspect host resources: {err}"
-                                ),
-                            ));
-                            continue;
-                        }
-                    };
+                let capability_router = match crate::plugin_runtime::build_router(
+                    &browser_mgr,
+                    &file_mgr,
+                )
+                .await
+                {
+                    Ok(router) => router,
+                    Err(err) => {
+                        warn!(
+                            job_id = %req.job_id,
+                            tool = %req.tool,
+                            error = %err,
+                            "IPC: job rejected because host resources could not be inspected"
+                        );
+                        let reason = format!(
+                            "exec capability unavailable: failed to inspect host resources: {err}"
+                        );
+                        let _ =
+                            tx.send(job_capability_rejection_envelope(&device_id, &req, reason));
+                        continue;
+                    }
+                };
                 if let Err(unavailable) = capability_router.ensure(CapabilityKind::Exec) {
                     let reason = unavailable.to_protocol_message();
                     warn!(
@@ -196,11 +198,7 @@ async fn handle_ipc_conn(
                         reason = %reason,
                         "IPC: job rejected by capability router"
                     );
-                    let _ = tx.send(job_capability_rejection_envelope(
-                        &device_id,
-                        &req,
-                        reason,
-                    ));
+                    let _ = tx.send(job_capability_rejection_envelope(&device_id, &req, reason));
                     continue;
                 }
 
@@ -411,31 +409,33 @@ async fn handle_ipc_conn(
                     "IPC: received browser request"
                 );
 
-                let capability_router =
-                    match crate::plugin_runtime::build_router(&browser_mgr, &file_mgr).await {
-                        Ok(router) => router,
-                        Err(err) => {
-                            let resp_env = Envelope {
-                                device_id: device_id.clone(),
-                                msg_id: new_msg_id(),
-                                ts_ms: now_ms(),
-                                payload: Some(envelope::Payload::BrowserResponse(
-                                    BrowserResponse {
-                                        request_id: req.request_id.clone(),
-                                        session_id: req.session_id.clone(),
-                                        success: false,
-                                        error: format!(
-                                            "browser capability unavailable: failed to inspect host resources: {err}"
-                                        ),
-                                        ..Default::default()
-                                    },
-                                )),
+                let capability_router = match crate::plugin_runtime::build_router(
+                    &browser_mgr,
+                    &file_mgr,
+                )
+                .await
+                {
+                    Ok(router) => router,
+                    Err(err) => {
+                        let resp_env = Envelope {
+                            device_id: device_id.clone(),
+                            msg_id: new_msg_id(),
+                            ts_ms: now_ms(),
+                            payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
+                                request_id: req.request_id.clone(),
+                                session_id: req.session_id.clone(),
+                                success: false,
+                                error: format!(
+                                    "browser capability unavailable: failed to inspect host resources: {err}"
+                                ),
                                 ..Default::default()
-                            };
-                            let _ = tx.send(resp_env);
-                            continue;
-                        }
-                    };
+                            })),
+                            ..Default::default()
+                        };
+                        let _ = tx.send(resp_env);
+                        continue;
+                    }
+                };
 
                 if let Err(unavailable) = capability_router.ensure(CapabilityKind::Browser) {
                     let resp_env = Envelope {
@@ -617,8 +617,9 @@ mod tests {
         assert_eq!(resp.session_id, "ipc-browser-session-1");
         assert!(!resp.success);
         assert!(
-            resp.error
-                .contains("install plugin browser-playwright-cli through the host plugin installer")
+            resp.error.contains(
+                "install plugin browser-playwright-cli through the host plugin installer"
+            )
         );
     }
 

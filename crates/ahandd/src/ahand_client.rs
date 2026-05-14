@@ -1774,10 +1774,7 @@ mod tests {
             "browser-playwright-cli".to_string(),
         ]);
 
-        assert_eq!(
-            capabilities,
-            vec!["exec", "file", "browser-playwright-cli"]
-        );
+        assert_eq!(capabilities, vec!["exec", "file", "browser-playwright-cli"]);
     }
 
     #[test]
@@ -1805,8 +1802,9 @@ mod tests {
         assert!(!resp.success);
         assert!(resp.error.contains("browser capability unavailable"));
         assert!(
-            resp.error
-                .contains("install plugin browser-playwright-cli through the host plugin installer")
+            resp.error.contains(
+                "install plugin browser-playwright-cli through the host plugin installer"
+            )
         );
     }
 
