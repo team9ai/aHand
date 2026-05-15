@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod ahand_client;
 mod approval;
 mod browser;
@@ -12,6 +14,7 @@ mod openclaw;
 mod outbox;
 mod policy;
 mod registry;
+mod result_parser;
 mod session;
 mod store;
 pub mod updater;
@@ -29,7 +32,7 @@ use tracing::info;
 #[derive(Parser)]
 #[command(name = "ahandd", about = "AHand local execution daemon")]
 struct Args {
-    /// Connection mode: "ahand-cloud" (default) or "openclaw-gateway"
+    /// Connection mode: "ahand-cloud" (default), "openclaw-gateway", or "local"
     #[arg(long, env = "AHAND_MODE")]
     mode: Option<String>,
 
@@ -135,7 +138,10 @@ async fn main() -> anyhow::Result<()> {
             if path.exists() {
                 tracing::info!("Loading config from {}", path.display());
                 config::Config::load(path)?
-            } else if args.url.is_none() {
+            } else if args.url.is_none()
+                && args.mode.as_deref().map(ConnectionMode::parse_lossy)
+                    != Some(ConnectionMode::Local)
+            {
                 // No config file and no --url: guide the user.
                 eprintln!("No config file found at {}", path.display());
                 eprintln!();
@@ -148,7 +154,7 @@ async fn main() -> anyhow::Result<()> {
                 // --url provided without config: build minimal config for quick testing.
                 config::Config {
                     mode: args.mode.clone(),
-                    server_url: args.url.clone().unwrap(),
+                    server_url: args.url.clone().unwrap_or_else(|| "local".to_string()),
                     device_id: None,
                     max_concurrent_jobs: None,
                     data_dir: None,
@@ -166,14 +172,17 @@ async fn main() -> anyhow::Result<()> {
             }
         } else {
             // Cannot determine home dir — require explicit --url.
-            if args.url.is_none() {
+            if args.url.is_none()
+                && args.mode.as_deref().map(ConnectionMode::parse_lossy)
+                    != Some(ConnectionMode::Local)
+            {
                 eprintln!("Cannot determine home directory. Please specify:");
                 eprintln!("  ahandd --config <path>  or  ahandd --url ws://host/ws");
                 std::process::exit(1);
             }
             config::Config {
                 mode: args.mode.clone(),
-                server_url: args.url.clone().unwrap(),
+                server_url: args.url.clone().unwrap_or_else(|| "local".to_string()),
                 device_id: None,
                 max_concurrent_jobs: None,
                 data_dir: None,
@@ -246,6 +255,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let connection_mode = cfg.connection_mode();
+    if connection_mode == ConnectionMode::Local && cfg.default_session_mode.is_none() {
+        cfg.default_session_mode = Some("trust".to_string());
+    }
     let debug_ipc = cfg.debug_ipc.unwrap_or(false);
     let ipc_socket_path = cfg.ipc_socket_path();
     let ipc_socket_mode = cfg.ipc_socket_mode();
@@ -413,6 +425,46 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     client.run().await
                 }
+            }
+            ConnectionMode::Local => {
+                anyhow::ensure!(
+                    debug_ipc,
+                    "local mode requires --debug-ipc or debug_ipc = true"
+                );
+
+                let hub_cfg = cfg.hub_config();
+                let identity_path = hub_cfg
+                    .private_key_path
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        cfg.data_dir()
+                            .map(|dir| dir.join(device_identity::IDENTITY_FILE))
+                    })
+                    .unwrap_or_else(device_identity::default_identity_path);
+                let identity = device_identity::DeviceIdentity::load_or_create(&identity_path)
+                    .context("failed to load device identity")?;
+                let device_id = identity.device_id();
+
+                info!(
+                    device_id = %device_id,
+                    max_concurrent_jobs = max_jobs,
+                    ipc_socket = %ipc_socket_path.display(),
+                    "ahandd starting in local debug mode"
+                );
+
+                ipc::serve_ipc(
+                    ipc_socket_path,
+                    ipc_socket_mode,
+                    Arc::clone(&registry),
+                    store_opt,
+                    session_mgr,
+                    approval_mgr,
+                    approval_broadcast_tx,
+                    device_id,
+                    browser_mgr,
+                )
+                .await
             }
         }
     };

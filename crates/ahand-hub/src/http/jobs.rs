@@ -33,11 +33,15 @@ pub struct CreateJobRequest {
     pub timeout_ms: u64,
     #[serde(default)]
     pub interactive: bool,
+    #[serde(default, alias = "executionMode")]
+    pub execution_mode: Option<String>,
 }
 
 impl CreateJobRequest {
-    pub fn into_new_job(self, requested_by: &str) -> NewJob {
-        NewJob {
+    pub fn into_new_job(self, requested_by: &str) -> ApiResult<NewJob> {
+        let interactive =
+            resolve_interactive_compat(self.execution_mode.as_deref(), self.interactive)?;
+        Ok(NewJob {
             device_id: self.device_id,
             tool: self.tool,
             args: self.args,
@@ -45,8 +49,8 @@ impl CreateJobRequest {
             env: Default::default(),
             timeout_ms: self.timeout_ms,
             requested_by: requested_by.into(),
-            interactive: self.interactive,
-        }
+            interactive,
+        })
     }
 }
 
@@ -127,6 +131,13 @@ impl JobRuntime {
                     env: job.env.clone(),
                     timeout_ms: job.timeout_ms,
                     interactive: job.interactive,
+                    execution_mode: if job.interactive {
+                        ahand_protocol::ExecutionMode::Pty as i32
+                    } else {
+                        ahand_protocol::ExecutionMode::Batch as i32
+                    },
+                    result_parser: String::new(),
+                    format: String::new(),
                 },
             )),
             ..Default::default()
@@ -629,7 +640,7 @@ pub async fn create_job(
     let Json(body) = body.map_err(ApiError::from_json_rejection)?;
     let job = state
         .jobs
-        .create_job(body.into_new_job(&format!("dashboard:{}", auth.0.subject)))
+        .create_job(body.into_new_job(&format!("dashboard:{}", auth.0.subject))?)
         .await
         .map_err(ApiError::from)?;
     Ok((
@@ -860,6 +871,20 @@ fn job_status_name(status: JobStatus) -> &'static str {
         JobStatus::Finished => "finished",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
+    }
+}
+
+fn resolve_interactive_compat(execution_mode: Option<&str>, interactive: bool) -> ApiResult<bool> {
+    match execution_mode {
+        Some("batch") => Ok(false),
+        Some("pty") => Ok(true),
+        Some("pipe_stream") => Err(ApiError::validation(
+            "pipe_stream execution mode is not supported by this hub",
+        )),
+        Some(other) => Err(ApiError::validation(format!(
+            "unknown execution_mode: {other}"
+        ))),
+        None => Ok(interactive),
     }
 }
 

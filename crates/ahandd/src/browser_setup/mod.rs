@@ -13,6 +13,7 @@ pub mod node;
 pub mod playwright;
 pub mod types;
 
+#[allow(unused_imports)]
 pub use browser_detect::{
     detect as detect_browser, detect_all as detect_all_browsers, tried_browsers,
 };

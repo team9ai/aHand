@@ -62,8 +62,10 @@ struct QueuedEnvelope {
 /// replied by tungstenite per RFC 6455) before its watchdog timeout
 /// fires — that's how we detect zombie TCP connections that survived
 /// macOS sleep/wake or NAT timeout without any visible socket error.
+#[allow(clippy::large_enum_variant)]
 enum OutboundFrame {
     Envelope(QueuedEnvelope),
+    #[cfg_attr(feature = "disable-ws-ping", allow(dead_code))]
     WsPing(Vec<u8>),
 }
 
@@ -74,6 +76,7 @@ impl BufferedEnvelopeSender {
 
     /// Send a raw WebSocket Ping. Returns Err only if the receiver task has
     /// already exited (session tearing down).
+    #[cfg_attr(feature = "disable-ws-ping", allow(dead_code))]
     fn send_ping(&self, payload: Vec<u8>) -> Result<(), ()> {
         self.tx.send(OutboundFrame::WsPing(payload)).map_err(|_| ())
     }
@@ -310,11 +313,10 @@ async fn connect_with_auth(
     let tcp = connect_tcp_with_keepalive(url)
         .await
         .map_err(ConnectError::Session)?;
-    let (ws_stream, _) =
-        tokio_tungstenite::client_async_tls_with_config(url, tcp, None, None)
-            .await
-            .map_err(anyhow::Error::from)
-            .map_err(ConnectError::Session)?;
+    let (ws_stream, _) = tokio_tungstenite::client_async_tls_with_config(url, tcp, None, None)
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(ConnectError::Session)?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let challenge = recv_hello_challenge(&mut stream).await?;
@@ -592,9 +594,12 @@ async fn connect_with_auth(
             }
             Some(envelope::Payload::StdinChunk(chunk)) => {
                 use crate::executor::StdinInput;
-                registry
-                    .send_stdin(&chunk.job_id, StdinInput::Data(chunk.data))
-                    .await;
+                let input = if chunk.data.is_empty() {
+                    StdinInput::Close
+                } else {
+                    StdinInput::Data(chunk.data)
+                };
+                registry.send_stdin(&chunk.job_id, input).await;
             }
             Some(envelope::Payload::TerminalResize(resize)) => {
                 use crate::executor::StdinInput;
@@ -976,37 +981,59 @@ async fn spawn_job<T>(
     let did = device_id.to_string();
     let reg = Arc::clone(registry);
     let st = store.clone();
-    let interactive = req.interactive;
+    let execution_mode = ahand_protocol::resolve_job_execution_mode(&req);
 
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
 
-    if interactive {
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<executor::StdinInput>();
-        reg.register_interactive(job_id.clone(), cancel_tx, stdin_tx)
-            .await;
+    match execution_mode {
+        ahand_protocol::ExecutionMode::Pty => {
+            let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<executor::StdinInput>();
+            reg.register_interactive(job_id.clone(), cancel_tx, stdin_tx)
+                .await;
 
-        let active = reg.active_count().await;
-        info!(job_id = %job_id, active_jobs = active, interactive = true, "interactive job accepted, acquiring permit");
+            let active = reg.active_count().await;
+            info!(job_id = %job_id, active_jobs = active, execution_mode = "pty", "interactive job accepted, acquiring permit");
 
-        tokio::spawn(async move {
-            let _permit = reg.acquire_permit().await;
-            let (exit_code, error) =
-                executor::run_job_pty(did, req, tx_clone, cancel_rx, stdin_rx, st).await;
-            reg.remove(&job_id).await;
-            reg.mark_completed(job_id, exit_code, error).await;
-        });
-    } else {
-        reg.register(job_id.clone(), cancel_tx).await;
+            tokio::spawn(async move {
+                let _permit = reg.acquire_permit().await;
+                let (exit_code, error) =
+                    executor::run_job_pty(did, req, tx_clone, cancel_rx, stdin_rx, st).await;
+                reg.remove(&job_id).await;
+                reg.mark_completed(job_id, exit_code, error).await;
+            });
+        }
+        ahand_protocol::ExecutionMode::Batch => {
+            reg.register(job_id.clone(), cancel_tx).await;
 
-        let active = reg.active_count().await;
-        info!(job_id = %job_id, active_jobs = active, "job accepted, acquiring permit");
+            let active = reg.active_count().await;
+            info!(job_id = %job_id, active_jobs = active, execution_mode = "batch", "job accepted, acquiring permit");
 
-        tokio::spawn(async move {
-            let _permit = reg.acquire_permit().await;
-            let (exit_code, error) = executor::run_job(did, req, tx_clone, cancel_rx, st).await;
-            reg.remove(&job_id).await;
-            reg.mark_completed(job_id, exit_code, error).await;
-        });
+            tokio::spawn(async move {
+                let _permit = reg.acquire_permit().await;
+                let (exit_code, error) = executor::run_job(did, req, tx_clone, cancel_rx, st).await;
+                reg.remove(&job_id).await;
+                reg.mark_completed(job_id, exit_code, error).await;
+            });
+        }
+        ahand_protocol::ExecutionMode::PipeStream => {
+            let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<executor::StdinInput>();
+            reg.register_interactive(job_id.clone(), cancel_tx, stdin_tx)
+                .await;
+
+            let active = reg.active_count().await;
+            info!(job_id = %job_id, active_jobs = active, execution_mode = "pipe_stream", "stream job accepted, acquiring permit");
+
+            tokio::spawn(async move {
+                let _permit = reg.acquire_permit().await;
+                let (exit_code, error) =
+                    executor::run_job_stream(did, req, tx_clone, cancel_rx, stdin_rx, st).await;
+                reg.remove(&job_id).await;
+                reg.mark_completed(job_id, exit_code, error).await;
+            });
+        }
+        ahand_protocol::ExecutionMode::Unspecified => {
+            unreachable!("resolver never returns unspecified")
+        }
     }
 }
 
@@ -1335,7 +1362,12 @@ async fn handle_file_request<T>(
 
     // Both the Allow+dangerous and NeedsApproval branches fall through here.
     let (approval_req, approval_rx) = approval_mgr
-        .submit(synthetic_req, caller_uid, approval_reason, previous_refusals)
+        .submit(
+            synthetic_req,
+            caller_uid,
+            approval_reason,
+            previous_refusals,
+        )
         .await;
 
     // Send ApprovalRequest to cloud via WS and broadcast to IPC clients.
@@ -1602,8 +1634,8 @@ mod tests {
     use crate::outbox::Outbox;
 
     use super::{
-        BufferedEnvelopeSender, ConnectError, OutboundFrame, QueuedEnvelope,
-        classify_hello_accepted_message, connect_tcp_with_keepalive,
+        BufferedEnvelopeSender, ConnectError, OutboundFrame, classify_hello_accepted_message,
+        connect_tcp_with_keepalive,
     };
 
     /// Spinning up a real `spawn(...)` daemon and reaching into its private
@@ -1645,17 +1677,19 @@ mod tests {
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             assert_eq!(
-                sock.keepalive_time().expect("read keepalive idle time"),
+                sock.tcp_keepalive_time().expect("read keepalive idle time"),
                 std::time::Duration::from_secs(30),
                 "TCP_KEEPIDLE must be 30s",
             );
             assert_eq!(
-                sock.keepalive_interval().expect("read keepalive probe interval"),
+                sock.tcp_keepalive_interval()
+                    .expect("read keepalive probe interval"),
                 std::time::Duration::from_secs(10),
                 "TCP_KEEPINTVL must be 10s",
             );
             assert_eq!(
-                sock.keepalive_retries().expect("read keepalive retry count"),
+                sock.tcp_keepalive_retries()
+                    .expect("read keepalive retry count"),
                 3,
                 "TCP_KEEPCNT must be 3",
             );

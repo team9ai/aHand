@@ -1,5 +1,6 @@
 export {
   Envelope,
+  ExecutionMode,
   Hello,
   Ed25519Auth,
   JobRequest,

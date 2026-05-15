@@ -152,19 +152,18 @@ fn with_auth(token: Arc<String>) -> impl Filter<Extract = (), Error = Rejection>
                 let token = token.clone();
                 async move {
                     // Check Authorization header
-                    if let Some(header) = auth_header {
-                        if let Some(bearer) = header.strip_prefix("Bearer ") {
-                            if bearer == token.as_str() {
-                                return Ok::<_, Rejection>(());
-                            }
-                        }
+                    if let Some(header) = auth_header
+                        && let Some(bearer) = header.strip_prefix("Bearer ")
+                        && bearer == token.as_str()
+                    {
+                        return Ok::<_, Rejection>(());
                     }
 
                     // Check query parameter
-                    if let Some(query_token) = query.get("token") {
-                        if query_token == token.as_str() {
-                            return Ok(());
-                        }
+                    if let Some(query_token) = query.get("token")
+                        && query_token == token.as_str()
+                    {
+                        return Ok(());
                     }
 
                     Err(reject::custom(Unauthorized))

@@ -146,15 +146,15 @@ impl FileManager {
     ) -> Result<Option<ApprovalEscalation>, FileError> {
         // Recursive PERMANENT delete forces approval even if none of the
         // paths themselves are marked dangerous (design.md:635).
-        if let Some(file_request::Operation::Delete(d)) = &req.operation {
-            if d.mode == DeleteMode::Permanent as i32 && d.recursive {
-                return Ok(Some(ApprovalEscalation {
-                    kind: EscalationKind::RecursivePermanentDelete,
-                    reason: "recursive permanent delete requires explicit approval"
-                        .to_string(),
-                    path: Some(d.path.clone()),
-                }));
-            }
+        if let Some(file_request::Operation::Delete(d)) = &req.operation
+            && d.mode == DeleteMode::Permanent as i32
+            && d.recursive
+        {
+            return Ok(Some(ApprovalEscalation {
+                kind: EscalationKind::RecursivePermanentDelete,
+                reason: "recursive permanent delete requires explicit approval".to_string(),
+                path: Some(d.path.clone()),
+            }));
         }
 
         // Walk the request's declared paths. collect_request_paths now
@@ -245,9 +245,9 @@ impl FileManager {
     ) -> Result<file_response::Result, FileError> {
         match op {
             file_request::Operation::Stat(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, false, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = fs_ops::handle_stat(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Stat(result))
             }
@@ -305,9 +305,9 @@ impl FileManager {
                 Ok(file_response::Result::Mkdir(result))
             }
             file_request::Operation::ReadText(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, false, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = text_read::handle_read_text(
                     req,
                     checked.resolved_path.as_path(),
@@ -317,9 +317,9 @@ impl FileManager {
                 Ok(file_response::Result::ReadText(result))
             }
             file_request::Operation::ReadBinary(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, false, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = binary_read::handle_read_binary(
                     req,
                     checked.resolved_path.as_path(),
@@ -329,9 +329,9 @@ impl FileManager {
                 Ok(file_response::Result::ReadBinary(result))
             }
             file_request::Operation::ReadImage(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, false, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
                 let result = binary_read::handle_read_image(
                     req,
                     checked.resolved_path.as_path(),
@@ -341,9 +341,9 @@ impl FileManager {
                 Ok(file_response::Result::ReadImage(result))
             }
             file_request::Operation::Write(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, true, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = write_ops::handle_write(
                     req,
                     checked.resolved_path.as_path(),
@@ -362,9 +362,9 @@ impl FileManager {
                 Ok(file_response::Result::Write(result))
             }
             file_request::Operation::Edit(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, true, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = write_ops::handle_edit(
                     req,
                     checked.resolved_path.as_path(),
@@ -374,16 +374,16 @@ impl FileManager {
                 Ok(file_response::Result::Edit(result))
             }
             file_request::Operation::Delete(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, true, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = fs_ops::handle_delete(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Delete(result))
             }
             file_request::Operation::Chmod(req) => {
-                let checked =
-                    self.policy
-                        .check_path(&req.path, true, req.no_follow_symlink)?;
+                let checked = self
+                    .policy
+                    .check_path(&req.path, true, req.no_follow_symlink)?;
                 let result = fs_ops::handle_chmod(req, checked.resolved_path.as_path()).await?;
                 Ok(file_response::Result::Chmod(result))
             }
@@ -800,24 +800,16 @@ pub(super) async fn reject_if_final_component_is_symlink(
     }
     // symlink_metadata never follows. If the file doesn't exist at all, we
     // let the downstream handler produce its own NotFound error.
-    if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await {
-        if metadata.file_type().is_symlink() {
-            return Err(file_error(
-                FileErrorCode::InvalidPath,
-                req_path,
-                "no_follow_symlink is set but the final component is a symlink",
-            ));
-        }
+    if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await
+        && metadata.file_type().is_symlink()
+    {
+        return Err(file_error(
+            FileErrorCode::InvalidPath,
+            req_path,
+            "no_follow_symlink is set but the final component is a symlink",
+        ));
     }
     Ok(())
-}
-
-fn unimplemented_error(path: &str) -> FileError {
-    file_error(
-        FileErrorCode::Unspecified,
-        path,
-        "operation not yet implemented",
-    )
 }
 
 #[cfg(test)]

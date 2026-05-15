@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ahand_protocol::{BrowserResponse, Envelope, JobFinished, JobRejected, SessionMode, envelope};
+use ahand_protocol::{
+    BrowserResponse, Envelope, ExecutionMode, JobFinished, JobRejected, SessionMode, envelope,
+    resolve_job_execution_mode,
+};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -38,8 +41,16 @@ pub async fn serve_ipc(
 
     let listener = UnixListener::bind(&socket_path)?;
 
-    // Set socket permissions.
-    set_permissions(&socket_path, socket_mode)?;
+    // Set socket permissions. Some restricted local environments allow
+    // binding Unix sockets but deny chmod on the socket file; keep the debug
+    // sidecar usable in that case.
+    if let Err(e) = set_permissions(&socket_path, socket_mode) {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            warn!(error = %e, path = %socket_path.display(), "IPC: failed to set socket permissions");
+        } else {
+            return Err(e.into());
+        }
+    }
 
     info!(path = %socket_path.display(), mode = format!("{:04o}", socket_mode), "IPC server listening");
 
@@ -204,25 +215,14 @@ async fn handle_ipc_conn(
                         let _ = tx.send(reject_env);
                     }
                     SessionDecision::Allow => {
-                        let job_id = req.job_id.clone();
-                        let tx_clone = tx.clone();
-                        let did = device_id.clone();
-                        let reg = Arc::clone(&registry);
-                        let st = store.clone();
-
-                        let (cancel_tx, cancel_rx) = mpsc::channel(1);
-                        reg.register(job_id.clone(), cancel_tx).await;
-
-                        let active = reg.active_count().await;
-                        info!(job_id = %job_id, active_jobs = active, "IPC: job accepted");
-
-                        tokio::spawn(async move {
-                            let _permit = reg.acquire_permit().await;
-                            let (exit_code, error) =
-                                executor::run_job(did, req, tx_clone, cancel_rx, st).await;
-                            reg.remove(&job_id).await;
-                            reg.mark_completed(job_id, exit_code, error).await;
-                        });
+                        spawn_ipc_job(
+                            device_id.clone(),
+                            req,
+                            tx.clone(),
+                            Arc::clone(&registry),
+                            store.clone(),
+                        )
+                        .await;
                     }
                     SessionDecision::NeedsApproval {
                         reason,
@@ -263,13 +263,7 @@ async fn handle_ipc_conn(
                             match result {
                                 Ok(Ok(resp)) if resp.approved => {
                                     info!(job_id = %job_id, "IPC: approval granted");
-                                    let (cancel_tx, cancel_rx) = mpsc::channel(1);
-                                    reg.register(job_id.clone(), cancel_tx).await;
-                                    let _permit = reg.acquire_permit().await;
-                                    let (exit_code, error) =
-                                        executor::run_job(did, req, tx_clone, cancel_rx, st).await;
-                                    reg.remove(&job_id).await;
-                                    reg.mark_completed(job_id, exit_code, error).await;
+                                    spawn_ipc_job(did, req, tx_clone, reg, st).await;
                                 }
                                 Ok(Ok(resp)) => {
                                     info!(job_id = %job_id, "IPC: approval denied");
@@ -320,6 +314,31 @@ async fn handle_ipc_conn(
             Some(envelope::Payload::CancelJob(cancel)) => {
                 info!(job_id = %cancel.job_id, "IPC: received cancel request");
                 registry.cancel(&cancel.job_id).await;
+            }
+            Some(envelope::Payload::StdinChunk(chunk)) => {
+                let input = if chunk.data.is_empty() {
+                    executor::StdinInput::Close
+                } else {
+                    executor::StdinInput::Data(chunk.data)
+                };
+                let delivered = registry.send_stdin(&chunk.job_id, input).await;
+                if !delivered {
+                    warn!(job_id = %chunk.job_id, "IPC: stdin chunk dropped; job is not interactive");
+                }
+            }
+            Some(envelope::Payload::TerminalResize(resize)) => {
+                let delivered = registry
+                    .send_stdin(
+                        &resize.job_id,
+                        executor::StdinInput::Resize {
+                            cols: resize.cols as u16,
+                            rows: resize.rows as u16,
+                        },
+                    )
+                    .await;
+                if !delivered {
+                    warn!(job_id = %resize.job_id, "IPC: terminal resize dropped; job is not interactive");
+                }
             }
             Some(envelope::Payload::ApprovalResponse(resp)) => {
                 info!(job_id = %resp.job_id, approved = resp.approved, "IPC: received approval response");
@@ -452,6 +471,67 @@ async fn handle_ipc_conn(
     drop(tx);
     let _ = send_handle.await;
     Ok(())
+}
+
+async fn spawn_ipc_job(
+    device_id: String,
+    req: ahand_protocol::JobRequest,
+    tx: mpsc::UnboundedSender<Envelope>,
+    registry: Arc<JobRegistry>,
+    store: Option<Arc<RunStore>>,
+) {
+    let job_id = req.job_id.clone();
+    let execution_mode = resolve_job_execution_mode(&req);
+    let (cancel_tx, cancel_rx) = mpsc::channel(1);
+
+    match execution_mode {
+        ExecutionMode::Batch => {
+            registry.register(job_id.clone(), cancel_tx).await;
+            let active = registry.active_count().await;
+            info!(job_id = %job_id, active_jobs = active, execution_mode = "batch", "IPC: job accepted");
+
+            tokio::spawn(async move {
+                let _permit = registry.acquire_permit().await;
+                let (exit_code, error) =
+                    executor::run_job(device_id, req, tx, cancel_rx, store).await;
+                registry.remove(&job_id).await;
+                registry.mark_completed(job_id, exit_code, error).await;
+            });
+        }
+        ExecutionMode::Pty => {
+            let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<executor::StdinInput>();
+            registry
+                .register_interactive(job_id.clone(), cancel_tx, stdin_tx)
+                .await;
+            let active = registry.active_count().await;
+            info!(job_id = %job_id, active_jobs = active, execution_mode = "pty", "IPC: interactive job accepted");
+
+            tokio::spawn(async move {
+                let _permit = registry.acquire_permit().await;
+                let (exit_code, error) =
+                    executor::run_job_pty(device_id, req, tx, cancel_rx, stdin_rx, store).await;
+                registry.remove(&job_id).await;
+                registry.mark_completed(job_id, exit_code, error).await;
+            });
+        }
+        ExecutionMode::PipeStream => {
+            let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<executor::StdinInput>();
+            registry
+                .register_interactive(job_id.clone(), cancel_tx, stdin_tx)
+                .await;
+            let active = registry.active_count().await;
+            info!(job_id = %job_id, active_jobs = active, execution_mode = "pipe_stream", "IPC: stream job accepted");
+
+            tokio::spawn(async move {
+                let _permit = registry.acquire_permit().await;
+                let (exit_code, error) =
+                    executor::run_job_stream(device_id, req, tx, cancel_rx, stdin_rx, store).await;
+                registry.remove(&job_id).await;
+                registry.mark_completed(job_id, exit_code, error).await;
+            });
+        }
+        ExecutionMode::Unspecified => unreachable!("resolver never returns unspecified"),
+    }
 }
 
 /// Read a length-prefixed frame: [4 bytes big-endian u32 length][N bytes payload].

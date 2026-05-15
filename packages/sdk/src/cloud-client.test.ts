@@ -120,7 +120,7 @@ describe("CloudClient.spawn", () => {
     expect(calls[1].init?.headers).toMatchObject({ Authorization: "Bearer test-token" });
   });
 
-  it("sends optional fields (env, cwd, timeoutMs, correlationId, interactive)", async () => {
+  it("sends optional fields (env, cwd, timeoutMs, correlationId, executionMode, resultParser, format compat interactive)", async () => {
     const { fn, calls } = mockFetch([
       () => jsonResponse({ jobId: "job-x" }, 201),
       () => sseResponse([sseEvent("finished", { exitCode: 0, durationMs: 1 })]),
@@ -133,7 +133,9 @@ describe("CloudClient.spawn", () => {
       env: { A: "1" },
       timeoutMs: 5000,
       correlationId: "cid-1",
-      interactive: true,
+      executionMode: "pty",
+      resultParser: "claude-stream-json",
+      format: "claude-code",
     });
     const body = JSON.parse(calls[0].init?.body as string);
     expect(body).toMatchObject({
@@ -141,7 +143,46 @@ describe("CloudClient.spawn", () => {
       env: { A: "1" },
       timeoutMs: 5000,
       correlationId: "cid-1",
+      executionMode: "pty",
+      resultParser: "claude-stream-json",
+      format: "claude-code",
       interactive: true,
+    });
+  });
+
+  it("maps deprecated interactive to executionMode and compat interactive", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ jobId: "job-x" }, 201),
+      () => sseResponse([sseEvent("finished", { exitCode: 0, durationMs: 1 })]),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await client.spawn({
+      deviceId: "d",
+      tool: "t",
+      interactive: true,
+    });
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body).toMatchObject({
+      executionMode: "pty",
+      interactive: true,
+    });
+  });
+
+  it("sends pipe_stream with compat interactive=false", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ jobId: "job-x" }, 201),
+      () => sseResponse([sseEvent("finished", { exitCode: 0, durationMs: 1 })]),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await client.spawn({
+      deviceId: "d",
+      tool: "t",
+      executionMode: "pipe_stream",
+    });
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body).toMatchObject({
+      executionMode: "pipe_stream",
+      interactive: false,
     });
   });
 

@@ -1070,6 +1070,9 @@ mod tests {
                     env: Default::default(),
                     timeout_ms: 30_000,
                     interactive: false,
+                    execution_mode: ahand_protocol::ExecutionMode::Batch as i32,
+                    result_parser: String::new(),
+                    format: String::new(),
                 },
             )),
             ..Default::default()

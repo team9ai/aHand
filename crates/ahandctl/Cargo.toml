@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ahand-protocol = { path = "../ahand-protocol" }
+ahandd = { path = "../ahandd" }
 tokio.workspace = true
 prost.workspace = true
 anyhow.workspace = true

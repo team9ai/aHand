@@ -113,6 +113,12 @@ pub struct CreateJobRequest {
     #[serde(default)]
     pub interactive: bool,
     #[serde(default)]
+    pub execution_mode: Option<String>,
+    #[serde(default)]
+    pub result_parser: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
     pub correlation_id: Option<String>,
 }
 
@@ -138,6 +144,11 @@ async fn create_job(
     }
 
     let Json(req) = body.map_err(|_| ControlError::BadRequest("invalid JSON body".into()))?;
+    let execution_mode = resolve_execution_mode(req.execution_mode.as_deref(), req.interactive)?;
+    let interactive = matches!(execution_mode, ahand_protocol::ExecutionMode::Pty);
+    let result_parser = resolve_result_parser(req.result_parser.as_deref())?;
+    let format = resolve_format(req.format.as_deref())?;
+    validate_format_for_parser(format, result_parser)?;
     if req.tool.trim().is_empty() {
         return Err(ControlError::BadRequest("tool must not be empty".into()));
     }
@@ -214,7 +225,10 @@ async fn create_job(
                 cwd: req.cwd.clone().unwrap_or_default(),
                 env: req.env.clone(),
                 timeout_ms,
-                interactive: req.interactive,
+                interactive,
+                execution_mode: execution_mode as i32,
+                result_parser: result_parser.to_string(),
+                format: format.to_string(),
             },
         )),
         ..Default::default()
@@ -420,6 +434,63 @@ async fn cancel_job(
     // the job locally.
     let _ = state.connections.send_envelope(&device_id, envelope).await;
     Ok(StatusCode::ACCEPTED)
+}
+
+fn resolve_execution_mode(
+    execution_mode: Option<&str>,
+    interactive: bool,
+) -> Result<ahand_protocol::ExecutionMode, ControlError> {
+    match execution_mode {
+        Some("batch") => Ok(ahand_protocol::ExecutionMode::Batch),
+        Some("pty") => Ok(ahand_protocol::ExecutionMode::Pty),
+        Some("pipe_stream") => Ok(ahand_protocol::ExecutionMode::PipeStream),
+        Some(other) => Err(ControlError::BadRequest(format!(
+            "unknown execution_mode: {other}"
+        ))),
+        None if interactive => Ok(ahand_protocol::ExecutionMode::Pty),
+        None => Ok(ahand_protocol::ExecutionMode::Batch),
+    }
+}
+
+fn resolve_result_parser(parser: Option<&str>) -> Result<&'static str, ControlError> {
+    match parser.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some(ahand_protocol::RESULT_PARSER_RAW) => Ok(ahand_protocol::RESULT_PARSER_RAW),
+        Some(ahand_protocol::RESULT_PARSER_CODEX_JSONL) => {
+            Ok(ahand_protocol::RESULT_PARSER_CODEX_JSONL)
+        }
+        Some(ahand_protocol::RESULT_PARSER_CLAUDE_STREAM_JSON) => {
+            Ok(ahand_protocol::RESULT_PARSER_CLAUDE_STREAM_JSON)
+        }
+        Some(other) => Err(ControlError::BadRequest(format!(
+            "unknown result_parser: {other}"
+        ))),
+    }
+}
+
+fn resolve_format(format: Option<&str>) -> Result<&'static str, ControlError> {
+    match format.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some(ahand_protocol::FORMAT_RAW) => Ok(ahand_protocol::FORMAT_RAW),
+        Some(ahand_protocol::FORMAT_CODEX) => Ok(ahand_protocol::FORMAT_CODEX),
+        Some(ahand_protocol::FORMAT_CLAUDE_CODE) => Ok(ahand_protocol::FORMAT_CLAUDE_CODE),
+        Some(other) => Err(ControlError::BadRequest(format!("unknown format: {other}"))),
+    }
+}
+
+fn validate_format_for_parser(format: &str, parser: &str) -> Result<(), ControlError> {
+    match (format, parser) {
+        (ahand_protocol::FORMAT_RAW, _)
+        | (ahand_protocol::FORMAT_CODEX, ahand_protocol::RESULT_PARSER_CODEX_JSONL)
+        | (ahand_protocol::FORMAT_CLAUDE_CODE, ahand_protocol::RESULT_PARSER_CLAUDE_STREAM_JSON) => {
+            Ok(())
+        }
+        (ahand_protocol::FORMAT_CODEX, _) => Err(ControlError::BadRequest(
+            "format codex requires resultParser codex-jsonl".into(),
+        )),
+        (ahand_protocol::FORMAT_CLAUDE_CODE, _) => Err(ControlError::BadRequest(
+            "format claude-code requires resultParser claude-stream-json".into(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -740,4 +811,79 @@ pub async fn browser_command_control(
         binary_mime,
         duration_ms,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        resolve_execution_mode, resolve_format, resolve_result_parser, validate_format_for_parser,
+    };
+    use ahand_protocol::ExecutionMode;
+
+    #[test]
+    fn explicit_pipe_stream_wins_over_interactive_compat_bool() {
+        let mode = resolve_execution_mode(Some("pipe_stream"), true).unwrap();
+        assert_eq!(mode, ExecutionMode::PipeStream);
+    }
+
+    #[test]
+    fn missing_execution_mode_falls_back_to_interactive_bool() {
+        assert_eq!(
+            resolve_execution_mode(None, false).unwrap(),
+            ExecutionMode::Batch
+        );
+        assert_eq!(
+            resolve_execution_mode(None, true).unwrap(),
+            ExecutionMode::Pty
+        );
+    }
+
+    #[test]
+    fn result_parser_defaults_to_raw() {
+        assert_eq!(resolve_result_parser(None).unwrap(), "raw");
+        assert_eq!(resolve_result_parser(Some("")).unwrap(), "raw");
+    }
+
+    #[test]
+    fn result_parser_accepts_known_values() {
+        assert_eq!(
+            resolve_result_parser(Some("codex-jsonl")).unwrap(),
+            "codex-jsonl"
+        );
+        assert_eq!(
+            resolve_result_parser(Some("claude-stream-json")).unwrap(),
+            "claude-stream-json"
+        );
+    }
+
+    #[test]
+    fn result_parser_rejects_unknown_values() {
+        assert!(resolve_result_parser(Some("codex")).is_err());
+    }
+
+    #[test]
+    fn format_defaults_to_raw() {
+        assert_eq!(resolve_format(None).unwrap(), "raw");
+        assert_eq!(resolve_format(Some("")).unwrap(), "raw");
+    }
+
+    #[test]
+    fn format_accepts_known_values() {
+        assert_eq!(resolve_format(Some("codex")).unwrap(), "codex");
+        assert_eq!(resolve_format(Some("claude-code")).unwrap(), "claude-code");
+    }
+
+    #[test]
+    fn format_rejects_unknown_values() {
+        assert!(resolve_format(Some("codex-jsonl")).is_err());
+    }
+
+    #[test]
+    fn format_must_match_result_parser() {
+        assert!(validate_format_for_parser("codex", "codex-jsonl").is_ok());
+        assert!(validate_format_for_parser("claude-code", "claude-stream-json").is_ok());
+        assert!(validate_format_for_parser("raw", "raw").is_ok());
+        assert!(validate_format_for_parser("codex", "raw").is_err());
+        assert!(validate_format_for_parser("claude-code", "codex-jsonl").is_err());
+    }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ahand_protocol::{Envelope, JobEvent, JobFinished, JobRequest, envelope, job_event};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -14,6 +14,8 @@ use crate::store::RunStore;
 pub enum StdinInput {
     /// Raw bytes to write to the PTY.
     Data(Vec<u8>),
+    /// Close the child stdin pipe when the caller reaches EOF.
+    Close,
     /// Resize the PTY to the given dimensions.
     Resize { cols: u16, rows: u16 },
 }
@@ -21,6 +23,7 @@ pub enum StdinInput {
 /// Sender half of the PTY stdin channel.
 pub type StdinSender = mpsc::UnboundedSender<StdinInput>;
 
+#[allow(clippy::result_unit_err)]
 pub trait EnvelopeSink: Clone + Send + Sync + 'static {
     fn send(&self, envelope: Envelope) -> Result<(), ()>;
 }
@@ -250,6 +253,232 @@ where
     }
 }
 
+/// Runs a job with piped stdin/stdout/stderr and sends Envelope-wrapped events
+/// back via the channel.
+///
+/// Unlike [`run_job_pty`], this does not allocate a TTY. It is intended for
+/// streaming CLIs such as `claude -p --output-format stream-json` or
+/// `codex exec`, where stdout/stderr should remain separately observable and
+/// callers may still feed stdin bytes.
+pub async fn run_job_stream<T>(
+    device_id: String,
+    req: JobRequest,
+    tx: T,
+    mut cancel_rx: mpsc::Receiver<()>,
+    mut stdin_rx: mpsc::UnboundedReceiver<StdinInput>,
+    store: Option<Arc<RunStore>>,
+) -> (i32, String)
+where
+    T: EnvelopeSink,
+{
+    let job_id = req.job_id.clone();
+    info!(job_id = %job_id, tool = %req.tool, "starting stream job");
+    let mut formatter = crate::result_parser::CodexFormatter::maybe_new(&req);
+
+    if let Some(s) = &store {
+        s.start_run(&job_id, &req);
+    }
+
+    let resolved = resolve_tool(&req.tool, std::env::var("SHELL").ok().as_deref());
+
+    let mut cmd = Command::new(&resolved.path);
+    for leading in &resolved.leading_args {
+        cmd.arg(leading);
+    }
+    cmd.args(&req.args);
+
+    if !req.cwd.is_empty() {
+        cmd.current_dir(&req.cwd);
+    }
+
+    for (k, v) in &req.env {
+        cmd.env(k, v);
+    }
+
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let spawn_result = cmd.spawn();
+    let mut child = match spawn_result {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(job_id = %job_id, error = %e, "failed to spawn stream job");
+            return finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store);
+        }
+    };
+
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdin_handle = tokio::spawn(async move {
+        let Some(mut stdin) = stdin else {
+            return;
+        };
+        while let Some(input) = stdin_rx.recv().await {
+            match input {
+                StdinInput::Data(data) => {
+                    if stdin.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    if stdin.flush().await.is_err() {
+                        break;
+                    }
+                }
+                StdinInput::Close => break,
+                StdinInput::Resize { .. } => {
+                    // Pipe-stream jobs intentionally have no terminal size.
+                }
+            }
+        }
+    });
+
+    let tx_out = tx.clone();
+    let tx_err = tx.clone();
+    let device_id_out = device_id.clone();
+    let device_id_err = device_id.clone();
+    let job_id_out = job_id.clone();
+    let job_id_err = job_id.clone();
+    let store_out = store.clone();
+    let store_err = store.clone();
+
+    let stdout_handle = tokio::spawn(async move {
+        if let Some(mut out) = stdout {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match out.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = &buf[..n];
+                        if let Some(s) = &store_out {
+                            s.append_stdout(&job_id_out, chunk);
+                        }
+                        if let Some(formatter) = &mut formatter {
+                            for record in formatter.push_stdout(chunk) {
+                                if let Some(s) = &store_out {
+                                    s.append_observation(&job_id_out, &record);
+                                }
+                                if let Some(line) = observation_line(&record) {
+                                    let envelope = make_event_envelope(
+                                        &device_id_out,
+                                        &job_id_out,
+                                        Some(line),
+                                        None,
+                                    );
+                                    let _ = tx_out.send(envelope);
+                                }
+                            }
+                        } else {
+                            let envelope = make_event_envelope(
+                                &device_id_out,
+                                &job_id_out,
+                                Some(chunk.to_vec()),
+                                None,
+                            );
+                            let _ = tx_out.send(envelope);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            if let Some(formatter) = &mut formatter {
+                for record in formatter.finish() {
+                    if let Some(s) = &store_out {
+                        s.append_observation(&job_id_out, &record);
+                    }
+                    if let Some(line) = observation_line(&record) {
+                        let envelope =
+                            make_event_envelope(&device_id_out, &job_id_out, Some(line), None);
+                        let _ = tx_out.send(envelope);
+                    }
+                }
+            }
+        }
+    });
+
+    let stderr_handle = tokio::spawn(async move {
+        if let Some(mut err) = stderr {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match err.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = &buf[..n];
+                        if let Some(s) = &store_err {
+                            s.append_stderr(&job_id_err, chunk);
+                        }
+                        let envelope = make_event_envelope(
+                            &device_id_err,
+                            &job_id_err,
+                            None,
+                            Some(chunk.to_vec()),
+                        );
+                        let _ = tx_err.send(envelope);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    let wait_result = if req.timeout_ms > 0 {
+        let timeout = std::time::Duration::from_millis(req.timeout_ms);
+        tokio::select! {
+            r = tokio::time::timeout(timeout, child.wait()) => {
+                match r {
+                    Ok(r) => Some(r),
+                    Err(_) => {
+                        warn!(job_id = %job_id, "stream job timed out, killing process");
+                        let _ = child.kill().await;
+                        stdin_handle.abort();
+                        let _ = stdout_handle.await;
+                        let _ = stderr_handle.await;
+                        return finish(&device_id, &job_id, -1, "timeout", &tx, &store);
+                    }
+                }
+            }
+            _ = cancel_rx.recv() => {
+                warn!(job_id = %job_id, "stream job cancelled, killing process");
+                let _ = child.kill().await;
+                stdin_handle.abort();
+                let _ = stdout_handle.await;
+                let _ = stderr_handle.await;
+                return finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
+            }
+        }
+    } else {
+        tokio::select! {
+            r = child.wait() => Some(r),
+            _ = cancel_rx.recv() => {
+                warn!(job_id = %job_id, "stream job cancelled, killing process");
+                let _ = child.kill().await;
+                stdin_handle.abort();
+                let _ = stdout_handle.await;
+                let _ = stderr_handle.await;
+                return finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
+            }
+        }
+    };
+
+    stdin_handle.abort();
+    let _ = stdout_handle.await;
+    let _ = stderr_handle.await;
+
+    match wait_result {
+        Some(Ok(status)) => {
+            let code = status.code().unwrap_or(-1);
+            info!(job_id = %job_id, exit_code = code, "stream job finished");
+            finish(&device_id, &job_id, code, "", &tx, &store)
+        }
+        Some(Err(e)) => {
+            warn!(job_id = %job_id, error = %e, "stream job wait error");
+            finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store)
+        }
+        None => finish(&device_id, &job_id, -1, "unknown error", &tx, &store),
+    }
+}
+
 /// Runs a job inside a PTY and sends Envelope-wrapped events back via the channel.
 ///
 /// Similar to [`run_job`] but allocates a pseudo-terminal so that the child
@@ -394,6 +623,7 @@ where
                         break;
                     }
                 }
+                StdinInput::Close => break,
                 StdinInput::Resize { cols, rows } => {
                     if let Ok(m) = master_stdin.lock() {
                         let _ = m.resize(PtySize {
@@ -520,6 +750,154 @@ fn make_event_envelope(
             },
         })),
         ..Default::default()
+    }
+}
+
+fn observation_line(record: &serde_json::Value) -> Option<Vec<u8>> {
+    match serde_json::to_vec(record) {
+        Ok(mut line) => {
+            line.push(b'\n');
+            Some(line)
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to encode observation stdout");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StdinInput, run_job_stream};
+    use ahand_protocol::{Envelope, ExecutionMode, JobRequest, envelope, job_event};
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn stream_job_with_codex_format_emits_observations_on_stdout() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Envelope>();
+        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinInput>();
+
+        let raw_codex = concat!(
+            "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item-1\",\"type\":\"agent_message\",\"text\":\"hello\"}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n",
+        );
+        stdin_tx
+            .send(StdinInput::Data(raw_codex.as_bytes().to_vec()))
+            .unwrap();
+        stdin_tx.send(StdinInput::Close).unwrap();
+
+        let req = JobRequest {
+            job_id: "job-format-codex".to_string(),
+            tool: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "cat".to_string()],
+            execution_mode: ExecutionMode::PipeStream as i32,
+            result_parser: ahand_protocol::RESULT_PARSER_CODEX_JSONL.to_string(),
+            format: ahand_protocol::FORMAT_CODEX.to_string(),
+            ..Default::default()
+        };
+
+        let (exit_code, error) = run_job_stream(
+            "device-1".to_string(),
+            req,
+            event_tx,
+            cancel_rx,
+            stdin_rx,
+            None,
+        )
+        .await;
+        assert_eq!(exit_code, 0);
+        assert!(error.is_empty());
+
+        let mut stdout_lines = Vec::new();
+        let mut finished = false;
+        while let Ok(envelope) = event_rx.try_recv() {
+            match envelope.payload {
+                Some(envelope::Payload::JobEvent(event)) => {
+                    if let Some(job_event::Event::StdoutChunk(chunk)) = event.event {
+                        let text = String::from_utf8(chunk).unwrap();
+                        stdout_lines.extend(
+                            text.lines()
+                                .map(str::to_string)
+                                .filter(|line| !line.is_empty()),
+                        );
+                    }
+                }
+                Some(envelope::Payload::JobFinished(done)) => {
+                    assert_eq!(done.exit_code, 0);
+                    finished = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(finished);
+        assert_eq!(stdout_lines.len(), 4);
+        let kinds = stdout_lines
+            .iter()
+            .map(|line| {
+                let value: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_ne!(value["type"].as_str(), Some("thread.started"));
+                value["kind"].as_str().unwrap().to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "agent_session",
+                "llm_call_start",
+                "llm_call_delta",
+                "llm_call_end",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_job_without_format_emits_raw_stdout() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<Envelope>();
+        let (_cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinInput>();
+
+        let raw_codex = "{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}\n";
+        stdin_tx
+            .send(StdinInput::Data(raw_codex.as_bytes().to_vec()))
+            .unwrap();
+        stdin_tx.send(StdinInput::Close).unwrap();
+
+        let req = JobRequest {
+            job_id: "job-format-raw".to_string(),
+            tool: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "cat".to_string()],
+            execution_mode: ExecutionMode::PipeStream as i32,
+            result_parser: ahand_protocol::RESULT_PARSER_CODEX_JSONL.to_string(),
+            format: ahand_protocol::FORMAT_RAW.to_string(),
+            ..Default::default()
+        };
+
+        let (exit_code, error) = run_job_stream(
+            "device-1".to_string(),
+            req,
+            event_tx,
+            cancel_rx,
+            stdin_rx,
+            None,
+        )
+        .await;
+        assert_eq!(exit_code, 0);
+        assert!(error.is_empty());
+
+        let mut stdout = String::new();
+        while let Ok(envelope) = event_rx.try_recv() {
+            if let Some(envelope::Payload::JobEvent(event)) = envelope.payload
+                && let Some(job_event::Event::StdoutChunk(chunk)) = event.event
+            {
+                stdout.push_str(&String::from_utf8(chunk).unwrap());
+            }
+        }
+
+        assert_eq!(stdout, raw_codex);
     }
 }
 

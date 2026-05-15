@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use ahand_protocol::{
-    ApprovalResponse, CancelJob, Envelope, Hello, JobRequest, PolicyQuery, PolicyUpdate,
-    SessionQuery, SetSessionMode, envelope,
+    ApprovalResponse, CancelJob, Envelope, ExecutionMode, Hello, JobRequest, PolicyQuery,
+    PolicyUpdate, SessionQuery, SetSessionMode, StdinChunk, envelope,
 };
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
@@ -12,7 +14,19 @@ use tracing::info;
 mod admin;
 mod browser_init;
 mod daemon;
+mod identity;
 mod upgrade;
+
+struct ExecRequest {
+    execution_mode: ExecutionMode,
+    cwd: Option<String>,
+    timeout_ms: u64,
+    env: HashMap<String, String>,
+    result_parser: String,
+    format: String,
+    tool: String,
+    args: Vec<String>,
+}
 
 #[derive(Parser)]
 #[command(name = "ahandctl", about = "AHand CLI debug tool")]
@@ -33,9 +47,28 @@ struct Args {
 enum Cmd {
     /// Send a job and stream its output
     Exec {
+        /// Execution attach mode: batch, pty, or pipe_stream
+        #[arg(long, default_value = "batch")]
+        execution_mode: String,
+        /// Working directory for the job
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Job timeout in milliseconds (0 = no timeout)
+        #[arg(long, default_value = "0")]
+        timeout_ms: u64,
+        /// Environment override in KEY=VALUE form; repeatable
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// Output parser hint: raw, codex-jsonl, or claude-stream-json
+        #[arg(long = "result-parser", default_value = "raw")]
+        result_parser: String,
+        /// Agent formatter hint: raw, codex, or claude-code
+        #[arg(long = "format", default_value = "raw")]
+        format: String,
         /// Tool to execute
         tool: String,
         /// Arguments to the tool
+        #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
     /// Cancel a running job
@@ -100,6 +133,24 @@ enum Cmd {
     },
     /// Show daemon status
     Status,
+    /// Manage the hub device identity used by ahandd
+    Identity {
+        #[command(subcommand)]
+        action: IdentityAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityAction {
+    /// Print deviceId and base64 publicKey for manual hub registration
+    Show {
+        /// Config file path. If set, reads [hub].private_key_path from this file.
+        #[arg(long)]
+        config: Option<String>,
+        /// Explicit identity file path. Overrides --config.
+        #[arg(long)]
+        identity_path: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -199,6 +250,14 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Status => {
             return daemon::status().await;
         }
+        Cmd::Identity { action } => match action {
+            IdentityAction::Show {
+                config,
+                identity_path,
+            } => {
+                return identity::show(config.clone(), identity_path.clone());
+            }
+        },
         _ => {}
     }
 
@@ -206,10 +265,29 @@ async fn main() -> anyhow::Result<()> {
         // IPC mode — connect via Unix socket.
         match args.command {
             Cmd::Exec {
+                execution_mode,
+                cwd,
+                timeout_ms,
+                env,
+                result_parser,
+                format,
                 tool,
                 args: tool_args,
             } => {
-                ipc_exec(ipc_path, &tool, &tool_args).await?;
+                ipc_exec(
+                    ipc_path,
+                    ExecRequest {
+                        execution_mode: parse_execution_mode(&execution_mode)?,
+                        cwd,
+                        timeout_ms,
+                        env: parse_env(env)?,
+                        result_parser: parse_result_parser(&result_parser)?,
+                        format: parse_format_for_parser(&format, &result_parser)?,
+                        tool,
+                        args: tool_args,
+                    },
+                )
+                .await?;
             }
             Cmd::Cancel { job_id } => {
                 ipc_cancel(ipc_path, &job_id).await?;
@@ -233,7 +311,8 @@ async fn main() -> anyhow::Result<()> {
             | Cmd::Start { .. }
             | Cmd::Stop
             | Cmd::Restart { .. }
-            | Cmd::Status => {
+            | Cmd::Status
+            | Cmd::Identity { .. } => {
                 unreachable!("Handled early, should not reach here");
             }
         }
@@ -241,10 +320,29 @@ async fn main() -> anyhow::Result<()> {
         // WS mode.
         match args.command {
             Cmd::Exec {
+                execution_mode,
+                cwd,
+                timeout_ms,
+                env,
+                result_parser,
+                format,
                 tool,
                 args: tool_args,
             } => {
-                ws_exec(&args.url, &tool, &tool_args).await?;
+                ws_exec(
+                    &args.url,
+                    ExecRequest {
+                        execution_mode: parse_execution_mode(&execution_mode)?,
+                        cwd,
+                        timeout_ms,
+                        env: parse_env(env)?,
+                        result_parser: parse_result_parser(&result_parser)?,
+                        format: parse_format_for_parser(&format, &result_parser)?,
+                        tool,
+                        args: tool_args,
+                    },
+                )
+                .await?;
             }
             Cmd::Cancel { job_id } => {
                 ws_cancel(&args.url, &job_id).await?;
@@ -268,7 +366,8 @@ async fn main() -> anyhow::Result<()> {
             | Cmd::Start { .. }
             | Cmd::Stop
             | Cmd::Restart { .. }
-            | Cmd::Status => {
+            | Cmd::Status
+            | Cmd::Identity { .. } => {
                 unreachable!("Handled early, should not reach here");
             }
         }
@@ -299,32 +398,159 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> s
     Ok(())
 }
 
+fn parse_execution_mode(value: &str) -> anyhow::Result<ExecutionMode> {
+    match value {
+        "batch" => Ok(ExecutionMode::Batch),
+        "pty" => Ok(ExecutionMode::Pty),
+        "pipe_stream" | "pipe-stream" | "stream" => Ok(ExecutionMode::PipeStream),
+        _ => anyhow::bail!("invalid execution mode {value:?}; use batch, pty, or pipe_stream"),
+    }
+}
+
+fn parse_env(items: Vec<String>) -> anyhow::Result<HashMap<String, String>> {
+    let mut env = HashMap::new();
+    for item in items {
+        let Some((key, value)) = item.split_once('=') else {
+            anyhow::bail!("invalid --env value {item:?}; expected KEY=VALUE");
+        };
+        if key.is_empty() {
+            anyhow::bail!("invalid --env value {item:?}; key cannot be empty");
+        }
+        env.insert(key.to_string(), value.to_string());
+    }
+    Ok(env)
+}
+
+fn parse_result_parser(value: &str) -> anyhow::Result<String> {
+    let normalized = value.trim();
+    if ahand_protocol::is_known_result_parser(normalized) {
+        Ok(normalized.to_string())
+    } else {
+        anyhow::bail!(
+            "invalid result parser {value:?}; use raw, codex-jsonl, or claude-stream-json"
+        );
+    }
+}
+
+fn parse_format(value: &str) -> anyhow::Result<String> {
+    let normalized = value.trim();
+    if ahand_protocol::is_known_format(normalized) {
+        Ok(normalized.to_string())
+    } else {
+        anyhow::bail!("invalid format {value:?}; use raw, codex, or claude-code");
+    }
+}
+
+fn parse_format_for_parser(value: &str, parser: &str) -> anyhow::Result<String> {
+    let format = parse_format(value)?;
+    match (format.as_str(), parser.trim()) {
+        (ahand_protocol::FORMAT_CODEX, ahand_protocol::RESULT_PARSER_CODEX_JSONL)
+        | (ahand_protocol::FORMAT_CLAUDE_CODE, ahand_protocol::RESULT_PARSER_CLAUDE_STREAM_JSON)
+        | (ahand_protocol::FORMAT_RAW, _) => Ok(format),
+        (ahand_protocol::FORMAT_CODEX, _) => {
+            anyhow::bail!("format codex requires --result-parser codex-jsonl")
+        }
+        (ahand_protocol::FORMAT_CLAUDE_CODE, _) => {
+            anyhow::bail!("format claude-code requires --result-parser claude-stream-json")
+        }
+        _ => Ok(format),
+    }
+}
+
+fn build_job_request(job_id: String, exec: ExecRequest) -> JobRequest {
+    JobRequest {
+        job_id,
+        tool: exec.tool,
+        args: exec.args,
+        cwd: exec.cwd.unwrap_or_default(),
+        env: exec.env,
+        timeout_ms: exec.timeout_ms,
+        interactive: ahand_protocol::execution_mode_interactive_compat(exec.execution_mode),
+        execution_mode: exec.execution_mode as i32,
+        result_parser: exec.result_parser,
+        format: exec.format,
+    }
+}
+
+fn mode_accepts_stdin(mode: ExecutionMode) -> bool {
+    matches!(mode, ExecutionMode::Pty | ExecutionMode::PipeStream)
+}
+
 // ── IPC exec ─────────────────────────────────────────────────────────
 
-async fn ipc_exec(socket_path: &str, tool: &str, args: &[String]) -> anyhow::Result<()> {
+async fn ipc_exec(socket_path: &str, exec: ExecRequest) -> anyhow::Result<()> {
     let stream = tokio::net::UnixStream::connect(socket_path).await?;
     let (mut reader, mut writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
     let device_id = format!("ctl-{}", std::process::id());
     let job_id = format!("ctl-job-{}", std::process::id());
+    let execution_mode = exec.execution_mode;
+    let forwards_stdin = mode_accepts_stdin(execution_mode);
 
     // Send JobRequest.
     let req = Envelope {
         device_id: device_id.clone(),
         msg_id: "req-0".to_string(),
         ts_ms: now_ms(),
-        payload: Some(envelope::Payload::JobRequest(JobRequest {
-            job_id: job_id.clone(),
-            tool: tool.to_string(),
-            args: args.to_vec(),
-            ..Default::default()
-        })),
+        payload: Some(envelope::Payload::JobRequest(build_job_request(
+            job_id.clone(),
+            exec,
+        ))),
         ..Default::default()
     };
     write_frame(&mut writer, &req.encode_to_vec()).await?;
 
-    info!(job_id = %job_id, "IPC: job submitted, waiting for output...");
+    let _writer_guard = if forwards_stdin {
+        let stdin_job_id = job_id.clone();
+        let stdin_device_id = device_id.clone();
+        tokio::spawn(async move {
+            let mut stdin = tokio::io::stdin();
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match stdin.read(&mut buf).await {
+                    Ok(0) => {
+                        let chunk = Envelope {
+                            device_id: stdin_device_id.clone(),
+                            msg_id: format!("stdin-{}", now_ms()),
+                            ts_ms: now_ms(),
+                            payload: Some(envelope::Payload::StdinChunk(StdinChunk {
+                                job_id: stdin_job_id.clone(),
+                                data: Vec::new(),
+                            })),
+                            ..Default::default()
+                        };
+                        let _ = write_frame(&mut writer, &chunk.encode_to_vec()).await;
+                        break;
+                    }
+                    Ok(n) => {
+                        let chunk = Envelope {
+                            device_id: stdin_device_id.clone(),
+                            msg_id: format!("stdin-{}", now_ms()),
+                            ts_ms: now_ms(),
+                            payload: Some(envelope::Payload::StdinChunk(StdinChunk {
+                                job_id: stdin_job_id.clone(),
+                                data: buf[..n].to_vec(),
+                            })),
+                            ..Default::default()
+                        };
+                        if write_frame(&mut writer, &chunk.encode_to_vec())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        None
+    } else {
+        Some(writer)
+    };
+
+    info!(job_id = %job_id, ?execution_mode, "IPC: job submitted, waiting for output...");
 
     // Read responses.
     loop {
@@ -484,28 +710,77 @@ async fn connect_and_hello(
     Ok((sink, stream, device_id))
 }
 
-async fn ws_exec(url: &str, tool: &str, args: &[String]) -> anyhow::Result<()> {
+async fn ws_exec(url: &str, exec: ExecRequest) -> anyhow::Result<()> {
     let (mut sink, mut stream, device_id) = connect_and_hello(url).await?;
 
     let job_id = format!("ctl-job-{}", std::process::id());
+    let execution_mode = exec.execution_mode;
+    let forwards_stdin = mode_accepts_stdin(execution_mode);
 
     let req = Envelope {
         device_id: device_id.clone(),
         msg_id: "req-0".to_string(),
         ts_ms: now_ms(),
-        payload: Some(envelope::Payload::JobRequest(JobRequest {
-            job_id: job_id.clone(),
-            tool: tool.to_string(),
-            args: args.to_vec(),
-            ..Default::default()
-        })),
+        payload: Some(envelope::Payload::JobRequest(build_job_request(
+            job_id.clone(),
+            exec,
+        ))),
         ..Default::default()
     };
 
     sink.send(tungstenite::Message::Binary(req.encode_to_vec()))
         .await?;
 
-    info!(job_id = %job_id, "job submitted, waiting for output...");
+    if forwards_stdin {
+        let stdin_job_id = job_id.clone();
+        let stdin_device_id = device_id.clone();
+        tokio::spawn(async move {
+            let mut stdin = tokio::io::stdin();
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match stdin.read(&mut buf).await {
+                    Ok(0) => {
+                        let chunk = Envelope {
+                            device_id: stdin_device_id.clone(),
+                            msg_id: format!("stdin-{}", now_ms()),
+                            ts_ms: now_ms(),
+                            payload: Some(envelope::Payload::StdinChunk(StdinChunk {
+                                job_id: stdin_job_id.clone(),
+                                data: Vec::new(),
+                            })),
+                            ..Default::default()
+                        };
+                        let _ = sink
+                            .send(tungstenite::Message::Binary(chunk.encode_to_vec()))
+                            .await;
+                        break;
+                    }
+                    Ok(n) => {
+                        let chunk = Envelope {
+                            device_id: stdin_device_id.clone(),
+                            msg_id: format!("stdin-{}", now_ms()),
+                            ts_ms: now_ms(),
+                            payload: Some(envelope::Payload::StdinChunk(StdinChunk {
+                                job_id: stdin_job_id.clone(),
+                                data: buf[..n].to_vec(),
+                            })),
+                            ..Default::default()
+                        };
+                        if sink
+                            .send(tungstenite::Message::Binary(chunk.encode_to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    info!(job_id = %job_id, ?execution_mode, "job submitted, waiting for output...");
 
     while let Some(msg) = stream.next().await {
         let msg = msg?;

@@ -25,12 +25,12 @@ fn find_ahandd_binary() -> Result<PathBuf> {
     }
 
     // 2. Sibling of current executable (dev builds: target/debug/)
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(dir) = current_exe.parent() {
-            let sibling = dir.join("ahandd");
-            if sibling.exists() {
-                return Ok(sibling);
-            }
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        let sibling = dir.join("ahandd");
+        if sibling.exists() {
+            return Ok(sibling);
         }
     }
 

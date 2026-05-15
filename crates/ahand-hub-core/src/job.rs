@@ -15,6 +15,43 @@ pub enum JobStatus {
     Cancelled,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JobExecutionMode {
+    Batch,
+    Pty,
+    PipeStream,
+}
+
+impl JobExecutionMode {
+    pub fn from_interactive(interactive: bool) -> Self {
+        if interactive { Self::Pty } else { Self::Batch }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Pty => "pty",
+            Self::PipeStream => "pipe_stream",
+        }
+    }
+}
+
+impl std::str::FromStr for JobExecutionMode {
+    type Err = HubError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "batch" => Ok(Self::Batch),
+            "pty" => Ok(Self::Pty),
+            "pipe_stream" => Ok(Self::PipeStream),
+            other => Err(HubError::InvalidToken(format!(
+                "unknown execution mode: {other}"
+            ))),
+        }
+    }
+}
+
 pub fn is_terminal_status(status: JobStatus) -> bool {
     matches!(
         status,
@@ -58,6 +95,7 @@ pub struct Job {
     pub env: HashMap<String, String>,
     pub timeout_ms: u64,
     pub interactive: bool,
+    pub execution_mode: JobExecutionMode,
     pub status: JobStatus,
     pub exit_code: Option<i32>,
     pub error: Option<String>,
@@ -79,6 +117,7 @@ impl Job {
             env: job.env,
             timeout_ms: job.timeout_ms,
             interactive: job.interactive,
+            execution_mode: JobExecutionMode::from_interactive(job.interactive),
             status: JobStatus::Pending,
             exit_code: None,
             error: None,

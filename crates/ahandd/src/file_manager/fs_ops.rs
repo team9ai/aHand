@@ -13,10 +13,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use ahand_protocol::{
-    file_chmod, DeleteMode, FileChmod, FileChmodResult, FileCopy, FileCopyResult,
-    FileCreateSymlink, FileCreateSymlinkResult, FileDelete, FileDeleteResult, FileEntry, FileError,
-    FileErrorCode, FileGlob, FileGlobResult, FileList, FileListResult, FileMkdir, FileMkdirResult,
-    FileMove, FileMoveResult, FileStat, FileStatResult, FileType, UnixPermission,
+    DeleteMode, FileChmod, FileChmodResult, FileCopy, FileCopyResult, FileCreateSymlink,
+    FileCreateSymlinkResult, FileDelete, FileDeleteResult, FileEntry, FileError, FileErrorCode,
+    FileGlob, FileGlobResult, FileList, FileListResult, FileMkdir, FileMkdirResult, FileMove,
+    FileMoveResult, FileStat, FileStatResult, FileType, UnixPermission, file_chmod,
 };
 
 use super::file_error;
@@ -306,10 +306,7 @@ pub async fn handle_glob(
 }
 
 /// Create a directory (and optionally parents). Respects `mode` on Unix.
-pub async fn handle_mkdir(
-    req: &FileMkdir,
-    resolved: &Path,
-) -> Result<FileMkdirResult, FileError> {
+pub async fn handle_mkdir(req: &FileMkdir, resolved: &Path) -> Result<FileMkdirResult, FileError> {
     if tokio::fs::try_exists(resolved).await.unwrap_or(false) {
         // Enforce "must be a directory" when the path exists.
         let metadata = tokio::fs::symlink_metadata(resolved)
@@ -515,7 +512,7 @@ pub fn guess_trash_path(original: &Path) -> Option<String> {
         let mut p = PathBuf::from(home);
         p.push(".Trash");
         p.push(basename);
-        return Some(p.to_string_lossy().into_owned());
+        Some(p.to_string_lossy().into_owned())
     }
 
     #[cfg(all(
@@ -551,7 +548,7 @@ pub fn guess_trash_path(original: &Path) -> Option<String> {
         let mut p = trash_root;
         p.push("files");
         p.push(basename);
-        return Some(p.to_string_lossy().into_owned());
+        Some(p.to_string_lossy().into_owned())
     }
 
     #[cfg(not(any(
@@ -676,8 +673,7 @@ fn copy_dir_sync(src: &Path, dst: &Path, count: &mut u32) -> Result<(), FileErro
             #[cfg(unix)]
             {
                 let target = std::fs::read_link(&from).map_err(|e| io_to_file_error(e, &from))?;
-                std::os::unix::fs::symlink(&target, &to)
-                    .map_err(|e| io_to_file_error(e, &to))?;
+                std::os::unix::fs::symlink(&target, &to).map_err(|e| io_to_file_error(e, &to))?;
                 *count += 1;
             }
         }
@@ -805,10 +801,7 @@ pub async fn handle_create_symlink(
 
 // ── Chmod ──────────────────────────────────────────────────────────────────
 
-pub async fn handle_chmod(
-    req: &FileChmod,
-    resolved: &Path,
-) -> Result<FileChmodResult, FileError> {
+pub async fn handle_chmod(req: &FileChmod, resolved: &Path) -> Result<FileChmodResult, FileError> {
     let Some(permission) = &req.permission else {
         return Err(file_error(
             FileErrorCode::Unspecified,
@@ -817,8 +810,7 @@ pub async fn handle_chmod(
         ));
     };
 
-    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink)
-        .await?;
+    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink).await?;
 
     match permission {
         file_chmod::Permission::Unix(unix) => {

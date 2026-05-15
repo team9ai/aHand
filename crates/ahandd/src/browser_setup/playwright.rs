@@ -89,22 +89,21 @@ pub async fn ensure(
     }
 
     // Check cache (skip if unchanged and not forced)
-    if !force && cli.exists() {
-        if let Ok(out) = tokio::process::Command::new(&cli)
+    if !force
+        && cli.exists()
+        && let Ok(out) = tokio::process::Command::new(&cli)
             .arg("--version")
             .output()
             .await
-        {
-            if out.status.success() {
-                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                emit(
-                    progress,
-                    Phase::Done,
-                    format!("playwright-cli {ver} already installed"),
-                );
-                return Ok(inspect().await);
-            }
-        }
+        && out.status.success()
+    {
+        let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        emit(
+            progress,
+            Phase::Done,
+            format!("playwright-cli {ver} already installed"),
+        );
+        return Ok(inspect().await);
     }
 
     emit(

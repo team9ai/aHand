@@ -9,11 +9,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ahand_protocol::{
-    file_chmod, file_edit, file_position, file_request, file_response, file_write, full_write,
     ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy, FileCreateSymlink, FileDelete,
     FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary,
     FileReadImage, FileReadText, FileRequest, FileResponse, FileStat, FileType, FileWrite,
-    FullWrite, ImageFormat, LineRangeReplace, StringReplace, UnixPermission,
+    FullWrite, ImageFormat, LineRangeReplace, StringReplace, UnixPermission, file_chmod, file_edit,
+    file_position, file_request, file_response, file_write, full_write,
 };
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
@@ -199,7 +199,8 @@ async fn e2e_read_image() {
     let (mgr, root) = test_manager(&dir);
     let file = root.join("img.png");
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(32, 32, |_, _| Rgb([0, 0, 0]));
-    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+    img.save_with_format(&file, image::ImageFormat::Png)
+        .unwrap();
 
     let req = FileRequest {
         request_id: "read_image".into(),
@@ -368,7 +369,12 @@ async fn e2e_create_symlink() {
     let Some(file_response::Result::CreateSymlink(_)) = resp.result else {
         panic!("expected create_symlink result");
     };
-    assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[cfg(unix)]

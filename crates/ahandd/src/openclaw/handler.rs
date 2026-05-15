@@ -2,6 +2,7 @@
 //!
 //! Dispatches incoming commands to appropriate handlers and maps results
 //! to OpenClaw protocol responses.
+#![allow(clippy::collapsible_if, clippy::too_many_arguments)]
 
 use std::collections::HashMap;
 use std::env;
@@ -326,7 +327,7 @@ impl OpenClawHandler {
         });
 
         // Wait with timeout
-        let timeout = timeout_ms.map(|ms| Duration::from_millis(ms));
+        let timeout = timeout_ms.map(Duration::from_millis);
         let (exit_code, timed_out) = if let Some(dur) = timeout {
             match tokio::time::timeout(dur, child.wait()).await {
                 Ok(Ok(status)) => (status.code(), false),
@@ -903,6 +904,9 @@ fn build_job_request(
         env: params.env.clone().unwrap_or_default(),
         timeout_ms: params.timeout_ms.or(invoke.timeout_ms).unwrap_or(120_000),
         interactive: false,
+        execution_mode: ahand_protocol::ExecutionMode::Batch as i32,
+        result_parser: String::new(),
+        format: String::new(),
     }
 }
 

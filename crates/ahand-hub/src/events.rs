@@ -316,7 +316,7 @@ mod tests {
     use std::time::Duration;
 
     use ahand_hub_core::audit::{AuditEntry, AuditFilter};
-    use ahand_hub_core::job::{Job, JobStatus};
+    use ahand_hub_core::job::{Job, JobExecutionMode, JobStatus};
     use ahand_hub_core::traits::AuditStore;
     use async_trait::async_trait;
     use chrono::Utc;
@@ -386,6 +386,7 @@ mod tests {
             env: Default::default(),
             timeout_ms: 30_000,
             interactive: false,
+            execution_mode: JobExecutionMode::Batch,
             status: JobStatus::Pending,
             exit_code: None,
             error: None,

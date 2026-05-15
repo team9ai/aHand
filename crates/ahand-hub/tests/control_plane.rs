@@ -23,7 +23,7 @@ mod support;
 use std::time::Duration;
 
 use ahand_hub_core::traits::DeviceAdminStore;
-use ahand_protocol::envelope;
+use ahand_protocol::{ExecutionMode, envelope};
 use futures_util::StreamExt;
 use prost::Message;
 use reqwest::StatusCode;
@@ -206,6 +206,11 @@ async fn create_job_happy_path_dispatches_and_streams_events() {
     assert_eq!(received.tool, "echo");
     assert_eq!(received.args, vec!["hello".to_string()]);
     assert_eq!(received.timeout_ms, 30_000);
+    assert_eq!(
+        ExecutionMode::try_from(received.execution_mode).unwrap(),
+        ExecutionMode::Batch
+    );
+    assert!(!received.interactive);
 
     // Send the GET in the test task so awaiting send() returns AFTER
     // the handler has called channels.subscribe(). Spawning send+read
@@ -322,6 +327,78 @@ async fn create_job_happy_path_dispatches_and_streams_events() {
 
     drop(device);
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn create_job_dispatches_format_to_daemon() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-dev-format", "user-cp").await;
+    let token = mint_cp_jwt(&server, "user-cp");
+
+    let resp = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "cp-dev-format",
+            "tool": "codex",
+            "args": ["exec", "--json", "-"],
+            "executionMode": "pipe_stream",
+            "resultParser": "codex-jsonl",
+            "format": "codex",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let received = recv_job_request(&mut device).await;
+    assert_eq!(received.tool, "codex");
+    assert_eq!(received.result_parser, "codex-jsonl");
+    assert_eq!(received.format, "codex");
+    assert_eq!(
+        ExecutionMode::try_from(received.execution_mode).unwrap(),
+        ExecutionMode::PipeStream
+    );
+    assert!(!received.interactive);
+}
+
+#[tokio::test]
+async fn create_job_pipe_stream_dispatches_explicit_execution_mode() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-dev-pipe", "user-pipe").await;
+    let token = mint_cp_jwt(&server, "user-pipe");
+
+    let resp = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "cp-dev-pipe",
+            "tool": "codex",
+            "args": ["exec", "Run tests"],
+            "timeoutMs": 30_000,
+            "executionMode": "pipe_stream",
+            "interactive": true
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let job_id = body["jobId"].as_str().unwrap().to_string();
+
+    let received = recv_job_request(&mut device).await;
+    assert_eq!(received.job_id, job_id);
+    assert_eq!(received.tool, "codex");
+    assert_eq!(
+        received.args,
+        vec!["exec".to_string(), "Run tests".to_string()]
+    );
+    assert_eq!(
+        ExecutionMode::try_from(received.execution_mode).unwrap(),
+        ExecutionMode::PipeStream
+    );
+    assert!(
+        !received.interactive,
+        "interactive remains the compatibility bool and must not encode pipe_stream"
+    );
 }
 
 #[tokio::test]

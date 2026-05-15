@@ -1,6 +1,7 @@
 //! Device identity for OpenClaw Gateway authentication.
 //!
 //! Generates and manages Ed25519 keypairs for device authentication.
+#![allow(clippy::too_many_arguments)]
 
 use std::path::PathBuf;
 

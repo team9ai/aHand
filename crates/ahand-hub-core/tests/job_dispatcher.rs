@@ -5,7 +5,8 @@ use ahand_hub_core::HubError;
 use ahand_hub_core::audit::{AuditEntry, AuditFilter};
 use ahand_hub_core::device::{Device, NewDevice};
 use ahand_hub_core::job::{
-    Job, JobFilter, JobStatus, NewJob, is_terminal_status, resolve_status_transition,
+    Job, JobExecutionMode, JobFilter, JobStatus, NewJob, is_terminal_status,
+    resolve_status_transition,
 };
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore};
@@ -652,6 +653,7 @@ async fn transition_propagates_job_store_update_errors() {
         env: HashMap::new(),
         timeout_ms: 30_000,
         interactive: false,
+        execution_mode: JobExecutionMode::Batch,
         status: JobStatus::Pending,
         exit_code: None,
         error: None,

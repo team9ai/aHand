@@ -9,12 +9,15 @@ pub enum ConnectionMode {
     AHandCloud,
     /// Connect to OpenClaw Gateway as a node
     OpenClawGateway,
+    /// Run only the local debug IPC sidecar, without any hub/control-plane connection.
+    Local,
 }
 
 impl ConnectionMode {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_lossy(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "openclaw-gateway" | "openclaw" => Self::OpenClawGateway,
+            "local" => Self::Local,
             _ => Self::AHandCloud,
         }
     }
@@ -22,7 +25,7 @@ impl ConnectionMode {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
-    /// Connection mode: "ahand-cloud" (default) or "openclaw-gateway"
+    /// Connection mode: "ahand-cloud" (default), "openclaw-gateway", or "local"
     #[serde(default)]
     pub mode: Option<String>,
 
@@ -319,7 +322,7 @@ fn expand_tilde(pattern: &str) -> anyhow::Result<String> {
 
 /// Apply [`expand_tilde`] to every entry in a mutable string list in place.
 /// Stops on the first failure so the caller sees the offending pattern.
-fn expand_tildes_in_place(list: &mut Vec<String>) -> anyhow::Result<()> {
+fn expand_tildes_in_place(list: &mut [String]) -> anyhow::Result<()> {
     for item in list.iter_mut() {
         *item = expand_tilde(item)?;
     }
@@ -348,7 +351,7 @@ impl Config {
     pub fn connection_mode(&self) -> ConnectionMode {
         self.mode
             .as_ref()
-            .map(|s| ConnectionMode::from_str(s))
+            .map(|s| ConnectionMode::parse_lossy(s))
             .unwrap_or_default()
     }
 
@@ -474,7 +477,10 @@ mod tilde_tests {
     fn expand_tilde_with_no_home_dir_passes_non_tilde_patterns_through() {
         // Patterns without a leading tilde shouldn't care whether HOME is
         // set — they're absolute or relative and need no expansion.
-        assert_eq!(expand_tilde_with("/etc/passwd", None).unwrap(), "/etc/passwd");
+        assert_eq!(
+            expand_tilde_with("/etc/passwd", None).unwrap(),
+            "/etc/passwd"
+        );
         assert_eq!(expand_tilde_with("./rel", None).unwrap(), "./rel");
         assert_eq!(
             expand_tilde_with("/tmp/~backup", None).unwrap(),
@@ -614,8 +620,7 @@ path_allowlist = ["/etc/passwd", "/var/log/**"]
         let err = Config::load(&path).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.to_lowercase().contains("no such file")
-                || msg.to_lowercase().contains("not found"),
+            msg.to_lowercase().contains("no such file") || msg.to_lowercase().contains("not found"),
             "expected NotFound IO error, got: {msg}"
         );
     }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub mod ahand_client;
 pub mod approval;
 pub mod browser;
@@ -8,6 +10,7 @@ pub mod executor;
 pub mod file_manager;
 pub mod outbox;
 pub mod registry;
+pub mod result_parser;
 pub mod session;
 pub mod store;
 pub mod updater;

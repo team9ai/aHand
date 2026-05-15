@@ -7,7 +7,7 @@
 //!
 //! The hub's wire contract (Task 1.4):
 //!   * POST `/api/control/jobs` — body is camelCase
-//!     `{deviceId, tool, args, cwd, env, timeoutMs, interactive,
+//!     `{deviceId, tool, args, cwd, env, timeoutMs, executionMode, resultParser, interactive,
 //!      correlationId}`; success returns `{jobId: string}` (201/202
 //!     on create, 200 on idempotent replay).
 //!   * GET  `/api/control/jobs/{id}/stream` — SSE with camelCase
@@ -57,7 +57,13 @@ export interface SpawnParams {
    * live returns the existing `jobId` without re-dispatching.
    */
   correlationId?: string;
-  /** Whether the job should run attached to a PTY. Defaults to false. */
+  /** Explicit execution mode. Defaults to `"batch"`. */
+  executionMode?: "batch" | "pty" | "pipe_stream";
+  /** Output parser hint. Defaults to `"raw"` on supported hubs. */
+  resultParser?: "raw" | "codex-jsonl" | "claude-stream-json";
+  /** Agent formatter hint. Defaults to `"raw"` on supported hubs. */
+  format?: "raw" | "codex" | "claude-code";
+  /** @deprecated Use `executionMode: "pty"` instead. */
   interactive?: boolean;
 
   /** Callback for stdout chunks. Thrown errors are swallowed. */
@@ -300,15 +306,20 @@ export class CloudClient {
       throw new CloudClientError("abort", "Aborted after token fetch");
     }
 
+    const executionMode = resolveExecutionMode(p);
     const requestBody: Record<string, unknown> = {
       deviceId: p.deviceId,
       tool: p.tool,
+      executionMode,
+      // Compatibility for older hub versions that only understand `interactive`.
+      interactive: executionMode === "pty",
     };
     if (p.args !== undefined) requestBody.args = p.args;
     if (p.cwd !== undefined) requestBody.cwd = p.cwd;
     if (p.env !== undefined) requestBody.env = p.env;
     if (p.timeoutMs !== undefined) requestBody.timeoutMs = p.timeoutMs;
-    if (p.interactive !== undefined) requestBody.interactive = p.interactive;
+    if (p.resultParser !== undefined) requestBody.resultParser = p.resultParser;
+    if (p.format !== undefined) requestBody.format = p.format;
     if (p.correlationId !== undefined) requestBody.correlationId = p.correlationId;
 
     let postRes: Response;
@@ -689,6 +700,11 @@ function isAbortError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
   const name = (err as { name?: unknown }).name;
   return name === "AbortError";
+}
+
+function resolveExecutionMode(p: SpawnParams): "batch" | "pty" | "pipe_stream" {
+  if (p.executionMode !== undefined) return p.executionMode;
+  return p.interactive ? "pty" : "batch";
 }
 
 /**

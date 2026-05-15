@@ -82,11 +82,27 @@ impl RunStore {
             "cwd": req.cwd,
             "env": req.env,
             "timeout_ms": req.timeout_ms,
+            "execution_mode": execution_mode_name(ahand_protocol::resolve_job_execution_mode(req)),
+            "result_parser": ahand_protocol::resolve_job_result_parser(req),
+            "format": ahand_protocol::resolve_job_format(req),
             "start_ms": now_ms(),
         });
 
         if let Err(e) = write_json(&run_dir.join("request.json"), &request) {
             warn!(job_id = %job_id, error = %e, "failed to write request.json");
+        }
+
+        let parser = json!({
+            "job_id": req.job_id,
+            "parser": ahand_protocol::resolve_job_result_parser(req),
+            "parser_version": 1,
+            "format": ahand_protocol::resolve_job_format(req),
+            "status": "configured",
+            "parse_errors": 0,
+            "start_ms": now_ms(),
+        });
+        if let Err(e) = write_json(&run_dir.join("parser.json"), &parser) {
+            warn!(job_id = %job_id, error = %e, "failed to write parser.json");
         }
     }
 
@@ -98,6 +114,19 @@ impl RunStore {
     /// Append a chunk to the stderr file for a run.
     pub fn append_stderr(&self, job_id: &str, chunk: &[u8]) {
         self.append_to_file(job_id, "stderr", chunk);
+    }
+
+    /// Append a normalized observation record as one JSON line.
+    pub fn append_observation(&self, job_id: &str, record: &serde_json::Value) {
+        let mut line = match serde_json::to_vec(record) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(job_id = %job_id, error = %e, "failed to encode observation");
+                return;
+            }
+        };
+        line.push(b'\n');
+        self.append_to_file(job_id, "observations.jsonl", &line);
     }
 
     /// Write the final result.json for a completed run.
@@ -161,6 +190,15 @@ fn describe_payload(envelope: &Envelope) -> &'static str {
     }
 }
 
+fn execution_mode_name(mode: ahand_protocol::ExecutionMode) -> &'static str {
+    match mode {
+        ahand_protocol::ExecutionMode::Unspecified => "unspecified",
+        ahand_protocol::ExecutionMode::Batch => "batch",
+        ahand_protocol::ExecutionMode::Pty => "pty",
+        ahand_protocol::ExecutionMode::PipeStream => "pipe_stream",
+    }
+}
+
 fn write_json(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
     let file = File::create(path)?;
     serde_json::to_writer_pretty(file, value)?;
@@ -196,8 +234,14 @@ mod tests {
 
     #[test]
     fn describe_payload_covers_every_variant() {
-        check(Payload::HelloChallenge(HelloChallenge::default()), "HelloChallenge");
-        check(Payload::HelloAccepted(HelloAccepted::default()), "HelloAccepted");
+        check(
+            Payload::HelloChallenge(HelloChallenge::default()),
+            "HelloChallenge",
+        );
+        check(
+            Payload::HelloAccepted(HelloAccepted::default()),
+            "HelloAccepted",
+        );
         check(Payload::Hello(Hello::default()), "Hello");
         check(Payload::JobRequest(JobRequest::default()), "JobRequest");
         check(Payload::JobEvent(JobEvent::default()), "JobEvent");
@@ -214,13 +258,22 @@ mod tests {
         );
         check(Payload::PolicyQuery(PolicyQuery::default()), "PolicyQuery");
         check(Payload::PolicyState(PolicyState::default()), "PolicyState");
-        check(Payload::PolicyUpdate(PolicyUpdate::default()), "PolicyUpdate");
+        check(
+            Payload::PolicyUpdate(PolicyUpdate::default()),
+            "PolicyUpdate",
+        );
         check(
             Payload::SetSessionMode(SetSessionMode::default()),
             "SetSessionMode",
         );
-        check(Payload::SessionState(SessionState::default()), "SessionState");
-        check(Payload::SessionQuery(SessionQuery::default()), "SessionQuery");
+        check(
+            Payload::SessionState(SessionState::default()),
+            "SessionState",
+        );
+        check(
+            Payload::SessionQuery(SessionQuery::default()),
+            "SessionQuery",
+        );
         check(
             Payload::BrowserRequest(BrowserRequest::default()),
             "BrowserRequest",
@@ -233,7 +286,10 @@ mod tests {
             Payload::UpdateCommand(UpdateCommand::default()),
             "UpdateCommand",
         );
-        check(Payload::UpdateStatus(UpdateStatus::default()), "UpdateStatus");
+        check(
+            Payload::UpdateStatus(UpdateStatus::default()),
+            "UpdateStatus",
+        );
         check(Payload::StdinChunk(StdinChunk::default()), "StdinChunk");
         check(
             Payload::TerminalResize(TerminalResize::default()),

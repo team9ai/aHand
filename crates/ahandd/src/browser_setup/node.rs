@@ -95,20 +95,20 @@ pub async fn ensure(
     let dirs = Dirs::new()?;
     let local_node = dirs.node.join("bin").join("node");
 
-    if !force && local_node.exists() {
-        if let Some(ver) = read_node_major_version(&local_node).await {
-            if ver >= NODE_MIN_VERSION {
-                emit(
-                    progress,
-                    Phase::Done,
-                    format!(
-                        "Node.js v{ver}.x already installed at {}",
-                        dirs.node.display()
-                    ),
-                );
-                return Ok(inspect().await);
-            }
-        }
+    if !force
+        && local_node.exists()
+        && let Some(ver) = read_node_major_version(&local_node).await
+        && ver >= NODE_MIN_VERSION
+    {
+        emit(
+            progress,
+            Phase::Done,
+            format!(
+                "Node.js v{ver}.x already installed at {}",
+                dirs.node.display()
+            ),
+        );
+        return Ok(inspect().await);
     }
 
     // Remove the old installation (whether --force was set or version was too low)

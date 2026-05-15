@@ -7,8 +7,59 @@
 /* eslint-disable */
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
 import { BrowserRequest, BrowserResponse } from "./browser.js";
+import { FileRequest, FileResponse } from "./file_ops.js";
 
 export const protobufPackage = "ahand.v1";
+
+/** ExecutionMode controls how a JobRequest child process is attached. */
+export enum ExecutionMode {
+  /** EXECUTION_MODE_UNSPECIFIED - Backcompat: infer from JobRequest.interactive. */
+  EXECUTION_MODE_UNSPECIFIED = 0,
+  /** EXECUTION_MODE_BATCH - Non-TTY command; stdout/stderr streamed separately. */
+  EXECUTION_MODE_BATCH = 1,
+  /** EXECUTION_MODE_PTY - PTY-backed command; supports stdin and resize. */
+  EXECUTION_MODE_PTY = 2,
+  /** EXECUTION_MODE_PIPE_STREAM - Non-TTY command with persistent stdin pipe. */
+  EXECUTION_MODE_PIPE_STREAM = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function executionModeFromJSON(object: any): ExecutionMode {
+  switch (object) {
+    case 0:
+    case "EXECUTION_MODE_UNSPECIFIED":
+      return ExecutionMode.EXECUTION_MODE_UNSPECIFIED;
+    case 1:
+    case "EXECUTION_MODE_BATCH":
+      return ExecutionMode.EXECUTION_MODE_BATCH;
+    case 2:
+    case "EXECUTION_MODE_PTY":
+      return ExecutionMode.EXECUTION_MODE_PTY;
+    case 3:
+    case "EXECUTION_MODE_PIPE_STREAM":
+      return ExecutionMode.EXECUTION_MODE_PIPE_STREAM;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return ExecutionMode.UNRECOGNIZED;
+  }
+}
+
+export function executionModeToJSON(object: ExecutionMode): string {
+  switch (object) {
+    case ExecutionMode.EXECUTION_MODE_UNSPECIFIED:
+      return "EXECUTION_MODE_UNSPECIFIED";
+    case ExecutionMode.EXECUTION_MODE_BATCH:
+      return "EXECUTION_MODE_BATCH";
+    case ExecutionMode.EXECUTION_MODE_PTY:
+      return "EXECUTION_MODE_PTY";
+    case ExecutionMode.EXECUTION_MODE_PIPE_STREAM:
+      return "EXECUTION_MODE_PIPE_STREAM";
+    case ExecutionMode.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
 
 /** Session mode controls how commands from a specific caller are handled. */
 export enum SessionMode {
@@ -170,7 +221,18 @@ export interface Envelope {
   updateStatus?: UpdateStatus | undefined;
   stdinChunk?: StdinChunk | undefined;
   terminalResize?: TerminalResize | undefined;
-  heartbeat?: Heartbeat | undefined;
+  heartbeat?:
+    | Heartbeat
+    | undefined;
+  /**
+   * Tag 32 is intentionally skipped: PR #1 (c9b8a4d, 2026-04-28)
+   * briefly assigned `FileResponse = 32` on `dev` and shifted
+   * Heartbeat to 33, breaking wire compat with deployed daemons.
+   * Don't reuse 32 even though no client ever decoded it correctly —
+   * a hub built between c9b8a4d and the fix will emit/parse it.
+   */
+  fileRequest?: FileRequest | undefined;
+  fileResponse?: FileResponse | undefined;
 }
 
 /**
@@ -230,8 +292,13 @@ export interface JobRequest {
   cwd: string;
   env: { [key: string]: string };
   timeoutMs: number;
-  /** request a PTY / interactive session */
+  /** Compatibility field: true maps to EXECUTION_MODE_PTY. */
   interactive: boolean;
+  executionMode: ExecutionMode;
+  /** Optional output parser hint: raw, codex-jsonl, claude-stream-json. */
+  resultParser: string;
+  /** Optional formatter hint: raw, codex, claude-code. */
+  format: string;
 }
 
 export interface JobRequest_EnvEntry {
@@ -431,6 +498,8 @@ function createBaseEnvelope(): Envelope {
     stdinChunk: undefined,
     terminalResize: undefined,
     heartbeat: undefined,
+    fileRequest: undefined,
+    fileResponse: undefined,
   };
 }
 
@@ -522,6 +591,12 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.heartbeat !== undefined) {
       Heartbeat.encode(message.heartbeat, writer.uint32(250).fork()).join();
+    }
+    if (message.fileRequest !== undefined) {
+      FileRequest.encode(message.fileRequest, writer.uint32(266).fork()).join();
+    }
+    if (message.fileResponse !== undefined) {
+      FileResponse.encode(message.fileResponse, writer.uint32(274).fork()).join();
     }
     return writer;
   },
@@ -765,6 +840,22 @@ export const Envelope: MessageFns<Envelope> = {
           message.heartbeat = Heartbeat.decode(reader, reader.uint32());
           continue;
         }
+        case 33: {
+          if (tag !== 266) {
+            break;
+          }
+
+          message.fileRequest = FileRequest.decode(reader, reader.uint32());
+          continue;
+        }
+        case 34: {
+          if (tag !== 274) {
+            break;
+          }
+
+          message.fileResponse = FileResponse.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -905,6 +996,16 @@ export const Envelope: MessageFns<Envelope> = {
         ? TerminalResize.fromJSON(object.terminal_resize)
         : undefined,
       heartbeat: isSet(object.heartbeat) ? Heartbeat.fromJSON(object.heartbeat) : undefined,
+      fileRequest: isSet(object.fileRequest)
+        ? FileRequest.fromJSON(object.fileRequest)
+        : isSet(object.file_request)
+        ? FileRequest.fromJSON(object.file_request)
+        : undefined,
+      fileResponse: isSet(object.fileResponse)
+        ? FileResponse.fromJSON(object.fileResponse)
+        : isSet(object.file_response)
+        ? FileResponse.fromJSON(object.file_response)
+        : undefined,
     };
   },
 
@@ -997,6 +1098,12 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.heartbeat !== undefined) {
       obj.heartbeat = Heartbeat.toJSON(message.heartbeat);
     }
+    if (message.fileRequest !== undefined) {
+      obj.fileRequest = FileRequest.toJSON(message.fileRequest);
+    }
+    if (message.fileResponse !== undefined) {
+      obj.fileResponse = FileResponse.toJSON(message.fileResponse);
+    }
     return obj;
   },
 
@@ -1077,6 +1184,12 @@ export const Envelope: MessageFns<Envelope> = {
       : undefined;
     message.heartbeat = (object.heartbeat !== undefined && object.heartbeat !== null)
       ? Heartbeat.fromPartial(object.heartbeat)
+      : undefined;
+    message.fileRequest = (object.fileRequest !== undefined && object.fileRequest !== null)
+      ? FileRequest.fromPartial(object.fileRequest)
+      : undefined;
+    message.fileResponse = (object.fileResponse !== undefined && object.fileResponse !== null)
+      ? FileResponse.fromPartial(object.fileResponse)
       : undefined;
     return message;
   },
@@ -1719,7 +1832,18 @@ export const BootstrapAuth: MessageFns<BootstrapAuth> = {
 };
 
 function createBaseJobRequest(): JobRequest {
-  return { jobId: "", tool: "", args: [], cwd: "", env: {}, timeoutMs: 0, interactive: false };
+  return {
+    jobId: "",
+    tool: "",
+    args: [],
+    cwd: "",
+    env: {},
+    timeoutMs: 0,
+    interactive: false,
+    executionMode: 0,
+    resultParser: "",
+    format: "",
+  };
 }
 
 export const JobRequest: MessageFns<JobRequest> = {
@@ -1744,6 +1868,15 @@ export const JobRequest: MessageFns<JobRequest> = {
     }
     if (message.interactive !== false) {
       writer.uint32(56).bool(message.interactive);
+    }
+    if (message.executionMode !== 0) {
+      writer.uint32(64).int32(message.executionMode);
+    }
+    if (message.resultParser !== "") {
+      writer.uint32(74).string(message.resultParser);
+    }
+    if (message.format !== "") {
+      writer.uint32(82).string(message.format);
     }
     return writer;
   },
@@ -1814,6 +1947,30 @@ export const JobRequest: MessageFns<JobRequest> = {
           message.interactive = reader.bool();
           continue;
         }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.executionMode = reader.int32() as any;
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.resultParser = reader.string();
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.format = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1848,6 +2005,17 @@ export const JobRequest: MessageFns<JobRequest> = {
         ? globalThis.Number(object.timeout_ms)
         : 0,
       interactive: isSet(object.interactive) ? globalThis.Boolean(object.interactive) : false,
+      executionMode: isSet(object.executionMode)
+        ? executionModeFromJSON(object.executionMode)
+        : isSet(object.execution_mode)
+        ? executionModeFromJSON(object.execution_mode)
+        : 0,
+      resultParser: isSet(object.resultParser)
+        ? globalThis.String(object.resultParser)
+        : isSet(object.result_parser)
+        ? globalThis.String(object.result_parser)
+        : "",
+      format: isSet(object.format) ? globalThis.String(object.format) : "",
     };
   },
 
@@ -1880,6 +2048,15 @@ export const JobRequest: MessageFns<JobRequest> = {
     if (message.interactive !== false) {
       obj.interactive = message.interactive;
     }
+    if (message.executionMode !== 0) {
+      obj.executionMode = executionModeToJSON(message.executionMode);
+    }
+    if (message.resultParser !== "") {
+      obj.resultParser = message.resultParser;
+    }
+    if (message.format !== "") {
+      obj.format = message.format;
+    }
     return obj;
   },
 
@@ -1903,6 +2080,9 @@ export const JobRequest: MessageFns<JobRequest> = {
     );
     message.timeoutMs = object.timeoutMs ?? 0;
     message.interactive = object.interactive ?? false;
+    message.executionMode = object.executionMode ?? 0;
+    message.resultParser = object.resultParser ?? "";
+    message.format = object.format ?? "";
     return message;
   },
 };

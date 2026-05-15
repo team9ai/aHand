@@ -5,6 +5,7 @@ import type {
   Envelope as EnvelopeMsg,
   PolicyUpdate as PolicyUpdateMsg,
 } from "@ahandai/proto";
+import { ExecutionMode } from "@ahandai/proto";
 import { makeEnvelope, decodeEnvelope } from "./codec.ts";
 import { Job } from "./job.ts";
 import { Outbox, prepareOutbound } from "./outbox.ts";
@@ -93,9 +94,10 @@ export class DeviceConnection extends EventEmitter {
         cwd: opts?.cwd ?? "",
         env: opts?.env ?? {},
         timeoutMs: opts?.timeoutMs ?? 0,
-        // `interactive` is a proto field for future PTY sessions. SDK callers
-        // cannot opt in yet; default to non-interactive.
+        // Keep `interactive` for old receivers while also sending the explicit
+        // mode for new receivers.
         interactive: false,
+        executionMode: ExecutionMode.EXECUTION_MODE_BATCH,
       },
     });
 

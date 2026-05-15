@@ -28,11 +28,11 @@
 
 use ahand_protocol::{
     ApprovalRequest, ApprovalResponse, BootstrapAuth, BrowserRequest, BrowserResponse, CancelJob,
-    Ed25519Auth, Envelope, FileRequest, FileResponse, Heartbeat, Hello, HelloAccepted,
-    HelloChallenge, JobEvent, JobFinished, JobRejected, JobRequest, PolicyQuery, PolicyState,
-    PolicyUpdate, RefusalContext, SessionMode, SessionQuery, SessionState, SetSessionMode,
-    StdinChunk, TerminalResize, UpdateCommand, UpdateState, UpdateStatus, UpdateSuggestion,
-    envelope, hello, job_event,
+    Ed25519Auth, Envelope, ExecutionMode, FileRequest, FileResponse, Heartbeat, Hello,
+    HelloAccepted, HelloChallenge, JobEvent, JobFinished, JobRejected, JobRequest, PolicyQuery,
+    PolicyState, PolicyUpdate, RefusalContext, SessionMode, SessionQuery, SessionState,
+    SetSessionMode, StdinChunk, TerminalResize, UpdateCommand, UpdateState, UpdateStatus,
+    UpdateSuggestion, envelope, hello, job_event,
 };
 use prost::Message;
 use std::path::{Path, PathBuf};
@@ -204,6 +204,9 @@ fn golden_job_request() {
         env: env_map,
         timeout_ms: 30_000,
         interactive: false,
+        execution_mode: ExecutionMode::Unspecified as i32,
+        result_parser: String::new(),
+        format: String::new(),
     }));
     assert_golden("job_request", &env);
 }

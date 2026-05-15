@@ -25,15 +25,15 @@ fn detect_with(
     config_override: Option<&str>,
     exists: &dyn Fn(&str) -> bool,
 ) -> Option<DetectedBrowser> {
-    if let Some(path) = config_override {
-        if exists(path) {
-            return Some(DetectedBrowser {
-                name: "Configured Browser".into(),
-                path: PathBuf::from(path),
-                kind: BrowserKind::Chrome, // conservative default for config override
-                source: CheckSource::System,
-            });
-        }
+    if let Some(path) = config_override
+        && exists(path)
+    {
+        return Some(DetectedBrowser {
+            name: "Configured Browser".into(),
+            path: PathBuf::from(path),
+            kind: BrowserKind::Chrome, // conservative default for config override
+            source: CheckSource::System,
+        });
     }
 
     for c in candidates() {

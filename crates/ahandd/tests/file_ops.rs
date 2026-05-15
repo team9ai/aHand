@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ahand_protocol::{
+    ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy, FileCreateSymlink, FileDelete,
+    FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary,
+    FileReadImage, FileReadText, FileRequest, FileStat, FileType, FileWrite, FullWrite,
+    ImageFormat, LineCol, LineRangeReplace, StopReason, StringReplace, UnixPermission, WriteAction,
     file_chmod, file_edit, file_position, file_read_text, file_request, file_response, file_write,
-    full_write, ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy,
-    FileCreateSymlink, FileDelete, FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir,
-    FileMove, FilePosition, FileReadBinary, FileReadImage, FileReadText, FileRequest, FileStat,
-    FileType, FileWrite, FullWrite, ImageFormat, LineCol, LineRangeReplace, StopReason,
-    StringReplace, UnixPermission, WriteAction,
+    full_write,
 };
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
@@ -95,9 +95,7 @@ fn expect_mkdir(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileMkdir
     }
 }
 
-fn expect_read_text(
-    resp: ahand_protocol::FileResponse,
-) -> ahand_protocol::FileReadTextResult {
+fn expect_read_text(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileReadTextResult {
     match resp.result {
         Some(file_response::Result::ReadText(r)) => r,
         other => panic!("expected read_text result, got {other:?}"),
@@ -125,18 +123,14 @@ fn wrap_read_text(req: FileReadText) -> FileRequest {
     }
 }
 
-fn expect_read_binary(
-    resp: ahand_protocol::FileResponse,
-) -> ahand_protocol::FileReadBinaryResult {
+fn expect_read_binary(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileReadBinaryResult {
     match resp.result {
         Some(file_response::Result::ReadBinary(r)) => r,
         other => panic!("expected read_binary result, got {other:?}"),
     }
 }
 
-fn expect_read_image(
-    resp: ahand_protocol::FileResponse,
-) -> ahand_protocol::FileReadImageResult {
+fn expect_read_image(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileReadImageResult {
     match resp.result {
         Some(file_response::Result::ReadImage(r)) => r,
         other => panic!("expected read_image result, got {other:?}"),
@@ -178,9 +172,7 @@ fn expect_move(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileMoveRe
     }
 }
 
-fn expect_symlink(
-    resp: ahand_protocol::FileResponse,
-) -> ahand_protocol::FileCreateSymlinkResult {
+fn expect_symlink(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileCreateSymlinkResult {
     match resp.result {
         Some(file_response::Result::CreateSymlink(r)) => r,
         other => panic!("expected create_symlink result, got {other:?}"),
@@ -830,7 +822,7 @@ async fn read_text_respects_max_bytes() {
     let result = expect_read_text(resp);
     assert_eq!(result.stop_reason, StopReason::MaxBytes as i32);
     assert!(result.lines.len() <= 3); // at most 2-3 lines
-    assert!(result.lines.len() >= 1);
+    assert!(!result.lines.is_empty());
 }
 
 #[tokio::test]
@@ -1026,7 +1018,12 @@ async fn read_text_encoding_forced_gbk() {
     let result = expect_read_text(resp);
     assert_eq!(result.lines.len(), 1);
     assert_eq!(result.lines[0].content, "你好");
-    assert!(result.detected_encoding.to_ascii_lowercase().contains("gbk"));
+    assert!(
+        result
+            .detected_encoding
+            .to_ascii_lowercase()
+            .contains("gbk")
+    );
 }
 
 #[tokio::test]
@@ -1035,7 +1032,9 @@ async fn read_text_nonexistent_file_returns_error() {
     let (mgr, root) = test_manager(&dir);
     let missing = root.join("missing.txt");
 
-    let resp = mgr.handle(&wrap_read_text(read_text_request(&missing))).await;
+    let resp = mgr
+        .handle(&wrap_read_text(read_text_request(&missing)))
+        .await;
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::NotFound as i32);
 }
@@ -1130,10 +1129,9 @@ async fn read_binary_past_eof_returns_empty() {
 /// Write a small synthetic PNG (via the `image` crate) to disk for testing.
 fn write_test_png(path: &Path, width: u32, height: u32) {
     use image::{ImageBuffer, Rgb};
-    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
-        ImageBuffer::from_fn(width, height, |x, y| {
-            Rgb([(x & 0xFF) as u8, (y & 0xFF) as u8, 0u8])
-        });
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(width, height, |x, y| {
+        Rgb([(x & 0xFF) as u8, (y & 0xFF) as u8, 0u8])
+    });
     img.save_with_format(path, image::ImageFormat::Png)
         .expect("failed to write test png");
 }
@@ -1294,7 +1292,8 @@ async fn read_image_input_size_exceeds_max_read_bytes_is_rejected() {
             ((x.wrapping_add(y)) as u8) ^ 0xAA,
         ])
     });
-    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+    img.save_with_format(&file, image::ImageFormat::Png)
+        .unwrap();
 
     let resp = mgr.handle(&image_req(&file, None, None)).await;
     let err = expect_error(resp);
@@ -1312,9 +1311,14 @@ async fn read_image_max_bytes_unreachable_returns_too_large() {
     let file = root.join("noise.png");
     // High-entropy image so JPEG can't compress it down.
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(256, 256, |x, y| {
-        Rgb([(x as u8).wrapping_mul(17) ^ y as u8, (x as u8).wrapping_add(y as u8), 0])
+        Rgb([
+            (x as u8).wrapping_mul(17) ^ y as u8,
+            (x as u8).wrapping_add(y as u8),
+            0,
+        ])
     });
-    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+    img.save_with_format(&file, image::ImageFormat::Png)
+        .unwrap();
 
     let req = FileRequest {
         request_id: "t".into(),
@@ -1557,7 +1561,9 @@ async fn write_exceeds_max_bytes_returns_too_large() {
     });
     let file = tmp_root.join("too_big.bin");
 
-    let resp = mgr.handle(&write_request_full(&file, &vec![0u8; 100], false)).await;
+    let resp = mgr
+        .handle(&write_request_full(&file, &[0u8; 100], false))
+        .await;
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::TooLarge as i32);
 }
@@ -2003,7 +2009,10 @@ async fn delete_trash_populates_trash_path() {
     let resp = mgr.handle(&req).await;
     let result = expect_delete(resp);
     assert_eq!(result.mode, DeleteMode::Trash as i32);
-    assert!(result.trash_path.is_some(), "trash_path should be populated");
+    assert!(
+        result.trash_path.is_some(),
+        "trash_path should be populated"
+    );
     assert!(!file.exists(), "original file should be gone");
 }
 
@@ -2066,10 +2075,7 @@ async fn copy_recursive_directory() {
     let result = expect_copy(resp);
     assert!(result.items_copied >= 3);
     assert_eq!(fs::read_to_string(dst_dir.join("a.txt")).unwrap(), "a");
-    assert_eq!(
-        fs::read_to_string(dst_dir.join("sub/b.txt")).unwrap(),
-        "b"
-    );
+    assert_eq!(fs::read_to_string(dst_dir.join("sub/b.txt")).unwrap(), "b");
 }
 
 // ── FileMove tests ─────────────────────────────────────────────────────────
@@ -2214,7 +2220,10 @@ async fn chmod_sets_unix_mode() {
     let resp = mgr.handle(&req).await;
     let result = expect_chmod(resp);
     assert_eq!(result.items_modified, 1);
-    assert_eq!(fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
 }
 
 #[cfg(unix)]
@@ -2245,7 +2254,11 @@ async fn chmod_recursive_applies_to_children() {
     let result = expect_chmod(resp);
     assert_eq!(result.items_modified, 3);
     assert_eq!(
-        fs::metadata(sub.join("a.txt")).unwrap().permissions().mode() & 0o777,
+        fs::metadata(sub.join("a.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
         0o700
     );
 }
@@ -2644,7 +2657,10 @@ async fn copy_recursive_overwrite_merges_into_existing_destination() {
     let resp = mgr.handle(&req).await;
     expect_copy(resp);
     assert_eq!(fs::read_to_string(dst.join("fresh.txt")).unwrap(), "new");
-    assert_eq!(fs::read_to_string(dst.join("untouched.txt")).unwrap(), "keep");
+    assert_eq!(
+        fs::read_to_string(dst.join("untouched.txt")).unwrap(),
+        "keep"
+    );
 }
 
 #[tokio::test]
@@ -2721,9 +2737,7 @@ async fn read_text_gbk_autodetect_without_forced_encoding() {
     let file = root.join("gbk-auto.txt");
     // "你好,世界" in GBK (with CJK punctuation to give chardetng enough
     // signal to lock in on GBK).
-    let gbk: Vec<u8> = vec![
-        0xC4, 0xE3, 0xBA, 0xC3, 0xA3, 0xAC, 0xCA, 0xC0, 0xBD, 0xE7,
-    ];
+    let gbk: Vec<u8> = vec![0xC4, 0xE3, 0xBA, 0xC3, 0xA3, 0xAC, 0xCA, 0xC0, 0xBD, 0xE7];
     fs::write(&file, &gbk).unwrap();
 
     let req = read_text_request(&file);
@@ -2774,9 +2788,7 @@ async fn read_text_empty_encoding_triggers_auto_detect() {
     let file = root.join("auto.txt");
     // "你好,世界" in GBK — same bytes as the gbk-autodetect test above, enough
     // signal for chardetng to lock onto GBK rather than falling back to UTF-8.
-    let gbk: Vec<u8> = vec![
-        0xC4, 0xE3, 0xBA, 0xC3, 0xA3, 0xAC, 0xCA, 0xC0, 0xBD, 0xE7,
-    ];
+    let gbk: Vec<u8> = vec![0xC4, 0xE3, 0xBA, 0xC3, 0xA3, 0xAC, 0xCA, 0xC0, 0xBD, 0xE7];
     fs::write(&file, &gbk).unwrap();
 
     let mut req = read_text_request(&file);
@@ -2837,13 +2849,17 @@ async fn read_image_passthrough_is_byte_for_byte_identical() {
     let file = root.join("pass.png");
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_fn(32, 32, |x, y| Rgb([(x * 7) as u8, (y * 11) as u8, 13u8]));
-    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+    img.save_with_format(&file, image::ImageFormat::Png)
+        .unwrap();
 
     let original = fs::read(&file).unwrap();
 
     let resp = mgr.handle(&image_req(&file, None, None)).await;
     let result = expect_read_image(resp);
-    assert_eq!(result.content, original, "passthrough must be byte-identical");
+    assert_eq!(
+        result.content, original,
+        "passthrough must be byte-identical"
+    );
     assert_eq!(result.width, 32);
     assert_eq!(result.height, 32);
     assert_eq!(result.original_bytes, original.len() as u64);
@@ -2856,9 +2872,9 @@ async fn read_image_max_height_only_preserves_aspect_ratio() {
     let dir = TempDir::new().unwrap();
     let (mgr, root) = test_manager(&dir);
     let file = root.join("tall.png");
-    let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
-        ImageBuffer::from_fn(800, 1000, |_, _| Rgb([0, 0, 0]));
-    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(800, 1000, |_, _| Rgb([0, 0, 0]));
+    img.save_with_format(&file, image::ImageFormat::Png)
+        .unwrap();
 
     // max_height=500, no max_width → height scaled to 500, width scaled
     // proportionally to 400.
@@ -2876,12 +2892,11 @@ async fn read_image_both_axis_resize_preserves_aspect_ratio() {
     let file = root.join("box.png");
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_fn(1000, 500, |_, _| Rgb([128, 128, 128]));
-    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+    img.save_with_format(&file, image::ImageFormat::Png)
+        .unwrap();
 
     // Both axes set — smaller axis wins. max_width=500 → height=250.
-    let resp = mgr
-        .handle(&image_req(&file, Some(500), Some(400)))
-        .await;
+    let resp = mgr.handle(&image_req(&file, Some(500), Some(400))).await;
     let result = expect_read_image(resp);
     assert!(result.width <= 500);
     assert!(result.height <= 400);
@@ -2922,7 +2937,8 @@ async fn read_image_quality_clamp_accepts_out_of_range_values() {
     let file = root.join("clamp.png");
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_fn(64, 64, |_, _| Rgb([50, 100, 150]));
-    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+    img.save_with_format(&file, image::ImageFormat::Png)
+        .unwrap();
 
     // quality = 0 (below minimum) → still produces valid JPEG output.
     let req_zero = FileRequest {
@@ -2980,7 +2996,8 @@ async fn read_image_bomb_guard_rejects_oversized_dimensions() {
     let file = tmp_root.join("big.png");
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
         ImageBuffer::from_fn(1024, 1024, |_, _| Rgb([0, 0, 0]));
-    img.save_with_format(&file, image::ImageFormat::Png).unwrap();
+    img.save_with_format(&file, image::ImageFormat::Png)
+        .unwrap();
 
     // The on-disk PNG is well under 1 MB (it compresses), so file-level
     // max_read_bytes wouldn't catch it. The dimension guard in
@@ -3049,7 +3066,10 @@ async fn check_request_approval_returns_true_for_dangerous_path_read() {
         escalation.kind,
         ahandd::file_manager::EscalationKind::DangerousPath
     );
-    assert_eq!(escalation.path.as_deref(), Some(secret.to_string_lossy().as_ref()));
+    assert_eq!(
+        escalation.path.as_deref(),
+        Some(secret.to_string_lossy().as_ref())
+    );
 }
 
 #[tokio::test]
@@ -3682,16 +3702,14 @@ async fn chmod_with_unix_permission_but_no_mode_or_owner_returns_unspecified_err
 /// rejected by `policy.check_path`.
 fn restrictive_policy(tmp_root: &Path) -> ahandd::file_manager::policy::FilePolicyChecker {
     let root_str = tmp_root.to_string_lossy().into_owned();
-    ahandd::file_manager::policy::FilePolicyChecker::new(
-        &ahandd::config::FilePolicyConfig {
-            enabled: true,
-            path_allowlist: vec![format!("{}/**", root_str), root_str.clone()],
-            path_denylist: vec![],
-            max_read_bytes: 100_000_000,
-            max_write_bytes: 100_000_000,
-            dangerous_paths: vec![],
-        },
-    )
+    ahandd::file_manager::policy::FilePolicyChecker::new(&ahandd::config::FilePolicyConfig {
+        enabled: true,
+        path_allowlist: vec![format!("{}/**", root_str), root_str.clone()],
+        path_denylist: vec![],
+        max_read_bytes: 100_000_000,
+        max_write_bytes: 100_000_000,
+        dangerous_paths: vec![],
+    })
 }
 
 #[tokio::test]

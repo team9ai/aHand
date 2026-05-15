@@ -1,6 +1,7 @@
 //! OpenClaw Gateway WebSocket client.
 //!
 //! Manages the connection to an OpenClaw Gateway and handles message routing.
+#![allow(clippy::collapsible_else_if, clippy::collapsible_if)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

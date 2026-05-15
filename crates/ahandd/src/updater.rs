@@ -350,6 +350,7 @@ fn restart_daemon() -> anyhow::Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_status<T: EnvelopeSink>(
     tx: &T,
     device_id: &str,
