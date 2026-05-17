@@ -362,6 +362,150 @@ async fn create_job_dispatches_format_to_daemon() {
 }
 
 #[tokio::test]
+async fn create_job_dispatches_hermes_formats_to_daemon_env() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-dev-hermes", "user-cp").await;
+    let token = mint_cp_jwt(&server, "user-cp");
+
+    let resp = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "cp-dev-hermes",
+            "inputFormat": "hermes-acp-json-rpc",
+            "outputFormat": "hermes-acp-json-rpc",
+            "executable": "/opt/hermes/bin/hermes",
+            "prompt": "Inspect the repo",
+            "model": "provider:model",
+            "sessionId": "ses-1",
+            "instructions": "Use project conventions.",
+            "env": {
+                "PATH": "/usr/bin",
+                "AHAND_INPUT_FORMAT": "wrong"
+            },
+            "executionMode": "pipe_stream"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let received = recv_job_request(&mut device).await;
+    assert_eq!(received.tool, "/opt/hermes/bin/hermes");
+    assert_eq!(
+        ExecutionMode::try_from(received.execution_mode).unwrap(),
+        ExecutionMode::PipeStream
+    );
+    assert_eq!(received.env.get("PATH").unwrap(), "/usr/bin");
+    assert_eq!(
+        received.env.get("AHAND_INPUT_FORMAT").unwrap(),
+        "hermes-acp-json-rpc"
+    );
+    assert_eq!(
+        received.env.get("AHAND_OUTPUT_FORMAT").unwrap(),
+        "hermes-acp-json-rpc"
+    );
+    assert_eq!(
+        received.env.get("AHAND_AGENT_EXECUTABLE").unwrap(),
+        "/opt/hermes/bin/hermes"
+    );
+    assert_eq!(
+        received.env.get("AHAND_AGENT_PROMPT").unwrap(),
+        "Inspect the repo"
+    );
+    assert_eq!(
+        received.env.get("AHAND_AGENT_MODEL").unwrap(),
+        "provider:model"
+    );
+    assert_eq!(received.env.get("AHAND_AGENT_SESSION_ID").unwrap(), "ses-1");
+    assert_eq!(
+        received.env.get("AHAND_AGENT_INSTRUCTIONS").unwrap(),
+        "Use project conventions."
+    );
+}
+
+#[tokio::test]
+async fn create_job_dispatches_claude_code_formats_to_daemon_env() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-dev-claude", "user-cp").await;
+    let token = mint_cp_jwt(&server, "user-cp");
+
+    let resp = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "cp-dev-claude",
+            "inputFormat": "claude-stream-json",
+            "outputFormat": "claude-stream-json",
+            "executable": "/opt/claude/bin/claude",
+            "prompt": "Review the repo",
+            "model": "claude-sonnet",
+            "sessionId": "claude-session-1",
+            "instructions": "Use Claude conventions.",
+            "maxTurns": "4",
+            "systemPrompt": "You are running under AHand.",
+            "permissionMode": "default",
+            "env": {
+                "PATH": "/usr/bin",
+                "AHAND_INPUT_FORMAT": "wrong"
+            },
+            "executionMode": "pipe_stream",
+            "resultParser": "claude-stream-json"
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    let received = recv_job_request(&mut device).await;
+    assert_eq!(received.tool, "/opt/claude/bin/claude");
+    assert_eq!(
+        ExecutionMode::try_from(received.execution_mode).unwrap(),
+        ExecutionMode::PipeStream
+    );
+    assert_eq!(received.result_parser, "claude-stream-json");
+    assert_eq!(received.format, "claude-code");
+    assert_eq!(received.input_format, "claude-stream-json");
+    assert_eq!(received.output_format, "claude-stream-json");
+    assert_eq!(received.env.get("PATH").unwrap(), "/usr/bin");
+    assert_eq!(
+        received.env.get("AHAND_INPUT_FORMAT").unwrap(),
+        "claude-stream-json"
+    );
+    assert_eq!(
+        received.env.get("AHAND_OUTPUT_FORMAT").unwrap(),
+        "claude-stream-json"
+    );
+    assert_eq!(
+        received.env.get("AHAND_AGENT_EXECUTABLE").unwrap(),
+        "/opt/claude/bin/claude"
+    );
+    assert_eq!(
+        received.env.get("AHAND_AGENT_PROMPT").unwrap(),
+        "Review the repo"
+    );
+    assert_eq!(
+        received.env.get("AHAND_AGENT_MODEL").unwrap(),
+        "claude-sonnet"
+    );
+    assert_eq!(
+        received.env.get("AHAND_AGENT_SESSION_ID").unwrap(),
+        "claude-session-1"
+    );
+    assert_eq!(received.env.get("AHAND_AGENT_MAX_TURNS").unwrap(), "4");
+    assert_eq!(
+        received.env.get("AHAND_AGENT_SYSTEM_PROMPT").unwrap(),
+        "You are running under AHand."
+    );
+    assert_eq!(
+        received.env.get("AHAND_AGENT_PERMISSION_MODE").unwrap(),
+        "default"
+    );
+    assert_eq!(
+        received.env.get("AHAND_AGENT_INSTRUCTIONS").unwrap(),
+        "Use Claude conventions."
+    );
+}
+
+#[tokio::test]
 async fn create_job_pipe_stream_dispatches_explicit_execution_mode() {
     let server = spawn_server_with_state(test_state().await).await;
     let mut device = attach_owned_device(&server, "cp-dev-pipe", "user-pipe").await;

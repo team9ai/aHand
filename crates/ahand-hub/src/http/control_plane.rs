@@ -101,6 +101,7 @@ fn header_bearer(value: &HeaderValue) -> Option<String> {
 #[serde(rename_all = "camelCase")]
 pub struct CreateJobRequest {
     pub device_id: String,
+    #[serde(default)]
     pub tool: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -119,7 +120,27 @@ pub struct CreateJobRequest {
     #[serde(default)]
     pub format: Option<String>,
     #[serde(default)]
+    pub input_format: Option<String>,
+    #[serde(default)]
+    pub output_format: Option<String>,
+    #[serde(default)]
     pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub executable: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub max_turns: Option<String>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub permission_mode: Option<String>,
 }
 
 /// Default job timeout when the SDK doesn't pass one. Matches the
@@ -146,10 +167,87 @@ async fn create_job(
     let Json(req) = body.map_err(|_| ControlError::BadRequest("invalid JSON body".into()))?;
     let execution_mode = resolve_execution_mode(req.execution_mode.as_deref(), req.interactive)?;
     let interactive = matches!(execution_mode, ahand_protocol::ExecutionMode::Pty);
-    let result_parser = resolve_result_parser(req.result_parser.as_deref())?;
-    let format = resolve_format(req.format.as_deref())?;
-    validate_format_for_parser(format, result_parser)?;
-    if req.tool.trim().is_empty() {
+    let input_format = resolve_input_format(req.input_format.as_deref())?;
+    let output_format = resolve_output_format(req.output_format.as_deref(), req.format.as_deref())?;
+    let result_parser =
+        resolve_result_parser_for_output(req.result_parser.as_deref(), output_format)?;
+    let legacy_format = legacy_format_for_output(req.format.as_deref(), output_format)?;
+    validate_input_output_format(input_format, output_format)?;
+    let mut env = req.env.clone();
+    let mut tool = req.tool.clone();
+    if input_format != ahand_protocol::INPUT_FORMAT_RAW
+        || output_format != ahand_protocol::OUTPUT_FORMAT_RAW
+    {
+        let executable = req
+            .executable
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| (!tool.trim().is_empty()).then_some(tool.trim()))
+            .ok_or_else(|| ControlError::BadRequest("executable is required".into()))?;
+        let prompt = req
+            .prompt
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| ControlError::BadRequest("prompt is required".into()))?;
+        env.insert("AHAND_INPUT_FORMAT".into(), input_format.to_string());
+        env.insert("AHAND_OUTPUT_FORMAT".into(), output_format.to_string());
+        env.insert("AHAND_AGENT_EXECUTABLE".into(), executable.to_string());
+        env.insert("AHAND_AGENT_PROMPT".into(), prompt.to_string());
+        if let Some(model) = req
+            .model
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            env.insert("AHAND_AGENT_MODEL".into(), model.to_string());
+        }
+        if let Some(session_id) = req
+            .session_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            env.insert("AHAND_AGENT_SESSION_ID".into(), session_id.to_string());
+        }
+        if let Some(instructions) = req
+            .instructions
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            env.insert("AHAND_AGENT_INSTRUCTIONS".into(), instructions.to_string());
+        }
+        if let Some(max_turns) = req
+            .max_turns
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            env.insert("AHAND_AGENT_MAX_TURNS".into(), max_turns.to_string());
+        }
+        if let Some(system_prompt) = req
+            .system_prompt
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            env.insert(
+                "AHAND_AGENT_SYSTEM_PROMPT".into(),
+                system_prompt.to_string(),
+            );
+        }
+        if let Some(permission_mode) = req
+            .permission_mode
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            env.insert(
+                "AHAND_AGENT_PERMISSION_MODE".into(),
+                permission_mode.to_string(),
+            );
+        }
+        if tool.trim().is_empty() {
+            tool = executable.to_string();
+        }
+    }
+
+    if tool.trim().is_empty() {
         return Err(ControlError::BadRequest("tool must not be empty".into()));
     }
     if req.device_id.is_empty() {
@@ -220,15 +318,17 @@ async fn create_job(
         payload: Some(ahand_protocol::envelope::Payload::JobRequest(
             ahand_protocol::JobRequest {
                 job_id: job_id.clone(),
-                tool: req.tool.clone(),
+                tool: tool.clone(),
                 args: req.args.clone(),
                 cwd: req.cwd.clone().unwrap_or_default(),
-                env: req.env.clone(),
+                env,
                 timeout_ms,
                 interactive,
                 execution_mode: execution_mode as i32,
                 result_parser: result_parser.to_string(),
-                format: format.to_string(),
+                format: legacy_format.to_string(),
+                input_format: input_format.to_string(),
+                output_format: output_format.to_string(),
             },
         )),
         ..Default::default()
@@ -467,6 +567,76 @@ fn resolve_result_parser(parser: Option<&str>) -> Result<&'static str, ControlEr
     }
 }
 
+fn resolve_result_parser_for_output(
+    parser: Option<&str>,
+    output_format: &str,
+) -> Result<&'static str, ControlError> {
+    match parser.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => resolve_result_parser(Some(value)),
+        None => Ok(match output_format {
+            ahand_protocol::OUTPUT_FORMAT_CODEX_JSONL => ahand_protocol::RESULT_PARSER_CODEX_JSONL,
+            ahand_protocol::OUTPUT_FORMAT_CLAUDE_STREAM_JSON => {
+                ahand_protocol::RESULT_PARSER_CLAUDE_STREAM_JSON
+            }
+            _ => ahand_protocol::RESULT_PARSER_RAW,
+        }),
+    }
+}
+
+fn resolve_input_format(format: Option<&str>) -> Result<&'static str, ControlError> {
+    match format.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some(ahand_protocol::INPUT_FORMAT_RAW) => Ok(ahand_protocol::INPUT_FORMAT_RAW),
+        Some(ahand_protocol::INPUT_FORMAT_TEXT) => Ok(ahand_protocol::INPUT_FORMAT_TEXT),
+        Some(ahand_protocol::INPUT_FORMAT_CLAUDE_STREAM_JSON) => {
+            Ok(ahand_protocol::INPUT_FORMAT_CLAUDE_STREAM_JSON)
+        }
+        Some(ahand_protocol::INPUT_FORMAT_HERMES_ACP_JSON_RPC) => {
+            Ok(ahand_protocol::INPUT_FORMAT_HERMES_ACP_JSON_RPC)
+        }
+        Some(other) => Err(ControlError::BadRequest(format!(
+            "unknown inputFormat: {other}"
+        ))),
+    }
+}
+
+fn resolve_output_format(
+    output_format: Option<&str>,
+    legacy_format: Option<&str>,
+) -> Result<&'static str, ControlError> {
+    if let Some(output_format) = output_format
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return match output_format {
+            ahand_protocol::OUTPUT_FORMAT_RAW => Ok(ahand_protocol::OUTPUT_FORMAT_RAW),
+            ahand_protocol::OUTPUT_FORMAT_CODEX_JSONL => {
+                Ok(ahand_protocol::OUTPUT_FORMAT_CODEX_JSONL)
+            }
+            ahand_protocol::OUTPUT_FORMAT_CLAUDE_STREAM_JSON => {
+                Ok(ahand_protocol::OUTPUT_FORMAT_CLAUDE_STREAM_JSON)
+            }
+            ahand_protocol::OUTPUT_FORMAT_HERMES_ACP_JSON_RPC => {
+                Ok(ahand_protocol::OUTPUT_FORMAT_HERMES_ACP_JSON_RPC)
+            }
+            other => Err(ControlError::BadRequest(format!(
+                "unknown outputFormat: {other}"
+            ))),
+        };
+    }
+
+    match legacy_format
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None | Some(ahand_protocol::FORMAT_RAW) => Ok(ahand_protocol::OUTPUT_FORMAT_RAW),
+        Some(ahand_protocol::FORMAT_CODEX) => Ok(ahand_protocol::OUTPUT_FORMAT_CODEX_JSONL),
+        Some(ahand_protocol::FORMAT_CLAUDE_CODE) => {
+            Ok(ahand_protocol::OUTPUT_FORMAT_CLAUDE_STREAM_JSON)
+        }
+        Some(other) => Err(ControlError::BadRequest(format!("unknown format: {other}"))),
+    }
+}
+
 fn resolve_format(format: Option<&str>) -> Result<&'static str, ControlError> {
     match format.map(str::trim).filter(|value| !value.is_empty()) {
         None | Some(ahand_protocol::FORMAT_RAW) => Ok(ahand_protocol::FORMAT_RAW),
@@ -476,6 +646,24 @@ fn resolve_format(format: Option<&str>) -> Result<&'static str, ControlError> {
     }
 }
 
+fn legacy_format_for_output(
+    legacy_format: Option<&str>,
+    output_format: &str,
+) -> Result<&'static str, ControlError> {
+    if let Some(legacy_format) = legacy_format
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return resolve_format(Some(legacy_format));
+    }
+    Ok(match output_format {
+        ahand_protocol::OUTPUT_FORMAT_CODEX_JSONL => ahand_protocol::FORMAT_CODEX,
+        ahand_protocol::OUTPUT_FORMAT_CLAUDE_STREAM_JSON => ahand_protocol::FORMAT_CLAUDE_CODE,
+        _ => ahand_protocol::FORMAT_RAW,
+    })
+}
+
+#[cfg(test)]
 fn validate_format_for_parser(format: &str, parser: &str) -> Result<(), ControlError> {
     match (format, parser) {
         (ahand_protocol::FORMAT_RAW, _)
@@ -488,6 +676,31 @@ fn validate_format_for_parser(format: &str, parser: &str) -> Result<(), ControlE
         )),
         (ahand_protocol::FORMAT_CLAUDE_CODE, _) => Err(ControlError::BadRequest(
             "format claude-code requires resultParser claude-stream-json".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn validate_input_output_format(
+    input_format: &str,
+    output_format: &str,
+) -> Result<(), ControlError> {
+    match (input_format, output_format) {
+        (ahand_protocol::INPUT_FORMAT_RAW, _)
+        | (ahand_protocol::INPUT_FORMAT_TEXT, _)
+        | (
+            ahand_protocol::INPUT_FORMAT_CLAUDE_STREAM_JSON,
+            ahand_protocol::OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
+        )
+        | (
+            ahand_protocol::INPUT_FORMAT_HERMES_ACP_JSON_RPC,
+            ahand_protocol::OUTPUT_FORMAT_HERMES_ACP_JSON_RPC,
+        ) => Ok(()),
+        (ahand_protocol::INPUT_FORMAT_CLAUDE_STREAM_JSON, _) => Err(ControlError::BadRequest(
+            "inputFormat claude-stream-json requires outputFormat claude-stream-json".into(),
+        )),
+        (ahand_protocol::INPUT_FORMAT_HERMES_ACP_JSON_RPC, _) => Err(ControlError::BadRequest(
+            "inputFormat hermes-acp-json-rpc requires outputFormat hermes-acp-json-rpc".into(),
         )),
         _ => Ok(()),
     }

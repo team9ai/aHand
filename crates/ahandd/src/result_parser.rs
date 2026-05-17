@@ -14,7 +14,7 @@ pub struct CodexFormatter {
 struct RuntimeContext {
     execution_mode: &'static str,
     result_parser: String,
-    format: String,
+    output_format: String,
     cwd: String,
     tool: String,
     args: Vec<String>,
@@ -22,9 +22,9 @@ struct RuntimeContext {
 
 impl CodexFormatter {
     pub fn maybe_new(req: &JobRequest) -> Option<Self> {
-        let format = ahand_protocol::resolve_job_format(req);
+        let output_format = ahand_protocol::resolve_job_output_format(req);
         let parser = ahand_protocol::resolve_job_result_parser(req);
-        if format != ahand_protocol::FORMAT_CODEX
+        if output_format != ahand_protocol::OUTPUT_FORMAT_CODEX_JSONL
             || parser != ahand_protocol::RESULT_PARSER_CODEX_JSONL
         {
             return None;
@@ -40,7 +40,7 @@ impl CodexFormatter {
                     req,
                 )),
                 result_parser: parser.to_string(),
-                format: format.to_string(),
+                output_format: output_format.to_string(),
                 cwd: req.cwd.clone(),
                 tool: req.tool.clone(),
                 args: req.args.clone(),
@@ -226,7 +226,7 @@ impl CodexFormatter {
                 "jobId": self.job_id,
                 "executionMode": self.runtime.execution_mode,
                 "resultParser": self.runtime.result_parser,
-                "format": self.runtime.format,
+                "outputFormat": self.runtime.output_format,
                 "cwd": self.runtime.cwd,
                 "tool": self.runtime.tool,
                 "args": self.runtime.args,

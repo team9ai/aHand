@@ -1,8 +1,21 @@
 # Run Claude Code or Codex Through AHand Pipe Stream
 
-This guide describes the full path from configuring AHand to calling Claude Code or Codex without PTY. The first supported integration shape is **single-turn CLI launch**: AHand starts the agent command with `pipe_stream`, forwards the prompt for this run, and streams stdout/stderr back.
+This guide describes the full path from configuring AHand to calling Codex and process-style agent commands without PTY. The process transport is **single-turn CLI launch**: AHand starts the agent command with `pipe_stream`, forwards the prompt for this run, and streams stdout/stderr back.
 
-This intentionally does not require a full cc-connect-style adapter yet. AHand launches the CLI process and makes process I/O observable. **Stdout is the user-facing data source.** By default stdout/stderr are raw child-process streams. When `--format codex` is enabled, the stdout stream returned to the caller changes to Codex formatter output as normalized observation JSONL. Raw Codex stdout is still preserved in run artifacts for debugging and replay, but callers should treat stdout as the only data stream they need to process.
+AHand now separates three stable knobs. See `docs/agent-stdio-formats.md` for the long-term contract:
+
+```text
+executionMode=pipe_stream
+  process transport: child stdin/stdout/stderr pipes
+
+inputFormat
+  AHand prompt/stdin -> child stdin format
+
+outputFormat
+  child stdout format -> raw bytes or AgentObservationRecord JSONL
+```
+
+For Codex, `inputFormat=text` writes the prompt to stdin, while `outputFormat=codex-jsonl` parses Codex JSONL stdout into normalized observation JSONL. For Claude Code and Hermes ACP, use their dedicated usage guides because their stdin and stdout formats are different. **Caller-facing stdout is still the user-facing data source.** With `outputFormat=raw`, stdout/stderr are raw child-process streams. With an agent-specific `outputFormat`, stdout returned to the caller is normalized observation JSONL. Raw child stdout is still preserved in run artifacts for debugging and replay.
 
 ## Target Path
 
@@ -16,23 +29,39 @@ caller
 -> stdout/stderr chunks back to SDK callbacks or SSE
 ```
 
-## Stdout Contract
+## Output Contract
 
-AHand uses stdout as the single user-facing data source. The `--format` option selects the stdout schema:
+AHand uses stdout as the single user-facing data source. The long-term `--output-format` option selects the stdout schema:
 
-| Format | Caller-facing stdout |
+| Output format | Caller-facing stdout |
 |---|---|
 | `raw` | Child process stdout bytes, unchanged. |
-| `codex` | Codex formatter output, one `AgentObservationRecord` JSON object per line. |
-| `claude-code` | Reserved for Claude Code formatter output. |
+| `codex-jsonl` | Codex stdout parsed and formatted as one `AgentObservationRecord` JSON object per line. |
+| `claude-stream-json` | Claude Code stdout parsed and formatted as observation JSONL. |
+| `hermes-acp-json-rpc` | Hermes ACP stdout parsed and formatted as observation JSONL. |
+
+The old `--format` flag is deprecated. Current implementations may still accept it as a compatibility alias, but new docs and APIs should use `--output-format` / `outputFormat`.
 
 Run artifacts such as `runs/<job_id>/stdout` and `observations.jsonl` are debug and replay artifacts. They are not a second user query path. SDK callbacks, `ahandctl`, and hub SSE should all expose the same selected stdout schema.
 
 Use `executionMode: "pipe_stream"` only when the target hub and daemon support it. The compatibility field `interactive=false` is still sent, but it is not enough to express stream semantics by itself.
 
+## Format Boundary
+
+`executionMode: "pipe_stream"` does not mean Codex, Claude, or ACP. It only means AHand uses non-PTY process pipes.
+
+Use `inputFormat` and `outputFormat` for agent protocol differences:
+
+| Agent | `inputFormat` | `outputFormat` |
+|---|---|---|
+| Raw process | `raw` | `raw` |
+| Codex | `text` | `codex-jsonl` |
+| Claude Code | `claude-stream-json` | `claude-stream-json` |
+| Hermes ACP | `hermes-acp-json-rpc` | `hermes-acp-json-rpc` |
+
 ## Single-Turn Agent Command Shape
 
-For now, treat Codex and Claude Code as ordinary CLI commands that AHand launches once per job.
+For low-level debugging, Codex can still be launched as an ordinary CLI command that AHand runs once per job.
 
 ### Codex
 
@@ -43,13 +72,14 @@ printf 'Run tests and explain failures\n' | cargo run -p ahandctl -- \
   --ipc /tmp/ahand-local-debug.sock \
   exec \
   --execution-mode pipe_stream \
+  --input-format text \
   --result-parser codex-jsonl \
-  --format codex \
+  --output-format codex-jsonl \
   --cwd "$PWD" \
   codex -- exec --skip-git-repo-check --json --cd "$PWD" -
 ```
 
-`--result-parser codex-jsonl` decodes Codex JSONL. `--format codex` enables the Codex formatter, which maps decoded Codex events into AHand's normalized observation dimensions and sends those observation records on stdout.
+`--input-format text` writes the prompt as plain text to Codex stdin. `--output-format codex-jsonl` decodes Codex JSONL stdout, maps decoded Codex events into AHand's normalized observation dimensions, and sends those observation records on stdout.
 
 Resume an existing Codex thread the same way:
 
@@ -58,15 +88,16 @@ printf 'Continue from the previous result\n' | cargo run -p ahandctl -- \
   --ipc /tmp/ahand-local-debug.sock \
   exec \
   --execution-mode pipe_stream \
+  --input-format text \
   --result-parser codex-jsonl \
-  --format codex \
+  --output-format codex-jsonl \
   --cwd "$PWD" \
   codex -- exec resume --skip-git-repo-check <thread_id> --json -
 ```
 
 ### Claude Code
 
-For single-turn launch, use Claude Code's print mode and pass the prompt as a command argument:
+Prefer the dedicated Claude Code adapter path in `docs/usage/claude-code.md`. The older low-level command form is only useful for raw process debugging:
 
 ```bash
 cargo run -p ahandctl -- \
@@ -78,7 +109,7 @@ cargo run -p ahandctl -- \
   claude -- -p "Review this repo" --output-format stream-json
 ```
 
-If a caller later needs long-lived Claude Code stdio with `--input-format stream-json --permission-prompt-tool stdio`, AHand will need a higher-level adapter or attach/send-stdin API. That is outside this single-turn launch path.
+The supported Claude Code integration does not share Codex's stdin text format. AHand writes Claude's native stream-json user message internally and then exposes normalized observation JSONL to callers.
 
 ## Quick Run Order
 
@@ -153,7 +184,7 @@ cargo run -p ahandctl -- \
   --ipc /tmp/ahand-local-debug.sock \
   exec --execution-mode pipe_stream --cwd "$PWD" \
   --result-parser codex-jsonl \
-  --format codex \
+  --output-format codex-jsonl \
   codex -- exec --skip-git-repo-check --json --cd "$PWD" -
 ```
 
@@ -166,8 +197,8 @@ What is currently verified:
 - daemon has a `pipe_stream` runtime using child `stdin/stdout/stderr` pipes.
 - local sidecar mode can run IPC-injected `pipe_stream` jobs without hub/control-plane.
 - single-turn CLI launch is enough to start Codex and Claude Code through AHand.
-- Codex JSONL parsing and `format=codex` observation output are implemented. With `format=codex`, live stdout contains observation JSONL instead of raw Codex JSONL.
-- Claude Code `stream-json` parsing is not implemented yet; `claude-stream-json` is currently a parser hint.
+- Codex JSONL parsing and `outputFormat=codex-jsonl` observation output are implemented. With `outputFormat=codex-jsonl`, live stdout contains observation JSONL instead of raw Codex JSONL.
+- Claude Code `stream-json` parsing is implemented through `inputFormat=claude-stream-json` and `outputFormat=claude-stream-json`. See `docs/usage/claude-code.md` for the supported path.
 - control-plane integration test for actual daemon WebSocket dispatch compiles; in restricted sandboxes it may not run because it needs to bind a local test port.
 
 ## Local Sidecar Debug Usage
@@ -207,7 +238,7 @@ printf 'Run tests and explain failures\n' | cargo run -p ahandctl -- \
   exec \
   --execution-mode pipe_stream \
   --result-parser codex-jsonl \
-  --format codex \
+  --output-format codex-jsonl \
   --cwd "$PWD" \
   codex -- exec --skip-git-repo-check --json --cd "$PWD" -
 ```
@@ -222,7 +253,7 @@ printf 'Run tests and explain failures\n' | cargo run -p ahandctl -- \
   exec \
   --execution-mode pipe_stream \
   --result-parser codex-jsonl \
-  --format codex \
+  --output-format codex-jsonl \
   --cwd "$PWD" \
   --env PATH="$PATH" \
   "$CODEX" -- exec --skip-git-repo-check --json --cd "$PWD" -
@@ -258,7 +289,7 @@ $AHAND_DATA/runs/<job_id>/
   result.json
 ```
 
-`request.json` records the submitted `JobRequest`, including `execution_mode`, `result_parser`, and `format`.
+`request.json` records the submitted `JobRequest`, including `execution_mode`, `result_parser`, and `outputFormat`.
 
 `parser.json` records parser and formatter configuration:
 
@@ -267,7 +298,7 @@ $AHAND_DATA/runs/<job_id>/
   "job_id": "ctl-job-...",
   "parser": "codex-jsonl",
   "parser_version": 1,
-  "format": "codex",
+  "outputFormat": "codex-jsonl",
   "status": "configured",
   "parse_errors": 0,
   "start_ms": 1778635825119
@@ -276,9 +307,9 @@ $AHAND_DATA/runs/<job_id>/
 
 `stdout` and `stderr` files in the run directory are debug artifacts and remain raw child-process output.
 
-With `--format codex`, live stdout from `ahandctl`, SDK callbacks, or hub SSE contains the same normalized observation records that are written to `observations.jsonl`. This is intentional: the explicit formatter switch changes the caller-facing stdout format, while preserving raw process stdout on disk.
+With `--output-format codex-jsonl`, live stdout from `ahandctl`, SDK callbacks, or hub SSE contains the same normalized observation records that are written to `observations.jsonl`. This is intentional: the explicit formatter switch changes the caller-facing stdout format, while preserving raw process stdout on disk.
 
-`observations.jsonl` is a debug copy of the formatted stdout when a formatter is enabled, for example `--format codex`. It is useful for local inspection and replay, but the user-facing data source is still stdout. Each line is a normalized observation record. Current Codex records include:
+`observations.jsonl` is a debug copy of the formatted stdout when a formatter is enabled, for example `--output-format codex-jsonl`. It is useful for local inspection and replay, but the user-facing data source is still stdout. Each line is a normalized observation record. Current Codex records include:
 
 ```text
 agent_session

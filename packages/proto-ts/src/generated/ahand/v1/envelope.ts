@@ -295,10 +295,14 @@ export interface JobRequest {
   /** Compatibility field: true maps to EXECUTION_MODE_PTY. */
   interactive: boolean;
   executionMode: ExecutionMode;
-  /** Optional output parser hint: raw, codex-jsonl, claude-stream-json. */
+  /** Deprecated output parser hint: raw, codex-jsonl, claude-stream-json. */
   resultParser: string;
-  /** Optional formatter hint: raw, codex, claude-code. */
+  /** Deprecated formatter hint: raw, codex, claude-code. */
   format: string;
+  /** Optional stdin format: raw, text, claude-stream-json, hermes-acp-json-rpc. */
+  inputFormat: string;
+  /** Optional stdout format: raw, codex-jsonl, claude-stream-json, hermes-acp-json-rpc. */
+  outputFormat: string;
 }
 
 export interface JobRequest_EnvEntry {
@@ -1843,6 +1847,8 @@ function createBaseJobRequest(): JobRequest {
     executionMode: 0,
     resultParser: "",
     format: "",
+    inputFormat: "",
+    outputFormat: "",
   };
 }
 
@@ -1877,6 +1883,12 @@ export const JobRequest: MessageFns<JobRequest> = {
     }
     if (message.format !== "") {
       writer.uint32(82).string(message.format);
+    }
+    if (message.inputFormat !== "") {
+      writer.uint32(90).string(message.inputFormat);
+    }
+    if (message.outputFormat !== "") {
+      writer.uint32(98).string(message.outputFormat);
     }
     return writer;
   },
@@ -1971,6 +1983,22 @@ export const JobRequest: MessageFns<JobRequest> = {
           message.format = reader.string();
           continue;
         }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.inputFormat = reader.string();
+          continue;
+        }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.outputFormat = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2016,6 +2044,16 @@ export const JobRequest: MessageFns<JobRequest> = {
         ? globalThis.String(object.result_parser)
         : "",
       format: isSet(object.format) ? globalThis.String(object.format) : "",
+      inputFormat: isSet(object.inputFormat)
+        ? globalThis.String(object.inputFormat)
+        : isSet(object.input_format)
+        ? globalThis.String(object.input_format)
+        : "",
+      outputFormat: isSet(object.outputFormat)
+        ? globalThis.String(object.outputFormat)
+        : isSet(object.output_format)
+        ? globalThis.String(object.output_format)
+        : "",
     };
   },
 
@@ -2057,6 +2095,12 @@ export const JobRequest: MessageFns<JobRequest> = {
     if (message.format !== "") {
       obj.format = message.format;
     }
+    if (message.inputFormat !== "") {
+      obj.inputFormat = message.inputFormat;
+    }
+    if (message.outputFormat !== "") {
+      obj.outputFormat = message.outputFormat;
+    }
     return obj;
   },
 
@@ -2083,6 +2127,8 @@ export const JobRequest: MessageFns<JobRequest> = {
     message.executionMode = object.executionMode ?? 0;
     message.resultParser = object.resultParser ?? "";
     message.format = object.format ?? "";
+    message.inputFormat = object.inputFormat ?? "";
+    message.outputFormat = object.outputFormat ?? "";
     return message;
   },
 };

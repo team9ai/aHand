@@ -8,6 +8,7 @@ export { Outbox } from "./outbox.ts";
 export { CloudClient, CloudClientError } from "./cloud-client.ts";
 export type {
   CloudClientOptions,
+  SpawnAgentParams,
   SpawnParams,
   SpawnResult,
   CloudClientErrorCode,

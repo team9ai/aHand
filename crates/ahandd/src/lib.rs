@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod agent;
 pub mod ahand_client;
 pub mod approval;
 pub mod browser;

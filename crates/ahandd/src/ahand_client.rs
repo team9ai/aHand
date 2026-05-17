@@ -981,9 +981,38 @@ async fn spawn_job<T>(
     let did = device_id.to_string();
     let reg = Arc::clone(registry);
     let st = store.clone();
-    let execution_mode = ahand_protocol::resolve_job_execution_mode(&req);
 
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
+    if crate::agent::claude_code::is_claude_code_job(&req) {
+        reg.register(job_id.clone(), cancel_tx).await;
+        let active = reg.active_count().await;
+        info!(job_id = %job_id, active_jobs = active, input_format = "claude-stream-json", output_format = "claude-stream-json", "Claude Code format job accepted, acquiring permit");
+
+        tokio::spawn(async move {
+            let _permit = reg.acquire_permit().await;
+            let (exit_code, error) =
+                crate::agent::claude_code::run_claude_code(did, req, tx_clone, cancel_rx, st).await;
+            reg.remove(&job_id).await;
+            reg.mark_completed(job_id, exit_code, error).await;
+        });
+        return;
+    }
+    if crate::agent::hermes_acp::is_hermes_acp_job(&req) {
+        reg.register(job_id.clone(), cancel_tx).await;
+        let active = reg.active_count().await;
+        info!(job_id = %job_id, active_jobs = active, input_format = "hermes-acp-json-rpc", output_format = "hermes-acp-json-rpc", "Hermes ACP format job accepted, acquiring permit");
+
+        tokio::spawn(async move {
+            let _permit = reg.acquire_permit().await;
+            let (exit_code, error) =
+                crate::agent::hermes_acp::run_hermes_acp(did, req, tx_clone, cancel_rx, st).await;
+            reg.remove(&job_id).await;
+            reg.mark_completed(job_id, exit_code, error).await;
+        });
+        return;
+    }
+
+    let execution_mode = ahand_protocol::resolve_job_execution_mode(&req);
 
     match execution_mode {
         ahand_protocol::ExecutionMode::Pty => {

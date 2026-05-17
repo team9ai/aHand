@@ -1,8 +1,8 @@
 # Codex JSONL Result Parser 开发计划
 
-**Goal:** 为 AHand 增加 Codex formatter：stdout 是用户唯一需要处理的数据源；当调用方显式指定 `format=codex` 时，用 Codex formatter 过滤 Codex CLI `--json` 输出的 JSONL 过程事件，并把 stdout 改写为统一维度的 `AgentObservationRecord` JSONL；未指定 formatter 时 stdout 继续保持 raw/兼容输出。这样既能观测 Codex 的 agent 身份、时间、LLM 输入输出、工具调用、错误和最终结果，也不破坏默认调试链路。
+**Goal:** 为 AHand 增加 Codex formatter：stdout 是用户唯一需要处理的数据源；当调用方显式指定 `outputFormat=codex-jsonl` 时，用 Codex formatter 过滤 Codex CLI `--json` 输出的 JSONL 过程事件，并把 stdout 改写为统一维度的 `AgentObservationRecord` JSONL；未指定 formatter 时 stdout 继续保持 raw/兼容输出。这样既能观测 Codex 的 agent 身份、时间、LLM 输入输出、工具调用、错误和最终结果，也不破坏默认调试链路。
 
-**Architecture:** `pipe_stream` runtime 继续负责启动 Codex 子进程和转发 stdin/stdout/stderr；`result_parser=codex-jsonl` 负责按行读取和 JSON decode；`format=codex` 负责把 decoded Codex events 过滤/映射成统一 `AgentObservationRecord`，并把这些 records 作为 caller-facing stdout 发给 `ahandctl`、SDK callback 或 hub SSE。raw child stdout 仍写入 run artifact，`observations.jsonl` 只是 formatted stdout 的 debug copy。formatter 是 stdout schema 选择能力，不能影响 Codex 进程生命周期。
+**Architecture:** `pipe_stream` runtime 继续负责进程级 stdin/stdout/stderr transport；`inputFormat=text` 负责把 AHand prompt 写成 Codex CLI 需要的 stdin plain text，并配合固定 `codex exec --json ... -` 启动形态；`outputFormat=codex-jsonl` 负责按行读取、JSON decode、把 decoded Codex events 过滤/映射成统一 `AgentObservationRecord`，并把这些 records 作为 caller-facing stdout 发给 `ahandctl`、SDK callback 或 hub SSE。`inputFormat=raw` 和 `outputFormat=raw` 都必须保留，用于普通 pipe_stream 调试和未归一化输出。raw child stdout 仍写入 run artifact，`observations.jsonl` 只是 formatted stdout 的 debug copy。
 
 **Tech Stack:** Rust, serde_json, protobuf/prost, ahandd RunStore, local IPC, hub output stream
 
@@ -44,7 +44,7 @@ Codex 会输出 JSONL，每一行是一个独立事件。真实输出示例：
 
 ## 目标
 
-`codex-jsonl` parser 负责识别 Codex 事件；当 `format=codex` 时，Codex formatter 需要把这些事件归一到这些维度：
+`codex-jsonl` parser 负责识别 Codex 事件；当 `outputFormat=codex-jsonl` 时，Codex formatter 需要把这些事件归一到这些维度：
 
 - `agent`：Codex agent id、thread id、agent kind、模型信息。
 - `time`：AHand observed time、turn/tool start/end 时间。
@@ -62,6 +62,13 @@ Codex 会输出 JSONL，每一行是一个独立事件。真实输出示例：
 - SDK callback / SSE 后续扩展
 - 统计 Codex 执行中的工具调用、失败点和 token 使用
 
+同时，Codex 接入需要和 Claude Code、Hermes ACP 对齐到同一组三个开关：
+
+- `executionMode=pipe_stream` 表达进程 transport。
+- `inputFormat=text` 把 prompt 转成 Codex stdin plain text；`inputFormat=raw` 保留原始 stdin。
+- `outputFormat=codex-jsonl` 把 Codex 原生 stdout JSONL 转成统一 observation JSONL；`outputFormat=raw` 保留原始 stdout。
+- `ExecutionMode::PipeStream` 只表示进程 transport，不表达 agent 协议类型。
+
 ## 非目标
 
 第一阶段不做：
@@ -75,46 +82,79 @@ Codex 会输出 JSONL，每一行是一个独立事件。真实输出示例：
 - 不因为 parser 失败改变 job exit code。
 - 不移除 stdout/stderr 原始文件。
 
-## Formatter 开关
+## Format 开关
 
-为兼容现有调试路径，新增一个显式 formatter 开关。这个开关表达“使用哪个 agent formatter 过滤和归一化输出”，不是 legacy / normalized 两种格式切换。
+为兼容现有调试路径，长期接口使用 `inputFormat` 和 `outputFormat`。旧 `format` 字段废弃；旧 `resultParser` 只作为兼容 parser hint。
 
 建议命名：
 
 ```bash
---format raw
---format codex
---format claude-code
+--input-format raw
+--input-format text
+--output-format raw
+--output-format codex-jsonl
 ```
 
 或者在 SDK / control-plane 中使用：
 
 ```ts
 {
-  resultParser: "codex-jsonl",
-  format: "raw" | "codex" | "claude-code"
+  executionMode: "pipe_stream",
+  inputFormat: "raw" | "text" | "claude-stream-json" | "hermes-acp-json-rpc",
+  outputFormat: "raw" | "codex-jsonl" | "claude-stream-json" | "hermes-acp-json-rpc"
 }
 ```
 
 语义：
 
-| 开关值 | 行为 |
+| 开关 | 行为 |
 |---|---|
-| `raw` | 默认值。caller-facing stdout 是 child raw stdout。 |
-| `codex` | caller-facing stdout 是 Codex formatter 输出的 `AgentObservationRecord` JSONL。 |
-| `claude-code` | 后续给 Claude Code formatter stdout 使用。 |
+| `inputFormat=raw` | 不转换输入，保留 caller-provided stdin。 |
+| `inputFormat=text` | 把 prompt 作为 plain text 写入 stdin。 |
+| `outputFormat=raw` | 默认值。caller-facing stdout 是 child raw stdout。 |
+| `outputFormat=codex-jsonl` | caller-facing stdout 是 Codex stdout 转换后的 `AgentObservationRecord` JSONL。 |
 
 兼容规则：
 
-- 不传 `format` 时默认为 `raw`。
+- 不传 `inputFormat` 时默认为 `raw`。
+- 不传 `outputFormat` 时默认为 `raw`。
 - `raw` 行为不能因为新增 formatter 被破坏。
-- `format=codex` 改变 stdout schema，但不改变 Codex 子进程 exit code。
+- `outputFormat=codex-jsonl` 改变 stdout schema，但不改变 Codex 子进程 exit code。
 - Codex formatter 失败时可以写 formatter error，但不能影响 raw 输出和 job finish。
 - 旧 SDK / 旧 hub 不认识该开关时，应自然降级为 `raw`。
-- 新 SDK 调旧 hub 时，如果用户显式请求 `format=codex`，需要返回明确 capability error 或降级提示，不能静默假装成功。
-- `format=codex` 必须和 Codex JSONL 输入匹配；如果 `resultParser` 不是 `codex-jsonl`，hub/daemon 应拒绝或降级为 `raw`，避免错误 formatter 误解析。
+- 新 SDK 调旧 hub 时，如果用户显式请求 `inputFormat` 或 `outputFormat`，需要返回明确 capability error 或降级提示，不能静默假装成功。
+- `outputFormat=codex-jsonl` 必须和 Codex JSONL stdout 匹配；如果旧 `resultParser` 不是 `codex-jsonl`，hub/daemon 应拒绝或降级为 `raw`，避免错误 formatter 误解析。
 
 ## 输入契约
+
+Codex 接入分成三层契约：process transport、stdin format、stdout format。
+
+### AHand 输入格式
+
+建议和 Hermes / Claude Code 共用长期 format fields：
+
+```text
+executionMode = "pipe_stream"
+inputFormat = "text"
+outputFormat = "codex-jsonl"
+executable = "/absolute/path/to/codex"
+prompt = "Run tests and explain failures."
+agentModel = optional
+agentSessionId = optional thread id for resume
+cwd = "/repo"
+env = explicit PATH/HOME/auth environment
+```
+
+兼容当前实现时，也可以继续由调用方手写 `exec` 命令并通过 stdin 传 prompt。后续 `inputFormat=text` 应把上述统一输入自动转成：
+
+```text
+codex exec --skip-git-repo-check --json --cd <cwd> -
+codex exec resume --skip-git-repo-check <thread_id> --json -
+```
+
+并把 `prompt` 写入 child stdin 后关闭 stdin。`inputFormat=raw` 必须继续保留，表示 AHand 不转换 stdin。
+
+### Codex 原生输出输入
 
 Codex parser 只解析 stdout。
 
@@ -143,7 +183,7 @@ Codex parser / formatter 分两层输出，但用户只消费 stdout。
 
 ### Raw 输出
 
-默认 `format=raw` 时保持当前兼容行为：
+默认 `outputFormat=raw` 时保持当前兼容行为：
 
 ```text
 caller-facing stdout = child raw stdout
@@ -153,7 +193,7 @@ run artifact 中的 `stdout` 文件也保存 child raw stdout。
 
 ### Codex Formatter 输出
 
-只有当 `format=codex` 时，Codex formatter 才启用。此时 caller-facing stdout 是统一的 `AgentObservationRecord` JSONL：
+只有当 `outputFormat=codex-jsonl` 时，Codex formatter 才启用。此时 caller-facing stdout 是统一的 `AgentObservationRecord` JSONL：
 
 ```json
 {
@@ -213,7 +253,7 @@ run artifact 中的 `stdout` 文件也保存 child raw stdout。
 
 ## 事件类型
 
-`format=codex` 时，第一阶段支持这些统一 `kind`：
+`outputFormat=codex-jsonl` 时，第一阶段支持这些统一 `kind`：
 
 ```text
 agent_session
@@ -240,7 +280,7 @@ plan_updated
 
 ## Codex 事件映射
 
-以下映射只对 `format=codex` 生效。`format=raw` 模式继续使用原有 raw/parser event 结构。
+以下映射只对 `outputFormat=codex-jsonl` 生效。`outputFormat=raw` 模式继续使用原有 raw/parser event 结构。
 
 | Codex `type` | 条件 | AHand `kind` | 提取维度 |
 |---|---|---|---|
@@ -256,7 +296,7 @@ plan_updated
 
 ## LLM Request 处理
 
-以下规则只对 `format=codex` 生效。
+以下规则只对 `outputFormat=codex-jsonl` 生效。
 
 Codex 当前 `exec --json` 输出通常不包含完整的 LLM request payload，因此 formatter 必须明确区分“未观测到”和“空数组”。
 
@@ -470,9 +510,9 @@ runs/<job_id>/
 
 `parsed_events.jsonl` 保存兼容 parser events。
 
-`observations.jsonl` 只在 `format=codex` 时写入，保存 caller-facing formatted stdout 的 debug copy。
+`observations.jsonl` 只在 `outputFormat=codex-jsonl` 时写入，保存 caller-facing formatted stdout 的 debug copy。
 
-`parsed_events.jsonl` 不建议在 `format=codex` 时改变 envelope；它继续作为 parser-level 兼容输出。用户不需要读取 artifact 文件，正常消费路径是 selected stdout。
+`parsed_events.jsonl` 不建议在 `outputFormat=codex-jsonl` 时改变 envelope；它继续作为 parser-level 兼容输出。用户不需要读取 artifact 文件，正常消费路径是 selected stdout。
 
 `parser.json` 从当前的静态配置文件升级为解析状态文件：
 
@@ -481,8 +521,8 @@ runs/<job_id>/
   "job_id": "ctl-job-376799",
   "parser": "codex-jsonl",
   "parser_version": 1,
-  "format": "codex",
-  "formatter": "codex",
+  "outputFormat": "codex-jsonl",
+  "formatter": "codex-jsonl",
   "formatter_version": 1,
   "status": "finished",
   "thread_id": "019e202b-3c86-7753-b018-0348eb9b1feb",
@@ -499,11 +539,13 @@ runs/<job_id>/
 
 ## 模块设计
 
-建议新增 daemon 内部模块：
+建议新增或整理 daemon 内部模块：
 
 ```text
 crates/ahandd/src/result_parser/
   mod.rs
+  input_format.rs
+  output_format.rs
   event.rs
   raw.rs
   codex_jsonl.rs
@@ -513,11 +555,22 @@ crates/ahandd/src/result_parser/
 
 | 文件 | 职责 |
 |---|---|
+| `input_format.rs` | `InputFormat`：`raw` / `text` / `claude-stream-json` / `hermes-acp-json-rpc` |
+| `output_format.rs` | `OutputFormat`：`raw` / `codex-jsonl` / `claude-stream-json` / `hermes-acp-json-rpc` |
 | `mod.rs` | parser / formatter trait、factory、stream dispatch |
 | `event.rs` | `AgentObservationRecord`、`ParserState`、`FormatterState`、统一维度类型 |
 | `raw.rs` | raw parser |
 | `codex_jsonl.rs` | Codex JSONL line buffer |
 | `codex_formatter.rs` | Codex event 到 AgentObservationRecord 的过滤和映射 |
+
+建议 input format trait：
+
+```rust
+trait InputFormatHandler {
+    fn input_format(&self) -> &'static str;
+    async fn write_initial_input(&self, stdin: ChildStdin, input: AgentInput) -> Result<()>;
+}
+```
 
 建议 trait：
 
@@ -552,10 +605,10 @@ JobRequest(result_parser = codex-jsonl)
 -> RunStore append stdout
 -> parser.push_stdout(chunk)
 -> RunStore append parsed_events.jsonl
--> if format=codex: codex_formatter.push_event(decoded_event)
--> if format=codex: RunStore append observations.jsonl
--> if format=codex: emit observation JSONL as JobEvent stdout
--> if format=raw: emit raw chunk as JobEvent stdout
+-> if outputFormat=codex-jsonl: codex_formatter.push_event(decoded_event)
+-> if outputFormat=codex-jsonl: RunStore append observations.jsonl
+-> if outputFormat=codex-jsonl: emit observation JSONL as JobEvent stdout
+-> if outputFormat=raw: emit raw chunk as JobEvent stdout
 -> update parser.json
 -> child exit
 -> parser.finish()
@@ -566,8 +619,8 @@ JobRequest(result_parser = codex-jsonl)
 关键约束：
 
 1. raw stdout/stderr artifact 写入优先，保证可回放。
-2. caller-facing stdout 由 `format` 决定：`raw` 转发 raw chunk，`codex` 转发 formatter records。
-3. parser 解析失败在 `format=codex` 时作为 `parse_error` record 输出到 stdout，不能阻断 job。
+2. caller-facing stdout 由 `outputFormat` 决定：`raw` 转发 raw chunk，`codex-jsonl` 转发 formatter records。
+3. parser 解析失败在 `outputFormat=codex-jsonl` 时作为 `parse_error` record 输出到 stdout，不能阻断 job。
 4. parser 不拥有 child process。
 5. parser 不影响 job exit code。
 6. parser / formatter 的文件写入失败不能导致 Codex 被 kill，但需要写 daemon warn log。
@@ -575,7 +628,7 @@ JobRequest(result_parser = codex-jsonl)
 ## 兼容策略
 
 - `result_parser` 缺失时默认为 `raw`。
-- `format` 缺失时默认为 `raw`，不启用 agent formatter。
+- `outputFormat` 缺失时默认为 `raw`，不启用 agent formatter。
 - `result_parser = raw` 时行为和旧版本一致。
 - 旧 run 目录没有 `parsed_events.jsonl` 时，读取层展示 raw stdout/stderr。
 - 旧 run 目录没有 `observations.jsonl` 时，读取层展示 raw 或 parser events。
@@ -586,16 +639,33 @@ JobRequest(result_parser = codex-jsonl)
 
 ## 开发阶段
 
+### Phase 0: Codex Input/Output Format Boundary
+
+- [ ] 定义 `inputFormat` / `outputFormat` typed fields。
+- [ ] 保留 `inputFormat=raw` 和 `outputFormat=raw`。
+- [ ] 实现 `inputFormat=text`：构造 `codex exec --json ... -` 并写 prompt stdin。
+- [ ] 实现 `outputFormat=codex-jsonl`：解析 Codex JSONL 并输出 observation JSONL。
+- [ ] 支持 resume：`codex exec resume <thread_id> --json -`。
+- [ ] 将 `prompt` 写入 stdin 并关闭 stdin。
+- [ ] 明确 `ExecutionMode::PipeStream` 只是 transport，不作为 Codex/Hermes/Claude 的协议选择。
+
+验收：
+
+- SDK 用户不需要手写 Codex CLI 参数即可启动 Codex。
+- 旧 `exec --execution-mode pipe_stream ... codex -- exec ... -` 路径继续可用。
+- `inputFormat=text` 不改变 `outputFormat=codex-jsonl` 的 stdout schema。
+
 ### Phase 1: Parser 基础设施
 
 - 新增 `AgentObservationRecord` 数据结构。
 - 新增 `AgentIdentity`、`ObservationTime`、`RuntimeContext`、`NormalizedLlmRequest`、`NormalizedLlmResponse`、`NormalizedToolCall`。
-- 新增 `AgentFormat` / `FormatterKind`：`raw` / `codex` / `claude-code`。
-- 在 CLI / SDK / hub / daemon 透传 `format`，默认 `raw`。
+- 新增 `InputFormat`：`raw` / `text` / `claude-stream-json` / `hermes-acp-json-rpc`。
+- 新增 `OutputFormat`：`raw` / `codex-jsonl` / `claude-stream-json` / `hermes-acp-json-rpc`。
+- 在 CLI / SDK / hub / daemon 透传 `outputFormat`，默认 `raw`。
 - 新增 `ResultParser` trait。
 - 新增 `AgentFormatter` trait。
 - 新增 parser factory：`raw` / `codex-jsonl`。
-- 新增 formatter factory：`raw` / `codex` / `claude-code`。
+- 新增 formatter factory：`raw` / `codex-jsonl` / `claude-stream-json` / `hermes-acp-json-rpc`。
 - `RunStore` 支持 append `parsed_events.jsonl`。
 - `RunStore` 支持 append `observations.jsonl`。
 - `RunStore` 支持更新 `parser.json` 状态。
@@ -613,11 +683,11 @@ JobRequest(result_parser = codex-jsonl)
 - 保持当前 raw stdout/stderr。
 - 保持当前 `parser.json`。
 - 如果已有 `parsed_events.jsonl` 兼容结构，则继续输出。
-- `format=raw` 时，不输出 `AgentObservationRecord`。
+- `outputFormat=raw` 时，不输出 `AgentObservationRecord`。
 
 ### Phase 4: Codex formatter 映射到统一维度
 
-- 仅在 `format=codex` 时启用。
+- 仅在 `outputFormat=codex-jsonl` 时启用。
 - `thread.started` -> `agent_session`。
 - `turn.started` -> `llm_call_start`。
 - `turn.completed` -> `llm_call_end`。
@@ -629,7 +699,7 @@ JobRequest(result_parser = codex-jsonl)
 
 ### Phase 5: LLM request 可用性标记
 
-- 仅在 `format=codex` 时启用。
+- 仅在 `outputFormat=codex-jsonl` 时启用。
 - `llmRequest.messages` 默认不伪造，标记 `availability.messages=unobserved`。
 - `llmRequest.tools` 默认不伪造，标记 `availability.tools=unobserved`。
 - 如果 AHand 保存了 stdin prompt snapshot，则补 inferred user message。
@@ -639,8 +709,8 @@ JobRequest(result_parser = codex-jsonl)
 
 - 用 local sidecar 跑 Codex。
 - 验证 run artifact `stdout` 保留完整 raw Codex JSONL。
-- 验证默认不传 `--format` 时 caller-facing stdout 是 raw 输出。
-- 验证传 `--format codex` 时 caller-facing stdout 是统一 `AgentObservationRecord`。
+- 验证默认不传 `--output-format` 时 caller-facing stdout 是 raw 输出。
+- 验证传 `--output-format codex-jsonl` 时 caller-facing stdout 是统一 `AgentObservationRecord`。
 - 验证 `observations.jsonl` 是 formatted stdout 的 debug copy。
 - 验证 `parser.json` 有 thread id、事件数、parse error 数。
 - 验证 Codex 失败时仍能写 `error` 和 `result.json`。
@@ -655,8 +725,8 @@ JobRequest(result_parser = codex-jsonl)
 - 增加 fixture：最后一行无 newline。
 - 增加 fixture：无 messages/tools 时 availability 标记正确。
 - 增加 fixture：AHand stdin prompt 可推导为 user message。
-- 增加 fixture：默认 `format=raw` 不输出 observation envelope。
-- 增加 fixture：`format=codex` 输出统一 observation record。
+- 增加 fixture：默认 `outputFormat=raw` 不输出 observation envelope。
+- 增加 fixture：`outputFormat=codex-jsonl` 输出统一 observation record。
 
 ### Phase 8: Hub / SDK 输出
 
@@ -668,14 +738,14 @@ JobRequest(result_parser = codex-jsonl)
 
 - `pipe_stream + codex-jsonl` 仍能正常启动 Codex。
 - run artifact `stdout` 文件内容和当前版本一致，不被 parser 修改。
-- 不传 `--format` 时保持 raw 输出。
-- 传 `--format codex` 时使用 Codex formatter，并通过 caller-facing stdout 输出统一 `AgentObservationRecord`。
-- `format=codex` 模式下，每条 observation 都包含：
+- 不传 `--output-format` 时保持 raw 输出。
+- 传 `--output-format codex-jsonl` 时使用 Codex formatter，并通过 caller-facing stdout 输出统一 `AgentObservationRecord`。
+- `outputFormat=codex-jsonl` 模式下，每条 observation 都包含：
   - `agent`
   - `time`
   - `runtime`
   - `raw`
-- `format=codex` 模式下，observation 至少包含：
+- `outputFormat=codex-jsonl` 模式下，observation 至少包含：
   - `agent_session`
   - `llm_call_start`
   - `llm_call_delta`
@@ -732,7 +802,7 @@ printf 'Run tests\n' | cargo run -p ahandctl -- \
   exec \
   --execution-mode pipe_stream \
   --result-parser codex-jsonl \
-  --format codex \
+  --output-format codex-jsonl \
   --cwd "$ARTICLES" \
   --env PATH="$PATH" \
   "$CODEX" -- exec --skip-git-repo-check --json --cd "$ARTICLES" -

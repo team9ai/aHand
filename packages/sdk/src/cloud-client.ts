@@ -7,8 +7,8 @@
 //!
 //! The hub's wire contract (Task 1.4):
 //!   * POST `/api/control/jobs` — body is camelCase
-//!     `{deviceId, tool, args, cwd, env, timeoutMs, executionMode, resultParser, interactive,
-//!      correlationId}`; success returns `{jobId: string}` (201/202
+//!     `{deviceId, tool, args, cwd, env, timeoutMs, executionMode, inputFormat,
+//!      outputFormat, resultParser, interactive, correlationId}`; success returns `{jobId: string}` (201/202
 //!     on create, 200 on idempotent replay).
 //!   * GET  `/api/control/jobs/{id}/stream` — SSE with camelCase
 //!     JSON payloads per event. Event types: `stdout` `{chunk}`,
@@ -59,10 +59,22 @@ export interface SpawnParams {
   correlationId?: string;
   /** Explicit execution mode. Defaults to `"batch"`. */
   executionMode?: "batch" | "pty" | "pipe_stream";
+  /** Stdin format. Defaults to `"raw"`. */
+  inputFormat?: "raw" | "text" | "claude-stream-json" | "hermes-acp-json-rpc";
+  /** Caller-facing stdout format. Defaults to `"raw"`. */
+  outputFormat?: "raw" | "codex-jsonl" | "claude-stream-json" | "hermes-acp-json-rpc";
   /** Output parser hint. Defaults to `"raw"` on supported hubs. */
   resultParser?: "raw" | "codex-jsonl" | "claude-stream-json";
-  /** Agent formatter hint. Defaults to `"raw"` on supported hubs. */
+  /** @deprecated Use `outputFormat` instead. */
   format?: "raw" | "codex" | "claude-code";
+  executable?: string;
+  model?: string;
+  sessionId?: string;
+  prompt?: string;
+  instructions?: string;
+  maxTurns?: string;
+  systemPrompt?: string;
+  permissionMode?: string;
   /** @deprecated Use `executionMode: "pty"` instead. */
   interactive?: boolean;
 
@@ -76,6 +88,28 @@ export interface SpawnParams {
    * AbortSignal — aborting triggers best-effort
    * `POST /cancel` + closes SSE + rejects with an `abort` error.
    */
+  signal?: AbortSignal;
+}
+
+export interface SpawnAgentParams {
+  deviceId: string;
+  inputFormat: "claude-stream-json" | "hermes-acp-json-rpc";
+  outputFormat: "claude-stream-json" | "hermes-acp-json-rpc";
+  executable: string;
+  prompt: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  timeoutMs?: number;
+  model?: string;
+  sessionId?: string;
+  instructions?: string;
+  maxTurns?: string | number;
+  systemPrompt?: string;
+  permissionMode?: string;
+  correlationId?: string;
+  onObservation?: (record: unknown) => void;
+  onStdout?: (chunk: string) => void;
+  onStderr?: (chunk: string) => void;
   signal?: AbortSignal;
 }
 
@@ -318,8 +352,24 @@ export class CloudClient {
     if (p.cwd !== undefined) requestBody.cwd = p.cwd;
     if (p.env !== undefined) requestBody.env = p.env;
     if (p.timeoutMs !== undefined) requestBody.timeoutMs = p.timeoutMs;
+    if (p.inputFormat !== undefined) requestBody.inputFormat = p.inputFormat;
+    if (p.outputFormat !== undefined) requestBody.outputFormat = p.outputFormat;
     if (p.resultParser !== undefined) requestBody.resultParser = p.resultParser;
     if (p.format !== undefined) requestBody.format = p.format;
+    if (p.executable !== undefined) requestBody.executable = p.executable;
+    if (p.model !== undefined) requestBody.model = p.model;
+    if (p.sessionId !== undefined) requestBody.sessionId = p.sessionId;
+    if (p.prompt !== undefined) requestBody.prompt = p.prompt;
+    if (p.instructions !== undefined) {
+      requestBody.instructions = p.instructions;
+    }
+    if (p.maxTurns !== undefined) requestBody.maxTurns = p.maxTurns;
+    if (p.systemPrompt !== undefined) {
+      requestBody.systemPrompt = p.systemPrompt;
+    }
+    if (p.permissionMode !== undefined) {
+      requestBody.permissionMode = p.permissionMode;
+    }
     if (p.correlationId !== undefined) requestBody.correlationId = p.correlationId;
 
     let postRes: Response;
@@ -361,6 +411,86 @@ export class CloudClient {
     } finally {
       p.signal?.removeEventListener("abort", abortHandler);
     }
+  }
+
+  /** Dispatch an agent stdio format job without hand-building the env contract. */
+  async spawnAgent(p: SpawnAgentParams): Promise<SpawnResult> {
+    if (p.inputFormat !== p.outputFormat) {
+      throw new CloudClientError(
+        "bad_request",
+        "spawnAgent requires matching inputFormat and outputFormat",
+      );
+    }
+
+    const env: Record<string, string> = {
+      ...(p.env ?? {}),
+      AHAND_INPUT_FORMAT: p.inputFormat,
+      AHAND_OUTPUT_FORMAT: p.outputFormat,
+      AHAND_AGENT_EXECUTABLE: p.executable,
+      AHAND_AGENT_PROMPT: p.prompt,
+    };
+    if (p.model !== undefined) env.AHAND_AGENT_MODEL = p.model;
+    if (p.sessionId !== undefined) env.AHAND_AGENT_SESSION_ID = p.sessionId;
+    if (p.instructions !== undefined) {
+      env.AHAND_AGENT_INSTRUCTIONS = p.instructions;
+    }
+    if (p.maxTurns !== undefined) {
+      env.AHAND_AGENT_MAX_TURNS = String(p.maxTurns);
+    }
+    if (p.systemPrompt !== undefined) {
+      env.AHAND_AGENT_SYSTEM_PROMPT = p.systemPrompt;
+    }
+    if (p.permissionMode !== undefined) {
+      env.AHAND_AGENT_PERMISSION_MODE = p.permissionMode;
+    }
+
+    const resultParser =
+      p.outputFormat === "claude-stream-json" ? "claude-stream-json" : "raw";
+    const legacyFormat =
+      p.outputFormat === "claude-stream-json" ? "claude-code" : "raw";
+
+    let observationBuffer = "";
+    return this.spawn({
+      deviceId: p.deviceId,
+      tool: p.executable,
+      cwd: p.cwd,
+      env,
+      timeoutMs: p.timeoutMs,
+      correlationId: p.correlationId,
+      executionMode: "pipe_stream",
+      inputFormat: p.inputFormat,
+      outputFormat: p.outputFormat,
+      resultParser,
+      format: legacyFormat,
+      executable: p.executable,
+      model: p.model,
+      sessionId: p.sessionId,
+      prompt: p.prompt,
+      instructions: p.instructions,
+      maxTurns: p.maxTurns === undefined ? undefined : String(p.maxTurns),
+      systemPrompt: p.systemPrompt,
+      permissionMode: p.permissionMode,
+      signal: p.signal,
+      onStdout: (chunk) => {
+        p.onStdout?.(chunk);
+        if (!p.onObservation) return;
+        observationBuffer += chunk;
+        let newline = observationBuffer.indexOf("\n");
+        while (newline !== -1) {
+          const line = observationBuffer.slice(0, newline).trim();
+          observationBuffer = observationBuffer.slice(newline + 1);
+          if (line.length > 0) {
+            try {
+              p.onObservation(JSON.parse(line));
+            } catch {
+              // Leave malformed lines to the raw stdout callback.
+            }
+          }
+          newline = observationBuffer.indexOf("\n");
+        }
+      },
+      onStderr: p.onStderr,
+    });
   }
 
   /**

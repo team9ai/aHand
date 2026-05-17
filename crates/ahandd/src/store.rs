@@ -129,6 +129,19 @@ impl RunStore {
         self.append_to_file(job_id, "observations.jsonl", &line);
     }
 
+    /// Append bytes to an arbitrary per-run artifact file.
+    pub fn append_artifact(&self, job_id: &str, name: &str, chunk: &[u8]) {
+        self.append_to_file(job_id, name, chunk);
+    }
+
+    /// Write a JSON value to an arbitrary per-run artifact file.
+    pub fn write_json_artifact(&self, job_id: &str, name: &str, value: &serde_json::Value) {
+        let path = self.data_dir.join("runs").join(job_id).join(name);
+        if let Err(e) = write_json(&path, value) {
+            warn!(job_id = %job_id, file = name, error = %e, "failed to write JSON artifact");
+        }
+    }
+
     /// Write the final result.json for a completed run.
     pub fn finish_run(&self, job_id: &str, exit_code: i32, error: &str) {
         let run_dir = self.data_dir.join("runs").join(job_id);

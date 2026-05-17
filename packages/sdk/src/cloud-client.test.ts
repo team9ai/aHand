@@ -495,6 +495,134 @@ describe("CloudClient.spawn", () => {
   });
 });
 
+describe("CloudClient.spawnAgent", () => {
+  it("builds Hermes ACP env and parses observation JSONL", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ jobId: "job-hermes" }, 201),
+      () =>
+        sseResponse([
+          sseEvent("stdout", {
+            chunk: "{\"kind\":\"agent_session\",\"agent\":{\"agentSessionId\":\"s-1\"}}\n",
+          }),
+          sseEvent("finished", { exitCode: 0, durationMs: 9 }),
+        ]),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const observations: unknown[] = [];
+
+    const result = await client.spawnAgent({
+      deviceId: "dev-1",
+      inputFormat: "hermes-acp-json-rpc",
+      outputFormat: "hermes-acp-json-rpc",
+      executable: "/usr/local/bin/hermes",
+      cwd: "/repo",
+      prompt: "inspect",
+      model: "provider:model",
+      sessionId: "s-previous",
+      instructions: "Use repo conventions.",
+      env: { PATH: "/usr/bin" },
+      onObservation: (record) => observations.push(record),
+    });
+
+    expect(result).toEqual({ exitCode: 0, durationMs: 9 });
+    expect(observations).toHaveLength(1);
+    expect(observations[0]).toMatchObject({ kind: "agent_session" });
+
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body).toMatchObject({
+      deviceId: "dev-1",
+      tool: "/usr/local/bin/hermes",
+      cwd: "/repo",
+      executionMode: "pipe_stream",
+      inputFormat: "hermes-acp-json-rpc",
+      outputFormat: "hermes-acp-json-rpc",
+      resultParser: "raw",
+      format: "raw",
+      interactive: false,
+      executable: "/usr/local/bin/hermes",
+      prompt: "inspect",
+      model: "provider:model",
+      sessionId: "s-previous",
+      instructions: "Use repo conventions.",
+      env: {
+        PATH: "/usr/bin",
+        AHAND_INPUT_FORMAT: "hermes-acp-json-rpc",
+        AHAND_OUTPUT_FORMAT: "hermes-acp-json-rpc",
+        AHAND_AGENT_EXECUTABLE: "/usr/local/bin/hermes",
+        AHAND_AGENT_PROMPT: "inspect",
+        AHAND_AGENT_MODEL: "provider:model",
+        AHAND_AGENT_SESSION_ID: "s-previous",
+        AHAND_AGENT_INSTRUCTIONS: "Use repo conventions.",
+      },
+    });
+  });
+
+  it("builds Claude Code env and typed fields", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ jobId: "job-claude" }, 201),
+      () =>
+        sseResponse([
+          sseEvent("stdout", {
+            chunk: "{\"kind\":\"agent_session\",\"agent\":{\"agentSessionId\":\"s-1\"}}\n",
+          }),
+          sseEvent("finished", { exitCode: 0, durationMs: 12 }),
+        ]),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const result = await client.spawnAgent({
+      deviceId: "dev-1",
+      inputFormat: "claude-stream-json",
+      outputFormat: "claude-stream-json",
+      executable: "/usr/local/bin/claude",
+      cwd: "/repo",
+      prompt: "review",
+      model: "claude-sonnet",
+      sessionId: "claude-session",
+      instructions: "Use repo conventions.",
+      maxTurns: 4,
+      systemPrompt: "You run inside AHand.",
+      permissionMode: "default",
+      env: { PATH: "/usr/bin" },
+    });
+
+    expect(result).toEqual({ exitCode: 0, durationMs: 12 });
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body).toMatchObject({
+      deviceId: "dev-1",
+      tool: "/usr/local/bin/claude",
+      cwd: "/repo",
+      executionMode: "pipe_stream",
+      inputFormat: "claude-stream-json",
+      outputFormat: "claude-stream-json",
+      resultParser: "claude-stream-json",
+      format: "claude-code",
+      interactive: false,
+      executable: "/usr/local/bin/claude",
+      prompt: "review",
+      model: "claude-sonnet",
+      sessionId: "claude-session",
+      instructions: "Use repo conventions.",
+      maxTurns: "4",
+      systemPrompt: "You run inside AHand.",
+      permissionMode: "default",
+      env: {
+        PATH: "/usr/bin",
+        AHAND_INPUT_FORMAT: "claude-stream-json",
+        AHAND_OUTPUT_FORMAT: "claude-stream-json",
+        AHAND_AGENT_EXECUTABLE: "/usr/local/bin/claude",
+        AHAND_AGENT_PROMPT: "review",
+        AHAND_AGENT_MODEL: "claude-sonnet",
+        AHAND_AGENT_SESSION_ID: "claude-session",
+        AHAND_AGENT_INSTRUCTIONS: "Use repo conventions.",
+        AHAND_AGENT_MAX_TURNS: "4",
+        AHAND_AGENT_SYSTEM_PROMPT: "You run inside AHand.",
+        AHAND_AGENT_PERMISSION_MODE: "default",
+      },
+    });
+  });
+});
+
 describe("CloudClient.cancel", () => {
   it("happy: POSTs cancel endpoint and resolves", async () => {
     const { fn, calls } = mockFetch([() => new Response(null, { status: 202 })]);

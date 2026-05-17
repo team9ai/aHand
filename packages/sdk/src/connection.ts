@@ -98,6 +98,10 @@ export class DeviceConnection extends EventEmitter {
         // mode for new receivers.
         interactive: false,
         executionMode: ExecutionMode.EXECUTION_MODE_BATCH,
+        resultParser: "raw",
+        format: "raw",
+        inputFormat: "raw",
+        outputFormat: "raw",
       },
     });
 

@@ -22,10 +22,42 @@ struct ExecRequest {
     cwd: Option<String>,
     timeout_ms: u64,
     env: HashMap<String, String>,
+    input_format: String,
+    output_format: String,
     result_parser: String,
     format: String,
     tool: String,
     args: Vec<String>,
+}
+
+struct HermesRunArgs {
+    hermes_path: String,
+    prompt: Option<String>,
+    prompt_file: Option<String>,
+    cwd: Option<String>,
+    timeout_ms: u64,
+    model: Option<String>,
+    session_id: Option<String>,
+    env: Vec<String>,
+    instructions: Option<String>,
+    instructions_file: Option<String>,
+}
+
+struct ClaudeCodeRunArgs {
+    claude_path: String,
+    prompt: Option<String>,
+    prompt_file: Option<String>,
+    cwd: Option<String>,
+    timeout_ms: u64,
+    model: Option<String>,
+    session_id: Option<String>,
+    max_turns: Option<String>,
+    system_prompt: Option<String>,
+    system_prompt_file: Option<String>,
+    permission_mode: Option<String>,
+    env: Vec<String>,
+    instructions: Option<String>,
+    instructions_file: Option<String>,
 }
 
 #[derive(Parser)]
@@ -59,10 +91,16 @@ enum Cmd {
         /// Environment override in KEY=VALUE form; repeatable
         #[arg(long = "env")]
         env: Vec<String>,
+        /// Stdin format: raw, text, claude-stream-json, or hermes-acp-json-rpc
+        #[arg(long = "input-format", default_value = "raw")]
+        input_format: String,
+        /// Stdout format: raw, codex-jsonl, claude-stream-json, or hermes-acp-json-rpc
+        #[arg(long = "output-format", default_value = "raw")]
+        output_format: String,
         /// Output parser hint: raw, codex-jsonl, or claude-stream-json
         #[arg(long = "result-parser", default_value = "raw")]
         result_parser: String,
-        /// Agent formatter hint: raw, codex, or claude-code
+        /// Deprecated formatter hint: raw, codex, or claude-code
         #[arg(long = "format", default_value = "raw")]
         format: String,
         /// Tool to execute
@@ -70,6 +108,82 @@ enum Cmd {
         /// Arguments to the tool
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
+    },
+    /// Send a Hermes ACP prompt through ahandd
+    Hermes {
+        /// Hermes executable path
+        hermes_path: String,
+        /// Prompt text. Use --prompt-file for larger prompts.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Read prompt text from a file
+        #[arg(long)]
+        prompt_file: Option<String>,
+        /// Working directory for the Hermes session
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Job timeout in milliseconds (0 = no timeout)
+        #[arg(long, default_value = "0")]
+        timeout_ms: u64,
+        /// Hermes model id
+        #[arg(long)]
+        model: Option<String>,
+        /// Resume an existing Hermes ACP session id
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Environment override in KEY=VALUE form; repeatable
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// Optional AHand instructions written as AGENTS.md/AGENTS.ahand.md in cwd
+        #[arg(long)]
+        instructions: Option<String>,
+        /// Read optional AHand instructions from a file
+        #[arg(long)]
+        instructions_file: Option<String>,
+    },
+    /// Send a Claude Code stream-json prompt through ahandd
+    ClaudeCode {
+        /// Claude executable path
+        claude_path: String,
+        /// Prompt text. Use --prompt-file for larger prompts.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Read prompt text from a file
+        #[arg(long)]
+        prompt_file: Option<String>,
+        /// Working directory for the Claude Code session
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Job timeout in milliseconds (0 = no timeout)
+        #[arg(long, default_value = "0")]
+        timeout_ms: u64,
+        /// Claude model id
+        #[arg(long)]
+        model: Option<String>,
+        /// Resume an existing Claude Code session id
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Maximum Claude turns
+        #[arg(long)]
+        max_turns: Option<String>,
+        /// Extra system prompt appended via Claude Code
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Read extra system prompt from a file
+        #[arg(long)]
+        system_prompt_file: Option<String>,
+        /// Claude permission mode, for example default or bypassPermissions
+        #[arg(long)]
+        permission_mode: Option<String>,
+        /// Environment override in KEY=VALUE form; repeatable
+        #[arg(long = "env")]
+        env: Vec<String>,
+        /// Optional AHand instructions written as CLAUDE.md/CLAUDE.ahand.md in cwd
+        #[arg(long)]
+        instructions: Option<String>,
+        /// Read optional AHand instructions from a file
+        #[arg(long)]
+        instructions_file: Option<String>,
     },
     /// Cancel a running job
     Cancel {
@@ -269,6 +383,8 @@ async fn main() -> anyhow::Result<()> {
                 cwd,
                 timeout_ms,
                 env,
+                input_format,
+                output_format,
                 result_parser,
                 format,
                 tool,
@@ -281,11 +397,79 @@ async fn main() -> anyhow::Result<()> {
                         cwd,
                         timeout_ms,
                         env: parse_env(env)?,
+                        input_format: parse_input_format(&input_format)?,
+                        output_format: parse_output_format(&output_format)?,
                         result_parser: parse_result_parser(&result_parser)?,
                         format: parse_format_for_parser(&format, &result_parser)?,
                         tool,
                         args: tool_args,
                     },
+                )
+                .await?;
+            }
+            Cmd::Hermes {
+                hermes_path,
+                prompt,
+                prompt_file,
+                cwd,
+                timeout_ms,
+                model,
+                session_id,
+                env,
+                instructions,
+                instructions_file,
+            } => {
+                ipc_exec(
+                    ipc_path,
+                    hermes_exec_request(HermesRunArgs {
+                        hermes_path,
+                        prompt,
+                        prompt_file,
+                        cwd,
+                        timeout_ms,
+                        model,
+                        session_id,
+                        env,
+                        instructions,
+                        instructions_file,
+                    })?,
+                )
+                .await?;
+            }
+            Cmd::ClaudeCode {
+                claude_path,
+                prompt,
+                prompt_file,
+                cwd,
+                timeout_ms,
+                model,
+                session_id,
+                max_turns,
+                system_prompt,
+                system_prompt_file,
+                permission_mode,
+                env,
+                instructions,
+                instructions_file,
+            } => {
+                ipc_exec(
+                    ipc_path,
+                    claude_code_exec_request(ClaudeCodeRunArgs {
+                        claude_path,
+                        prompt,
+                        prompt_file,
+                        cwd,
+                        timeout_ms,
+                        model,
+                        session_id,
+                        max_turns,
+                        system_prompt,
+                        system_prompt_file,
+                        permission_mode,
+                        env,
+                        instructions,
+                        instructions_file,
+                    })?,
                 )
                 .await?;
             }
@@ -324,6 +508,8 @@ async fn main() -> anyhow::Result<()> {
                 cwd,
                 timeout_ms,
                 env,
+                input_format,
+                output_format,
                 result_parser,
                 format,
                 tool,
@@ -336,11 +522,79 @@ async fn main() -> anyhow::Result<()> {
                         cwd,
                         timeout_ms,
                         env: parse_env(env)?,
+                        input_format: parse_input_format(&input_format)?,
+                        output_format: parse_output_format(&output_format)?,
                         result_parser: parse_result_parser(&result_parser)?,
                         format: parse_format_for_parser(&format, &result_parser)?,
                         tool,
                         args: tool_args,
                     },
+                )
+                .await?;
+            }
+            Cmd::Hermes {
+                hermes_path,
+                prompt,
+                prompt_file,
+                cwd,
+                timeout_ms,
+                model,
+                session_id,
+                env,
+                instructions,
+                instructions_file,
+            } => {
+                ws_exec(
+                    &args.url,
+                    hermes_exec_request(HermesRunArgs {
+                        hermes_path,
+                        prompt,
+                        prompt_file,
+                        cwd,
+                        timeout_ms,
+                        model,
+                        session_id,
+                        env,
+                        instructions,
+                        instructions_file,
+                    })?,
+                )
+                .await?;
+            }
+            Cmd::ClaudeCode {
+                claude_path,
+                prompt,
+                prompt_file,
+                cwd,
+                timeout_ms,
+                model,
+                session_id,
+                max_turns,
+                system_prompt,
+                system_prompt_file,
+                permission_mode,
+                env,
+                instructions,
+                instructions_file,
+            } => {
+                ws_exec(
+                    &args.url,
+                    claude_code_exec_request(ClaudeCodeRunArgs {
+                        claude_path,
+                        prompt,
+                        prompt_file,
+                        cwd,
+                        timeout_ms,
+                        model,
+                        session_id,
+                        max_turns,
+                        system_prompt,
+                        system_prompt_file,
+                        permission_mode,
+                        env,
+                        instructions,
+                        instructions_file,
+                    })?,
                 )
                 .await?;
             }
@@ -432,6 +686,28 @@ fn parse_result_parser(value: &str) -> anyhow::Result<String> {
     }
 }
 
+fn parse_input_format(value: &str) -> anyhow::Result<String> {
+    let normalized = value.trim();
+    if ahand_protocol::is_known_input_format(normalized) {
+        Ok(normalized.to_string())
+    } else {
+        anyhow::bail!(
+            "invalid input format {value:?}; use raw, text, claude-stream-json, or hermes-acp-json-rpc"
+        );
+    }
+}
+
+fn parse_output_format(value: &str) -> anyhow::Result<String> {
+    let normalized = value.trim();
+    if ahand_protocol::is_known_output_format(normalized) {
+        Ok(normalized.to_string())
+    } else {
+        anyhow::bail!(
+            "invalid output format {value:?}; use raw, codex-jsonl, claude-stream-json, or hermes-acp-json-rpc"
+        );
+    }
+}
+
 fn parse_format(value: &str) -> anyhow::Result<String> {
     let normalized = value.trim();
     if ahand_protocol::is_known_format(normalized) {
@@ -469,6 +745,132 @@ fn build_job_request(job_id: String, exec: ExecRequest) -> JobRequest {
         execution_mode: exec.execution_mode as i32,
         result_parser: exec.result_parser,
         format: exec.format,
+        input_format: exec.input_format,
+        output_format: exec.output_format,
+    }
+}
+
+fn hermes_exec_request(args: HermesRunArgs) -> anyhow::Result<ExecRequest> {
+    let prompt = read_inline_or_file(args.prompt, args.prompt_file, "prompt")?;
+    let instructions =
+        read_optional_inline_or_file(args.instructions, args.instructions_file, "instructions")?;
+    let mut env = parse_env(args.env)?;
+    env.insert(
+        "AHAND_INPUT_FORMAT".to_string(),
+        ahand_protocol::INPUT_FORMAT_HERMES_ACP_JSON_RPC.to_string(),
+    );
+    env.insert(
+        "AHAND_OUTPUT_FORMAT".to_string(),
+        ahand_protocol::OUTPUT_FORMAT_HERMES_ACP_JSON_RPC.to_string(),
+    );
+    env.insert(
+        "AHAND_AGENT_EXECUTABLE".to_string(),
+        args.hermes_path.clone(),
+    );
+    env.insert("AHAND_AGENT_PROMPT".to_string(), prompt);
+    if let Some(model) = args.model {
+        env.insert("AHAND_AGENT_MODEL".to_string(), model);
+    }
+    if let Some(session_id) = args.session_id {
+        env.insert("AHAND_AGENT_SESSION_ID".to_string(), session_id);
+    }
+    if let Some(instructions) = instructions {
+        env.insert("AHAND_AGENT_INSTRUCTIONS".to_string(), instructions);
+    }
+
+    Ok(ExecRequest {
+        execution_mode: ExecutionMode::PipeStream,
+        cwd: args.cwd,
+        timeout_ms: args.timeout_ms,
+        env,
+        input_format: ahand_protocol::INPUT_FORMAT_HERMES_ACP_JSON_RPC.to_string(),
+        output_format: ahand_protocol::OUTPUT_FORMAT_HERMES_ACP_JSON_RPC.to_string(),
+        result_parser: ahand_protocol::RESULT_PARSER_RAW.to_string(),
+        format: ahand_protocol::FORMAT_RAW.to_string(),
+        tool: args.hermes_path,
+        args: Vec::new(),
+    })
+}
+
+fn claude_code_exec_request(args: ClaudeCodeRunArgs) -> anyhow::Result<ExecRequest> {
+    let prompt = read_inline_or_file(args.prompt, args.prompt_file, "prompt")?;
+    let system_prompt =
+        read_optional_inline_or_file(args.system_prompt, args.system_prompt_file, "system-prompt")?;
+    let instructions =
+        read_optional_inline_or_file(args.instructions, args.instructions_file, "instructions")?;
+    let mut env = parse_env(args.env)?;
+    env.insert(
+        "AHAND_INPUT_FORMAT".to_string(),
+        ahand_protocol::INPUT_FORMAT_CLAUDE_STREAM_JSON.to_string(),
+    );
+    env.insert(
+        "AHAND_OUTPUT_FORMAT".to_string(),
+        ahand_protocol::OUTPUT_FORMAT_CLAUDE_STREAM_JSON.to_string(),
+    );
+    env.insert(
+        "AHAND_AGENT_EXECUTABLE".to_string(),
+        args.claude_path.clone(),
+    );
+    env.insert("AHAND_AGENT_PROMPT".to_string(), prompt);
+    if let Some(model) = args.model {
+        env.insert("AHAND_AGENT_MODEL".to_string(), model);
+    }
+    if let Some(session_id) = args.session_id {
+        env.insert("AHAND_AGENT_SESSION_ID".to_string(), session_id);
+    }
+    if let Some(max_turns) = args.max_turns {
+        env.insert("AHAND_AGENT_MAX_TURNS".to_string(), max_turns);
+    }
+    if let Some(system_prompt) = system_prompt {
+        env.insert("AHAND_AGENT_SYSTEM_PROMPT".to_string(), system_prompt);
+    }
+    if let Some(permission_mode) = args.permission_mode {
+        env.insert("AHAND_AGENT_PERMISSION_MODE".to_string(), permission_mode);
+    }
+    if let Some(instructions) = instructions {
+        env.insert("AHAND_AGENT_INSTRUCTIONS".to_string(), instructions);
+    }
+
+    Ok(ExecRequest {
+        execution_mode: ExecutionMode::PipeStream,
+        cwd: args.cwd,
+        timeout_ms: args.timeout_ms,
+        env,
+        input_format: ahand_protocol::INPUT_FORMAT_CLAUDE_STREAM_JSON.to_string(),
+        output_format: ahand_protocol::OUTPUT_FORMAT_CLAUDE_STREAM_JSON.to_string(),
+        result_parser: ahand_protocol::RESULT_PARSER_CLAUDE_STREAM_JSON.to_string(),
+        format: ahand_protocol::FORMAT_CLAUDE_CODE.to_string(),
+        tool: args.claude_path,
+        args: Vec::new(),
+    })
+}
+
+fn read_inline_or_file(
+    inline: Option<String>,
+    file: Option<String>,
+    label: &str,
+) -> anyhow::Result<String> {
+    match (inline, file) {
+        (Some(_), Some(_)) => anyhow::bail!("use either --{label} or --{label}-file, not both"),
+        (Some(value), None) if !value.trim().is_empty() => Ok(value),
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|error| anyhow::anyhow!("failed to read {label} file {path}: {error}")),
+        _ => anyhow::bail!("missing --{label} or --{label}-file"),
+    }
+}
+
+fn read_optional_inline_or_file(
+    inline: Option<String>,
+    file: Option<String>,
+    label: &str,
+) -> anyhow::Result<Option<String>> {
+    match (inline, file) {
+        (Some(_), Some(_)) => anyhow::bail!("use either --{label} or --{label}-file, not both"),
+        (Some(value), None) if !value.trim().is_empty() => Ok(Some(value)),
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("failed to read {label} file {path}: {error}")),
+        _ => Ok(None),
     }
 }
 

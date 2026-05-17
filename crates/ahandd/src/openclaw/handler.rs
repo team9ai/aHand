@@ -907,6 +907,8 @@ fn build_job_request(
         execution_mode: ahand_protocol::ExecutionMode::Batch as i32,
         result_parser: String::new(),
         format: String::new(),
+        input_format: String::new(),
+        output_format: String::new(),
     }
 }
 

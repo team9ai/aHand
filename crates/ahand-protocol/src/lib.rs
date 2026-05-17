@@ -14,6 +14,16 @@ pub const FORMAT_RAW: &str = "raw";
 pub const FORMAT_CODEX: &str = "codex";
 pub const FORMAT_CLAUDE_CODE: &str = "claude-code";
 
+pub const INPUT_FORMAT_RAW: &str = "raw";
+pub const INPUT_FORMAT_TEXT: &str = "text";
+pub const INPUT_FORMAT_CLAUDE_STREAM_JSON: &str = "claude-stream-json";
+pub const INPUT_FORMAT_HERMES_ACP_JSON_RPC: &str = "hermes-acp-json-rpc";
+
+pub const OUTPUT_FORMAT_RAW: &str = "raw";
+pub const OUTPUT_FORMAT_CODEX_JSONL: &str = "codex-jsonl";
+pub const OUTPUT_FORMAT_CLAUDE_STREAM_JSON: &str = "claude-stream-json";
+pub const OUTPUT_FORMAT_HERMES_ACP_JSON_RPC: &str = "hermes-acp-json-rpc";
+
 pub fn resolve_job_execution_mode(job: &JobRequest) -> ExecutionMode {
     match ExecutionMode::try_from(job.execution_mode).unwrap_or(ExecutionMode::Unspecified) {
         ExecutionMode::Unspecified => {
@@ -40,6 +50,47 @@ pub fn is_known_result_parser(parser: &str) -> bool {
     matches!(
         parser,
         RESULT_PARSER_RAW | RESULT_PARSER_CODEX_JSONL | RESULT_PARSER_CLAUDE_STREAM_JSON
+    )
+}
+
+pub fn resolve_job_input_format(job: &JobRequest) -> &str {
+    let format = job.input_format.trim();
+    if format.is_empty() {
+        INPUT_FORMAT_RAW
+    } else {
+        format
+    }
+}
+
+pub fn is_known_input_format(format: &str) -> bool {
+    matches!(
+        format,
+        INPUT_FORMAT_RAW
+            | INPUT_FORMAT_TEXT
+            | INPUT_FORMAT_CLAUDE_STREAM_JSON
+            | INPUT_FORMAT_HERMES_ACP_JSON_RPC
+    )
+}
+
+pub fn resolve_job_output_format(job: &JobRequest) -> &str {
+    let output_format = job.output_format.trim();
+    if !output_format.is_empty() {
+        return output_format;
+    }
+    match resolve_job_format(job) {
+        FORMAT_CODEX => OUTPUT_FORMAT_CODEX_JSONL,
+        FORMAT_CLAUDE_CODE => OUTPUT_FORMAT_CLAUDE_STREAM_JSON,
+        _ => OUTPUT_FORMAT_RAW,
+    }
+}
+
+pub fn is_known_output_format(format: &str) -> bool {
+    matches!(
+        format,
+        OUTPUT_FORMAT_RAW
+            | OUTPUT_FORMAT_CODEX_JSONL
+            | OUTPUT_FORMAT_CLAUDE_STREAM_JSON
+            | OUTPUT_FORMAT_HERMES_ACP_JSON_RPC
     )
 }
 

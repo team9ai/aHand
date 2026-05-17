@@ -207,6 +207,8 @@ fn golden_job_request() {
         execution_mode: ExecutionMode::Unspecified as i32,
         result_parser: String::new(),
         format: String::new(),
+        input_format: String::new(),
+        output_format: String::new(),
     }));
     assert_golden("job_request", &env);
 }

@@ -481,8 +481,39 @@ async fn spawn_ipc_job(
     store: Option<Arc<RunStore>>,
 ) {
     let job_id = req.job_id.clone();
-    let execution_mode = resolve_job_execution_mode(&req);
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
+    if crate::agent::claude_code::is_claude_code_job(&req) {
+        registry.register(job_id.clone(), cancel_tx).await;
+        let active = registry.active_count().await;
+        info!(job_id = %job_id, active_jobs = active, input_format = "claude-stream-json", output_format = "claude-stream-json", "IPC: Claude Code format job accepted");
+
+        tokio::spawn(async move {
+            let _permit = registry.acquire_permit().await;
+            let (exit_code, error) =
+                crate::agent::claude_code::run_claude_code(device_id, req, tx, cancel_rx, store)
+                    .await;
+            registry.remove(&job_id).await;
+            registry.mark_completed(job_id, exit_code, error).await;
+        });
+        return;
+    }
+    if crate::agent::hermes_acp::is_hermes_acp_job(&req) {
+        registry.register(job_id.clone(), cancel_tx).await;
+        let active = registry.active_count().await;
+        info!(job_id = %job_id, active_jobs = active, input_format = "hermes-acp-json-rpc", output_format = "hermes-acp-json-rpc", "IPC: Hermes ACP format job accepted");
+
+        tokio::spawn(async move {
+            let _permit = registry.acquire_permit().await;
+            let (exit_code, error) =
+                crate::agent::hermes_acp::run_hermes_acp(device_id, req, tx, cancel_rx, store)
+                    .await;
+            registry.remove(&job_id).await;
+            registry.mark_completed(job_id, exit_code, error).await;
+        });
+        return;
+    }
+
+    let execution_mode = resolve_job_execution_mode(&req);
 
     match execution_mode {
         ExecutionMode::Batch => {
