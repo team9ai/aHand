@@ -20,7 +20,7 @@ use crate::device_identity::DeviceIdentity;
 use crate::executor::{self, EnvelopeSink as _};
 use crate::file_manager::FileManager;
 use crate::outbox::{Outbox, prepare_outbound};
-use crate::plugin_runtime::{CapabilityKind, CapabilityUnavailable};
+use crate::plugin_runtime::{CapabilityKind, CapabilityUnavailable, JobProvider};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::{Direction, RunStore};
@@ -915,6 +915,25 @@ fn file_unavailable_response(
     )
 }
 
+fn managed_runtime_interactive_rejection(
+    device_id: &str,
+    req: &ahand_protocol::JobRequest,
+) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::JobRejected(JobRejected {
+            job_id: req.job_id.clone(),
+            reason: format!(
+                "managed runtime tool {} does not support interactive PTY jobs",
+                req.tool
+            ),
+        })),
+        ..Default::default()
+    }
+}
+
 /// Handle an incoming JobRequest with idempotency + session mode check.
 #[allow(clippy::too_many_arguments)]
 async fn handle_job_request<T>(
@@ -932,20 +951,28 @@ async fn handle_job_request<T>(
 ) where
     T: crate::executor::EnvelopeSink,
 {
-    let capability_router = match crate::plugin_runtime::build_router(browser_mgr, file_mgr).await {
-        Ok(router) => router,
+    let provider_registry =
+        match crate::plugin_runtime::build_provider_registry(browser_mgr, file_mgr).await {
+            Ok(registry) => registry,
+            Err(err) => {
+                reject_job_for_capability_error(
+                    device_id,
+                    &req,
+                    tx,
+                    format!("exec capability unavailable: failed to inspect host resources: {err}"),
+                );
+                return;
+            }
+        };
+    let job_provider = match provider_registry.resolve_job_provider(&req.tool) {
+        Ok(provider) => provider,
         Err(err) => {
-            reject_job_for_capability_error(
-                device_id,
-                &req,
-                tx,
-                format!("exec capability unavailable: failed to inspect host resources: {err}"),
-            );
+            reject_job_for_capability_error(device_id, &req, tx, err.to_protocol_message());
             return;
         }
     };
-    if let Err(unavailable) = capability_router.ensure(CapabilityKind::Exec) {
-        reject_job_for_capability_error(device_id, &req, tx, unavailable.to_protocol_message());
+    if req.interactive && matches!(job_provider, JobProvider::ManagedRuntime { .. }) {
+        let _ = tx.send(managed_runtime_interactive_rejection(device_id, &req));
         return;
     }
 
@@ -991,7 +1018,7 @@ async fn handle_job_request<T>(
             let _ = tx.send(reject_env);
         }
         SessionDecision::Allow => {
-            spawn_job(device_id, req, tx, registry, store).await;
+            spawn_job(device_id, req, job_provider, tx, registry, store).await;
         }
         SessionDecision::NeedsApproval {
             reason,
@@ -1026,13 +1053,14 @@ async fn handle_job_request<T>(
             let timeout = amgr.default_timeout();
             let job_id = req.job_id.clone();
             let cuid = caller_uid.to_string();
+            let job_provider = job_provider.clone();
 
             tokio::spawn(async move {
                 let result = tokio::time::timeout(timeout, approval_rx).await;
                 match result {
                     Ok(Ok(resp)) if resp.approved => {
                         info!(job_id = %job_id, "approval granted");
-                        spawn_job(&did, req, &tx_clone, &reg, &st).await;
+                        spawn_job(&did, req, job_provider, &tx_clone, &reg, &st).await;
                     }
                     Ok(Ok(resp)) => {
                         // Denied — record refusal if reason provided.
@@ -1082,6 +1110,7 @@ async fn handle_job_request<T>(
 async fn spawn_job<T>(
     device_id: &str,
     req: ahand_protocol::JobRequest,
+    provider: JobProvider,
     tx: &T,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
@@ -1098,6 +1127,11 @@ async fn spawn_job<T>(
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
 
     if interactive {
+        if matches!(provider, JobProvider::ManagedRuntime { .. }) {
+            let _ = tx.send(managed_runtime_interactive_rejection(device_id, &req));
+            return;
+        }
+
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<executor::StdinInput>();
         reg.register_interactive(job_id.clone(), cancel_tx, stdin_tx)
             .await;
@@ -1120,7 +1154,14 @@ async fn spawn_job<T>(
 
         tokio::spawn(async move {
             let _permit = reg.acquire_permit().await;
-            let (exit_code, error) = executor::run_job(did, req, tx_clone, cancel_rx, st).await;
+            let (exit_code, error) = match provider {
+                JobProvider::DefaultExec => {
+                    executor::run_job(did, req, tx_clone, cancel_rx, st).await
+                }
+                JobProvider::ManagedRuntime { target, .. } => {
+                    executor::run_job_with_target(did, req, target, tx_clone, cancel_rx, st).await
+                }
+            };
             reg.remove(&job_id).await;
             reg.mark_completed(job_id, exit_code, error).await;
         });
@@ -1191,8 +1232,13 @@ async fn handle_browser_request<T>(
         "received browser request"
     );
 
-    let capability_router = match crate::plugin_runtime::build_router(browser_mgr, file_mgr).await {
-        Ok(router) => router,
+    let provider_registry = match crate::plugin_runtime::build_provider_registry(
+        browser_mgr,
+        file_mgr,
+    )
+    .await
+    {
+        Ok(registry) => registry,
         Err(err) => {
             let resp_env = Envelope {
                 device_id: device_id.to_string(),
@@ -1213,7 +1259,7 @@ async fn handle_browser_request<T>(
             return;
         }
     };
-    if let Err(unavailable) = capability_router.ensure(CapabilityKind::Browser) {
+    if let Err(unavailable) = provider_registry.ensure(CapabilityKind::Browser) {
         let resp_env = Envelope {
             device_id: device_id.to_string(),
             msg_id: new_msg_id(),
@@ -1367,19 +1413,22 @@ async fn handle_file_request<T>(
     // field hiding behind a generic "PolicyDenied" message.
     let req_paths_joined = file_mgr.request_paths(&req).join(", ");
 
-    let capability_router = match crate::plugin_runtime::build_router(browser_mgr, file_mgr).await {
-        Ok(router) => router,
-        Err(err) => {
-            send_file_response(crate::file_manager::error_response(
-                req.request_id.clone(),
-                ahand_protocol::FileErrorCode::PolicyDenied,
-                &req_paths_joined,
-                &format!("file capability unavailable: failed to inspect host resources: {err}"),
-            ));
-            return;
-        }
-    };
-    if let Err(unavailable) = capability_router.ensure(CapabilityKind::File) {
+    let provider_registry =
+        match crate::plugin_runtime::build_provider_registry(browser_mgr, file_mgr).await {
+            Ok(registry) => registry,
+            Err(err) => {
+                send_file_response(crate::file_manager::error_response(
+                    req.request_id.clone(),
+                    ahand_protocol::FileErrorCode::PolicyDenied,
+                    &req_paths_joined,
+                    &format!(
+                        "file capability unavailable: failed to inspect host resources: {err}"
+                    ),
+                ));
+                return;
+            }
+        };
+    if let Err(unavailable) = provider_registry.ensure(CapabilityKind::File) {
         send_file_response(file_unavailable_response(
             &req,
             &req_paths_joined,
@@ -1837,6 +1886,28 @@ mod tests {
                 );
             }
             other => panic!("expected file error response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn managed_runtime_interactive_rejection_preserves_job_id() {
+        let req = ahand_protocol::JobRequest {
+            job_id: "node-interactive-1".to_string(),
+            tool: "plugin:node".to_string(),
+            interactive: true,
+            ..Default::default()
+        };
+
+        let env = super::managed_runtime_interactive_rejection("device-1", &req);
+
+        assert_eq!(env.device_id, "device-1");
+        match env.payload {
+            Some(envelope::Payload::JobRejected(rejected)) => {
+                assert_eq!(rejected.job_id, "node-interactive-1");
+                assert!(rejected.reason.contains("plugin:node"));
+                assert!(rejected.reason.contains("interactive"));
+            }
+            other => panic!("expected JobRejected, got {other:?}"),
         }
     }
 
