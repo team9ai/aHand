@@ -99,7 +99,7 @@ enum Cmd {
         /// Force reinstall (clean existing installation first)
         #[arg(long)]
         force: bool,
-        /// Run only a single step: node or playwright
+        /// Run only a single step: node, python, or playwright
         #[arg(long)]
         step: Option<String>,
     },
@@ -542,7 +542,7 @@ fn collect_plugin_and_dependencies(
 }
 
 fn has_install_step(plugin: &str) -> bool {
-    matches!(plugin, "node" | "browser-playwright-cli")
+    matches!(plugin, "node" | "python" | "browser-playwright-cli")
 }
 
 fn write_pid_file(data_dir: &Option<PathBuf>) -> Option<PathBuf> {
@@ -584,6 +584,14 @@ mod plugin_cli_tests {
     #[test]
     fn node_plugin_install_steps_include_only_node() {
         assert_eq!(install_steps_for("node").unwrap(), vec!["node".to_string()]);
+    }
+
+    #[test]
+    fn python_plugin_install_steps_include_only_python() {
+        assert_eq!(
+            install_steps_for("python").unwrap(),
+            vec!["python".to_string()]
+        );
     }
 
     #[test]

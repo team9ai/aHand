@@ -129,6 +129,7 @@ Owner: `python`
 Provider behavior:
 
 - Active only when the `python` plugin is installed and exports a `python` executable resource.
+- `ahandd plugin install python` installs a managed CPython runtime from a pinned python-build-standalone release asset into `dependencies/python`.
 - Selected by explicit `JobRequest.tool` token:
 
 ```text
@@ -281,11 +282,13 @@ Add tests before implementation:
 - managed runtime interactive requests return `JobRejected`.
 - Hello advertises active `node-exec` / `python-exec` additively.
 - Existing `job_request_tool` contract stays green for `node` / `python` PATH semantics.
+- CLI install coverage verifies `python` has an install step and `browser_setup::inspect("python")` recognizes the plugin.
 
 ## Acceptance Criteria
 
 - Stage 3 introduces a first-party provider registry used by cloud WS and debug IPC dispatch.
 - `plugin:node` and `plugin:python` execute managed runtime binaries directly when installed.
+- `ahandd plugin install python` installs Python and `getHostResource()` exports the managed `python` executable path and version.
 - Plain `node` and `python` retain current PATH-based execution.
 - Hello advertises `node-exec` and `python-exec` only when active.
 - Missing runtime plugins return host-neutral install guidance.

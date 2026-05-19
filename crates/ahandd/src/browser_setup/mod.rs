@@ -2,7 +2,7 @@
 //!
 //! Public API:
 //! - `inspect_all()`, `inspect(name)` — read-only diagnostic
-//! - `run_all(force, progress)` — install everything (or refresh)
+//! - `run_all(force, progress)` — install browser automation dependencies
 //! - `run_step(name, force, progress)` — install a single component
 //! - `detect_browser(config_override)`, `detect_all_browsers()` — browser detection
 
@@ -11,6 +11,7 @@ use anyhow::{Result, bail};
 pub mod browser_detect;
 pub mod node;
 pub mod playwright;
+pub mod python;
 pub mod types;
 
 pub use browser_detect::{
@@ -85,6 +86,7 @@ pub async fn inspect_all() -> Vec<CheckReport> {
 pub async fn inspect(name: &str) -> Option<CheckReport> {
     match name {
         "node" => Some(node::inspect().await),
+        "python" => Some(python::inspect().await),
         "playwright" | "browser-playwright-cli" => Some(playwright::inspect().await),
         "browser" => Some(inspect_browser()),
         _ => None,
@@ -123,7 +125,7 @@ pub async fn run_all(
     Ok(vec![node_report, playwright_report, browser_report])
 }
 
-/// Run a single install step. Valid names: `node`, `playwright`,
+/// Run a single install step. Valid names: `node`, `python`, `playwright`,
 /// `browser-playwright-cli`, plus non-installable plugin ids for diagnostics.
 /// Returns an error for `playwright`/`browser-playwright-cli` if Node is not
 /// already installed.
@@ -141,6 +143,10 @@ pub async fn run_step(
         "node" => match node::ensure(force, progress_ref).await {
             Ok(r) => Ok(r),
             Err(e) => Err(wrap_failure(e, "node", "Node.js", progress_ref)),
+        },
+        "python" => match python::ensure(force, progress_ref).await {
+            Ok(r) => Ok(r),
+            Err(e) => Err(wrap_failure(e, "python", "Python", progress_ref)),
         },
         "playwright" | "browser-playwright-cli" => {
             let node_status = node::inspect().await;
@@ -161,11 +167,11 @@ pub async fn run_step(
                 )),
             }
         }
-        "shell" | "file" | "python" => {
+        "shell" | "file" => {
             bail!("plugin `{name}` does not have an install step in this release")
         }
         other => bail!(
-            "unknown step `{other}`. Valid install steps: node, playwright, browser-playwright-cli"
+            "unknown step `{other}`. Valid install steps: node, python, playwright, browser-playwright-cli"
         ),
     }
 }
@@ -280,6 +286,7 @@ mod tests {
     #[tokio::test]
     async fn inspect_accepts_plugin_id_aliases() {
         assert!(inspect("node").await.is_some());
+        assert!(inspect("python").await.is_some());
         assert!(inspect("playwright").await.is_some());
         assert!(inspect("browser-playwright-cli").await.is_some());
     }

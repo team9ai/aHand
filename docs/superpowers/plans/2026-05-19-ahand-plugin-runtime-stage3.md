@@ -934,3 +934,21 @@ gh pr create --draft --repo team9ai/aHand --base codex/plugin-runtime-stage2 --h
 ```
 
 Expected: draft PR created against Stage 2.
+
+---
+
+## Task 7: Repair Python Plugin Installer
+
+**Reason:** Manual install verification found that `python` had manifest, runtime path, and host-resource detection, but `ahandd plugin install python` still returned "does not have an install step in this release".
+
+**Files:**
+- `crates/ahandd/src/browser_setup/python.rs`
+- `crates/ahandd/src/browser_setup/mod.rs`
+- `crates/ahandd/src/main.rs`
+- `docs/superpowers/specs/2026-05-19-ahand-plugin-runtime-stage3-design.md`
+- `docs/superpowers/plans/2026-05-19-ahand-plugin-runtime-stage3.md`
+
+- [x] Add red tests for `python` install step routing and setup inspect recognition.
+- [x] Add a managed Python installer using pinned python-build-standalone `3.12.13+20260510` `install_only` assets.
+- [x] Wire `browser_setup::run_step("python")` and `ahandd plugin install python`.
+- [x] Verify a real install under a temporary `HOME`: `doctor python` moves from `Missing` to `Installed`, `host-resource` exports `dependencies/python/bin/python3`, and the exported binary reports `Python 3.12.13`.
