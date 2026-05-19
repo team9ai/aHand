@@ -7,6 +7,8 @@ pub enum CapabilityKind {
     Exec,
     File,
     Browser,
+    NodeExec,
+    PythonExec,
 }
 
 impl CapabilityKind {
@@ -15,6 +17,8 @@ impl CapabilityKind {
             Self::Exec => "exec",
             Self::File => "file",
             Self::Browser => "browser-playwright-cli",
+            Self::NodeExec => "node-exec",
+            Self::PythonExec => "python-exec",
         }
     }
 
@@ -23,6 +27,8 @@ impl CapabilityKind {
             Self::Exec => "exec",
             Self::File => "file",
             Self::Browser => "browser",
+            Self::NodeExec => "node",
+            Self::PythonExec => "python",
         }
     }
 }
@@ -152,6 +158,8 @@ impl CapabilityRouter {
             CapabilityKind::Exec,
             CapabilityKind::File,
             CapabilityKind::Browser,
+            CapabilityKind::NodeExec,
+            CapabilityKind::PythonExec,
         ]
         .into_iter()
         .filter(|capability| self.ensure(*capability).is_ok())
@@ -211,6 +219,20 @@ mod tests {
         assert_eq!(
             router.active_wire_capabilities(),
             vec!["exec", "file", "browser-playwright-cli"]
+        );
+    }
+
+    #[test]
+    fn active_wire_capabilities_include_managed_runtime_exec_when_active() {
+        let router = CapabilityRouter::new(vec![
+            CapabilityEntry::active(CapabilityKind::Exec, "shell"),
+            CapabilityEntry::active(CapabilityKind::NodeExec, "node"),
+            CapabilityEntry::active(CapabilityKind::PythonExec, "python"),
+        ]);
+
+        assert_eq!(
+            router.active_wire_capabilities(),
+            vec!["exec", "node-exec", "python-exec"]
         );
     }
 

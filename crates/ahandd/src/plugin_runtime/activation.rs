@@ -36,6 +36,8 @@ pub fn router_from_plugins(
         exec_entry(plugins),
         file_entry(plugins, config),
         browser_entry(plugins, config),
+        runtime_entry(plugins, CapabilityKind::NodeExec, "node", "node"),
+        runtime_entry(plugins, CapabilityKind::PythonExec, "python", "python"),
     ])
 }
 
@@ -156,6 +158,66 @@ fn browser_entry(plugins: &[InstalledPluginResource], config: ActivationConfig) 
             },
         }),
     }
+}
+
+fn runtime_entry(
+    plugins: &[InstalledPluginResource],
+    capability: CapabilityKind,
+    plugin_id: &str,
+    resource_name: &str,
+) -> CapabilityEntry {
+    match plugin_status(plugins, plugin_id) {
+        Some(PluginStatus::Installed) => {
+            if has_executable_resource(plugins, plugin_id, resource_name) {
+                CapabilityEntry::active(capability, plugin_id)
+            } else {
+                CapabilityEntry::unavailable(CapabilityUnavailable {
+                    capability,
+                    plugin_id: plugin_id.to_string(),
+                    status: PluginStatus::Missing,
+                    reason: format!("{plugin_id} executable resource is missing"),
+                    remediation: CapabilityRemediation::InstallPlugin {
+                        plugin_id: plugin_id.to_string(),
+                    },
+                })
+            }
+        }
+        Some(status) => CapabilityEntry::unavailable(CapabilityUnavailable {
+            capability,
+            plugin_id: plugin_id.to_string(),
+            status,
+            reason: format!("{plugin_id} plugin is {}", status_word(status)),
+            remediation: CapabilityRemediation::InstallPlugin {
+                plugin_id: plugin_id.to_string(),
+            },
+        }),
+        None => CapabilityEntry::unavailable(CapabilityUnavailable {
+            capability,
+            plugin_id: plugin_id.to_string(),
+            status: PluginStatus::Missing,
+            reason: format!("{plugin_id} plugin is not registered"),
+            remediation: CapabilityRemediation::InstallPlugin {
+                plugin_id: plugin_id.to_string(),
+            },
+        }),
+    }
+}
+
+fn has_executable_resource(
+    plugins: &[InstalledPluginResource],
+    plugin_id: &str,
+    resource_name: &str,
+) -> bool {
+    plugins
+        .iter()
+        .find(|plugin| plugin.id == plugin_id)
+        .and_then(|plugin| plugin.resources.get(resource_name))
+        .is_some_and(|resource| {
+            matches!(
+                resource,
+                crate::plugin_runtime::HostResourceValue::Executable { .. }
+            )
+        })
 }
 
 fn first_missing_dependency(
@@ -290,6 +352,51 @@ mod tests {
                 message: "enable browser capabilities in host configuration".to_string()
             }
         );
+    }
+
+    #[test]
+    fn node_exec_active_when_node_resource_is_exported() {
+        let mut plugins = base_plugins();
+        plugins[2].resources.insert(
+            "node".to_string(),
+            crate::plugin_runtime::HostResourceValue::Executable {
+                name: "node".to_string(),
+                path: "/tmp/ahand/node/bin/node".to_string(),
+                version: Some("v24.13.0".to_string()),
+            },
+        );
+
+        let router = router_from_plugins(
+            &plugins,
+            ActivationConfig {
+                browser_enabled: true,
+                file_enabled: true,
+                system_browser_available: true,
+            },
+        );
+
+        assert!(router.ensure(CapabilityKind::NodeExec).is_ok());
+    }
+
+    #[test]
+    fn python_exec_missing_recommends_installing_python_plugin() {
+        let plugins = base_plugins();
+
+        let router = router_from_plugins(
+            &plugins,
+            ActivationConfig {
+                browser_enabled: true,
+                file_enabled: true,
+                system_browser_available: true,
+            },
+        );
+
+        let err = router.ensure(CapabilityKind::PythonExec).unwrap_err();
+        assert_eq!(err.plugin_id, "python");
+        assert!(matches!(
+            err.remediation,
+            CapabilityRemediation::InstallPlugin { ref plugin_id } if plugin_id == "python"
+        ));
     }
 
     #[test]
