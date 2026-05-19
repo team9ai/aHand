@@ -12,7 +12,7 @@ use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::executor;
 use crate::file_manager::FileManager;
-use crate::plugin_runtime::{CapabilityKind, CapabilityUnavailable};
+use crate::plugin_runtime::{CapabilityKind, CapabilityUnavailable, JobProvider};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::RunStore;
@@ -168,13 +168,13 @@ async fn handle_ipc_conn(
 
         match envelope.payload {
             Some(envelope::Payload::JobRequest(req)) => {
-                let capability_router = match crate::plugin_runtime::build_router(
+                let provider_registry = match crate::plugin_runtime::build_provider_registry(
                     &browser_mgr,
                     &file_mgr,
                 )
                 .await
                 {
-                    Ok(router) => router,
+                    Ok(registry) => registry,
                     Err(err) => {
                         warn!(
                             job_id = %req.job_id,
@@ -190,15 +190,30 @@ async fn handle_ipc_conn(
                         continue;
                     }
                 };
-                if let Err(unavailable) = capability_router.ensure(CapabilityKind::Exec) {
-                    let reason = unavailable.to_protocol_message();
+                let job_provider = match provider_registry.resolve_job_provider(&req.tool) {
+                    Ok(provider) => provider,
+                    Err(unavailable) => {
+                        let reason = unavailable.to_protocol_message();
+                        warn!(
+                            job_id = %req.job_id,
+                            tool = %req.tool,
+                            reason = %reason,
+                            "IPC: job rejected by capability provider"
+                        );
+                        let _ =
+                            tx.send(job_capability_rejection_envelope(&device_id, &req, reason));
+                        continue;
+                    }
+                };
+                if req.interactive && matches!(job_provider, JobProvider::ManagedRuntime { .. }) {
                     warn!(
                         job_id = %req.job_id,
                         tool = %req.tool,
-                        reason = %reason,
-                        "IPC: job rejected by capability router"
+                        "IPC: managed runtime job rejected because interactive PTY is unsupported"
                     );
-                    let _ = tx.send(job_capability_rejection_envelope(&device_id, &req, reason));
+                    let _ = tx.send(managed_runtime_interactive_rejection_envelope(
+                        &device_id, &req,
+                    ));
                     continue;
                 }
 
@@ -249,6 +264,7 @@ async fn handle_ipc_conn(
                         let did = device_id.clone();
                         let reg = Arc::clone(&registry);
                         let st = store.clone();
+                        let provider = job_provider.clone();
 
                         let (cancel_tx, cancel_rx) = mpsc::channel(1);
                         reg.register(job_id.clone(), cancel_tx).await;
@@ -259,7 +275,8 @@ async fn handle_ipc_conn(
                         tokio::spawn(async move {
                             let _permit = reg.acquire_permit().await;
                             let (exit_code, error) =
-                                executor::run_job(did, req, tx_clone, cancel_rx, st).await;
+                                run_job_with_provider(did, req, provider, tx_clone, cancel_rx, st)
+                                    .await;
                             reg.remove(&job_id).await;
                             reg.mark_completed(job_id, exit_code, error).await;
                         });
@@ -297,6 +314,7 @@ async fn handle_ipc_conn(
                         let timeout = amgr.default_timeout();
                         let job_id = req.job_id.clone();
                         let cuid = caller_uid.clone();
+                        let provider = job_provider.clone();
 
                         tokio::spawn(async move {
                             let result = tokio::time::timeout(timeout, approval_rx).await;
@@ -306,8 +324,10 @@ async fn handle_ipc_conn(
                                     let (cancel_tx, cancel_rx) = mpsc::channel(1);
                                     reg.register(job_id.clone(), cancel_tx).await;
                                     let _permit = reg.acquire_permit().await;
-                                    let (exit_code, error) =
-                                        executor::run_job(did, req, tx_clone, cancel_rx, st).await;
+                                    let (exit_code, error) = run_job_with_provider(
+                                        did, req, provider, tx_clone, cancel_rx, st,
+                                    )
+                                    .await;
                                     reg.remove(&job_id).await;
                                     reg.mark_completed(job_id, exit_code, error).await;
                                 }
@@ -409,13 +429,13 @@ async fn handle_ipc_conn(
                     "IPC: received browser request"
                 );
 
-                let capability_router = match crate::plugin_runtime::build_router(
+                let provider_registry = match crate::plugin_runtime::build_provider_registry(
                     &browser_mgr,
                     &file_mgr,
                 )
                 .await
                 {
-                    Ok(router) => router,
+                    Ok(registry) => registry,
                     Err(err) => {
                         let resp_env = Envelope {
                             device_id: device_id.clone(),
@@ -437,7 +457,7 @@ async fn handle_ipc_conn(
                     }
                 };
 
-                if let Err(unavailable) = capability_router.ensure(CapabilityKind::Browser) {
+                if let Err(unavailable) = provider_registry.ensure(CapabilityKind::Browser) {
                     let resp_env = Envelope {
                         device_id: device_id.clone(),
                         msg_id: new_msg_id(),
@@ -532,6 +552,41 @@ fn job_capability_rejection_envelope(
             reason,
         })),
         ..Default::default()
+    }
+}
+
+fn managed_runtime_interactive_rejection_envelope(
+    device_id: &str,
+    req: &ahand_protocol::JobRequest,
+) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::JobRejected(JobRejected {
+            job_id: req.job_id.clone(),
+            reason: format!(
+                "managed runtime tool {} does not support interactive PTY jobs",
+                req.tool
+            ),
+        })),
+        ..Default::default()
+    }
+}
+
+async fn run_job_with_provider(
+    device_id: String,
+    req: ahand_protocol::JobRequest,
+    provider: JobProvider,
+    tx: mpsc::UnboundedSender<Envelope>,
+    cancel_rx: mpsc::Receiver<()>,
+    store: Option<Arc<RunStore>>,
+) -> (i32, String) {
+    match provider {
+        JobProvider::DefaultExec => executor::run_job(device_id, req, tx, cancel_rx, store).await,
+        JobProvider::ManagedRuntime { target, .. } => {
+            executor::run_job_with_target(device_id, req, target, tx, cancel_rx, store).await
+        }
     }
 }
 
@@ -646,6 +701,28 @@ mod tests {
                         .reason
                         .contains("exec capability unavailable: host shell unavailable")
                 );
+            }
+            other => panic!("expected JobRejected envelope, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ipc_managed_runtime_interactive_rejection_preserves_job_id() {
+        let req = ahand_protocol::JobRequest {
+            job_id: "ipc-python-interactive-1".to_string(),
+            tool: "plugin:python".to_string(),
+            interactive: true,
+            ..Default::default()
+        };
+
+        let env = managed_runtime_interactive_rejection_envelope("device-1", &req);
+
+        assert_eq!(env.device_id, "device-1");
+        match env.payload {
+            Some(envelope::Payload::JobRejected(rejected)) => {
+                assert_eq!(rejected.job_id, "ipc-python-interactive-1");
+                assert!(rejected.reason.contains("plugin:python"));
+                assert!(rejected.reason.contains("interactive"));
             }
             other => panic!("expected JobRejected envelope, got {other:?}"),
         }
