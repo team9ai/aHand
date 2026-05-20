@@ -143,6 +143,23 @@ async fn recv_cancel(
     panic!("device socket closed before CancelJob arrived");
 }
 
+async fn recv_runtime_request(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> ahand_protocol::RuntimeRequest {
+    while let Some(message) = socket.next().await {
+        let msg = message.unwrap();
+        if let WsMessage::Binary(data) = msg {
+            let envelope = ahand_protocol::Envelope::decode(data.as_ref()).unwrap();
+            if let Some(envelope::Payload::RuntimeRequest(req)) = envelope.payload {
+                return req;
+            }
+        }
+    }
+    panic!("device socket closed before RuntimeRequest arrived");
+}
+
 async fn send_envelope(
     socket: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -322,6 +339,115 @@ async fn create_job_happy_path_dispatches_and_streams_events() {
 
     drop(device);
     server.shutdown().await;
+}
+
+#[tokio::test]
+async fn host_resource_control_endpoint_round_trips_runtime_response() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-runtime-1", "user-runtime").await;
+    let token = mint_cp_jwt(&server, "user-runtime");
+    let url = format!("{}/api/control/host-resource", server.http_base_url());
+
+    let post_task = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "deviceId": "cp-runtime-1",
+                "timeoutMs": 30_000,
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    let req = recv_runtime_request(&mut device).await;
+    assert!(matches!(
+        &req.operation,
+        Some(ahand_protocol::runtime_request::Operation::HostResource(_))
+    ));
+    send_envelope(
+        &mut device,
+        ahand_protocol::Envelope {
+            device_id: "cp-runtime-1".into(),
+            msg_id: "runtime-resp-1".into(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::RuntimeResponse(
+                ahand_protocol::RuntimeResponse {
+                    request_id: req.request_id,
+                    success: true,
+                    result_json: r#"{"runtimeVersion":"0.1.14","platform":"darwin","arch":"arm64","plugins":[]}"#.into(),
+                    error: None,
+                },
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let resp = post_task.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["data"]["runtimeVersion"], "0.1.14");
+}
+
+#[tokio::test]
+async fn plugin_install_control_endpoint_dispatches_plugin_install_request() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-runtime-2", "user-runtime").await;
+    let token = mint_cp_jwt(&server, "user-runtime");
+    let url = format!("{}/api/control/plugins/install", server.http_base_url());
+
+    let post_task = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(url)
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "deviceId": "cp-runtime-2",
+                "pluginId": "python",
+                "force": true,
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    let req = recv_runtime_request(&mut device).await;
+    match req.operation {
+        Some(ahand_protocol::runtime_request::Operation::PluginInstall(install)) => {
+            assert_eq!(install.plugin_id, "python");
+            assert!(install.force);
+        }
+        other => panic!("expected PluginInstall runtime request, got {other:?}"),
+    }
+    send_envelope(
+        &mut device,
+        ahand_protocol::Envelope {
+            device_id: "cp-runtime-2".into(),
+            msg_id: "runtime-resp-2".into(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::RuntimeResponse(
+                ahand_protocol::RuntimeResponse {
+                    request_id: req.request_id,
+                    success: false,
+                    result_json: String::new(),
+                    error: Some(ahand_protocol::RuntimeError {
+                        code: "install_failed".into(),
+                        message: "network unavailable".into(),
+                    }),
+                },
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let resp = post_task.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert_eq!(body["error"]["code"], "install_failed");
 }
 
 #[tokio::test]

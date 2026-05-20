@@ -3,6 +3,7 @@ pub mod capability;
 
 pub mod builtin;
 pub mod host_resource;
+pub mod install;
 pub mod manifest;
 pub mod path_env;
 pub mod provider;
@@ -16,6 +17,7 @@ pub use capability::{
     CapabilityUnavailable,
 };
 pub use host_resource::get_host_resource;
+pub use install::{InstallProgress, install_plugin, install_steps_for};
 pub use manifest::{ExecutableResourceManifest, HelpManifest, PluginManifest, ResourceManifest};
 pub use provider::{
     CapabilityProviderRegistry, JobProvider, JobProviderKind, build_provider_registry,
@@ -23,6 +25,6 @@ pub use provider::{
 };
 pub use registry::PluginRegistry;
 pub use resource::{
-    HostResourceSnapshot, HostResourceValue, InstalledPluginResource, PluginStatus,
+    HostResourceSnapshot, HostResourceValue, InstalledPluginResource, PluginStatus, RuntimePackage,
 };
 pub use runtime_dir::RuntimeDirs;

@@ -45,6 +45,8 @@ message Envelope {
     // a hub built between c9b8a4d and the fix will emit/parse it.
     FileRequest      file_request      = 33;
     FileResponse     file_response     = 34;
+    RuntimeRequest   runtime_request   = 35;
+    RuntimeResponse  runtime_response  = 36;
   }
 }
 
@@ -135,6 +137,39 @@ message JobRejected {
 // CancelJob - request to cancel a running job.
 message CancelJob {
   string job_id = 1;
+}
+
+// RuntimeRequest - cloud asks local daemon to inspect or initialize managed
+// runtime plugins such as node/python/browser-playwright-cli.
+message RuntimeRequest {
+  string request_id = 1;
+
+  oneof operation {
+    HostResourceQuery host_resource = 10;
+    PluginInstall     plugin_install = 11;
+  }
+}
+
+message HostResourceQuery {}
+
+message PluginInstall {
+  string plugin_id = 1;
+  bool force = 2;
+}
+
+message RuntimeResponse {
+  string request_id = 1;
+  bool success = 2;
+  // JSON payload owned by ahandd. For host_resource and successful
+  // plugin_install responses this is a HostResourceSnapshot serialized with
+  // serde's public getHostResource shape.
+  string result_json = 3;
+  RuntimeError error = 4;
+}
+
+message RuntimeError {
+  string code = 1;
+  string message = 2;
 }
 
 // ApprovalRequest - daemon asks user to approve a job (strict mode).

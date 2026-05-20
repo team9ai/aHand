@@ -57,6 +57,7 @@ pub struct AppState {
     pub connections: Arc<crate::ws::device_gateway::ConnectionRegistry>,
     pub browser_pending:
         Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::BrowserResponse>>>,
+    pub pending_runtime_requests: Arc<crate::pending_runtime_requests::PendingRuntimeRequests>,
     pub events: Arc<crate::events::EventBus>,
     pub output_stream: Arc<crate::output_stream::OutputStream>,
     pub bootstrap_tokens: Arc<crate::bootstrap::BootstrapCredentials>,
@@ -174,6 +175,7 @@ impl AppState {
             audit_store.clone(),
         ));
         let pending_file_requests = crate::pending_file_requests::new_pending_requests();
+        let pending_runtime_requests = crate::pending_runtime_requests::new_pending_requests();
         let s3_client = if let Some(ref s3_cfg) = config.s3 {
             Some(Arc::new(crate::s3::S3Client::new(s3_cfg).await))
         } else {
@@ -231,6 +233,7 @@ impl AppState {
             control_rate_limiter,
             connections,
             browser_pending,
+            pending_runtime_requests,
             events,
             output_stream,
             bootstrap_tokens: Arc::new(bootstrap_tokens),

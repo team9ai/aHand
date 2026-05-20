@@ -270,6 +270,7 @@ mod tests {
             dependencies: dependencies.iter().map(|dep| dep.to_string()).collect(),
             capabilities: Vec::new(),
             resources: BTreeMap::new(),
+            packages: Vec::new(),
             help_prompt: None,
         }
     }

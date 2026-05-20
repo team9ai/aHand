@@ -585,6 +585,9 @@ async fn connect_with_auth(
                 )
                 .await;
             }
+            Some(envelope::Payload::RuntimeRequest(req)) => {
+                handle_runtime_request(device_id, req, &tx).await;
+            }
             Some(envelope::Payload::UpdateCommand(cmd)) => {
                 info!(update_id = %cmd.update_id, target = %cmd.target_version,
                     "received update command from hub");
@@ -1369,6 +1372,113 @@ async fn handle_browser_request<T>(
             };
             let _ = tx.send(resp_env);
         }
+    }
+}
+
+async fn handle_runtime_request<T>(device_id: &str, req: ahand_protocol::RuntimeRequest, tx: &T)
+where
+    T: crate::executor::EnvelopeSink,
+{
+    info!(
+        request_id = %req.request_id,
+        operation = runtime_op_name(req.operation.as_ref()),
+        "received runtime request"
+    );
+
+    let response = match req.operation {
+        Some(ahand_protocol::runtime_request::Operation::HostResource(_)) => {
+            runtime_host_resource_response(&req.request_id).await
+        }
+        Some(ahand_protocol::runtime_request::Operation::PluginInstall(install)) => {
+            runtime_plugin_install_response(&req.request_id, install).await
+        }
+        None => runtime_error_response(
+            &req.request_id,
+            "invalid_request",
+            "runtime request missing operation",
+        ),
+    };
+
+    let env = Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::RuntimeResponse(response)),
+        ..Default::default()
+    };
+    let _ = tx.send(env);
+}
+
+async fn runtime_host_resource_response(request_id: &str) -> ahand_protocol::RuntimeResponse {
+    match crate::plugin_runtime::get_host_resource().await {
+        Ok(snapshot) => match serde_json::to_string(&snapshot) {
+            Ok(result_json) => runtime_success_response(request_id, result_json),
+            Err(err) => runtime_error_response(request_id, "serialization_failed", err.to_string()),
+        },
+        Err(err) => runtime_error_response(request_id, "host_resource_failed", format!("{err:#}")),
+    }
+}
+
+async fn runtime_plugin_install_response(
+    request_id: &str,
+    install: ahand_protocol::PluginInstall,
+) -> ahand_protocol::RuntimeResponse {
+    if install.plugin_id.trim().is_empty() {
+        return runtime_error_response(
+            request_id,
+            "invalid_request",
+            "plugin_id must not be empty",
+        );
+    }
+    let request = request_id.to_string();
+    let progress: crate::plugin_runtime::InstallProgress = Arc::new(move |event| {
+        info!(
+            request_id = %request,
+            step = event.step,
+            phase = ?event.phase,
+            message = %event.message,
+            "runtime plugin install progress"
+        );
+    });
+    match crate::plugin_runtime::install_plugin(&install.plugin_id, install.force, progress).await {
+        Ok(_) => runtime_host_resource_response(request_id).await,
+        Err(err) => runtime_error_response(request_id, "install_failed", format!("{err:#}")),
+    }
+}
+
+fn runtime_op_name(op: Option<&ahand_protocol::runtime_request::Operation>) -> &'static str {
+    match op {
+        Some(ahand_protocol::runtime_request::Operation::HostResource(_)) => "host_resource",
+        Some(ahand_protocol::runtime_request::Operation::PluginInstall(_)) => "plugin_install",
+        None => "unspecified",
+    }
+}
+
+fn runtime_success_response(
+    request_id: &str,
+    result_json: String,
+) -> ahand_protocol::RuntimeResponse {
+    ahand_protocol::RuntimeResponse {
+        request_id: request_id.to_string(),
+        success: true,
+        result_json,
+        error: None,
+    }
+}
+
+fn runtime_error_response(
+    request_id: &str,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> ahand_protocol::RuntimeResponse {
+    ahand_protocol::RuntimeResponse {
+        request_id: request_id.to_string(),
+        success: false,
+        result_json: String::new(),
+        error: Some(ahand_protocol::RuntimeError {
+            code: code.into(),
+            message: message.into(),
+        }),
     }
 }
 

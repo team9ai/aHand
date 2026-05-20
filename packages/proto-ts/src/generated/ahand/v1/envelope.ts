@@ -183,6 +183,8 @@ export interface Envelope {
    */
   fileRequest?: FileRequest | undefined;
   fileResponse?: FileResponse | undefined;
+  runtimeRequest?: RuntimeRequest | undefined;
+  runtimeResponse?: RuntimeResponse | undefined;
 }
 
 /**
@@ -279,6 +281,41 @@ export interface JobRejected {
 /** CancelJob - request to cancel a running job. */
 export interface CancelJob {
   jobId: string;
+}
+
+/**
+ * RuntimeRequest - cloud asks local daemon to inspect or initialize managed
+ * runtime plugins such as node/python/browser-playwright-cli.
+ */
+export interface RuntimeRequest {
+  requestId: string;
+  hostResource?: HostResourceQuery | undefined;
+  pluginInstall?: PluginInstall | undefined;
+}
+
+export interface HostResourceQuery {
+}
+
+export interface PluginInstall {
+  pluginId: string;
+  force: boolean;
+}
+
+export interface RuntimeResponse {
+  requestId: string;
+  success: boolean;
+  /**
+   * JSON payload owned by ahandd. For host_resource and successful
+   * plugin_install responses this is a HostResourceSnapshot serialized with
+   * serde's public getHostResource shape.
+   */
+  resultJson: string;
+  error: RuntimeError | undefined;
+}
+
+export interface RuntimeError {
+  code: string;
+  message: string;
 }
 
 /** ApprovalRequest - daemon asks user to approve a job (strict mode). */
@@ -445,6 +482,8 @@ function createBaseEnvelope(): Envelope {
     heartbeat: undefined,
     fileRequest: undefined,
     fileResponse: undefined,
+    runtimeRequest: undefined,
+    runtimeResponse: undefined,
   };
 }
 
@@ -542,6 +581,12 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.fileResponse !== undefined) {
       FileResponse.encode(message.fileResponse, writer.uint32(274).fork()).join();
+    }
+    if (message.runtimeRequest !== undefined) {
+      RuntimeRequest.encode(message.runtimeRequest, writer.uint32(282).fork()).join();
+    }
+    if (message.runtimeResponse !== undefined) {
+      RuntimeResponse.encode(message.runtimeResponse, writer.uint32(290).fork()).join();
     }
     return writer;
   },
@@ -801,6 +846,22 @@ export const Envelope: MessageFns<Envelope> = {
           message.fileResponse = FileResponse.decode(reader, reader.uint32());
           continue;
         }
+        case 35: {
+          if (tag !== 282) {
+            break;
+          }
+
+          message.runtimeRequest = RuntimeRequest.decode(reader, reader.uint32());
+          continue;
+        }
+        case 36: {
+          if (tag !== 290) {
+            break;
+          }
+
+          message.runtimeResponse = RuntimeResponse.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -951,6 +1012,16 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.file_response)
         ? FileResponse.fromJSON(object.file_response)
         : undefined,
+      runtimeRequest: isSet(object.runtimeRequest)
+        ? RuntimeRequest.fromJSON(object.runtimeRequest)
+        : isSet(object.runtime_request)
+        ? RuntimeRequest.fromJSON(object.runtime_request)
+        : undefined,
+      runtimeResponse: isSet(object.runtimeResponse)
+        ? RuntimeResponse.fromJSON(object.runtimeResponse)
+        : isSet(object.runtime_response)
+        ? RuntimeResponse.fromJSON(object.runtime_response)
+        : undefined,
     };
   },
 
@@ -1049,6 +1120,12 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.fileResponse !== undefined) {
       obj.fileResponse = FileResponse.toJSON(message.fileResponse);
     }
+    if (message.runtimeRequest !== undefined) {
+      obj.runtimeRequest = RuntimeRequest.toJSON(message.runtimeRequest);
+    }
+    if (message.runtimeResponse !== undefined) {
+      obj.runtimeResponse = RuntimeResponse.toJSON(message.runtimeResponse);
+    }
     return obj;
   },
 
@@ -1135,6 +1212,12 @@ export const Envelope: MessageFns<Envelope> = {
       : undefined;
     message.fileResponse = (object.fileResponse !== undefined && object.fileResponse !== null)
       ? FileResponse.fromPartial(object.fileResponse)
+      : undefined;
+    message.runtimeRequest = (object.runtimeRequest !== undefined && object.runtimeRequest !== null)
+      ? RuntimeRequest.fromPartial(object.runtimeRequest)
+      : undefined;
+    message.runtimeResponse = (object.runtimeResponse !== undefined && object.runtimeResponse !== null)
+      ? RuntimeResponse.fromPartial(object.runtimeResponse)
       : undefined;
     return message;
   },
@@ -2401,6 +2484,431 @@ export const CancelJob: MessageFns<CancelJob> = {
   fromPartial(object: DeepPartial<CancelJob>): CancelJob {
     const message = createBaseCancelJob();
     message.jobId = object.jobId ?? "";
+    return message;
+  },
+};
+
+function createBaseRuntimeRequest(): RuntimeRequest {
+  return { requestId: "", hostResource: undefined, pluginInstall: undefined };
+}
+
+export const RuntimeRequest: MessageFns<RuntimeRequest> = {
+  encode(message: RuntimeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.requestId !== "") {
+      writer.uint32(10).string(message.requestId);
+    }
+    if (message.hostResource !== undefined) {
+      HostResourceQuery.encode(message.hostResource, writer.uint32(82).fork()).join();
+    }
+    if (message.pluginInstall !== undefined) {
+      PluginInstall.encode(message.pluginInstall, writer.uint32(90).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RuntimeRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRuntimeRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.requestId = reader.string();
+          continue;
+        }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.hostResource = HostResourceQuery.decode(reader, reader.uint32());
+          continue;
+        }
+        case 11: {
+          if (tag !== 90) {
+            break;
+          }
+
+          message.pluginInstall = PluginInstall.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RuntimeRequest {
+    return {
+      requestId: isSet(object.requestId)
+        ? globalThis.String(object.requestId)
+        : isSet(object.request_id)
+        ? globalThis.String(object.request_id)
+        : "",
+      hostResource: isSet(object.hostResource)
+        ? HostResourceQuery.fromJSON(object.hostResource)
+        : isSet(object.host_resource)
+        ? HostResourceQuery.fromJSON(object.host_resource)
+        : undefined,
+      pluginInstall: isSet(object.pluginInstall)
+        ? PluginInstall.fromJSON(object.pluginInstall)
+        : isSet(object.plugin_install)
+        ? PluginInstall.fromJSON(object.plugin_install)
+        : undefined,
+    };
+  },
+
+  toJSON(message: RuntimeRequest): unknown {
+    const obj: any = {};
+    if (message.requestId !== "") {
+      obj.requestId = message.requestId;
+    }
+    if (message.hostResource !== undefined) {
+      obj.hostResource = HostResourceQuery.toJSON(message.hostResource);
+    }
+    if (message.pluginInstall !== undefined) {
+      obj.pluginInstall = PluginInstall.toJSON(message.pluginInstall);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RuntimeRequest>): RuntimeRequest {
+    return RuntimeRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RuntimeRequest>): RuntimeRequest {
+    const message = createBaseRuntimeRequest();
+    message.requestId = object.requestId ?? "";
+    message.hostResource = (object.hostResource !== undefined && object.hostResource !== null)
+      ? HostResourceQuery.fromPartial(object.hostResource)
+      : undefined;
+    message.pluginInstall = (object.pluginInstall !== undefined && object.pluginInstall !== null)
+      ? PluginInstall.fromPartial(object.pluginInstall)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseHostResourceQuery(): HostResourceQuery {
+  return {};
+}
+
+export const HostResourceQuery: MessageFns<HostResourceQuery> = {
+  encode(_: HostResourceQuery, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): HostResourceQuery {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseHostResourceQuery();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(_: any): HostResourceQuery {
+    return {};
+  },
+
+  toJSON(_: HostResourceQuery): unknown {
+    const obj: any = {};
+    return obj;
+  },
+
+  create(base?: DeepPartial<HostResourceQuery>): HostResourceQuery {
+    return HostResourceQuery.fromPartial(base ?? {});
+  },
+  fromPartial(_: DeepPartial<HostResourceQuery>): HostResourceQuery {
+    const message = createBaseHostResourceQuery();
+    return message;
+  },
+};
+
+function createBasePluginInstall(): PluginInstall {
+  return { pluginId: "", force: false };
+}
+
+export const PluginInstall: MessageFns<PluginInstall> = {
+  encode(message: PluginInstall, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.pluginId !== "") {
+      writer.uint32(10).string(message.pluginId);
+    }
+    if (message.force !== false) {
+      writer.uint32(16).bool(message.force);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PluginInstall {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePluginInstall();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.pluginId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.force = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PluginInstall {
+    return {
+      pluginId: isSet(object.pluginId)
+        ? globalThis.String(object.pluginId)
+        : isSet(object.plugin_id)
+        ? globalThis.String(object.plugin_id)
+        : "",
+      force: isSet(object.force) ? globalThis.Boolean(object.force) : false,
+    };
+  },
+
+  toJSON(message: PluginInstall): unknown {
+    const obj: any = {};
+    if (message.pluginId !== "") {
+      obj.pluginId = message.pluginId;
+    }
+    if (message.force !== false) {
+      obj.force = message.force;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PluginInstall>): PluginInstall {
+    return PluginInstall.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PluginInstall>): PluginInstall {
+    const message = createBasePluginInstall();
+    message.pluginId = object.pluginId ?? "";
+    message.force = object.force ?? false;
+    return message;
+  },
+};
+
+function createBaseRuntimeResponse(): RuntimeResponse {
+  return { requestId: "", success: false, resultJson: "", error: undefined };
+}
+
+export const RuntimeResponse: MessageFns<RuntimeResponse> = {
+  encode(message: RuntimeResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.requestId !== "") {
+      writer.uint32(10).string(message.requestId);
+    }
+    if (message.success !== false) {
+      writer.uint32(16).bool(message.success);
+    }
+    if (message.resultJson !== "") {
+      writer.uint32(26).string(message.resultJson);
+    }
+    if (message.error !== undefined) {
+      RuntimeError.encode(message.error, writer.uint32(34).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RuntimeResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRuntimeResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.requestId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.success = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.resultJson = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.error = RuntimeError.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RuntimeResponse {
+    return {
+      requestId: isSet(object.requestId)
+        ? globalThis.String(object.requestId)
+        : isSet(object.request_id)
+        ? globalThis.String(object.request_id)
+        : "",
+      success: isSet(object.success) ? globalThis.Boolean(object.success) : false,
+      resultJson: isSet(object.resultJson)
+        ? globalThis.String(object.resultJson)
+        : isSet(object.result_json)
+        ? globalThis.String(object.result_json)
+        : "",
+      error: isSet(object.error) ? RuntimeError.fromJSON(object.error) : undefined,
+    };
+  },
+
+  toJSON(message: RuntimeResponse): unknown {
+    const obj: any = {};
+    if (message.requestId !== "") {
+      obj.requestId = message.requestId;
+    }
+    if (message.success !== false) {
+      obj.success = message.success;
+    }
+    if (message.resultJson !== "") {
+      obj.resultJson = message.resultJson;
+    }
+    if (message.error !== undefined) {
+      obj.error = RuntimeError.toJSON(message.error);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RuntimeResponse>): RuntimeResponse {
+    return RuntimeResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RuntimeResponse>): RuntimeResponse {
+    const message = createBaseRuntimeResponse();
+    message.requestId = object.requestId ?? "";
+    message.success = object.success ?? false;
+    message.resultJson = object.resultJson ?? "";
+    message.error = (object.error !== undefined && object.error !== null)
+      ? RuntimeError.fromPartial(object.error)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseRuntimeError(): RuntimeError {
+  return { code: "", message: "" };
+}
+
+export const RuntimeError: MessageFns<RuntimeError> = {
+  encode(message: RuntimeError, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.code !== "") {
+      writer.uint32(10).string(message.code);
+    }
+    if (message.message !== "") {
+      writer.uint32(18).string(message.message);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RuntimeError {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRuntimeError();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.code = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.message = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RuntimeError {
+    return {
+      code: isSet(object.code) ? globalThis.String(object.code) : "",
+      message: isSet(object.message) ? globalThis.String(object.message) : "",
+    };
+  },
+
+  toJSON(message: RuntimeError): unknown {
+    const obj: any = {};
+    if (message.code !== "") {
+      obj.code = message.code;
+    }
+    if (message.message !== "") {
+      obj.message = message.message;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RuntimeError>): RuntimeError {
+    return RuntimeError.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RuntimeError>): RuntimeError {
+    const message = createBaseRuntimeError();
+    message.code = object.code ?? "";
+    message.message = object.message ?? "";
     return message;
   },
 };

@@ -17,4 +17,12 @@ export type {
   FileParams,
   FileResult,
   FileErrorPayload,
+  HostResourceParams,
+  HostResourceSnapshot,
+  HostResourceValue,
+  InstalledPluginResource,
+  PluginInstallParams,
+  RuntimeControlResult,
+  RuntimePackage,
+  RuntimePluginStatus,
 } from "./cloud-client.ts";

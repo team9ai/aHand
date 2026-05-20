@@ -29,10 +29,10 @@
 use ahand_protocol::{
     ApprovalRequest, ApprovalResponse, BootstrapAuth, BrowserRequest, BrowserResponse, CancelJob,
     Ed25519Auth, Envelope, FileRequest, FileResponse, Heartbeat, Hello, HelloAccepted,
-    HelloChallenge, JobEvent, JobFinished, JobRejected, JobRequest, PolicyQuery, PolicyState,
-    PolicyUpdate, RefusalContext, SessionMode, SessionQuery, SessionState, SetSessionMode,
-    StdinChunk, TerminalResize, UpdateCommand, UpdateState, UpdateStatus, UpdateSuggestion,
-    envelope, hello, job_event,
+    HelloChallenge, HostResourceQuery, JobEvent, JobFinished, JobRejected, JobRequest, PolicyQuery,
+    PolicyState, PolicyUpdate, RefusalContext, RuntimeRequest, RuntimeResponse, SessionMode,
+    SessionQuery, SessionState, SetSessionMode, StdinChunk, TerminalResize, UpdateCommand,
+    UpdateState, UpdateStatus, UpdateSuggestion, envelope, hello, job_event, runtime_request,
 };
 use prost::Message;
 use std::path::{Path, PathBuf};
@@ -470,6 +470,28 @@ fn golden_file_response() {
     assert_golden("file_response", &env);
 }
 
+#[test]
+fn golden_runtime_request() {
+    let env = base_envelope(envelope::Payload::RuntimeRequest(RuntimeRequest {
+        request_id: "runtime-req-1".into(),
+        operation: Some(runtime_request::Operation::HostResource(
+            HostResourceQuery {},
+        )),
+    }));
+    assert_golden("runtime_request", &env);
+}
+
+#[test]
+fn golden_runtime_response() {
+    let env = base_envelope(envelope::Payload::RuntimeResponse(RuntimeResponse {
+        request_id: "runtime-req-1".into(),
+        success: true,
+        result_json: r#"{"plugins":[]}"#.into(),
+        error: None,
+    }));
+    assert_golden("runtime_response", &env);
+}
+
 // ── Exhaustiveness lock ─────────────────────────────────────────────────
 //
 // Every arm of `envelope::Payload` must map to a fixture name AND that
@@ -513,6 +535,8 @@ fn payload_fixture_name(p: &envelope::Payload) -> &'static str {
         TerminalResize(_) => "terminal_resize",
         FileRequest(_) => "file_request",
         FileResponse(_) => "file_response",
+        RuntimeRequest(_) => "runtime_request",
+        RuntimeResponse(_) => "runtime_response",
         Heartbeat(_) => "heartbeat",
     }
 }
@@ -555,6 +579,8 @@ fn every_payload_variant_has_a_fixture_file() {
         envelope::Payload::TerminalResize(TerminalResize::default()),
         envelope::Payload::FileRequest(FileRequest::default()),
         envelope::Payload::FileResponse(FileResponse::default()),
+        envelope::Payload::RuntimeRequest(RuntimeRequest::default()),
+        envelope::Payload::RuntimeResponse(RuntimeResponse::default()),
         envelope::Payload::Heartbeat(Heartbeat::default()),
     ];
 

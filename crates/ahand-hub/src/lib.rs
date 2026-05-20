@@ -9,6 +9,8 @@ pub mod file_service;
 pub mod http;
 pub mod output_stream;
 pub mod pending_file_requests;
+pub mod pending_runtime_requests;
+pub mod runtime_service;
 pub mod s3;
 pub mod state;
 pub mod webhook;

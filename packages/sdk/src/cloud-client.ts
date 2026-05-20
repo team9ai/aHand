@@ -17,6 +17,10 @@
 //!     Keepalives are `:keepalive\n\n` SSE comments. The stream ends
 //!     after `finished` or `error`.
 //!   * POST `/api/control/jobs/{id}/cancel` — returns 202 with no body.
+//!   * POST `/api/control/host-resource` — returns the target daemon's
+//!     getHostResource snapshot.
+//!   * POST `/api/control/plugins/install` — initializes a managed runtime
+//!     plugin on the target daemon, then returns a fresh host-resource snapshot.
 //!   * Error envelope on 4xx/5xx: `{error: {code, message}}`.
 //!
 //! Auth is a control-plane JWT provided via `getAuthToken()`. It's
@@ -76,6 +80,63 @@ export interface SpawnParams {
 /** Resolved result of a successful `spawn()`. */
 export interface SpawnResult {
   exitCode: number;
+  durationMs: number;
+}
+
+export type RuntimePluginStatus =
+  | "installed"
+  | "missing"
+  | "outdated"
+  | "failed"
+  | "blocked";
+
+export interface RuntimePackage {
+  name: string;
+  version?: string;
+}
+
+export type HostResourceValue =
+  | { kind: "executable"; name: string; path: string; version?: string }
+  | { kind: "directory"; name: string; path: string }
+  | { kind: "env"; name: string; value: string }
+  | { kind: "config"; name: string; value: unknown };
+
+export interface InstalledPluginResource {
+  id: string;
+  version: string;
+  status: RuntimePluginStatus;
+  dependencies: string[];
+  capabilities: string[];
+  resources: Record<string, HostResourceValue>;
+  packages?: RuntimePackage[];
+  helpPrompt?: string;
+}
+
+export interface HostResourceSnapshot {
+  runtimeVersion: string;
+  platform: string;
+  arch: string;
+  plugins: InstalledPluginResource[];
+}
+
+export interface HostResourceParams {
+  deviceId: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface PluginInstallParams {
+  deviceId: string;
+  pluginId: string;
+  force?: boolean;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+export interface RuntimeControlResult<T = unknown> {
+  success: boolean;
+  data?: T;
+  error?: { code: string; message: string };
   durationMs: number;
 }
 
@@ -747,6 +808,40 @@ export class CloudClient {
     };
   }
 
+  /** `POST /api/control/host-resource`. Returns a target daemon runtime snapshot. */
+  async hostResource(
+    params: HostResourceParams,
+  ): Promise<RuntimeControlResult<HostResourceSnapshot>> {
+    return this.runtimeRequest<HostResourceSnapshot>(
+      "/api/control/host-resource",
+      {
+        deviceId: params.deviceId,
+        ...(params.timeoutMs !== undefined && { timeoutMs: params.timeoutMs }),
+      },
+      params.signal,
+    );
+  }
+
+  /**
+   * `POST /api/control/plugins/install`. Initializes a managed runtime plugin
+   * (node, python, browser-playwright-cli) on the target daemon and returns a
+   * fresh host-resource snapshot.
+   */
+  async installPlugin(
+    params: PluginInstallParams,
+  ): Promise<RuntimeControlResult<HostResourceSnapshot>> {
+    return this.runtimeRequest<HostResourceSnapshot>(
+      "/api/control/plugins/install",
+      {
+        deviceId: params.deviceId,
+        pluginId: params.pluginId,
+        force: params.force ?? false,
+        ...(params.timeoutMs !== undefined && { timeoutMs: params.timeoutMs }),
+      },
+      params.signal,
+    );
+  }
+
   /** `POST /api/control/jobs/{id}/cancel`. Returns 202 with no body. */
   async cancel(jobId: string): Promise<void> {
     const fetchImpl = this.fetchImpl();
@@ -936,6 +1031,92 @@ export class CloudClient {
         // compatibility with future hub events.
         return undefined;
     }
+  }
+
+  private async runtimeRequest<T>(
+    path: "/api/control/host-resource" | "/api/control/plugins/install",
+    body: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<RuntimeControlResult<T>> {
+    if (signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted before request");
+    }
+
+    const fetchImpl = this.fetchImpl();
+    const token = await this.opts.getAuthToken();
+    if (signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
+
+    let res: Response;
+    try {
+      res = await fetchImpl(`${this.opts.hubUrl}${path}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (err) {
+      throw this.normalizeFetchError(err);
+    }
+    if (!res.ok) throw await toTypedHttpError(res);
+
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch (e: unknown) {
+      if (isAbortError(e)) {
+        throw new CloudClientError(
+          "abort",
+          "runtime request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw new CloudClientError("network", String(e), { cause: e });
+    }
+
+    if (json === null || typeof json !== "object" || Array.isArray(json)) {
+      throw new CloudClientError(
+        "server_error",
+        "Hub runtime response malformed: root is not an object",
+      );
+    }
+    const record = json as Record<string, unknown>;
+    if (typeof record.success !== "boolean") {
+      throw new CloudClientError(
+        "server_error",
+        "Hub runtime response malformed: 'success' missing or not boolean",
+      );
+    }
+    const error =
+      record.error && typeof record.error === "object"
+        ? {
+            code:
+              typeof (record.error as Record<string, unknown>).code === "string"
+                ? ((record.error as Record<string, unknown>).code as string)
+                : "unspecified",
+            message:
+              typeof (record.error as Record<string, unknown>).message === "string"
+                ? ((record.error as Record<string, unknown>).message as string)
+                : "",
+          }
+        : undefined;
+    return {
+      success: record.success,
+      data: record.data === undefined || record.data === null ? undefined : (record.data as T),
+      error,
+      durationMs: typeof record.durationMs === "number" ? record.durationMs : 0,
+    };
   }
 
   /**

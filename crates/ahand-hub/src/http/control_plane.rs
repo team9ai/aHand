@@ -9,6 +9,8 @@
 //!   * `POST /api/control/jobs/{id}/cancel` — best-effort cancel
 //!   * `POST /api/control/browser`         — synchronous browser command
 //!   * `POST /api/control/files`           — synchronous file operation
+//!   * `POST /api/control/host-resource`   — synchronous host runtime snapshot
+//!   * `POST /api/control/plugins/install` — initialize a managed runtime plugin
 //!
 //! Auth: **control-plane JWT** (`token_type = ControlPlane`) only —
 //! device JWTs are rejected by [`verify_control_plane_jwt`]. The JWT's
@@ -65,6 +67,8 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/control/jobs/{id}/cancel", post(cancel_job))
         .route("/api/control/browser", post(browser_command_control))
         .route("/api/control/files", post(control_files))
+        .route("/api/control/host-resource", post(control_host_resource))
+        .route("/api/control/plugins/install", post(control_plugin_install))
         .layer(middleware::from_fn_with_state(
             state,
             require_control_plane_jwt,
@@ -983,4 +987,230 @@ pub async fn control_files(
     let envelope =
         control_files_dto::build_response_envelope(response, &body.operation, duration_ms);
     Ok(Json(envelope))
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Runtime resource and plugin initialization endpoints.
+// ──────────────────────────────────────────────────────────────────────
+
+use crate::runtime_service::{self, RuntimeServiceError};
+
+const DEFAULT_HOST_RESOURCE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_PLUGIN_INSTALL_TIMEOUT_MS: u64 = 15 * 60 * 1000;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlHostResourceRequest {
+    pub device_id: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlPluginInstallRequest {
+    pub device_id: String,
+    pub plugin_id: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlRuntimeResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ControlRuntimeError>,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlRuntimeError {
+    pub code: String,
+    pub message: String,
+}
+
+pub async fn control_host_resource(
+    Extension(claims): Extension<ControlPlaneJwtClaims>,
+    State(state): State<AppState>,
+    body: Result<Json<ControlHostResourceRequest>, JsonRejection>,
+) -> ApiResult<Json<ControlRuntimeResponse>> {
+    if claims.scope != "jobs:execute" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT scope does not permit this action",
+        ));
+    }
+
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
+    let device_id = ensure_control_device(&state, &claims, &body.device_id).await?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request = ahand_protocol::RuntimeRequest {
+        request_id,
+        operation: Some(ahand_protocol::runtime_request::Operation::HostResource(
+            ahand_protocol::HostResourceQuery {},
+        )),
+    };
+    let timeout = Duration::from_millis(
+        body.timeout_ms
+            .unwrap_or(DEFAULT_HOST_RESOURCE_TIMEOUT_MS)
+            .clamp(1_000, DEFAULT_PLUGIN_INSTALL_TIMEOUT_MS),
+    );
+    execute_runtime_request(&state, &device_id, request, timeout).await
+}
+
+pub async fn control_plugin_install(
+    Extension(claims): Extension<ControlPlaneJwtClaims>,
+    State(state): State<AppState>,
+    body: Result<Json<ControlPluginInstallRequest>, JsonRejection>,
+) -> ApiResult<Json<ControlRuntimeResponse>> {
+    if claims.scope != "jobs:execute" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT scope does not permit this action",
+        ));
+    }
+
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
+    if body.plugin_id.trim().is_empty() {
+        return Err(ApiError::validation("pluginId must not be empty"));
+    }
+    let device_id = ensure_control_device(&state, &claims, &body.device_id).await?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request = ahand_protocol::RuntimeRequest {
+        request_id,
+        operation: Some(ahand_protocol::runtime_request::Operation::PluginInstall(
+            ahand_protocol::PluginInstall {
+                plugin_id: body.plugin_id,
+                force: body.force,
+            },
+        )),
+    };
+    let timeout = Duration::from_millis(
+        body.timeout_ms
+            .unwrap_or(DEFAULT_PLUGIN_INSTALL_TIMEOUT_MS)
+            .clamp(1_000, DEFAULT_PLUGIN_INSTALL_TIMEOUT_MS),
+    );
+    execute_runtime_request(&state, &device_id, request, timeout).await
+}
+
+async fn ensure_control_device(
+    state: &AppState,
+    claims: &ControlPlaneJwtClaims,
+    device_id: &str,
+) -> ApiResult<String> {
+    if state
+        .control_rate_limiter
+        .check_key(&claims.external_user_id)
+        .is_err()
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Rate limit exceeded for this user",
+        ));
+    }
+    if device_id.is_empty() {
+        return Err(ApiError::validation("deviceId must not be empty"));
+    }
+    let device = state
+        .devices
+        .find_by_id(device_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("device store: {e}")))?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "DEVICE_NOT_FOUND",
+                format!("Device {device_id} not found"),
+            )
+        })?;
+    if device.external_user_id.as_deref() != Some(claims.external_user_id.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "NOT_DEVICE_OWNER",
+            format!("Caller does not own device {device_id}"),
+        ));
+    }
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&device.id)
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT does not grant access to this device",
+        ));
+    }
+    if !state.connections.is_online(&device.id) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "DEVICE_OFFLINE",
+            format!("Device {} is not currently connected", device.id),
+        ));
+    }
+    Ok(device.id)
+}
+
+async fn execute_runtime_request(
+    state: &AppState,
+    device_id: &str,
+    request: ahand_protocol::RuntimeRequest,
+    timeout: Duration,
+) -> ApiResult<Json<ControlRuntimeResponse>> {
+    let started = std::time::Instant::now();
+    let response = runtime_service::execute(state, device_id, request, timeout)
+        .await
+        .map_err(map_runtime_service_error)?;
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let data = if response.result_json.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str::<serde_json::Value>(&response.result_json).map_err(|e| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "MALFORMED_RUNTIME_RESPONSE",
+                    format!("daemon returned malformed runtime JSON: {e}"),
+                )
+            })?,
+        )
+    };
+    let error = response.error.map(|err| ControlRuntimeError {
+        code: err.code,
+        message: err.message,
+    });
+    Ok(Json(ControlRuntimeResponse {
+        success: response.success,
+        data,
+        error,
+        duration_ms,
+    }))
+}
+
+fn map_runtime_service_error(err: RuntimeServiceError) -> ApiError {
+    match err {
+        RuntimeServiceError::AtCapacity | RuntimeServiceError::Duplicate { .. } => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RUNTIME_REQUESTS_AT_CAPACITY",
+            err.to_string(),
+        ),
+        RuntimeServiceError::DeviceOffline { .. } => {
+            ApiError::new(StatusCode::CONFLICT, "DEVICE_OFFLINE", err.to_string())
+        }
+        RuntimeServiceError::Timeout { .. } => ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            "RUNTIME_TIMEOUT",
+            err.to_string(),
+        ),
+        RuntimeServiceError::ChannelClosed | RuntimeServiceError::Internal(_) => {
+            ApiError::internal(err.to_string())
+        }
+    }
 }

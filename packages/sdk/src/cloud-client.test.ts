@@ -1481,6 +1481,94 @@ describe("CloudClient.files", () => {
   });
 });
 
+describe("CloudClient runtime control", () => {
+  it("hostResource POSTs camelCase body and returns snapshot data", async () => {
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse({
+          success: true,
+          data: {
+            runtimeVersion: "0.1.14",
+            platform: "darwin",
+            arch: "arm64",
+            plugins: [
+              {
+                id: "node",
+                version: "0.1.0",
+                status: "installed",
+                dependencies: [],
+                capabilities: ["node-exec"],
+                resources: {
+                  node: {
+                    kind: "executable",
+                    name: "node",
+                    path: "/tmp/node/bin/node",
+                    version: "v24.13.0",
+                  },
+                },
+                packages: [{ name: "typescript", version: "5.9.3" }],
+              },
+            ],
+          },
+          durationMs: 8,
+        }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const result = await client.hostResource({ deviceId: "dev-1", timeoutMs: 5000 });
+
+    expect(calls[0].url).toBe("https://hub.test/api/control/host-resource");
+    expect(JSON.parse(calls[0].init?.body as string)).toEqual({
+      deviceId: "dev-1",
+      timeoutMs: 5000,
+    });
+    expect(result.success).toBe(true);
+    expect(result.data?.plugins[0]?.packages).toEqual([
+      { name: "typescript", version: "5.9.3" },
+    ]);
+    expect(result.durationMs).toBe(8);
+  });
+
+  it("installPlugin POSTs pluginId/force and preserves daemon errors", async () => {
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse({
+          success: false,
+          error: { code: "install_failed", message: "network unavailable" },
+          durationMs: 12,
+        }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const result = await client.installPlugin({
+      deviceId: "dev-1",
+      pluginId: "python",
+      force: true,
+    });
+
+    expect(calls[0].url).toBe("https://hub.test/api/control/plugins/install");
+    expect(JSON.parse(calls[0].init?.body as string)).toEqual({
+      deviceId: "dev-1",
+      pluginId: "python",
+      force: true,
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toEqual({
+      code: "install_failed",
+      message: "network unavailable",
+    });
+  });
+
+  it("bad: malformed runtime response throws CloudClientError(server_error)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({ data: {} })]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(client.hostResource({ deviceId: "dev-1" })).rejects.toMatchObject({
+      code: "server_error",
+    });
+  });
+});
+
 describe("CloudClientError", () => {
   it("exposes expected properties", () => {
     const err = new CloudClientError("forbidden", "msg", {

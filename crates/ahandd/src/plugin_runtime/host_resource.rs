@@ -2,11 +2,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::browser_setup::CheckStatus;
+use serde::Deserialize;
+use tokio::process::Command;
 
 use super::builtin::builtin_registry;
 use super::{
     HostResourceSnapshot, HostResourceValue, InstalledPluginResource, PluginManifest, PluginStatus,
-    RuntimeDirs,
+    RuntimeDirs, RuntimePackage,
 };
 
 pub async fn get_host_resource() -> anyhow::Result<HostResourceSnapshot> {
@@ -22,7 +24,7 @@ pub async fn get_host_resource() -> anyhow::Result<HostResourceSnapshot> {
     if let Some(manifest) = registry.get("node") {
         dependency_statuses.insert(
             "node".to_string(),
-            node_resource(manifest, &runtime, &node_report).status,
+            node_resource(manifest, &runtime, &node_report).await.status,
         );
     }
 
@@ -31,12 +33,12 @@ pub async fn get_host_resource() -> anyhow::Result<HostResourceSnapshot> {
         plugins.push(match manifest.id.as_str() {
             "shell" => shell_resource_from_path(manifest, shell_candidate.clone()),
             "file" => file_resource(manifest),
-            "node" => node_resource(manifest, &runtime, &node_report),
+            "node" => node_resource(manifest, &runtime, &node_report).await,
             "python" => python_resource(manifest, &runtime).await,
             "browser-playwright-cli" => {
                 browser_playwright_resource(manifest, &dependency_statuses).await
             }
-            _ => manifest_resource(manifest, PluginStatus::Missing, BTreeMap::new()),
+            _ => manifest_resource(manifest, PluginStatus::Missing, BTreeMap::new(), Vec::new()),
         });
     }
 
@@ -95,7 +97,7 @@ fn shell_path() -> String {
 
 fn shell_resource_from_path(manifest: &PluginManifest, shell: String) -> InstalledPluginResource {
     if shell_status_from_path(&shell) != PluginStatus::Installed {
-        return manifest_resource(manifest, PluginStatus::Missing, BTreeMap::new());
+        return manifest_resource(manifest, PluginStatus::Missing, BTreeMap::new(), Vec::new());
     }
 
     let mut resources = BTreeMap::new();
@@ -108,7 +110,7 @@ fn shell_resource_from_path(manifest: &PluginManifest, shell: String) -> Install
         },
     );
 
-    manifest_resource(manifest, PluginStatus::Installed, resources)
+    manifest_resource(manifest, PluginStatus::Installed, resources, Vec::new())
 }
 
 fn shell_status_from_path(shell: &str) -> PluginStatus {
@@ -140,15 +142,21 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 fn file_resource(manifest: &PluginManifest) -> InstalledPluginResource {
-    manifest_resource(manifest, PluginStatus::Installed, BTreeMap::new())
+    manifest_resource(
+        manifest,
+        PluginStatus::Installed,
+        BTreeMap::new(),
+        Vec::new(),
+    )
 }
 
-fn node_resource(
+async fn node_resource(
     manifest: &PluginManifest,
     runtime: &RuntimeDirs,
     report: &crate::browser_setup::CheckReport,
 ) -> InstalledPluginResource {
     let mut resources = BTreeMap::new();
+    let mut packages = Vec::new();
     let status = match &report.status {
         CheckStatus::Ok { version, path, .. } => {
             let npm = runtime.npm_bin();
@@ -169,6 +177,7 @@ fn node_resource(
                         version: None,
                     },
                 );
+                packages = node_packages(runtime).await;
                 PluginStatus::Installed
             } else {
                 PluginStatus::Failed
@@ -177,7 +186,7 @@ fn node_resource(
         other => plugin_status_from_check(other),
     };
 
-    manifest_resource(manifest, status, resources)
+    manifest_resource(manifest, status, resources, packages)
 }
 
 async fn python_resource(
@@ -186,11 +195,11 @@ async fn python_resource(
 ) -> InstalledPluginResource {
     let python = runtime.python_bin();
     if !python.exists() {
-        return manifest_resource(manifest, PluginStatus::Missing, BTreeMap::new());
+        return manifest_resource(manifest, PluginStatus::Missing, BTreeMap::new(), Vec::new());
     }
 
     let Ok(version) = executable_version(&python).await else {
-        return manifest_resource(manifest, PluginStatus::Failed, BTreeMap::new());
+        return manifest_resource(manifest, PluginStatus::Failed, BTreeMap::new(), Vec::new());
     };
 
     let mut resources = BTreeMap::new();
@@ -198,12 +207,13 @@ async fn python_resource(
         "python".to_string(),
         HostResourceValue::Executable {
             name: "python".to_string(),
-            path: path_to_string(python),
+            path: path_to_string(&python),
             version,
         },
     );
 
-    manifest_resource(manifest, PluginStatus::Installed, resources)
+    let packages = python_packages(&python).await;
+    manifest_resource(manifest, PluginStatus::Installed, resources, packages)
 }
 
 async fn browser_playwright_resource(
@@ -211,7 +221,7 @@ async fn browser_playwright_resource(
     dependency_statuses: &BTreeMap<String, PluginStatus>,
 ) -> InstalledPluginResource {
     if !dependencies_installed(manifest, dependency_statuses) {
-        return manifest_resource(manifest, PluginStatus::Blocked, BTreeMap::new());
+        return manifest_resource(manifest, PluginStatus::Blocked, BTreeMap::new(), Vec::new());
     }
 
     let report = crate::browser_setup::playwright::inspect().await;
@@ -231,7 +241,7 @@ async fn browser_playwright_resource(
         other => plugin_status_from_check(other),
     };
 
-    manifest_resource(manifest, status, resources)
+    manifest_resource(manifest, status, resources, Vec::new())
 }
 
 fn dependencies_installed(
@@ -244,10 +254,109 @@ fn dependencies_installed(
         .all(|dependency| dependency_statuses.get(dependency) == Some(&PluginStatus::Installed))
 }
 
+async fn node_packages(runtime: &RuntimeDirs) -> Vec<RuntimePackage> {
+    let npm = runtime.npm_bin();
+    if !npm.is_file() {
+        return Vec::new();
+    }
+    let Ok(output) = Command::new(npm)
+        .args(["list", "-g", "--depth=0", "--json"])
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_npm_packages(&stdout)
+}
+
+async fn python_packages(python: &Path) -> Vec<RuntimePackage> {
+    let Ok(output) = Command::new(python)
+        .args(["-m", "pip", "list", "--format=json"])
+        .output()
+        .await
+    else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_python_packages(&stdout)
+}
+
+#[derive(Debug, Deserialize)]
+struct NpmList {
+    dependencies: Option<BTreeMap<String, NpmDependency>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NpmDependency {
+    version: Option<String>,
+}
+
+fn parse_npm_packages(json: &str) -> Vec<RuntimePackage> {
+    let Ok(list) = serde_json::from_str::<NpmList>(json) else {
+        return Vec::new();
+    };
+    let mut packages = list
+        .dependencies
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(name, _)| !is_node_system_package(name))
+        .map(|(name, dep)| RuntimePackage {
+            name,
+            version: dep.version,
+        })
+        .collect::<Vec<_>>();
+    sort_packages(&mut packages);
+    packages
+}
+
+#[derive(Debug, Deserialize)]
+struct PipListPackage {
+    name: String,
+    version: Option<String>,
+}
+
+fn parse_python_packages(json: &str) -> Vec<RuntimePackage> {
+    let Ok(list) = serde_json::from_str::<Vec<PipListPackage>>(json) else {
+        return Vec::new();
+    };
+    let mut packages = list
+        .into_iter()
+        .filter(|pkg| !is_python_system_package(&pkg.name))
+        .map(|pkg| RuntimePackage {
+            name: pkg.name,
+            version: pkg.version,
+        })
+        .collect::<Vec<_>>();
+    sort_packages(&mut packages);
+    packages
+}
+
+fn is_node_system_package(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "npm" | "corepack")
+}
+
+fn is_python_system_package(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "pip" | "setuptools" | "wheel"
+    )
+}
+
+fn sort_packages(packages: &mut [RuntimePackage]) {
+    packages.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
 fn manifest_resource(
     manifest: &PluginManifest,
     status: PluginStatus,
     resources: BTreeMap<String, HostResourceValue>,
+    packages: Vec<RuntimePackage>,
 ) -> InstalledPluginResource {
     InstalledPluginResource {
         id: manifest.id.clone(),
@@ -256,6 +365,7 @@ fn manifest_resource(
         dependencies: manifest.dependencies.clone(),
         capabilities: manifest.capabilities.clone(),
         resources,
+        packages,
         help_prompt: manifest.help.as_ref().map(|help| help.prompt.clone()),
     }
 }
@@ -364,8 +474,8 @@ mod tests {
         assert_eq!(normalize_arch("x86_64"), "x64");
     }
 
-    #[test]
-    fn node_resource_does_not_report_missing_npm_executable() {
+    #[tokio::test]
+    async fn node_resource_does_not_report_missing_npm_executable() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = RuntimeDirs::from_root(dir.path().to_path_buf());
         let report = CheckReport {
@@ -379,7 +489,7 @@ mod tests {
             fix_hint: None,
         };
 
-        let plugin = node_resource(&manifest("node"), &runtime, &report);
+        let plugin = node_resource(&manifest("node"), &runtime, &report).await;
 
         assert_eq!(plugin.status, PluginStatus::Failed);
         assert!(plugin.resources.contains_key("node"));
@@ -437,5 +547,60 @@ mod tests {
 
         assert_eq!(plugin.status, PluginStatus::Blocked);
         assert!(plugin.resources.is_empty());
+    }
+
+    #[test]
+    fn parse_npm_packages_filters_managed_runtime_system_packages() {
+        let packages = parse_npm_packages(
+            r#"{
+              "dependencies": {
+                "npm": {"version": "11.0.0"},
+                "corepack": {"version": "0.31.0"},
+                "@playwright/cli": {"version": "1.56.1"},
+                "typescript": {"version": "5.9.3"}
+              }
+            }"#,
+        );
+
+        assert_eq!(
+            packages,
+            vec![
+                RuntimePackage {
+                    name: "@playwright/cli".to_string(),
+                    version: Some("1.56.1".to_string()),
+                },
+                RuntimePackage {
+                    name: "typescript".to_string(),
+                    version: Some("5.9.3".to_string()),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_python_packages_filters_bootstrap_packages() {
+        let packages = parse_python_packages(
+            r#"[
+              {"name": "pip", "version": "25.0"},
+              {"name": "setuptools", "version": "75.0"},
+              {"name": "wheel", "version": "0.45"},
+              {"name": "pytest", "version": "9.0.1"},
+              {"name": "requests", "version": "2.32.5"}
+            ]"#,
+        );
+
+        assert_eq!(
+            packages,
+            vec![
+                RuntimePackage {
+                    name: "pytest".to_string(),
+                    version: Some("9.0.1".to_string()),
+                },
+                RuntimePackage {
+                    name: "requests".to_string(),
+                    version: Some("2.32.5".to_string()),
+                },
+            ]
+        );
     }
 }

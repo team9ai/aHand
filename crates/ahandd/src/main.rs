@@ -17,7 +17,6 @@ mod session;
 mod store;
 pub mod updater;
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -502,47 +501,10 @@ async fn run_plugin_command(command: &PluginCmd) -> anyhow::Result<()> {
 }
 
 async fn run_plugin_install(plugin: &str, force: bool) -> anyhow::Result<()> {
-    for step in install_steps_for(plugin)? {
+    for step in plugin_runtime::install_steps_for(plugin)? {
         cli::browser_init::run(force, Some(step)).await?;
     }
     Ok(())
-}
-
-fn install_steps_for(plugin: &str) -> anyhow::Result<Vec<String>> {
-    let registry = plugin_runtime::builtin::builtin_registry()?;
-    let activation_order = registry.activation_order()?;
-    let mut required = BTreeSet::new();
-    collect_plugin_and_dependencies(plugin, &registry, &mut required)?;
-
-    let steps = activation_order
-        .into_iter()
-        .filter(|id| required.contains(id) && has_install_step(id))
-        .collect::<Vec<_>>();
-
-    if steps.is_empty() {
-        anyhow::bail!("plugin `{plugin}` does not have an install step in this release");
-    }
-
-    Ok(steps)
-}
-
-fn collect_plugin_and_dependencies(
-    plugin: &str,
-    registry: &plugin_runtime::PluginRegistry,
-    required: &mut BTreeSet<String>,
-) -> anyhow::Result<()> {
-    let manifest = registry
-        .get(plugin)
-        .ok_or_else(|| anyhow::anyhow!("unknown plugin `{plugin}`"))?;
-    for dependency in &manifest.dependencies {
-        collect_plugin_and_dependencies(dependency, registry, required)?;
-    }
-    required.insert(plugin.to_string());
-    Ok(())
-}
-
-fn has_install_step(plugin: &str) -> bool {
-    matches!(plugin, "node" | "python" | "browser-playwright-cli")
 }
 
 fn write_pid_file(data_dir: &Option<PathBuf>) -> Option<PathBuf> {
@@ -576,27 +538,32 @@ mod plugin_cli_tests {
     #[test]
     fn browser_plugin_install_steps_include_node_dependency_first() {
         assert_eq!(
-            install_steps_for("browser-playwright-cli").unwrap(),
+            plugin_runtime::install_steps_for("browser-playwright-cli").unwrap(),
             vec!["node".to_string(), "browser-playwright-cli".to_string()]
         );
     }
 
     #[test]
     fn node_plugin_install_steps_include_only_node() {
-        assert_eq!(install_steps_for("node").unwrap(), vec!["node".to_string()]);
+        assert_eq!(
+            plugin_runtime::install_steps_for("node").unwrap(),
+            vec!["node".to_string()]
+        );
     }
 
     #[test]
     fn python_plugin_install_steps_include_only_python() {
         assert_eq!(
-            install_steps_for("python").unwrap(),
+            plugin_runtime::install_steps_for("python").unwrap(),
             vec!["python".to_string()]
         );
     }
 
     #[test]
     fn non_installable_plugin_reports_no_install_step() {
-        let err = install_steps_for("file").unwrap_err().to_string();
+        let err = plugin_runtime::install_steps_for("file")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not have an install step"));
     }
 

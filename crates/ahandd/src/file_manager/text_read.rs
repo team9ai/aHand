@@ -27,8 +27,8 @@
 use std::path::Path;
 
 use ahand_protocol::{
-    file_position, FileError, FileErrorCode, FilePosition, FileReadText, FileReadTextResult,
-    PositionInfo, StopReason, TextLine,
+    FileError, FileErrorCode, FilePosition, FileReadText, FileReadTextResult, PositionInfo,
+    StopReason, TextLine, file_position,
 };
 
 use super::file_error;
@@ -91,7 +91,10 @@ pub async fn handle_read_text(
     let max_lines = req.max_lines.unwrap_or(DEFAULT_MAX_LINES) as usize;
     // Clamp against the policy-level read budget so callers can never
     // bypass `max_read_bytes` by requesting a larger per-call max_bytes.
-    let max_bytes = req.max_bytes.unwrap_or(DEFAULT_MAX_BYTES).min(max_read_bytes);
+    let max_bytes = req
+        .max_bytes
+        .unwrap_or(DEFAULT_MAX_BYTES)
+        .min(max_read_bytes);
     let max_line_width = req.max_line_width.unwrap_or(DEFAULT_MAX_LINE_WIDTH);
     let target_end_byte = req
         .target_end
@@ -180,8 +183,7 @@ pub async fn handle_read_text(
         if !cut_short && display_end_raw > effective_start {
             if raw.get(display_end_raw - 1) == Some(&b'\n') {
                 display_end_raw -= 1;
-                if display_end_raw > effective_start
-                    && raw.get(display_end_raw - 1) == Some(&b'\r')
+                if display_end_raw > effective_start && raw.get(display_end_raw - 1) == Some(&b'\r')
                 {
                     display_end_raw -= 1;
                 }
@@ -230,10 +232,7 @@ pub async fn handle_read_text(
     }
 
     // End position info — also in RAW bytes.
-    let end_line_start_raw = line_offsets
-        .get(end_line_idx)
-        .copied()
-        .unwrap_or(raw.len());
+    let end_line_start_raw = line_offsets.get(end_line_idx).copied().unwrap_or(raw.len());
     let end_pos = PositionInfo {
         line: end_line_idx as u64 + 1,
         byte_in_file: end_byte as u64,

@@ -854,6 +854,14 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                         }
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
                         queue_ack_only(&control_tx, &device_id, envelope.seq)?;
+                    } else if let Some(ahand_protocol::envelope::Payload::RuntimeResponse(ref runtime_resp)) = envelope.payload {
+                        state.pending_runtime_requests.resolve(
+                            &device_id,
+                            &runtime_resp.request_id,
+                            runtime_resp.clone(),
+                        );
+                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
                     } else if dispatch_control_plane_event(&state, &envelope) {
                         // The control-plane tracker handled the frame, or
                         // the job id is a stale non-dashboard id that must
@@ -982,6 +990,8 @@ fn envelope_payload_variant_name(p: &Option<ahand_protocol::envelope::Payload>) 
         Some(Heartbeat(_)) => "Heartbeat",
         Some(FileRequest(_)) => "FileRequest",
         Some(FileResponse(_)) => "FileResponse",
+        Some(RuntimeRequest(_)) => "RuntimeRequest",
+        Some(RuntimeResponse(_)) => "RuntimeResponse",
     }
 }
 

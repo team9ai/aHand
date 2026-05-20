@@ -129,6 +129,7 @@ mod tests {
             dependencies: Vec::new(),
             capabilities: Vec::new(),
             resources,
+            packages: Vec::new(),
             help_prompt: None,
         }
     }

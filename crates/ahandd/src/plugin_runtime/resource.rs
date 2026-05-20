@@ -30,8 +30,18 @@ pub struct InstalledPluginResource {
     pub dependencies: Vec<String>,
     pub capabilities: Vec<String>,
     pub resources: BTreeMap<String, HostResourceValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<RuntimePackage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub help_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimePackage {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -86,6 +96,10 @@ mod tests {
                 dependencies: vec![],
                 capabilities: vec![],
                 resources,
+                packages: vec![RuntimePackage {
+                    name: "typescript".to_string(),
+                    version: Some("5.9.3".to_string()),
+                }],
                 help_prompt: Some("Use managed Node.js.".to_string()),
             }],
         };
@@ -111,6 +125,10 @@ mod tests {
                             "version": "v24.14.0"
                         }
                     },
+                    "packages": [{
+                        "name": "typescript",
+                        "version": "5.9.3"
+                    }],
                     "helpPrompt": "Use managed Node.js."
                 }]
             })

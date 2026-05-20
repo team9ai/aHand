@@ -177,6 +177,7 @@ mod tests {
             dependencies: Vec::new(),
             capabilities: Vec::new(),
             resources: node_resources,
+            packages: Vec::new(),
             help_prompt: None,
         }];
         let registry = CapabilityProviderRegistry::from_plugins(
