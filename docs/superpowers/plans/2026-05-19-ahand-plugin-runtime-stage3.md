@@ -952,3 +952,23 @@ Expected: draft PR created against Stage 2.
 - [x] Add a managed Python installer using pinned python-build-standalone `3.12.13+20260510` `install_only` assets.
 - [x] Wire `browser_setup::run_step("python")` and `ahandd plugin install python`.
 - [x] Verify a real install under a temporary `HOME`: `doctor python` moves from `Missing` to `Installed`, `host-resource` exports `dependencies/python/bin/python3`, and the exported binary reports `Python 3.12.13`.
+
+---
+
+## Task 8: Add Managed Runtime PATH Enrichment
+
+**Reason:** After local managed Node/Python installation completes, crate-mode command execution should be able to run `node`, `npm`, `python`, or `python3` without agents hard-coding absolute paths from `getHostResource()`.
+
+**Files:**
+- `crates/ahandd/src/plugin_runtime/path_env.rs`
+- `crates/ahandd/src/plugin_runtime/mod.rs`
+- `crates/ahandd/src/executor.rs`
+- `crates/ahandd/src/openclaw/handler.rs`
+- `docs/superpowers/specs/2026-05-19-ahand-plugin-runtime-stage3-design.md`
+- `docs/superpowers/plans/2026-05-19-ahand-plugin-runtime-stage3.md`
+
+- [x] Add shared PATH construction that reads installed `node` / `python` executable resources from the host-resource snapshot.
+- [x] Prepend managed runtime `bin` directories ahead of the caller's base `PATH`, with duplicate removal.
+- [x] Apply the enriched `PATH` to default `JobRequest` execution.
+- [x] Apply the enriched `PATH` to OpenClaw `system.run` and `system.which`.
+- [x] Add unit tests for installed-resource detection, PATH ordering, de-duplication, and case-insensitive PATH key handling.

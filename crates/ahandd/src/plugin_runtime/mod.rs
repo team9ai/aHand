@@ -4,6 +4,7 @@ pub mod capability;
 pub mod builtin;
 pub mod host_resource;
 pub mod manifest;
+pub mod path_env;
 pub mod provider;
 pub mod registry;
 pub mod resource;

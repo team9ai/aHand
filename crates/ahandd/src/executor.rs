@@ -145,8 +145,12 @@ where
     }
 
     for (k, v) in &req.env {
-        cmd.env(k, v);
+        if !crate::plugin_runtime::path_env::is_path_env_key(k) {
+            cmd.env(k, v);
+        }
     }
+    let path = crate::plugin_runtime::path_env::child_process_path(&req.env).await;
+    cmd.env("PATH", path);
 
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());

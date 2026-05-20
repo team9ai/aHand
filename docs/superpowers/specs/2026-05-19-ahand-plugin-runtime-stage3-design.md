@@ -15,9 +15,9 @@ node-exec   -> node plugin
 python-exec -> python plugin
 ```
 
-These capabilities must not change existing `JobRequest.tool = "node"` or `JobRequest.tool = "python"` behavior. Those existing values remain PATH-based executable names. Managed runtime execution is selected only through explicit provider-owned tool tokens.
+These capabilities must not reinterpret existing `JobRequest.tool = "node"` or `JobRequest.tool = "python"` as provider tokens. Those existing values remain PATH-based executable names. Managed runtime execution is selected only through explicit provider-owned tool tokens, while the default child process `PATH` may be enriched with installed managed runtime bins as described below.
 
-OpenClaw remains out of scope.
+Full OpenClaw provider migration remains out of scope. OpenClaw `system.run` and `system.which` share the managed runtime `PATH` enrichment so crate-mode hosts can find locally installed managed Node/Python runtimes.
 
 ## Goals
 
@@ -26,6 +26,7 @@ OpenClaw remains out of scope.
 - Preserve current protocol payloads and current request/response envelopes.
 - Add explicit managed runtime direct execution for the `node` and `python` plugins.
 - Keep `node` and `python` shell-independent: provider execution should run the managed binary path directly, not via shell.
+- Prepend installed managed Node/Python `bin` directories to child process `PATH` for default exec and OpenClaw command execution.
 - Keep existing policy, approval, idempotency, cancellation, PTY, file policy, and browser domain behavior intact.
 - Keep unavailable capability responses host-neutral and compatible with team9 crate-mode hosts.
 
@@ -37,7 +38,7 @@ OpenClaw remains out of scope.
 - Automatic plugin installation during dispatch.
 - OpenClaw command handler migration.
 - Changing protobuf schemas.
-- Changing the meaning of existing `JobRequest.tool = "node"` or `"python"`.
+- Reinterpreting existing `JobRequest.tool = "node"` or `"python"` as managed runtime provider tokens.
 
 ## Capability Provider Model
 
@@ -85,6 +86,8 @@ Provider behavior:
 - Existing `JobRequest` flow remains the default shell-backed execution path.
 - `JobRequest.tool = "$SHELL"` and `"shell"` keep current login-shell behavior.
 - Literal tools keep current PATH/path resolution behavior.
+- Child process `PATH` prepends managed runtime `bin` directories only when `getHostResource()` reports the local `node` or `python` plugin as `installed` and exports the corresponding executable resource.
+- If a request supplies a `PATH` environment override, that value is used as the base path and the managed runtime `bin` directories are prepended to it.
 - Interactive jobs continue using PTY support.
 
 ### `file`
@@ -151,7 +154,7 @@ plugin:node   -> managed node runtime provider
 plugin:python -> managed python runtime provider
 ```
 
-This avoids surprising users who currently rely on shell PATH behavior while allowing agents to deliberately choose the managed runtime after reading `getHostResource()`.
+The provider registry still avoids silently converting plain `node` / `python` tool tokens into managed runtime providers. However, child commands now receive a daemon-computed `PATH`: if local managed Node/Python installation is complete, their `bin` directories are placed before the caller's base `PATH`. This lets crate-mode hosts run commands like `node --version` or `python3 --version` after installation without hard-coding absolute runtime paths.
 
 Future protocol versions may add structured fields for provider selection. Stage 3 intentionally avoids schema changes.
 
