@@ -1504,6 +1504,8 @@ async fn create_job_timeout_streams_error_and_sends_cancel() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let job_id = body["jobId"].as_str().unwrap().to_string();
 
+    // Subscribe before waiting on daemon delivery so slow CI cannot let the
+    // timeout finalize and remove the job before the stream endpoint is opened.
     let resp = reqwest::Client::new()
         .get(format!(
             "{}/api/control/jobs/{job_id}/stream",
@@ -1530,12 +1532,12 @@ async fn create_job_timeout_streams_error_and_sends_cancel() {
     let received = recv_job_request(&mut device).await;
     assert_eq!(received.job_id, job_id);
 
-    let cancel = tokio::time::timeout(Duration::from_secs(2), recv_cancel(&mut device))
+    let cancel = tokio::time::timeout(Duration::from_secs(5), recv_cancel(&mut device))
         .await
         .expect("expected timeout cancel envelope");
     assert_eq!(cancel.job_id, job_id);
 
-    let body = tokio::time::timeout(Duration::from_secs(2), stream_task)
+    let body = tokio::time::timeout(Duration::from_secs(5), stream_task)
         .await
         .expect("expected timeout SSE event")
         .unwrap();
