@@ -10,22 +10,46 @@ pub const NODE_LTS_VERSION: &str = "24.13.0";
 pub struct Dirs {
     pub ahand: PathBuf,
     pub node: PathBuf,
+    runtime: crate::plugin_runtime::RuntimeDirs,
 }
 
 impl Dirs {
     pub fn new() -> Result<Self> {
-        let home = dirs::home_dir().context("cannot determine home directory")?;
-        let ahand = home.join(".ahand");
-        Ok(Self {
-            node: ahand.join("node"),
+        let runtime = crate::plugin_runtime::RuntimeDirs::new()?;
+        Ok(Self::from_runtime(runtime))
+    }
+
+    pub fn from_runtime_root(root: PathBuf) -> Self {
+        Self::from_runtime(crate::plugin_runtime::RuntimeDirs::from_root(root))
+    }
+
+    fn from_runtime(runtime: crate::plugin_runtime::RuntimeDirs) -> Self {
+        let ahand = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".ahand");
+        let node = runtime.node_dir();
+        Self {
             ahand,
-        })
+            node,
+            runtime,
+        }
+    }
+
+    pub fn local_node_bin(&self) -> PathBuf {
+        self.runtime.node_bin()
+    }
+
+    pub fn npm_bin(&self) -> PathBuf {
+        self.runtime.npm_bin()
+    }
+
+    pub fn playwright_cli_bin(&self) -> PathBuf {
+        self.runtime.playwright_cli_bin()
     }
 }
 
 fn local_node_bin() -> Result<PathBuf> {
-    let dirs = Dirs::new()?;
-    Ok(dirs.node.join("bin").join("node"))
+    Ok(Dirs::new()?.local_node_bin())
 }
 
 /// Read-only check: report current Node.js status.
@@ -93,7 +117,7 @@ pub async fn ensure(
     progress: &(dyn Fn(ProgressEvent) + Send + Sync),
 ) -> Result<CheckReport> {
     let dirs = Dirs::new()?;
-    let local_node = dirs.node.join("bin").join("node");
+    let local_node = dirs.local_node_bin();
 
     if !force && local_node.exists() {
         if let Some(ver) = read_node_major_version(&local_node).await {
@@ -282,6 +306,21 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn dirs_use_plugin_runtime_node_directory() {
+        let root = PathBuf::from("/tmp/ahand-primary-runtime");
+        let dirs = Dirs::from_runtime_root(root);
+
+        assert_eq!(
+            dirs.node,
+            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node")
+        );
+        assert_eq!(
+            dirs.local_node_bin(),
+            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node/bin/node")
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Task 4 verification: node.rs has NO subprocess install calls — the entire
     // install path is pure-Rust (reqwest HTTP download + xz2/tar extraction).
@@ -351,10 +390,7 @@ mod tests {
         );
 
         // Verify the phase sequence matches install_node()'s order
-        let phases: Vec<String> = events
-            .iter()
-            .map(|e| format!("{:?}", e.phase))
-            .collect();
+        let phases: Vec<String> = events.iter().map(|e| format!("{:?}", e.phase)).collect();
         assert_eq!(
             phases,
             vec!["Starting", "Downloading", "Extracting", "Verifying", "Done"]
@@ -373,28 +409,25 @@ mod tests {
         let bin_dir = dir.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let node_bin = bin_dir.join("node");
-        std::fs::write(
-            &node_bin,
-            "#!/bin/sh\necho 'v24.13.0'\n",
-        )
-        .unwrap();
+        std::fs::write(&node_bin, "#!/bin/sh\necho 'v24.13.0'\n").unwrap();
         let mut perms = std::fs::metadata(&node_bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&node_bin, perms).unwrap();
 
         // read_node_major_version reads the binary directly, so test it in isolation
         let version = read_node_major_version(&node_bin).await;
-        assert_eq!(version, Some(24), "fake node binary should report major version 24");
+        assert_eq!(
+            version,
+            Some(24),
+            "fake node binary should report major version 24"
+        );
     }
 
     /// Confirms read_node_major_version returns None for a binary that fails to run.
     #[tokio::test]
     async fn read_node_major_version_returns_none_for_nonexistent_bin() {
         let version = read_node_major_version(std::path::Path::new("/nonexistent/node")).await;
-        assert_eq!(
-            version, None,
-            "nonexistent binary should return None"
-        );
+        assert_eq!(version, None, "nonexistent binary should return None");
     }
 
     /// Confirms read_node_major_version returns None when output is unparseable.
@@ -411,10 +444,7 @@ mod tests {
         std::fs::set_permissions(&bin, perms).unwrap();
 
         let version = read_node_major_version(&bin).await;
-        assert_eq!(
-            version, None,
-            "garbage version output should return None"
-        );
+        assert_eq!(version, None, "garbage version output should return None");
     }
 
     /// Confirms read_node_major_version parses the standard `vMAJOR.MINOR.PATCH` format.
@@ -443,9 +473,6 @@ mod tests {
             ["darwin", "linux", "win"].contains(&os),
             "unexpected os: {os}"
         );
-        assert!(
-            ["arm64", "x64"].contains(&arch),
-            "unexpected arch: {arch}"
-        );
+        assert!(["arm64", "x64"].contains(&arch), "unexpected arch: {arch}");
     }
 }

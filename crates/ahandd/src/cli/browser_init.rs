@@ -10,7 +10,7 @@ pub async fn run(force: bool, step: Option<String>) -> Result<()> {
         Some(name) => {
             let report = browser_setup::run_step(name, force, progress).await?;
             println!();
-            println!("Step `{name}` complete.");
+            println!("Plugin step `{name}` complete.");
             print_summary(&[report]);
         }
         None => {

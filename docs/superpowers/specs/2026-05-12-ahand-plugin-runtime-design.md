@@ -217,7 +217,7 @@ type HostResourceSnapshot = {
 type InstalledPluginResource = {
   id: string;
   version: string;
-  status: "installed" | "missing" | "outdated" | "failed";
+  status: "installed" | "missing" | "outdated" | "failed" | "blocked";
   dependencies: string[];
   capabilities: string[];
   resources: Record<string, HostResourceValue>;

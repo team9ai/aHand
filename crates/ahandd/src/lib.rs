@@ -7,6 +7,7 @@ pub mod device_identity;
 pub mod executor;
 pub mod file_manager;
 pub mod outbox;
+pub mod plugin_runtime;
 pub mod registry;
 pub mod session;
 pub mod store;

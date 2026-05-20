@@ -11,9 +11,9 @@ use super::types::{
 
 pub const PLAYWRIGHT_CLI_VERSION: &str = "0.1.1";
 
-fn cli_path() -> Result<PathBuf> {
+pub fn cli_path() -> Result<PathBuf> {
     let dirs = Dirs::new()?;
-    Ok(dirs.node.join("bin").join("playwright-cli"))
+    Ok(dirs.playwright_cli_bin())
 }
 
 /// Read-only check: report current playwright-cli status.
@@ -171,7 +171,7 @@ pub async fn ensure(
     progress: &(dyn Fn(ProgressEvent) + Send + Sync),
 ) -> Result<CheckReport> {
     let dirs = Dirs::new()?;
-    let npm = dirs.node.join("bin").join("npm");
+    let npm = dirs.npm_bin();
     if !npm.exists() {
         anyhow::bail!(
             "npm not found at {} — install Node.js first (`ahandd browser-init --step node`)",

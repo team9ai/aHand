@@ -48,6 +48,21 @@ pub struct ResolvedTool {
     pub leading_args: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionTarget {
+    pub path: String,
+    pub leading_args: Vec<String>,
+}
+
+impl From<ResolvedTool> for ExecutionTarget {
+    fn from(value: ResolvedTool) -> Self {
+        Self {
+            path: value.path,
+            leading_args: value.leading_args,
+        }
+    }
+}
+
 /// Resolve `tool` against the daemon's environment.
 ///
 /// Special tokens `"$SHELL"` and `"shell"` mean "the user's default login
@@ -88,6 +103,24 @@ pub async fn run_job<T>(
     device_id: String,
     req: JobRequest,
     tx: T,
+    cancel_rx: mpsc::Receiver<()>,
+    store: Option<Arc<RunStore>>,
+) -> (i32, String)
+where
+    T: EnvelopeSink,
+{
+    let target = ExecutionTarget::from(resolve_tool(
+        &req.tool,
+        std::env::var("SHELL").ok().as_deref(),
+    ));
+    run_job_with_target(device_id, req, target, tx, cancel_rx, store).await
+}
+
+pub async fn run_job_with_target<T>(
+    device_id: String,
+    req: JobRequest,
+    target: ExecutionTarget,
+    tx: T,
     mut cancel_rx: mpsc::Receiver<()>,
     store: Option<Arc<RunStore>>,
 ) -> (i32, String)
@@ -101,10 +134,8 @@ where
         s.start_run(&job_id, &req);
     }
 
-    let resolved = resolve_tool(&req.tool, std::env::var("SHELL").ok().as_deref());
-
-    let mut cmd = Command::new(&resolved.path);
-    for leading in &resolved.leading_args {
+    let mut cmd = Command::new(&target.path);
+    for leading in &target.leading_args {
         cmd.arg(leading);
     }
     cmd.args(&req.args);
@@ -114,8 +145,12 @@ where
     }
 
     for (k, v) in &req.env {
-        cmd.env(k, v);
+        if !crate::plugin_runtime::path_env::is_path_env_key(k) {
+            cmd.env(k, v);
+        }
     }
+    let path = crate::plugin_runtime::path_env::child_process_path(&req.env).await;
+    cmd.env("PATH", path);
 
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -538,7 +573,8 @@ fn new_msg_id() -> String {
 
 #[cfg(test)]
 mod tool_resolution_tests {
-    use super::{ResolvedTool, resolve_tool};
+    use super::{ExecutionTarget, ResolvedTool, resolve_tool, run_job_with_target};
+    use ahand_protocol::JobRequest;
 
     #[test]
     fn dollar_shell_sentinel_resolves_to_shell_env_with_login_flag() {
@@ -636,5 +672,53 @@ mod tool_resolution_tests {
                 leading_args: vec![],
             }
         );
+    }
+
+    #[tokio::test]
+    async fn run_job_with_target_uses_explicit_executable_path() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("managed-runtime");
+        std::fs::write(&script, "#!/bin/sh\necho managed:$1\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+        let req = JobRequest {
+            job_id: "managed-runtime-job".to_string(),
+            tool: "plugin:node".to_string(),
+            args: vec!["ok".to_string()],
+            ..Default::default()
+        };
+
+        let (exit_code, error) = run_job_with_target(
+            "device-1".to_string(),
+            req,
+            ExecutionTarget {
+                path: script.to_string_lossy().to_string(),
+                leading_args: Vec::new(),
+            },
+            tx,
+            cancel_rx,
+            None,
+        )
+        .await;
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(error, "");
+
+        let mut saw_stdout = false;
+        while let Ok(env) = rx.try_recv() {
+            if let Some(ahand_protocol::envelope::Payload::JobEvent(event)) = env.payload {
+                if let Some(ahand_protocol::job_event::Event::StdoutChunk(bytes)) = event.event {
+                    saw_stdout |= String::from_utf8_lossy(&bytes).contains("managed:ok");
+                }
+            }
+        }
+        assert!(saw_stdout, "managed runtime stdout should be streamed");
     }
 }
