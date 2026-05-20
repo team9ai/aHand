@@ -102,6 +102,7 @@ name = "ahandctl"
 version = "0.1.2"
 dependencies = [
  "ahand-protocol",
+ "ahandd",
  "anyhow",
  "clap",
  "dirs 5.0.1",

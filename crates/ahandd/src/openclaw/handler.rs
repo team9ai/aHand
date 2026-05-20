@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -266,13 +266,16 @@ impl OpenClawHandler {
             cmd.current_dir(dir);
         }
 
-        // Apply environment overrides with sanitization
-        if let Some(overrides) = env_overrides {
-            let sanitized = sanitize_env(overrides);
-            for (key, value) in sanitized {
+        let command_env = env_overrides
+            .map(sanitize_env)
+            .unwrap_or_else(|| env::vars().collect());
+        for (key, value) in &command_env {
+            if !crate::plugin_runtime::path_env::is_path_env_key(key) {
                 cmd.env(key, value);
             }
         }
+        let path = crate::plugin_runtime::path_env::child_process_path(&command_env).await;
+        cmd.env("PATH", path);
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -441,8 +444,11 @@ impl OpenClawHandler {
         };
 
         let mut found: HashMap<String, String> = HashMap::new();
-        let path_env = env::var("PATH").unwrap_or_default();
-        let path_dirs: Vec<&str> = path_env.split(':').collect();
+        let base_path = env::var("PATH").unwrap_or_default();
+        let path_env =
+            crate::plugin_runtime::path_env::path_with_installed_runtime_bins_or_base(&base_path)
+                .await;
+        let path_dirs: Vec<PathBuf> = std::env::split_paths(&path_env).collect();
 
         for bin in &params.bins {
             let bin = bin.trim();
@@ -451,7 +457,7 @@ impl OpenClawHandler {
             }
 
             for dir in &path_dirs {
-                let candidate = Path::new(dir).join(bin);
+                let candidate = dir.join(bin);
                 if candidate.exists() && candidate.is_file() {
                     found.insert(bin.to_string(), candidate.to_string_lossy().to_string());
                     break;
@@ -1344,7 +1350,10 @@ fn sanitize_env(overrides: &HashMap<String, String>) -> HashMap<String, String> 
             }
             // Only allow PATH if it prepends to current PATH
             if trimmed == base_path || trimmed.ends_with(&format!(":{}", base_path)) {
-                result.insert(key.clone(), value.clone());
+                result.retain(|existing_key, _| {
+                    !crate::plugin_runtime::path_env::is_path_env_key(existing_key)
+                });
+                result.insert("PATH".to_string(), value.clone());
             }
             continue;
         }
