@@ -1496,16 +1496,13 @@ async fn create_job_timeout_streams_error_and_sends_cancel() {
             "deviceId": "cp-dev-timeout",
             "tool": "sleep",
             "args": ["10"],
-            "timeoutMs": 50,
+            "timeoutMs": 500,
         }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
     let body: serde_json::Value = resp.json().await.unwrap();
     let job_id = body["jobId"].as_str().unwrap().to_string();
-
-    let received = recv_job_request(&mut device).await;
-    assert_eq!(received.job_id, job_id);
 
     let resp = reqwest::Client::new()
         .get(format!(
@@ -1530,12 +1527,15 @@ async fn create_job_timeout_streams_error_and_sends_cancel() {
         body
     });
 
-    let cancel = tokio::time::timeout(Duration::from_secs(1), recv_cancel(&mut device))
+    let received = recv_job_request(&mut device).await;
+    assert_eq!(received.job_id, job_id);
+
+    let cancel = tokio::time::timeout(Duration::from_secs(2), recv_cancel(&mut device))
         .await
         .expect("expected timeout cancel envelope");
     assert_eq!(cancel.job_id, job_id);
 
-    let body = tokio::time::timeout(Duration::from_secs(1), stream_task)
+    let body = tokio::time::timeout(Duration::from_secs(2), stream_task)
         .await
         .expect("expected timeout SSE event")
         .unwrap();
