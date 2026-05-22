@@ -141,6 +141,10 @@ pub struct CreateJobRequest {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub permission_mode: Option<String>,
+    #[serde(default)]
+    pub mcp_config: Option<serde_json::Value>,
+    #[serde(default)]
+    pub mcp_config_mode: Option<String>,
 }
 
 /// Default job timeout when the SDK doesn't pass one. Matches the
@@ -241,6 +245,17 @@ async fn create_job(
                 "AHAND_AGENT_PERMISSION_MODE".into(),
                 permission_mode.to_string(),
             );
+        }
+        if let Some(mcp_config) = &req.mcp_config {
+            validate_mcp_config(mcp_config)?;
+            env.insert(
+                "AHAND_AGENT_MCP_CONFIG".into(),
+                serde_json::to_string(mcp_config)
+                    .map_err(|err| ControlError::Internal(err.to_string()))?,
+            );
+        }
+        if let Some(mode) = resolve_mcp_config_mode(req.mcp_config_mode.as_deref())? {
+            env.insert("AHAND_AGENT_MCP_CONFIG_MODE".into(), mode.to_string());
         }
         if tool.trim().is_empty() {
             tool = executable.to_string();
@@ -561,6 +576,7 @@ fn resolve_result_parser(parser: Option<&str>) -> Result<&'static str, ControlEr
         Some(ahand_protocol::RESULT_PARSER_CLAUDE_STREAM_JSON) => {
             Ok(ahand_protocol::RESULT_PARSER_CLAUDE_STREAM_JSON)
         }
+        Some(ahand_protocol::RESULT_PARSER_HERMES) => Ok(ahand_protocol::RESULT_PARSER_HERMES),
         Some(other) => Err(ControlError::BadRequest(format!(
             "unknown result_parser: {other}"
         ))),
@@ -577,6 +593,9 @@ fn resolve_result_parser_for_output(
             ahand_protocol::OUTPUT_FORMAT_CODEX_JSONL => ahand_protocol::RESULT_PARSER_CODEX_JSONL,
             ahand_protocol::OUTPUT_FORMAT_CLAUDE_STREAM_JSON => {
                 ahand_protocol::RESULT_PARSER_CLAUDE_STREAM_JSON
+            }
+            ahand_protocol::OUTPUT_FORMAT_HERMES_ACP_JSON_RPC => {
+                ahand_protocol::RESULT_PARSER_HERMES
             }
             _ => ahand_protocol::RESULT_PARSER_RAW,
         }),
@@ -704,6 +723,68 @@ fn validate_input_output_format(
         )),
         _ => Ok(()),
     }
+}
+
+fn resolve_mcp_config_mode(mode: Option<&str>) -> Result<Option<&'static str>, ControlError> {
+    match mode.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some("replace") => Ok(Some("replace")),
+        Some(other) => Err(ControlError::BadRequest(format!(
+            "unknown mcpConfigMode: {other}; use replace"
+        ))),
+    }
+}
+
+fn validate_mcp_config(value: &serde_json::Value) -> Result<(), ControlError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| ControlError::BadRequest("mcpConfig must be a JSON object".into()))?;
+    let Some(servers) = object.get("mcpServers") else {
+        return Ok(());
+    };
+    let servers = servers.as_object().ok_or_else(|| {
+        ControlError::BadRequest("mcpConfig.mcpServers must be a JSON object".into())
+    })?;
+    for (name, server) in servers {
+        if name.trim().is_empty() {
+            return Err(ControlError::BadRequest(
+                "mcpConfig server name must not be empty".into(),
+            ));
+        }
+        let server = server.as_object().ok_or_else(|| {
+            ControlError::BadRequest(format!("mcpConfig server {name:?} must be a JSON object"))
+        })?;
+        server
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ControlError::BadRequest(format!(
+                    "mcpConfig server {name:?} requires non-empty command"
+                ))
+            })?;
+        if let Some(args) = server.get("args") {
+            let args = args.as_array().ok_or_else(|| {
+                ControlError::BadRequest(format!("mcpConfig server {name:?} args must be an array"))
+            })?;
+            if args.iter().any(|arg| !arg.is_string()) {
+                return Err(ControlError::BadRequest(format!(
+                    "mcpConfig server {name:?} args must contain only strings"
+                )));
+            }
+        }
+        if let Some(env) = server.get("env") {
+            let env = env.as_object().ok_or_else(|| {
+                ControlError::BadRequest(format!("mcpConfig server {name:?} env must be an object"))
+            })?;
+            if env.values().any(|value| !value.is_string()) {
+                return Err(ControlError::BadRequest(format!(
+                    "mcpConfig server {name:?} env values must contain only strings"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn now_ms() -> u64 {
@@ -1029,7 +1110,8 @@ pub async fn browser_command_control(
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_execution_mode, resolve_format, resolve_result_parser, validate_format_for_parser,
+        resolve_execution_mode, resolve_format, resolve_result_parser,
+        resolve_result_parser_for_output, validate_format_for_parser,
     };
     use ahand_protocol::ExecutionMode;
 
@@ -1066,6 +1148,15 @@ mod tests {
         assert_eq!(
             resolve_result_parser(Some("claude-stream-json")).unwrap(),
             "claude-stream-json"
+        );
+        assert_eq!(resolve_result_parser(Some("hermes")).unwrap(), "hermes");
+        assert_eq!(
+            resolve_result_parser_for_output(
+                None,
+                ahand_protocol::OUTPUT_FORMAT_HERMES_ACP_JSON_RPC
+            )
+            .unwrap(),
+            "hermes"
         );
     }
 

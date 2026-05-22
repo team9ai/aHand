@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ahand_protocol::{Envelope, JobEvent, JobFinished, JobRequest, envelope, job_event};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -8,6 +10,9 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::agent::mcp_config::{
+    MCP_CONFIG_ENV, MCP_CONFIG_MODE_ENV, McpConfig, McpConfigMode, server_names,
+};
 use crate::store::RunStore;
 
 /// Messages that can be sent to the PTY stdin channel.
@@ -279,6 +284,11 @@ where
         s.start_run(&job_id, &req);
     }
 
+    let codex_home = match prepare_codex_mcp_home(&req, &job_id, &store) {
+        Ok(home) => home,
+        Err(error) => return finish(&device_id, &job_id, -1, &error, &tx, &store),
+    };
+
     let resolved = resolve_tool(&req.tool, std::env::var("SHELL").ok().as_deref());
 
     let mut cmd = Command::new(&resolved.path);
@@ -292,7 +302,13 @@ where
     }
 
     for (k, v) in &req.env {
+        if k == MCP_CONFIG_ENV || k == MCP_CONFIG_MODE_ENV {
+            continue;
+        }
         cmd.env(k, v);
+    }
+    if let Some(home) = &codex_home {
+        cmd.env("CODEX_HOME", home);
     }
 
     cmd.stdin(std::process::Stdio::piped());
@@ -304,6 +320,7 @@ where
         Ok(c) => c,
         Err(e) => {
             warn!(job_id = %job_id, error = %e, "failed to spawn stream job");
+            cleanup_codex_home(codex_home.as_ref());
             return finish(&device_id, &job_id, -1, &e.to_string(), &tx, &store);
         }
     };
@@ -434,6 +451,7 @@ where
                         stdin_handle.abort();
                         let _ = stdout_handle.await;
                         let _ = stderr_handle.await;
+                        cleanup_codex_home(codex_home.as_ref());
                         return finish(&device_id, &job_id, -1, "timeout", &tx, &store);
                     }
                 }
@@ -444,6 +462,7 @@ where
                 stdin_handle.abort();
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
+                cleanup_codex_home(codex_home.as_ref());
                 return finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
             }
         }
@@ -456,6 +475,7 @@ where
                 stdin_handle.abort();
                 let _ = stdout_handle.await;
                 let _ = stderr_handle.await;
+                cleanup_codex_home(codex_home.as_ref());
                 return finish(&device_id, &job_id, -1, "cancelled", &tx, &store);
             }
         }
@@ -464,6 +484,7 @@ where
     stdin_handle.abort();
     let _ = stdout_handle.await;
     let _ = stderr_handle.await;
+    cleanup_codex_home(codex_home.as_ref());
 
     match wait_result {
         Some(Ok(status)) => {
@@ -766,10 +787,259 @@ fn observation_line(record: &serde_json::Value) -> Option<Vec<u8>> {
     }
 }
 
+fn prepare_codex_mcp_home(
+    req: &JobRequest,
+    job_id: &str,
+    store: &Option<Arc<RunStore>>,
+) -> Result<Option<PathBuf>, String> {
+    if ahand_protocol::resolve_job_input_format(req) != ahand_protocol::INPUT_FORMAT_TEXT
+        || ahand_protocol::resolve_job_output_format(req)
+            != ahand_protocol::OUTPUT_FORMAT_CODEX_JSONL
+    {
+        return Ok(None);
+    }
+    let Some(mcp_config) = McpConfig::from_env(
+        req.env.get(MCP_CONFIG_ENV).map(String::as_str),
+        req.env.get(MCP_CONFIG_MODE_ENV).map(String::as_str),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let home = std::env::temp_dir().join(format!(
+        "ahand-codex-home-{}-{}-{}",
+        std::process::id(),
+        sanitize_filename(job_id),
+        now_millis()
+    ));
+    std::fs::create_dir_all(&home)
+        .map_err(|error| format!("failed to create Codex home {}: {error}", home.display()))?;
+
+    let config_path = home.join("config.toml");
+    let base_home = resolve_base_codex_home(req);
+    if let Some(base_home) = &base_home {
+        copy_codex_home_support_files(base_home, &home)?;
+    }
+    let mut config = read_base_codex_config(base_home.as_ref())?;
+    merge_codex_mcp_config(&mut config, &mcp_config)?;
+    std::fs::write(&config_path, config).map_err(|error| {
+        format!(
+            "failed to write Codex config {}: {error}",
+            config_path.display()
+        )
+    })?;
+
+    let names = server_names(&mcp_config.value);
+    let server_count = names.len();
+    append_json_artifact(
+        store,
+        job_id,
+        "mcp.jsonl",
+        &serde_json::json!({
+            "kind": "mcp_config_injected",
+            "agent": "codex",
+            "mode": match mcp_config.mode {
+                McpConfigMode::Merge => "merge",
+                McpConfigMode::Replace => "replace",
+            },
+            "serverNames": names,
+            "serverCount": server_count,
+            "target": "CODEX_HOME/config.toml",
+        }),
+    );
+
+    Ok(Some(home))
+}
+
+fn resolve_base_codex_home(req: &JobRequest) -> Option<PathBuf> {
+    req.env
+        .get("CODEX_HOME")
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("CODEX_HOME")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
+}
+
+fn read_base_codex_config(base_home: Option<&PathBuf>) -> Result<String, String> {
+    let Some(base_home) = base_home else {
+        return Ok(String::new());
+    };
+    let path = base_home.join("config.toml");
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    std::fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "failed to read base Codex config {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn copy_codex_home_support_files(base_home: &PathBuf, target_home: &PathBuf) -> Result<(), String> {
+    for name in ["auth.json", "config.json", "instructions.md"] {
+        let source = base_home.join(name);
+        if source.is_file() {
+            std::fs::copy(&source, target_home.join(name)).map_err(|error| {
+                format!(
+                    "failed to copy Codex home file {}: {error}",
+                    source.display()
+                )
+            })?;
+        }
+    }
+    let sessions = base_home.join("sessions");
+    if sessions.exists() {
+        let target = target_home.join("sessions");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&sessions, &target).map_err(|error| {
+                format!(
+                    "failed to link Codex sessions {} -> {}: {error}",
+                    target.display(),
+                    sessions.display()
+                )
+            })?;
+        }
+        #[cfg(not(unix))]
+        {
+            if sessions.is_dir() {
+                std::fs::create_dir_all(&target).map_err(|error| {
+                    format!(
+                        "failed to create Codex sessions {}: {error}",
+                        target.display()
+                    )
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn merge_codex_mcp_config(config: &mut String, mcp_config: &McpConfig) -> Result<(), String> {
+    let mut value = if config.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        config
+            .parse::<toml::Value>()
+            .map_err(|error| format!("failed to parse base Codex config.toml: {error}"))?
+    };
+    let root = value
+        .as_table_mut()
+        .ok_or_else(|| "Codex config.toml root must be a table".to_string())?;
+    if matches!(mcp_config.mode, McpConfigMode::Replace) {
+        root.remove("mcp_servers");
+    }
+    let servers = root
+        .entry("mcp_servers".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| "Codex config.toml mcp_servers must be a table".to_string())?;
+
+    let Some(json_servers) = mcp_config
+        .value
+        .get("mcpServers")
+        .and_then(serde_json::Value::as_object)
+    else {
+        *config = toml::to_string_pretty(&value)
+            .map_err(|error| format!("failed to serialize Codex config: {error}"))?;
+        return Ok(());
+    };
+
+    for (name, server) in json_servers {
+        let server = server
+            .as_object()
+            .ok_or_else(|| format!("mcp server {name:?} must be a JSON object"))?;
+        let mut table = toml::map::Map::new();
+        table.insert(
+            "command".to_string(),
+            toml::Value::String(
+                server
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+        );
+        let args = server
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(|arg| toml::Value::String(arg.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        table.insert("args".to_string(), toml::Value::Array(args));
+        if let Some(env) = server.get("env").and_then(serde_json::Value::as_object) {
+            let mut env_table = toml::map::Map::new();
+            for (key, value) in env {
+                if let Some(value) = value.as_str() {
+                    env_table.insert(key.clone(), toml::Value::String(value.to_string()));
+                }
+            }
+            table.insert("env".to_string(), toml::Value::Table(env_table));
+        }
+        servers.insert(name.clone(), toml::Value::Table(table));
+    }
+
+    *config = toml::to_string_pretty(&value)
+        .map_err(|error| format!("failed to serialize Codex config: {error}"))?;
+    Ok(())
+}
+
+fn cleanup_codex_home(path: Option<&PathBuf>) {
+    if let Some(path) = path {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+fn append_json_artifact(
+    store: &Option<Arc<RunStore>>,
+    job_id: &str,
+    name: &str,
+    value: &serde_json::Value,
+) {
+    if let Some(store) = store
+        && let Ok(mut line) = serde_json::to_vec(value)
+    {
+        line.push(b'\n');
+        store.append_artifact(job_id, name, &line);
+    }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn sanitize_filename(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{StdinInput, run_job_stream};
+    use super::{StdinInput, merge_codex_mcp_config, run_job_stream};
+    use crate::agent::mcp_config::{McpConfig, McpConfigMode};
     use ahand_protocol::{Envelope, ExecutionMode, JobRequest, envelope, job_event};
+    use serde_json::json;
     use tokio::sync::mpsc;
 
     #[tokio::test]
@@ -852,6 +1122,65 @@ mod tests {
                 "llm_call_end",
             ]
         );
+    }
+
+    #[test]
+    fn codex_mcp_merge_overwrites_same_server_and_keeps_others() {
+        let mut config = r#"
+[mcp_servers.keep]
+command = "uvx"
+args = ["keep"]
+
+[mcp_servers.fs]
+command = "old"
+"#
+        .to_string();
+        let mcp = McpConfig {
+            mode: McpConfigMode::Merge,
+            value: json!({
+                "mcpServers": {
+                    "fs": {
+                        "command": "npx",
+                        "args": ["-y", "server"],
+                        "env": { "TOKEN": "secret" }
+                    }
+                }
+            }),
+        };
+
+        merge_codex_mcp_config(&mut config, &mcp).unwrap();
+        let value = config.parse::<toml::Value>().unwrap();
+        assert_eq!(
+            value["mcp_servers"]["keep"]["command"].as_str(),
+            Some("uvx")
+        );
+        assert_eq!(value["mcp_servers"]["fs"]["command"].as_str(), Some("npx"));
+        assert_eq!(
+            value["mcp_servers"]["fs"]["env"]["TOKEN"].as_str(),
+            Some("secret")
+        );
+    }
+
+    #[test]
+    fn codex_mcp_replace_removes_inherited_servers() {
+        let mut config = r#"
+[mcp_servers.keep]
+command = "uvx"
+"#
+        .to_string();
+        let mcp = McpConfig {
+            mode: McpConfigMode::Replace,
+            value: json!({
+                "mcpServers": {
+                    "fs": { "command": "npx" }
+                }
+            }),
+        };
+
+        merge_codex_mcp_config(&mut config, &mcp).unwrap();
+        let value = config.parse::<toml::Value>().unwrap();
+        assert!(value["mcp_servers"].get("keep").is_none());
+        assert_eq!(value["mcp_servers"]["fs"]["command"].as_str(), Some("npx"));
     }
 
     #[tokio::test]

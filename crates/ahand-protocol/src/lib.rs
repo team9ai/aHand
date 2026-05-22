@@ -9,6 +9,7 @@ pub use ahand::v1::*;
 pub const RESULT_PARSER_RAW: &str = "raw";
 pub const RESULT_PARSER_CODEX_JSONL: &str = "codex-jsonl";
 pub const RESULT_PARSER_CLAUDE_STREAM_JSON: &str = "claude-stream-json";
+pub const RESULT_PARSER_HERMES: &str = "hermes";
 
 pub const FORMAT_RAW: &str = "raw";
 pub const FORMAT_CODEX: &str = "codex";
@@ -49,7 +50,10 @@ pub fn resolve_job_result_parser(job: &JobRequest) -> &str {
 pub fn is_known_result_parser(parser: &str) -> bool {
     matches!(
         parser,
-        RESULT_PARSER_RAW | RESULT_PARSER_CODEX_JSONL | RESULT_PARSER_CLAUDE_STREAM_JSON
+        RESULT_PARSER_RAW
+            | RESULT_PARSER_CODEX_JSONL
+            | RESULT_PARSER_CLAUDE_STREAM_JSON
+            | RESULT_PARSER_HERMES
     )
 }
 

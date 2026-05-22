@@ -115,7 +115,7 @@ message JobRequest {
   uint64 timeout_ms = 6;
   bool   interactive = 7;  // Compatibility field: true maps to EXECUTION_MODE_PTY.
   ExecutionMode execution_mode = 8;
-  string result_parser = 9; // Deprecated output parser hint: raw, codex-jsonl, claude-stream-json.
+  string result_parser = 9; // Deprecated output parser hint: raw, codex-jsonl, claude-stream-json, hermes.
   string format = 10; // Deprecated formatter hint: raw, codex, claude-code.
   string input_format = 11; // Optional stdin format: raw, text, claude-stream-json, hermes-acp-json-rpc.
   string output_format = 12; // Optional stdout format: raw, codex-jsonl, claude-stream-json, hermes-acp-json-rpc.

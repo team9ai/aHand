@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ahand_protocol::{Envelope, JobEvent, JobFinished, JobRequest, envelope, job_event};
 use serde_json::{Value, json};
@@ -10,6 +12,10 @@ use tracing::{info, warn};
 
 use crate::executor::EnvelopeSink;
 use crate::store::RunStore;
+
+use super::mcp_config::{
+    MCP_CONFIG_ENV, MCP_CONFIG_MODE_ENV, McpConfig, McpConfigMode, server_names,
+};
 
 const INPUT_FORMAT_ENV: &str = "AHAND_INPUT_FORMAT";
 const OUTPUT_FORMAT_ENV: &str = "AHAND_OUTPUT_FORMAT";
@@ -48,6 +54,7 @@ struct ClaudeCodeConfig {
     system_prompt: Option<String>,
     permission_mode: Option<String>,
     instructions: Option<String>,
+    mcp_config: Option<McpConfig>,
 }
 
 impl ClaudeCodeConfig {
@@ -80,6 +87,10 @@ impl ClaudeCodeConfig {
             system_prompt: env_value(req, SYSTEM_PROMPT_ENV),
             permission_mode: env_value(req, PERMISSION_MODE_ENV),
             instructions: env_value(req, INSTRUCTIONS_ENV),
+            mcp_config: McpConfig::from_env(
+                req.env.get(MCP_CONFIG_ENV).map(String::as_str),
+                req.env.get(MCP_CONFIG_MODE_ENV).map(String::as_str),
+            )?,
         })
     }
 }
@@ -117,13 +128,22 @@ where
         return finish(&device_id, &job_id, -1, &error, &tx, &store);
     }
 
-    let mut child = match spawn_claude(&config).await {
-        Ok(child) => child,
+    let mcp_config_file = match prepare_mcp_config_file(&config, &job_id, &store) {
+        Ok(path) => path,
         Err(error) => return finish(&device_id, &job_id, -1, &error, &tx, &store),
+    };
+
+    let mut child = match spawn_claude(&config, mcp_config_file.as_ref()).await {
+        Ok(child) => child,
+        Err(error) => {
+            cleanup_mcp_config_file(mcp_config_file.as_ref());
+            return finish(&device_id, &job_id, -1, &error, &tx, &store);
+        }
     };
 
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.kill().await;
+        cleanup_mcp_config_file(mcp_config_file.as_ref());
         return finish(
             &device_id,
             &job_id,
@@ -135,6 +155,7 @@ where
     };
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill().await;
+        cleanup_mcp_config_file(mcp_config_file.as_ref());
         return finish(
             &device_id,
             &job_id,
@@ -151,6 +172,7 @@ where
         Ok(line) => line,
         Err(error) => {
             let _ = child.kill().await;
+            cleanup_mcp_config_file(mcp_config_file.as_ref());
             return finish(
                 &device_id,
                 &job_id,
@@ -164,6 +186,7 @@ where
     stdin_line.push(b'\n');
     if let Err(error) = stdin.write_all(&stdin_line).await {
         let _ = child.kill().await;
+        cleanup_mcp_config_file(mcp_config_file.as_ref());
         return finish(
             &device_id,
             &job_id,
@@ -240,6 +263,7 @@ where
         let _ = child.kill().await;
         stdout_handle.abort();
         stderr_handle.abort();
+        cleanup_mcp_config_file(mcp_config_file.as_ref());
         return finish(&device_id, &job_id, -1, &error, &tx, &store);
     }
 
@@ -251,6 +275,7 @@ where
         },
     };
     let _ = stderr_handle.await;
+    cleanup_mcp_config_file(mcp_config_file.as_ref());
 
     if let Some(error) = stdout_outcome.error {
         return finish(&device_id, &job_id, -1, &error, &tx, &store);
@@ -279,7 +304,10 @@ where
     finish(&device_id, &job_id, 0, "", &tx, &store)
 }
 
-async fn spawn_claude(config: &ClaudeCodeConfig) -> Result<tokio::process::Child, String> {
+async fn spawn_claude(
+    config: &ClaudeCodeConfig,
+    mcp_config_file: Option<&PathBuf>,
+) -> Result<tokio::process::Child, String> {
     let mut cmd = Command::new(&config.executable);
     cmd.arg("-p")
         .arg("--output-format")
@@ -309,6 +337,9 @@ async fn spawn_claude(config: &ClaudeCodeConfig) -> Result<tokio::process::Child
     if let Some(permission_mode) = &config.permission_mode {
         cmd.arg("--permission-mode").arg(permission_mode);
     }
+    if let Some(path) = mcp_config_file {
+        cmd.arg("--mcp-config").arg(path);
+    }
 
     if !config.cwd.is_empty() {
         cmd.current_dir(&config.cwd);
@@ -325,7 +356,96 @@ async fn spawn_claude(config: &ClaudeCodeConfig) -> Result<tokio::process::Child
 }
 
 fn is_filtered_claude_env(key: &str) -> bool {
-    key == "CLAUDECODE" || key.starts_with("CLAUDECODE_") || key.starts_with("CLAUDE_CODE_")
+    key == MCP_CONFIG_ENV
+        || key == MCP_CONFIG_MODE_ENV
+        || key == "CLAUDECODE"
+        || key.starts_with("CLAUDECODE_")
+        || key.starts_with("CLAUDE_CODE_")
+}
+
+fn prepare_mcp_config_file(
+    config: &ClaudeCodeConfig,
+    job_id: &str,
+    store: &Option<Arc<RunStore>>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(mcp_config) = &config.mcp_config else {
+        return Ok(None);
+    };
+    let path = std::env::temp_dir().join(format!(
+        "ahand-claude-mcp-{}-{}-{}.json",
+        std::process::id(),
+        sanitize_filename(job_id),
+        now_millis()
+    ));
+    let bytes = serde_json::to_vec(&mcp_config.value)
+        .map_err(|error| format!("failed to serialize MCP config: {error}"))?;
+    write_private_file(&path, &bytes)
+        .map_err(|error| format!("failed to write MCP config {}: {error}", path.display()))?;
+    let names = server_names(&mcp_config.value);
+    let server_count = names.len();
+    append_json_line(
+        store,
+        job_id,
+        "mcp.jsonl",
+        &json!({
+            "kind": "mcp_config_injected",
+            "agent": "claude-code",
+            "mode": match mcp_config.mode {
+                McpConfigMode::Merge => "merge",
+                McpConfigMode::Replace => "replace",
+            },
+            "serverNames": names,
+            "serverCount": server_count,
+            "target": "claude --mcp-config",
+        }),
+    );
+    Ok(Some(path))
+}
+
+fn cleanup_mcp_config_file(path: Option<&PathBuf>) {
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn write_private_file(path: &PathBuf, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn sanitize_filename(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn prepare_context(
@@ -999,6 +1119,23 @@ mod tests {
         other.env.remove(INPUT_FORMAT_ENV);
         other.input_format.clear();
         assert!(!is_claude_code_job(&other));
+    }
+
+    #[test]
+    fn config_reads_mcp_config_body_and_replace_mode() {
+        let mut req = req();
+        req.env.insert(
+            MCP_CONFIG_ENV.to_string(),
+            r#"{"mcpServers":{"fs":{"command":"npx","args":["-y","server"],"env":{"TOKEN":"secret"}}}}"#
+                .to_string(),
+        );
+        req.env
+            .insert(MCP_CONFIG_MODE_ENV.to_string(), "replace".to_string());
+
+        let config = ClaudeCodeConfig::from_job(&req).unwrap();
+        let mcp = config.mcp_config.unwrap();
+        assert_eq!(mcp.mode, McpConfigMode::Replace);
+        assert_eq!(server_names(&mcp.value), vec!["fs".to_string()]);
     }
 
     #[test]

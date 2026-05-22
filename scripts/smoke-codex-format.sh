@@ -12,6 +12,9 @@ SMOKE_CWD="${AHAND_SMOKE_CWD:-$ROOT_DIR}"
 TARGET_FILE="${AHAND_SMOKE_FILE:-crates/ahand-protocol/src/lib.rs}"
 TIMEOUT_MS="${AHAND_SMOKE_TIMEOUT_MS:-60000}"
 PROMPT="${AHAND_SMOKE_PROMPT:-}"
+MCP_CONFIG_FILE="${AHAND_SMOKE_MCP_CONFIG_FILE:-}"
+MCP_CONFIG_MODE="${AHAND_SMOKE_MCP_CONFIG_MODE:-}"
+CODEX_BYPASS_APPROVALS="${AHAND_SMOKE_CODEX_BYPASS_APPROVALS:-false}"
 
 usage() {
   cat <<'EOF'
@@ -24,11 +27,19 @@ Options:
   --prompt-file PATH    Read prompt text from a file.
   --timeout-ms MS       Job timeout in milliseconds.
   --codex-path PATH     Codex executable path.
+  --mcp-config-file PATH
+                        MCP config JSON body: { "mcpServers": ... }.
+  --mcp-config-mode replace
+                        Omit for default merge; use replace to ignore inherited servers.
+  --dangerously-bypass-approvals-and-sandbox
+                        Pass Codex's non-interactive approval/sandbox bypass flag.
   -h, --help            Show this help.
 
 Environment aliases:
   AHAND_SMOKE_CWD, AHAND_SMOKE_FILE, AHAND_SMOKE_PROMPT,
-  AHAND_SMOKE_TIMEOUT_MS, CODEX_PATH
+  AHAND_SMOKE_TIMEOUT_MS, AHAND_SMOKE_MCP_CONFIG_FILE,
+  AHAND_SMOKE_MCP_CONFIG_MODE, AHAND_SMOKE_CODEX_BYPASS_APPROVALS,
+  CODEX_PATH
 EOF
 }
 
@@ -40,6 +51,9 @@ while [ $# -gt 0 ]; do
     --prompt-file) PROMPT="$(cat "$2")"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="$2"; shift 2 ;;
     --codex-path) CODEX_PATH="$2"; shift 2 ;;
+    --mcp-config-file) MCP_CONFIG_FILE="$2"; shift 2 ;;
+    --mcp-config-mode) MCP_CONFIG_MODE="$2"; shift 2 ;;
+    --dangerously-bypass-approvals-and-sandbox) CODEX_BYPASS_APPROVALS="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     --*) echo "ERROR: unknown option $1" >&2; usage >&2; exit 1 ;;
     *) CODEX_PATH="$1"; shift ;;
@@ -51,6 +65,19 @@ if [ -z "$PROMPT" ]; then
 fi
 if [[ "$SMOKE_CWD" != /* ]]; then
   SMOKE_CWD="$ROOT_DIR/$SMOKE_CWD"
+fi
+MCP_ARGS=()
+if [ -n "$MCP_CONFIG_FILE" ]; then
+  MCP_ARGS+=(--mcp-config-file "$MCP_CONFIG_FILE")
+fi
+if [ -n "$MCP_CONFIG_MODE" ]; then
+  MCP_ARGS+=(--mcp-config-mode "$MCP_CONFIG_MODE")
+fi
+CODEX_EXEC_ARGS=()
+if [ "$CODEX_BYPASS_APPROVALS" = "true" ]; then
+  CODEX_EXEC_ARGS+=(--dangerously-bypass-approvals-and-sandbox)
+else
+  CODEX_EXEC_ARGS+=(--sandbox read-only)
 fi
 
 if [ -n "${CODEX_PATH:-}" ]; then
@@ -108,10 +135,11 @@ printf '%s\n' "$PROMPT" | "$ROOT_DIR/target/debug/ahandctl" \
   --result-parser codex-jsonl \
   --cwd "$SMOKE_CWD" \
   --timeout-ms "$TIMEOUT_MS" \
+  "${MCP_ARGS[@]}" \
   "$CODEX" -- exec \
     --ignore-rules \
     --skip-git-repo-check \
-    --sandbox read-only \
+    "${CODEX_EXEC_ARGS[@]}" \
     --json \
     --cd "$SMOKE_CWD" \
     - >"$OUT_FILE" 2>&1

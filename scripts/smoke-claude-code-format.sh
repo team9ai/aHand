@@ -13,6 +13,9 @@ TARGET_FILE="${AHAND_SMOKE_FILE:-crates/ahand-protocol/src/lib.rs}"
 TIMEOUT_MS="${AHAND_SMOKE_TIMEOUT_MS:-60000}"
 PROMPT="${AHAND_SMOKE_PROMPT:-}"
 REQUIRE_TOOL="${AHAND_SMOKE_REQUIRE_TOOL:-false}"
+MCP_CONFIG_FILE="${AHAND_SMOKE_MCP_CONFIG_FILE:-}"
+MCP_CONFIG_MODE="${AHAND_SMOKE_MCP_CONFIG_MODE:-}"
+PERMISSION_MODE="${AHAND_SMOKE_PERMISSION_MODE:-}"
 
 usage() {
   cat <<'EOF'
@@ -25,13 +28,20 @@ Options:
   --prompt-file PATH    Read prompt text from a file.
   --timeout-ms MS       Job timeout in milliseconds.
   --claude-path PATH    Claude executable path.
+  --mcp-config-file PATH
+                        MCP config JSON body: { "mcpServers": ... }.
+  --mcp-config-mode replace
+                        Omit for default merge; use replace to ignore inherited servers.
+  --permission-mode MODE
+                        Claude permission mode, for example default or bypassPermissions.
   --require-tool        Require at least one tool_call observation.
   -h, --help            Show this help.
 
 Environment aliases:
   AHAND_SMOKE_CWD, AHAND_SMOKE_FILE, AHAND_SMOKE_PROMPT,
   AHAND_SMOKE_TIMEOUT_MS, AHAND_SMOKE_REQUIRE_TOOL,
-  CLAUDE_PATH
+  AHAND_SMOKE_MCP_CONFIG_FILE, AHAND_SMOKE_MCP_CONFIG_MODE,
+  AHAND_SMOKE_PERMISSION_MODE, CLAUDE_PATH
 EOF
 }
 
@@ -43,6 +53,9 @@ while [ $# -gt 0 ]; do
     --prompt-file) PROMPT="$(cat "$2")"; shift 2 ;;
     --timeout-ms) TIMEOUT_MS="$2"; shift 2 ;;
     --claude-path) CLAUDE_PATH="$2"; shift 2 ;;
+    --mcp-config-file) MCP_CONFIG_FILE="$2"; shift 2 ;;
+    --mcp-config-mode) MCP_CONFIG_MODE="$2"; shift 2 ;;
+    --permission-mode) PERMISSION_MODE="$2"; shift 2 ;;
     --require-tool) REQUIRE_TOOL="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     --*) echo "ERROR: unknown option $1" >&2; usage >&2; exit 1 ;;
@@ -73,6 +86,16 @@ else
     echo "ERROR: claude not found. Set CLAUDE_PATH=/absolute/path/to/claude." >&2
     exit 1
   fi
+fi
+MCP_ARGS=()
+if [ -n "$MCP_CONFIG_FILE" ]; then
+  MCP_ARGS+=(--mcp-config-file "$MCP_CONFIG_FILE")
+fi
+if [ -n "$MCP_CONFIG_MODE" ]; then
+  MCP_ARGS+=(--mcp-config-mode "$MCP_CONFIG_MODE")
+fi
+if [ -n "$PERMISSION_MODE" ]; then
+  MCP_ARGS+=(--permission-mode "$PERMISSION_MODE")
 fi
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ahand-claude-smoke.XXXXXX")"
@@ -116,6 +139,7 @@ set +e
   --cwd "$SMOKE_CWD" \
   --timeout-ms "$TIMEOUT_MS" \
   --prompt "$PROMPT" \
+  "${MCP_ARGS[@]}" \
   "$CLAUDE" >"$OUT_FILE" 2>&1
 STATUS=$?
 set -e

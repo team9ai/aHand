@@ -1,0 +1,378 @@
+#!/bin/bash
+# Run AHand locally with one MCP config and one selected agent runtime.
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+CWD="$ROOT_DIR"
+RUNTIME=""
+PROMPT=""
+PROMPT_FILE=""
+TIMEOUT_MS="${AHAND_WITH_MCP_TIMEOUT_MS:-3600000}"
+MCP_CONFIG_FILE="${AHAND_WITH_MCP_CONFIG_FILE:-$ROOT_DIR/docs/examples/capability-hub-mcp.json}"
+MCP_CONFIG_MODE="${AHAND_WITH_MCP_CONFIG_MODE:-}"
+CODEX_PATH="${CODEX_PATH:-}"
+CLAUDE_PATH="${CLAUDE_PATH:-}"
+HERMES_PATH="${HERMES_PATH:-}"
+CLAUDE_PERMISSION_MODE="${AHAND_WITH_MCP_CLAUDE_PERMISSION_MODE:-bypassPermissions}"
+CODEX_BYPASS_APPROVALS="${AHAND_WITH_MCP_CODEX_BYPASS_APPROVALS:-true}"
+REQUIRE_MCP_TOOL="${AHAND_WITH_MCP_REQUIRE_TOOL:-false}"
+REQUIRE_HERMES_OBSERVATIONS="${AHAND_WITH_MCP_REQUIRE_HERMES_OBSERVATIONS:-false}"
+KEEP_TMP="${AHAND_WITH_MCP_KEEP_TMP:-false}"
+
+usage() {
+  cat <<'EOF'
+Usage: ahand_with_mcp --runtime codex|claude|hermes --prompt "..." [options]
+
+Options:
+  --runtime NAME        Agent runtime: codex, claude, or hermes.
+  --prompt TEXT         Prompt to send.
+  --prompt-file PATH    Read prompt from file.
+  --cwd DIR             Working directory for the agent task.
+  --timeout-ms MS       Job timeout in milliseconds.
+  --mcp-config-file PATH
+                        MCP config JSON body: { "mcpServers": ... }.
+                        Defaults to docs/examples/capability-hub-mcp.json.
+  --mcp-config-mode replace
+                        Omit for default merge; use replace to ignore inherited servers.
+  --codex-path PATH     Codex executable path.
+  --claude-path PATH    Claude executable path.
+  --hermes-path PATH    Hermes executable path.
+  --claude-permission-mode MODE
+                        Claude permission mode. Default: bypassPermissions.
+  --codex-no-bypass-approvals
+                        Do not pass Codex --dangerously-bypass-approvals-and-sandbox.
+  --require-mcp-tool    Fail unless at least one normalized MCP tool output is emitted.
+  --require-hermes-observations
+                        For Hermes, fail unless observations use aggregated llm_message
+                        and no token-level llm_call_delta records are emitted.
+  --keep-tmp            Keep the temporary daemon directory and print its path.
+  -h, --help            Show this help.
+
+Environment aliases:
+  AHAND_WITH_MCP_CONFIG_FILE, AHAND_WITH_MCP_CONFIG_MODE,
+  AHAND_WITH_MCP_TIMEOUT_MS, AHAND_WITH_MCP_CLAUDE_PERMISSION_MODE,
+  AHAND_WITH_MCP_CODEX_BYPASS_APPROVALS, AHAND_WITH_MCP_REQUIRE_TOOL,
+  AHAND_WITH_MCP_REQUIRE_HERMES_OBSERVATIONS, AHAND_WITH_MCP_KEEP_TMP,
+  CODEX_PATH, CLAUDE_PATH, HERMES_PATH
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --runtime) RUNTIME="$2"; shift 2 ;;
+    --prompt) PROMPT="$2"; shift 2 ;;
+    --prompt-file) PROMPT_FILE="$2"; shift 2 ;;
+    --cwd) CWD="$2"; shift 2 ;;
+    --timeout-ms) TIMEOUT_MS="$2"; shift 2 ;;
+    --mcp-config-file) MCP_CONFIG_FILE="$2"; shift 2 ;;
+    --mcp-config-mode) MCP_CONFIG_MODE="$2"; shift 2 ;;
+    --codex-path) CODEX_PATH="$2"; shift 2 ;;
+    --claude-path) CLAUDE_PATH="$2"; shift 2 ;;
+    --hermes-path) HERMES_PATH="$2"; shift 2 ;;
+    --claude-permission-mode) CLAUDE_PERMISSION_MODE="$2"; shift 2 ;;
+    --codex-no-bypass-approvals) CODEX_BYPASS_APPROVALS="false"; shift ;;
+    --require-mcp-tool) REQUIRE_MCP_TOOL="true"; shift ;;
+    --require-hermes-observations) REQUIRE_HERMES_OBSERVATIONS="true"; shift ;;
+    --keep-tmp) KEEP_TMP="true"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*) echo "ERROR: unknown option $1" >&2; usage >&2; exit 1 ;;
+    *) echo "ERROR: unexpected argument $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+case "$RUNTIME" in
+  codex|claude|hermes) ;;
+  "") echo "ERROR: --runtime is required: codex, claude, or hermes." >&2; usage >&2; exit 1 ;;
+  *) echo "ERROR: invalid --runtime $RUNTIME; use codex, claude, or hermes." >&2; exit 1 ;;
+esac
+
+if [ -n "$PROMPT_FILE" ]; then
+  PROMPT="$(cat "$PROMPT_FILE")"
+fi
+if [ -z "$PROMPT" ]; then
+  echo "ERROR: --prompt or --prompt-file is required." >&2
+  exit 1
+fi
+if [[ "$CWD" != /* ]]; then
+  CWD="$ROOT_DIR/$CWD"
+fi
+if [[ "$MCP_CONFIG_FILE" != /* ]]; then
+  MCP_CONFIG_FILE="$ROOT_DIR/$MCP_CONFIG_FILE"
+fi
+if [ ! -f "$MCP_CONFIG_FILE" ]; then
+  echo "ERROR: MCP config file not found: $MCP_CONFIG_FILE" >&2
+  exit 1
+fi
+
+if [ "$RUNTIME" = "claude" ] && [ -z "$CLAUDE_PATH" ]; then
+  if [ -f "$HOME/.nvs/nvs.sh" ]; then
+    set +u
+    # shellcheck disable=SC1091
+    source "$HOME/.nvs/nvs.sh"
+    nvs use 22 >/dev/null 2>&1 || true
+    set -u
+  fi
+  if command -v claude >/dev/null 2>&1; then
+    CLAUDE_PATH="$(command -v claude)"
+  fi
+fi
+if [ "$RUNTIME" = "codex" ] && [ -z "$CODEX_PATH" ]; then
+  if command -v codex >/dev/null 2>&1; then
+    CODEX_PATH="$(command -v codex)"
+  elif [ -x /Applications/Codex.app/Contents/Resources/codex ]; then
+    CODEX_PATH="/Applications/Codex.app/Contents/Resources/codex"
+  fi
+fi
+if [ "$RUNTIME" = "hermes" ] && [ -z "$HERMES_PATH" ]; then
+  if command -v hermes >/dev/null 2>&1; then
+    HERMES_PATH="$(command -v hermes)"
+  fi
+fi
+
+case "$RUNTIME" in
+  claude)
+    [ -n "$CLAUDE_PATH" ] || { echo "ERROR: claude not found. Use --claude-path." >&2; exit 1; }
+    ;;
+  codex)
+    [ -n "$CODEX_PATH" ] || { echo "ERROR: codex not found. Use --codex-path." >&2; exit 1; }
+    ;;
+  hermes)
+    [ -n "$HERMES_PATH" ] || { echo "ERROR: hermes not found. Use --hermes-path." >&2; exit 1; }
+    ;;
+esac
+
+MCP_ARGS=(--mcp-config-file "$MCP_CONFIG_FILE")
+if [ -n "$MCP_CONFIG_MODE" ]; then
+  MCP_ARGS+=(--mcp-config-mode "$MCP_CONFIG_MODE")
+fi
+
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ahand-with-mcp.XXXXXX")"
+SOCKET="$TMP_DIR/ahand.sock"
+DATA_DIR="$TMP_DIR/data"
+DAEMON_LOG="$TMP_DIR/ahandd.log"
+OUT_FILE="$TMP_DIR/stdout.jsonl"
+
+cleanup() {
+  if [ -n "${DAEMON_PID:-}" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    kill "$DAEMON_PID" 2>/dev/null || true
+    wait "$DAEMON_PID" 2>/dev/null || true
+  fi
+  if [ "$KEEP_TMP" != "true" ]; then
+    rm -rf "$TMP_DIR"
+  fi
+}
+trap cleanup EXIT
+
+cd "$ROOT_DIR"
+cargo build -p ahandd -p ahandctl >/dev/null
+
+"$ROOT_DIR/target/debug/ahandd" \
+  --mode local \
+  --debug-ipc \
+  --ipc-socket "$SOCKET" \
+  --data-dir "$DATA_DIR" >"$DAEMON_LOG" 2>&1 &
+DAEMON_PID=$!
+
+for _ in $(seq 1 100); do
+  [ -S "$SOCKET" ] && break
+  sleep 0.05
+done
+if [ ! -S "$SOCKET" ]; then
+  echo "ERROR: daemon IPC socket was not created." >&2
+  cat "$DAEMON_LOG" >&2 || true
+  exit 1
+fi
+
+set +e
+case "$RUNTIME" in
+  claude)
+    CLAUDE_ARGS=()
+    if [ -n "$CLAUDE_PERMISSION_MODE" ]; then
+      CLAUDE_ARGS+=(--permission-mode "$CLAUDE_PERMISSION_MODE")
+    fi
+    "$ROOT_DIR/target/debug/ahandctl" \
+      --ipc "$SOCKET" \
+      claude-code \
+      --cwd "$CWD" \
+      --timeout-ms "$TIMEOUT_MS" \
+      --prompt "$PROMPT" \
+      "${MCP_ARGS[@]}" \
+      "${CLAUDE_ARGS[@]}" \
+      "$CLAUDE_PATH" >"$OUT_FILE" 2>&1
+    STATUS=$?
+    ;;
+  hermes)
+    "$ROOT_DIR/target/debug/ahandctl" \
+      --ipc "$SOCKET" \
+      hermes \
+      --cwd "$CWD" \
+      --timeout-ms "$TIMEOUT_MS" \
+      --prompt "$PROMPT" \
+      "${MCP_ARGS[@]}" \
+      "$HERMES_PATH" >"$OUT_FILE" 2>&1
+    STATUS=$?
+    ;;
+  codex)
+    CODEX_EXEC_ARGS=()
+    if [ "$CODEX_BYPASS_APPROVALS" = "true" ]; then
+      CODEX_EXEC_ARGS+=(--dangerously-bypass-approvals-and-sandbox)
+    else
+      CODEX_EXEC_ARGS+=(--sandbox read-only)
+    fi
+    printf '%s\n' "$PROMPT" | "$ROOT_DIR/target/debug/ahandctl" \
+      --ipc "$SOCKET" \
+      exec \
+      --execution-mode pipe_stream \
+      --input-format text \
+      --output-format codex-jsonl \
+      --result-parser codex-jsonl \
+      --cwd "$CWD" \
+      --timeout-ms "$TIMEOUT_MS" \
+      "${MCP_ARGS[@]}" \
+      "$CODEX_PATH" -- exec \
+        --ignore-rules \
+        --skip-git-repo-check \
+        "${CODEX_EXEC_ARGS[@]}" \
+        --json \
+        --cd "$CWD" \
+        - >"$OUT_FILE" 2>&1
+    STATUS=$?
+    ;;
+esac
+set -e
+
+node - "$OUT_FILE" "$RUNTIME" "$STATUS" "$REQUIRE_MCP_TOOL" "$REQUIRE_HERMES_OBSERVATIONS" <<'NODE'
+const fs = require("fs");
+const [file, runtime, statusText, requireToolText, requireHermesObservationsText] = process.argv.slice(2);
+const status = Number(statusText);
+const requireTool = requireToolText === "true";
+const requireHermesObservations = requireHermesObservationsText === "true";
+const rawText = fs.readFileSync(file, "utf8");
+const lines = rawText.split(/\r?\n/).filter(Boolean);
+const records = [];
+for (const line of lines) {
+  if (!line.trim().startsWith("{")) continue;
+  try {
+    records.push(JSON.parse(line));
+  } catch {
+    // Non-JSON diagnostics from the child process are allowed in output.
+  }
+}
+
+function printFailureDetails(reason) {
+  console.error(reason);
+  console.error(`Output saved at: ${file}`);
+
+  const diagnostics = lines.filter((line) => !line.trim().startsWith("{"));
+  if (diagnostics.length > 0) {
+    console.error("--- child diagnostics tail ---");
+    for (const line of diagnostics.slice(-80)) {
+      console.error(line);
+    }
+  }
+
+  const errorRecords = records.filter((record) => record.kind === "error" || record.error);
+  if (errorRecords.length > 0) {
+    console.error("--- parsed error records tail ---");
+    for (const record of errorRecords.slice(-20)) {
+      console.error(JSON.stringify(record));
+    }
+  }
+
+  const lastText = [...records]
+    .reverse()
+    .map((record) => record.llmResponse?.responseText)
+    .find((text) => typeof text === "string" && text.length > 0);
+  if (lastText) {
+    console.error("--- last response ---");
+    console.error(lastText);
+  }
+}
+
+if (status !== 0) {
+  printFailureDetails(`ERROR: ahandctl exited with ${status}`);
+  process.exit(1);
+}
+if (records.length === 0) {
+  printFailureDetails("ERROR: no JSON observation records were emitted");
+  process.exit(1);
+}
+if (/MCP startup failed|failed to initialize MCP client|handshaking with MCP server failed/i.test(rawText)) {
+  printFailureDetails("ERROR: MCP server startup failed");
+  process.exit(1);
+}
+if (requireTool && !records.some((r) => r.kind === "tool_call_output" && r.toolCall?.toolKind === "mcp")) {
+  printFailureDetails("ERROR: missing normalized MCP tool output");
+  process.exit(1);
+}
+const kindCounts = new Map();
+for (const record of records) {
+  kindCounts.set(record.kind || "unknown", (kindCounts.get(record.kind || "unknown") || 0) + 1);
+}
+const llmMessages = records.filter((r) => r.kind === "llm_message");
+const llmDeltas = records.filter((r) => r.kind === "llm_call_delta");
+if (runtime === "hermes" && requireHermesObservations) {
+  if (llmMessages.length === 0) {
+    printFailureDetails("ERROR: Hermes observations did not contain aggregated llm_message records");
+    process.exit(1);
+  }
+  if (llmDeltas.length > 0) {
+    printFailureDetails(`ERROR: Hermes observations still contain ${llmDeltas.length} llm_call_delta records`);
+    process.exit(1);
+  }
+  if (!records.some((r) => r.runtime?.resultParser === "hermes")) {
+    printFailureDetails("ERROR: Hermes observations are missing runtime.resultParser=hermes");
+    process.exit(1);
+  }
+}
+const lastText = [...records]
+  .reverse()
+  .map((r) => r.llmResponse?.responseText)
+  .find((text) => typeof text === "string" && text.length > 0);
+const mcpTools = records
+  .filter((r) => r.kind === "tool_call_output" && r.toolCall?.toolKind === "mcp")
+  .map((r) => `${r.toolCall.serverName || ""}/${r.toolCall.toolName || ""}`.replace(/^\//, ""));
+console.error(`ok: runtime=${runtime} records=${records.length} mcpToolOutputs=${mcpTools.length}`);
+console.error(`kinds: ${[...kindCounts.entries()].map(([kind, count]) => `${kind}=${count}`).join(", ")}`);
+if (runtime === "hermes") {
+  const channels = new Map();
+  for (const record of llmMessages) {
+    const channel = record.llmResponse?.channel || "unknown";
+    channels.set(channel, (channels.get(channel) || 0) + 1);
+  }
+  const lengths = llmMessages
+    .map((record) => record.llmResponse?.responseText)
+    .filter((text) => typeof text === "string")
+    .map((text) => text.length);
+  const avgLength = lengths.length
+    ? Math.round(lengths.reduce((sum, length) => sum + length, 0) / lengths.length)
+    : 0;
+  console.error(
+    `hermes observations: llm_message=${llmMessages.length} llm_call_delta=${llmDeltas.length} avgMessageChars=${avgLength}`,
+  );
+  if (channels.size > 0) {
+    console.error(`hermes channels: ${[...channels.entries()].map(([channel, count]) => `${channel}=${count}`).join(", ")}`);
+  }
+}
+if (mcpTools.length > 0) {
+  console.error(`mcp tools: ${[...new Set(mcpTools)].join(", ")}`);
+}
+if (lastText) {
+  console.error("last response:");
+  console.error(lastText);
+}
+for (const record of records) {
+  console.log(JSON.stringify(record));
+}
+NODE
+VERIFY_STATUS=$?
+
+if [ "$KEEP_TMP" = "true" ]; then
+  echo "tmp: $TMP_DIR" >&2
+  echo "stdout: $OUT_FILE" >&2
+  find "$DATA_DIR" -name observations.jsonl -print | sed 's/^/observations: /' >&2 || true
+  find "$DATA_DIR" -name acp-events.jsonl -print | sed 's/^/acp-events: /' >&2 || true
+fi
+
+exit "$VERIFY_STATUS"

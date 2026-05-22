@@ -171,6 +171,12 @@ impl CodexFormatter {
                 tool_call_json(item, "started"),
                 self.raw(raw),
             )],
+            (true, "mcp_tool_call") => vec![self.record(
+                "tool_call_start",
+                json!({}),
+                mcp_tool_call_json(item, "started"),
+                self.raw(raw),
+            )],
             (false, "command_execution") => {
                 let mut records = Vec::new();
                 let output = item
@@ -195,6 +201,26 @@ impl CodexFormatter {
                     "tool_call_end",
                     json!({}),
                     tool_call_json(item, status),
+                    self.raw(raw),
+                ));
+                records
+            }
+            (false, "mcp_tool_call") => {
+                let mut records = Vec::new();
+                if item.get("result").is_some_and(|value| !value.is_null())
+                    || item.get("error").is_some_and(|value| !value.is_null())
+                {
+                    records.push(self.record(
+                        "tool_call_output",
+                        json!({}),
+                        mcp_tool_call_json(item, mcp_status(item)),
+                        self.raw(raw.clone()),
+                    ));
+                }
+                records.push(self.record(
+                    "tool_call_end",
+                    json!({}),
+                    mcp_tool_call_json(item, mcp_status(item)),
                     self.raw(raw),
                 ));
                 records
@@ -314,6 +340,54 @@ fn tool_call_json(item: &Value, status: &str) -> Value {
     tool_call
 }
 
+fn mcp_tool_call_json(item: &Value, status: &str) -> Value {
+    let server = item.get("server").and_then(Value::as_str).unwrap_or("");
+    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
+    let mut tool_call = json!({
+        "toolCallId": item.get("id").and_then(Value::as_str).unwrap_or(""),
+        "toolName": tool,
+        "toolKind": "mcp",
+        "serverName": server,
+        "input": item.get("arguments").cloned().unwrap_or_else(|| json!({})),
+        "status": status,
+    });
+
+    if let Some(result) = item.get("result").filter(|value| !value.is_null()) {
+        tool_call["output"] = result.clone();
+        if let Some(output_text) = mcp_result_text(result) {
+            tool_call["outputText"] = json!(output_text);
+        }
+    }
+
+    if let Some(error) = item.get("error").filter(|value| !value.is_null()) {
+        tool_call["error"] = error.clone();
+    }
+
+    tool_call
+}
+
+fn mcp_status(item: &Value) -> &'static str {
+    if item.get("error").is_some_and(|value| !value.is_null()) {
+        return "failed";
+    }
+    match item.get("status").and_then(Value::as_str) {
+        Some("completed") => "completed",
+        Some("failed") => "failed",
+        Some("cancelled") | Some("canceled") => "cancelled",
+        _ => "completed",
+    }
+}
+
+fn mcp_result_text(result: &Value) -> Option<String> {
+    let content = result.get("content").and_then(Value::as_array)?;
+    let text = content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    (!text.is_empty()).then_some(text)
+}
+
 fn normalize_usage(usage: Option<&Value>) -> Value {
     let Some(usage) = usage else {
         return json!({});
@@ -402,6 +476,33 @@ mod tests {
         assert_eq!(records[2]["llmResponse"]["responseText"], "hello");
         assert_eq!(records[4]["toolCall"]["outputText"], "clean\n");
         assert_eq!(records[6]["llmResponse"]["usage"]["inputTokens"], 1);
+    }
+
+    #[test]
+    fn parses_codex_mcp_tool_calls_into_observations() {
+        let mut formatter = CodexFormatter::maybe_new(&req("codex", "codex-jsonl")).unwrap();
+        let input = concat!(
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"item-1\",\"type\":\"mcp_tool_call\",\"server\":\"tarot\",\"tool\":\"list_spreads\",\"arguments\":{},\"status\":\"in_progress\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"item-1\",\"type\":\"mcp_tool_call\",\"server\":\"tarot\",\"tool\":\"list_spreads\",\"arguments\":{},\"status\":\"completed\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"[{\\\"id\\\":\\\"single-card\\\"}]\"}],\"structured_content\":null},\"error\":null}}\n",
+        );
+
+        let records = formatter.push_stdout(input.as_bytes());
+        let kinds = records
+            .iter()
+            .map(|record| record["kind"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            vec!["tool_call_start", "tool_call_output", "tool_call_end"]
+        );
+        assert_eq!(records[0]["toolCall"]["toolKind"], "mcp");
+        assert_eq!(records[0]["toolCall"]["serverName"], "tarot");
+        assert_eq!(records[0]["toolCall"]["toolName"], "list_spreads");
+        assert_eq!(
+            records[1]["toolCall"]["outputText"],
+            "[{\"id\":\"single-card\"}]"
+        );
     }
 
     #[test]

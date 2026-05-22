@@ -39,6 +39,9 @@ struct HermesRunArgs {
     model: Option<String>,
     session_id: Option<String>,
     env: Vec<String>,
+    mcp_config: Option<String>,
+    mcp_config_file: Option<String>,
+    mcp_config_mode: Option<String>,
     instructions: Option<String>,
     instructions_file: Option<String>,
 }
@@ -56,6 +59,9 @@ struct ClaudeCodeRunArgs {
     system_prompt_file: Option<String>,
     permission_mode: Option<String>,
     env: Vec<String>,
+    mcp_config: Option<String>,
+    mcp_config_file: Option<String>,
+    mcp_config_mode: Option<String>,
     instructions: Option<String>,
     instructions_file: Option<String>,
 }
@@ -103,6 +109,15 @@ enum Cmd {
         /// Deprecated formatter hint: raw, codex, or claude-code
         #[arg(long = "format", default_value = "raw")]
         format: String,
+        /// MCP config JSON body. Use --mcp-config-file for larger configs.
+        #[arg(long = "mcp-config")]
+        mcp_config: Option<String>,
+        /// Read MCP config JSON body from a file
+        #[arg(long = "mcp-config-file")]
+        mcp_config_file: Option<String>,
+        /// MCP config strategy. Omit for default merge; use replace to ignore inherited servers.
+        #[arg(long = "mcp-config-mode")]
+        mcp_config_mode: Option<String>,
         /// Tool to execute
         tool: String,
         /// Arguments to the tool
@@ -134,6 +149,15 @@ enum Cmd {
         /// Environment override in KEY=VALUE form; repeatable
         #[arg(long = "env")]
         env: Vec<String>,
+        /// MCP config JSON body. Use --mcp-config-file for larger configs.
+        #[arg(long = "mcp-config")]
+        mcp_config: Option<String>,
+        /// Read MCP config JSON body from a file
+        #[arg(long = "mcp-config-file")]
+        mcp_config_file: Option<String>,
+        /// MCP config strategy. Omit for default merge; use replace to ignore inherited servers.
+        #[arg(long = "mcp-config-mode")]
+        mcp_config_mode: Option<String>,
         /// Optional AHand instructions written as AGENTS.md/AGENTS.ahand.md in cwd
         #[arg(long)]
         instructions: Option<String>,
@@ -178,6 +202,15 @@ enum Cmd {
         /// Environment override in KEY=VALUE form; repeatable
         #[arg(long = "env")]
         env: Vec<String>,
+        /// MCP config JSON body. Use --mcp-config-file for larger configs.
+        #[arg(long = "mcp-config")]
+        mcp_config: Option<String>,
+        /// Read MCP config JSON body from a file
+        #[arg(long = "mcp-config-file")]
+        mcp_config_file: Option<String>,
+        /// MCP config strategy. Omit for default merge; use replace to ignore inherited servers.
+        #[arg(long = "mcp-config-mode")]
+        mcp_config_mode: Option<String>,
         /// Optional AHand instructions written as CLAUDE.md/CLAUDE.ahand.md in cwd
         #[arg(long)]
         instructions: Option<String>,
@@ -387,6 +420,9 @@ async fn main() -> anyhow::Result<()> {
                 output_format,
                 result_parser,
                 format,
+                mcp_config,
+                mcp_config_file,
+                mcp_config_mode,
                 tool,
                 args: tool_args,
             } => {
@@ -396,7 +432,7 @@ async fn main() -> anyhow::Result<()> {
                         execution_mode: parse_execution_mode(&execution_mode)?,
                         cwd,
                         timeout_ms,
-                        env: parse_env(env)?,
+                        env: parse_env_with_mcp(env, mcp_config, mcp_config_file, mcp_config_mode)?,
                         input_format: parse_input_format(&input_format)?,
                         output_format: parse_output_format(&output_format)?,
                         result_parser: parse_result_parser(&result_parser)?,
@@ -416,6 +452,9 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 session_id,
                 env,
+                mcp_config,
+                mcp_config_file,
+                mcp_config_mode,
                 instructions,
                 instructions_file,
             } => {
@@ -430,6 +469,9 @@ async fn main() -> anyhow::Result<()> {
                         model,
                         session_id,
                         env,
+                        mcp_config,
+                        mcp_config_file,
+                        mcp_config_mode,
                         instructions,
                         instructions_file,
                     })?,
@@ -449,6 +491,9 @@ async fn main() -> anyhow::Result<()> {
                 system_prompt_file,
                 permission_mode,
                 env,
+                mcp_config,
+                mcp_config_file,
+                mcp_config_mode,
                 instructions,
                 instructions_file,
             } => {
@@ -467,6 +512,9 @@ async fn main() -> anyhow::Result<()> {
                         system_prompt_file,
                         permission_mode,
                         env,
+                        mcp_config,
+                        mcp_config_file,
+                        mcp_config_mode,
                         instructions,
                         instructions_file,
                     })?,
@@ -512,6 +560,9 @@ async fn main() -> anyhow::Result<()> {
                 output_format,
                 result_parser,
                 format,
+                mcp_config,
+                mcp_config_file,
+                mcp_config_mode,
                 tool,
                 args: tool_args,
             } => {
@@ -521,7 +572,7 @@ async fn main() -> anyhow::Result<()> {
                         execution_mode: parse_execution_mode(&execution_mode)?,
                         cwd,
                         timeout_ms,
-                        env: parse_env(env)?,
+                        env: parse_env_with_mcp(env, mcp_config, mcp_config_file, mcp_config_mode)?,
                         input_format: parse_input_format(&input_format)?,
                         output_format: parse_output_format(&output_format)?,
                         result_parser: parse_result_parser(&result_parser)?,
@@ -541,6 +592,9 @@ async fn main() -> anyhow::Result<()> {
                 model,
                 session_id,
                 env,
+                mcp_config,
+                mcp_config_file,
+                mcp_config_mode,
                 instructions,
                 instructions_file,
             } => {
@@ -555,6 +609,9 @@ async fn main() -> anyhow::Result<()> {
                         model,
                         session_id,
                         env,
+                        mcp_config,
+                        mcp_config_file,
+                        mcp_config_mode,
                         instructions,
                         instructions_file,
                     })?,
@@ -574,6 +631,9 @@ async fn main() -> anyhow::Result<()> {
                 system_prompt_file,
                 permission_mode,
                 env,
+                mcp_config,
+                mcp_config_file,
+                mcp_config_mode,
                 instructions,
                 instructions_file,
             } => {
@@ -592,6 +652,9 @@ async fn main() -> anyhow::Result<()> {
                         system_prompt_file,
                         permission_mode,
                         env,
+                        mcp_config,
+                        mcp_config_file,
+                        mcp_config_mode,
                         instructions,
                         instructions_file,
                     })?,
@@ -675,13 +738,29 @@ fn parse_env(items: Vec<String>) -> anyhow::Result<HashMap<String, String>> {
     Ok(env)
 }
 
+fn parse_env_with_mcp(
+    items: Vec<String>,
+    mcp_config: Option<String>,
+    mcp_config_file: Option<String>,
+    mcp_config_mode: Option<String>,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut env = parse_env(items)?;
+    if let Some(mcp_config) = read_optional_mcp_config(mcp_config, mcp_config_file)? {
+        env.insert("AHAND_AGENT_MCP_CONFIG".to_string(), mcp_config);
+    }
+    if let Some(mcp_config_mode) = parse_mcp_config_mode(mcp_config_mode)? {
+        env.insert("AHAND_AGENT_MCP_CONFIG_MODE".to_string(), mcp_config_mode);
+    }
+    Ok(env)
+}
+
 fn parse_result_parser(value: &str) -> anyhow::Result<String> {
     let normalized = value.trim();
     if ahand_protocol::is_known_result_parser(normalized) {
         Ok(normalized.to_string())
     } else {
         anyhow::bail!(
-            "invalid result parser {value:?}; use raw, codex-jsonl, or claude-stream-json"
+            "invalid result parser {value:?}; use raw, codex-jsonl, claude-stream-json, or hermes"
         );
     }
 }
@@ -754,6 +833,8 @@ fn hermes_exec_request(args: HermesRunArgs) -> anyhow::Result<ExecRequest> {
     let prompt = read_inline_or_file(args.prompt, args.prompt_file, "prompt")?;
     let instructions =
         read_optional_inline_or_file(args.instructions, args.instructions_file, "instructions")?;
+    let mcp_config = read_optional_mcp_config(args.mcp_config, args.mcp_config_file)?;
+    let mcp_config_mode = parse_mcp_config_mode(args.mcp_config_mode)?;
     let mut env = parse_env(args.env)?;
     env.insert(
         "AHAND_INPUT_FORMAT".to_string(),
@@ -777,6 +858,12 @@ fn hermes_exec_request(args: HermesRunArgs) -> anyhow::Result<ExecRequest> {
     if let Some(instructions) = instructions {
         env.insert("AHAND_AGENT_INSTRUCTIONS".to_string(), instructions);
     }
+    if let Some(mcp_config) = mcp_config {
+        env.insert("AHAND_AGENT_MCP_CONFIG".to_string(), mcp_config);
+    }
+    if let Some(mcp_config_mode) = mcp_config_mode {
+        env.insert("AHAND_AGENT_MCP_CONFIG_MODE".to_string(), mcp_config_mode);
+    }
 
     Ok(ExecRequest {
         execution_mode: ExecutionMode::PipeStream,
@@ -785,7 +872,7 @@ fn hermes_exec_request(args: HermesRunArgs) -> anyhow::Result<ExecRequest> {
         env,
         input_format: ahand_protocol::INPUT_FORMAT_HERMES_ACP_JSON_RPC.to_string(),
         output_format: ahand_protocol::OUTPUT_FORMAT_HERMES_ACP_JSON_RPC.to_string(),
-        result_parser: ahand_protocol::RESULT_PARSER_RAW.to_string(),
+        result_parser: ahand_protocol::RESULT_PARSER_HERMES.to_string(),
         format: ahand_protocol::FORMAT_RAW.to_string(),
         tool: args.hermes_path,
         args: Vec::new(),
@@ -798,6 +885,8 @@ fn claude_code_exec_request(args: ClaudeCodeRunArgs) -> anyhow::Result<ExecReque
         read_optional_inline_or_file(args.system_prompt, args.system_prompt_file, "system-prompt")?;
     let instructions =
         read_optional_inline_or_file(args.instructions, args.instructions_file, "instructions")?;
+    let mcp_config = read_optional_mcp_config(args.mcp_config, args.mcp_config_file)?;
+    let mcp_config_mode = parse_mcp_config_mode(args.mcp_config_mode)?;
     let mut env = parse_env(args.env)?;
     env.insert(
         "AHAND_INPUT_FORMAT".to_string(),
@@ -829,6 +918,12 @@ fn claude_code_exec_request(args: ClaudeCodeRunArgs) -> anyhow::Result<ExecReque
     }
     if let Some(instructions) = instructions {
         env.insert("AHAND_AGENT_INSTRUCTIONS".to_string(), instructions);
+    }
+    if let Some(mcp_config) = mcp_config {
+        env.insert("AHAND_AGENT_MCP_CONFIG".to_string(), mcp_config);
+    }
+    if let Some(mcp_config_mode) = mcp_config_mode {
+        env.insert("AHAND_AGENT_MCP_CONFIG_MODE".to_string(), mcp_config_mode);
     }
 
     Ok(ExecRequest {
@@ -871,6 +966,37 @@ fn read_optional_inline_or_file(
             .map(Some)
             .map_err(|error| anyhow::anyhow!("failed to read {label} file {path}: {error}")),
         _ => Ok(None),
+    }
+}
+
+fn read_optional_mcp_config(
+    inline: Option<String>,
+    file: Option<String>,
+) -> anyhow::Result<Option<String>> {
+    let Some(raw) = read_optional_inline_or_file(inline, file, "mcp-config")? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    if !value.is_object() {
+        anyhow::bail!("mcp-config must be a JSON object");
+    }
+    if let Some(servers) = value.get("mcpServers")
+        && !servers.is_object()
+    {
+        anyhow::bail!("mcp-config mcpServers must be a JSON object");
+    }
+    Ok(Some(serde_json::to_string(&value)?))
+}
+
+fn parse_mcp_config_mode(value: Option<String>) -> anyhow::Result<Option<String>> {
+    match value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok(None),
+        Some("replace") => Ok(Some("replace".to_string())),
+        Some(other) => anyhow::bail!("invalid mcp-config-mode {other:?}; use replace"),
     }
 }
 

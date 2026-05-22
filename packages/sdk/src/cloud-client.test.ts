@@ -520,6 +520,15 @@ describe("CloudClient.spawnAgent", () => {
       model: "provider:model",
       sessionId: "s-previous",
       instructions: "Use repo conventions.",
+      mcpConfig: {
+        mcpServers: {
+          fs: {
+            command: "npx",
+            args: ["-y", "server"],
+          },
+        },
+      },
+      mcpConfigMode: "replace",
       env: { PATH: "/usr/bin" },
       onObservation: (record) => observations.push(record),
     });
@@ -536,7 +545,7 @@ describe("CloudClient.spawnAgent", () => {
       executionMode: "pipe_stream",
       inputFormat: "hermes-acp-json-rpc",
       outputFormat: "hermes-acp-json-rpc",
-      resultParser: "raw",
+      resultParser: "hermes",
       format: "raw",
       interactive: false,
       executable: "/usr/local/bin/hermes",
@@ -544,6 +553,15 @@ describe("CloudClient.spawnAgent", () => {
       model: "provider:model",
       sessionId: "s-previous",
       instructions: "Use repo conventions.",
+      mcpConfig: {
+        mcpServers: {
+          fs: {
+            command: "npx",
+            args: ["-y", "server"],
+          },
+        },
+      },
+      mcpConfigMode: "replace",
       env: {
         PATH: "/usr/bin",
         AHAND_INPUT_FORMAT: "hermes-acp-json-rpc",
@@ -553,6 +571,9 @@ describe("CloudClient.spawnAgent", () => {
         AHAND_AGENT_MODEL: "provider:model",
         AHAND_AGENT_SESSION_ID: "s-previous",
         AHAND_AGENT_INSTRUCTIONS: "Use repo conventions.",
+        AHAND_AGENT_MCP_CONFIG:
+          "{\"mcpServers\":{\"fs\":{\"command\":\"npx\",\"args\":[\"-y\",\"server\"]}}}",
+        AHAND_AGENT_MCP_CONFIG_MODE: "replace",
       },
     });
   });

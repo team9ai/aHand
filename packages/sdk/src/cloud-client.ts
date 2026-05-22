@@ -64,7 +64,7 @@ export interface SpawnParams {
   /** Caller-facing stdout format. Defaults to `"raw"`. */
   outputFormat?: "raw" | "codex-jsonl" | "claude-stream-json" | "hermes-acp-json-rpc";
   /** Output parser hint. Defaults to `"raw"` on supported hubs. */
-  resultParser?: "raw" | "codex-jsonl" | "claude-stream-json";
+  resultParser?: "raw" | "codex-jsonl" | "claude-stream-json" | "hermes";
   /** @deprecated Use `outputFormat` instead. */
   format?: "raw" | "codex" | "claude-code";
   executable?: string;
@@ -75,6 +75,10 @@ export interface SpawnParams {
   maxTurns?: string;
   systemPrompt?: string;
   permissionMode?: string;
+  /** MCP config JSON body: `{ mcpServers: ... }`. */
+  mcpConfig?: Record<string, unknown>;
+  /** Omit for default merge. Use `"replace"` to ignore inherited MCP servers. */
+  mcpConfigMode?: "replace";
   /** @deprecated Use `executionMode: "pty"` instead. */
   interactive?: boolean;
 
@@ -106,6 +110,10 @@ export interface SpawnAgentParams {
   maxTurns?: string | number;
   systemPrompt?: string;
   permissionMode?: string;
+  /** MCP config JSON body: `{ mcpServers: ... }`. */
+  mcpConfig?: Record<string, unknown>;
+  /** Omit for default merge. Use `"replace"` to ignore inherited MCP servers. */
+  mcpConfigMode?: "replace";
   correlationId?: string;
   onObservation?: (record: unknown) => void;
   onStdout?: (chunk: string) => void;
@@ -370,6 +378,8 @@ export class CloudClient {
     if (p.permissionMode !== undefined) {
       requestBody.permissionMode = p.permissionMode;
     }
+    if (p.mcpConfig !== undefined) requestBody.mcpConfig = p.mcpConfig;
+    if (p.mcpConfigMode !== undefined) requestBody.mcpConfigMode = p.mcpConfigMode;
     if (p.correlationId !== undefined) requestBody.correlationId = p.correlationId;
 
     let postRes: Response;
@@ -443,9 +453,19 @@ export class CloudClient {
     if (p.permissionMode !== undefined) {
       env.AHAND_AGENT_PERMISSION_MODE = p.permissionMode;
     }
+    if (p.mcpConfig !== undefined) {
+      env.AHAND_AGENT_MCP_CONFIG = JSON.stringify(p.mcpConfig);
+    }
+    if (p.mcpConfigMode !== undefined) {
+      env.AHAND_AGENT_MCP_CONFIG_MODE = p.mcpConfigMode;
+    }
 
     const resultParser =
-      p.outputFormat === "claude-stream-json" ? "claude-stream-json" : "raw";
+      p.outputFormat === "claude-stream-json"
+        ? "claude-stream-json"
+        : p.outputFormat === "hermes-acp-json-rpc"
+          ? "hermes"
+          : "raw";
     const legacyFormat =
       p.outputFormat === "claude-stream-json" ? "claude-code" : "raw";
 
@@ -470,6 +490,8 @@ export class CloudClient {
       maxTurns: p.maxTurns === undefined ? undefined : String(p.maxTurns),
       systemPrompt: p.systemPrompt,
       permissionMode: p.permissionMode,
+      mcpConfig: p.mcpConfig,
+      mcpConfigMode: p.mcpConfigMode,
       signal: p.signal,
       onStdout: (chunk) => {
         p.onStdout?.(chunk);

@@ -379,9 +379,20 @@ async fn create_job_dispatches_hermes_formats_to_daemon_env() {
             "model": "provider:model",
             "sessionId": "ses-1",
             "instructions": "Use project conventions.",
+            "mcpConfig": {
+                "mcpServers": {
+                    "fs": {
+                        "command": "npx",
+                        "args": ["-y", "server"]
+                    }
+                }
+            },
+            "mcpConfigMode": "replace",
             "env": {
                 "PATH": "/usr/bin",
-                "AHAND_INPUT_FORMAT": "wrong"
+                "AHAND_INPUT_FORMAT": "wrong",
+                "AHAND_AGENT_MCP_CONFIG": "wrong",
+                "AHAND_AGENT_MCP_CONFIG_MODE": "wrong"
             },
             "executionMode": "pipe_stream"
         }),
@@ -420,6 +431,14 @@ async fn create_job_dispatches_hermes_formats_to_daemon_env() {
     assert_eq!(
         received.env.get("AHAND_AGENT_INSTRUCTIONS").unwrap(),
         "Use project conventions."
+    );
+    let mcp_config: serde_json::Value =
+        serde_json::from_str(received.env.get("AHAND_AGENT_MCP_CONFIG").unwrap()).unwrap();
+    assert_eq!(mcp_config["mcpServers"]["fs"]["command"], "npx");
+    assert_eq!(mcp_config["mcpServers"]["fs"]["args"][1], "server");
+    assert_eq!(
+        received.env.get("AHAND_AGENT_MCP_CONFIG_MODE").unwrap(),
+        "replace"
     );
 }
 

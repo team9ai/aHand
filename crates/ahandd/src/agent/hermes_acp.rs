@@ -11,6 +11,10 @@ use tracing::{info, warn};
 use crate::executor::EnvelopeSink;
 use crate::store::RunStore;
 
+use super::mcp_config::{
+    MCP_CONFIG_ENV, MCP_CONFIG_MODE_ENV, McpConfig, McpConfigMode, server_names,
+};
+
 const INPUT_FORMAT_ENV: &str = "AHAND_INPUT_FORMAT";
 const OUTPUT_FORMAT_ENV: &str = "AHAND_OUTPUT_FORMAT";
 const EXECUTABLE_ENV: &str = "AHAND_AGENT_EXECUTABLE";
@@ -43,6 +47,7 @@ struct HermesAcpConfig {
     model: Option<String>,
     session_id: Option<String>,
     instructions: Option<String>,
+    mcp_config: Option<McpConfig>,
 }
 
 impl HermesAcpConfig {
@@ -84,6 +89,10 @@ impl HermesAcpConfig {
                 .get(INSTRUCTIONS_ENV)
                 .filter(|value| !value.trim().is_empty())
                 .cloned(),
+            mcp_config: McpConfig::from_env(
+                req.env.get(MCP_CONFIG_ENV).map(String::as_str),
+                req.env.get(MCP_CONFIG_MODE_ENV).map(String::as_str),
+            )?,
         })
     }
 }
@@ -257,6 +266,9 @@ async fn spawn_hermes(config: &HermesAcpConfig) -> Result<tokio::process::Child,
         cmd.current_dir(&config.cwd);
     }
     for (key, value) in &config.env {
+        if key == MCP_CONFIG_ENV || key == MCP_CONFIG_MODE_ENV {
+            continue;
+        }
         cmd.env(key, value);
     }
 
@@ -305,6 +317,36 @@ fn prepare_context(
     Ok(())
 }
 
+fn hermes_mcp_servers(
+    config: &HermesAcpConfig,
+    job_id: &str,
+    store: &Option<Arc<RunStore>>,
+) -> Result<Vec<Value>, String> {
+    let Some(mcp_config) = &config.mcp_config else {
+        return Ok(Vec::new());
+    };
+    let servers = mcp_config.hermes_servers()?;
+    let names = server_names(&mcp_config.value);
+    let server_count = names.len();
+    append_json_line(
+        store,
+        job_id,
+        "mcp.jsonl",
+        &json!({
+            "kind": "mcp_config_injected",
+            "agent": "hermes-acp",
+            "mode": match mcp_config.mode {
+                McpConfigMode::Merge => "merge",
+                McpConfigMode::Replace => "replace",
+            },
+            "serverNames": names,
+            "serverCount": server_count,
+            "target": "session/new.mcpServers",
+        }),
+    );
+    Ok(servers)
+}
+
 async fn run_sequence<T>(
     stdin: tokio::process::ChildStdin,
     mut frame_rx: mpsc::UnboundedReceiver<Value>,
@@ -350,6 +392,9 @@ where
     );
 
     let session = if let Some(session_id) = &config.session_id {
+        if config.mcp_config.is_some() {
+            return Err("mcpConfig is only supported for new Hermes sessions".to_string());
+        }
         client
             .request(
                 "session/resume",
@@ -368,9 +413,10 @@ where
             )
             .await?
     } else {
+        let mcp_servers = hermes_mcp_servers(config, job_id, store)?;
         let mut params = json!({
             "cwd": config.cwd,
-            "mcpServers": [],
+            "mcpServers": mcp_servers,
         });
         if let Some(model) = &config.model {
             params["model"] = json!(model);
@@ -698,9 +744,32 @@ impl ProviderError {
 
 fn detect_provider_error(text: &str) -> Option<ProviderError> {
     let lower = text.to_ascii_lowercase();
-    let code = if lower.contains("rate limit") || lower.contains("429") {
+    if lower.contains("tool ") && lower.contains(" returned error") {
+        return None;
+    }
+
+    let looks_error = lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("exception")
+        || lower.contains("rate limit")
+        || lower.contains("quota")
+        || lower.contains("unauthorized")
+        || lower.contains("authentication")
+        || lower.contains("invalid api key");
+    if !looks_error {
+        return None;
+    }
+
+    let code = if lower.contains("rate limit")
+        || lower.contains("http 429")
+        || lower.contains("status 429")
+        || lower.contains("code 429")
+    {
         "provider_rate_limited"
-    } else if lower.contains("insufficient_quota")
+    } else if lower.contains("http 402")
+        || lower.contains("status 402")
+        || lower.contains("code 402")
+        || lower.contains("insufficient_quota")
         || lower.contains("quota")
         || lower.contains("billing")
         || lower.contains("credits")
@@ -732,6 +801,28 @@ struct HermesAcpFormatter {
     cwd: String,
     executable: String,
     seq: u64,
+    source_seq: u64,
+    pending_llm: Option<PendingLlmMessage>,
+    tool_calls: HashMap<String, ToolCallState>,
+}
+
+#[derive(Debug)]
+struct PendingLlmMessage {
+    channel: String,
+    text: String,
+    start_seq: u64,
+    end_seq: u64,
+    chunk_count: u64,
+    started_at_ms: u64,
+    ended_at_ms: u64,
+    source_kind: String,
+}
+
+#[derive(Debug, Clone)]
+struct ToolCallState {
+    tool_name: String,
+    tool_kind: String,
+    input: Value,
 }
 
 impl HermesAcpFormatter {
@@ -744,6 +835,9 @@ impl HermesAcpFormatter {
             cwd: config.cwd.clone(),
             executable: config.executable.clone(),
             seq: 0,
+            source_seq: 0,
+            pending_llm: None,
+            tool_calls: HashMap::new(),
         }
     }
 
@@ -758,24 +852,33 @@ impl HermesAcpFormatter {
     }
 
     fn format_initialize(&mut self, raw: &Value) -> Vec<Value> {
-        vec![self.record("status", json!({"status": "initialized"}), raw.clone())]
+        let mut records = self.flush_llm_message();
+        records.push(self.record("status", json!({"status": "initialized"}), raw.clone()));
+        records
     }
 
     fn format_session(&mut self, raw: &Value) -> Vec<Value> {
-        vec![self.record("agent_session", json!({}), raw.clone())]
+        let mut records = self.flush_llm_message();
+        records.push(self.record("agent_session", json!({}), raw.clone()));
+        records
     }
 
     fn format_status(&mut self, status: &str, raw: &Value) -> Vec<Value> {
-        vec![self.record("status", json!({ "status": status }), raw.clone())]
+        let mut records = self.flush_llm_message();
+        records.push(self.record("status", json!({ "status": status }), raw.clone()));
+        records
     }
 
     fn format_prompt_result(&mut self, raw: &Value) -> Vec<Value> {
-        let mut records = Vec::new();
+        let mut records = self.flush_llm_message();
         let text = output_text(raw);
         if !text.is_empty() {
             records.push(self.record(
-                "llm_call_delta",
-                json!({ "responseText": text }),
+                "llm_message",
+                json!({
+                    "channel": "message",
+                    "responseText": text,
+                }),
                 raw.clone(),
             ));
         }
@@ -785,38 +888,41 @@ impl HermesAcpFormatter {
 
     fn format_permission_request(&mut self, raw: &Value, option_id: &str) -> Vec<Value> {
         let params = raw.get("params").cloned().unwrap_or_else(|| raw.clone());
-        vec![
-            self.record(
-                "permission_request",
-                permission_payload(&params),
-                raw.clone(),
-            ),
-            self.record(
-                "policy_decision",
-                json!({
-                    "decision": "approve",
-                    "optionId": option_id,
-                    "scope": "session",
-                    "reason": "Hermes ACP requested permission through session/request_permission",
-                }),
-                raw.clone(),
-            ),
-        ]
+        let mut records = self.flush_llm_message();
+        records.push(self.record(
+            "permission_request",
+            permission_payload(&params),
+            raw.clone(),
+        ));
+        records.push(self.record(
+            "policy_decision",
+            json!({
+                "decision": "approve",
+                "optionId": option_id,
+                "scope": "session",
+                "reason": "Hermes ACP requested permission through session/request_permission",
+            }),
+            raw.clone(),
+        ));
+        records
     }
 
     fn format_policy_decision(&mut self, raw: &Value, decision: &str, reason: &str) -> Vec<Value> {
-        vec![self.record(
+        let mut records = self.flush_llm_message();
+        records.push(self.record(
             "policy_decision",
             json!({
                 "decision": decision,
                 "reason": reason,
             }),
             raw.clone(),
-        )]
+        ));
+        records
     }
 
     fn format_provider_error(&mut self, error: &ProviderError) -> Vec<Value> {
-        vec![self.record(
+        let mut records = self.flush_llm_message();
+        records.push(self.record(
             "error",
             json!({
                 "code": error.code.clone(),
@@ -828,12 +934,16 @@ impl HermesAcpFormatter {
                 "source": "stderr",
                 "message": error.message.clone(),
             }),
-        )]
+        ));
+        records
     }
 
     fn format_event(&mut self, raw: Value) -> Vec<Value> {
+        self.source_seq += 1;
         if raw.get("ahand_parse_error").is_some() {
-            return vec![self.record("parse_error", raw.clone(), raw)];
+            let mut records = self.flush_llm_message();
+            records.push(self.record("parse_error", raw.clone(), raw));
+            return records;
         }
 
         let method = raw.get("method").and_then(Value::as_str).unwrap_or("");
@@ -845,22 +955,35 @@ impl HermesAcpFormatter {
         let lower = method.to_ascii_lowercase();
 
         if lower.contains("tool") && (lower.contains("start") || lower.contains("call")) {
-            return vec![self.record("tool_call_start", tool_payload(&params, "started"), raw)];
+            let mut records = self.flush_llm_message();
+            let payload = self.tool_payload_for_event(&params, "started");
+            records.push(self.record("tool_call_start", payload, raw));
+            return records;
         }
         if lower.contains("tool") && (lower.contains("result") || lower.contains("output")) {
-            return vec![self.record("tool_call_output", tool_payload(&params, "output"), raw)];
+            let mut records = self.flush_llm_message();
+            let payload = self.tool_payload_for_event(&params, "output");
+            records.push(self.record("tool_call_output", payload, raw));
+            return records;
         }
         if lower.contains("tool") && (lower.contains("end") || lower.contains("finish")) {
-            return vec![self.record("tool_call_end", tool_payload(&params, "completed"), raw)];
+            let mut records = self.flush_llm_message();
+            let payload = self.tool_payload_for_event(&params, "completed");
+            records.push(self.record("tool_call_end", payload, raw));
+            return records;
         }
         if lower.contains("error") {
-            return vec![self.record("error", params, raw)];
+            let mut records = self.flush_llm_message();
+            records.push(self.record("error", params, raw));
+            return records;
         }
         if let Some(text) = find_string(&params, &["text", "content", "delta", "message"]) {
-            return vec![self.record("llm_call_delta", json!({ "responseText": text }), raw)];
+            return self.push_llm_chunk("message", text, "text");
         }
 
-        vec![self.record("raw", json!({}), raw)]
+        let mut records = self.flush_llm_message();
+        records.push(self.record("raw", json!({}), raw));
+        records
     }
 
     fn format_session_update(&mut self, params: &Value, raw: Value) -> Vec<Value> {
@@ -874,24 +997,18 @@ impl HermesAcpFormatter {
 
         match update_type.as_deref() {
             Some("agent_message_chunk") | Some("AgentMessageChunk") => {
-                vec![self.record(
-                    "llm_call_delta",
-                    json!({ "responseText": content_text(update_body) }),
-                    raw,
-                )]
+                self.push_llm_chunk("message", &content_text(update_body), "agent_message_chunk")
             }
-            Some("agent_thought_chunk") | Some("AgentThoughtChunk") => {
-                vec![self.record(
-                    "llm_call_delta",
-                    json!({
-                        "channel": "thinking",
-                        "responseText": content_text(update_body),
-                    }),
-                    raw,
-                )]
-            }
+            Some("agent_thought_chunk") | Some("AgentThoughtChunk") => self.push_llm_chunk(
+                "thinking",
+                &content_text(update_body),
+                "agent_thought_chunk",
+            ),
             Some("tool_call") | Some("ToolCall") => {
-                vec![self.record("tool_call_start", tool_payload(update_body, "started"), raw)]
+                let mut records = self.flush_llm_message();
+                let payload = self.tool_payload_for_event(update_body, "started");
+                records.push(self.record("tool_call_start", payload, raw));
+                records
             }
             Some("tool_call_update") | Some("ToolCallUpdate") => {
                 let status = find_string(update_body, &["status"]).unwrap_or("completed");
@@ -900,22 +1017,173 @@ impl HermesAcpFormatter {
                 } else {
                     "tool_call_output"
                 };
-                vec![self.record(kind, tool_payload(update_body, status), raw)]
+                let mut records = self.flush_llm_message();
+                let payload = self.tool_payload_for_event(update_body, status);
+                records.push(self.record(kind, payload, raw));
+                records
             }
             Some("usage_update") | Some("UsageUpdate") => {
-                vec![self.record("llm_call_end", usage_payload(update_body), raw)]
+                let mut records = self.flush_llm_message();
+                records.push(self.record("llm_call_end", usage_payload(update_body), raw));
+                records
             }
             Some("permission_request") | Some("PermissionRequest") => {
-                vec![self.record("permission_request", permission_payload(update_body), raw)]
+                let mut records = self.flush_llm_message();
+                records.push(self.record(
+                    "permission_request",
+                    permission_payload(update_body),
+                    raw,
+                ));
+                records
             }
             Some("policy_decision") | Some("PolicyDecision") => {
-                vec![self.record("policy_decision", update_body.clone(), raw)]
+                let mut records = self.flush_llm_message();
+                records.push(self.record("policy_decision", update_body.clone(), raw));
+                records
             }
             Some("turn_end") | Some("end_turn") | Some("TurnEnd") => {
-                vec![self.record("llm_call_end", usage_payload(update_body), raw)]
+                let mut records = self.flush_llm_message();
+                records.push(self.record("llm_call_end", usage_payload(update_body), raw));
+                records
             }
-            _ => vec![self.record("raw", json!({ "updateType": update_type }), raw)],
+            Some("plan") | Some("Plan") => {
+                let mut records = self.flush_llm_message();
+                records.push(self.record("plan_update", plan_payload(update_body), raw));
+                records
+            }
+            _ => {
+                let mut records = self.flush_llm_message();
+                records.push(self.record("raw", json!({ "updateType": update_type }), raw));
+                records
+            }
         }
+    }
+
+    fn tool_payload_for_event(&mut self, value: &Value, status: &str) -> Value {
+        let mut payload = tool_payload(value, status);
+        let tool_call_id = payload
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        if let Some(state) = self.tool_calls.get(&tool_call_id) {
+            if payload
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+            {
+                payload["toolName"] = json!(state.tool_name);
+            }
+            if payload
+                .get("toolKind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .is_empty()
+            {
+                payload["toolKind"] = json!(state.tool_kind);
+            }
+            if payload.get("input").is_none_or(Value::is_null) && !state.input.is_null() {
+                payload["input"] = state.input.clone();
+            }
+        }
+
+        if !tool_call_id.is_empty() && status == "started" {
+            self.tool_calls.insert(
+                tool_call_id.clone(),
+                ToolCallState {
+                    tool_name: payload
+                        .get("toolName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    tool_kind: payload
+                        .get("toolKind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    input: payload.get("input").cloned().unwrap_or(Value::Null),
+                },
+            );
+        }
+
+        if matches!(status, "completed" | "failed") {
+            self.tool_calls.remove(&tool_call_id);
+        }
+
+        payload
+    }
+
+    fn push_llm_chunk(&mut self, channel: &str, text: &str, source_kind: &str) -> Vec<Value> {
+        let mut records = Vec::new();
+        if text.is_empty() {
+            return records;
+        }
+
+        let should_flush = self
+            .pending_llm
+            .as_ref()
+            .is_some_and(|pending| pending.channel != channel);
+        if should_flush {
+            records.extend(self.flush_llm_message());
+        }
+
+        let now = now_ms();
+        match &mut self.pending_llm {
+            Some(pending) if pending.channel == channel => {
+                pending.text.push_str(text);
+                pending.end_seq = self.source_seq;
+                pending.chunk_count += 1;
+                pending.ended_at_ms = now;
+            }
+            _ => {
+                self.pending_llm = Some(PendingLlmMessage {
+                    channel: channel.to_string(),
+                    text: text.to_string(),
+                    start_seq: self.source_seq,
+                    end_seq: self.source_seq,
+                    chunk_count: 1,
+                    started_at_ms: now,
+                    ended_at_ms: now,
+                    source_kind: source_kind.to_string(),
+                });
+            }
+        }
+        records
+    }
+
+    fn flush_llm_message(&mut self) -> Vec<Value> {
+        let Some(pending) = self.pending_llm.take() else {
+            return Vec::new();
+        };
+        if pending.text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut record = self.record(
+            "llm_message",
+            json!({
+                "channel": pending.channel,
+                "responseText": pending.text,
+            }),
+            json!({
+                "source": "stdout",
+                "protocol": "acp-json-rpc",
+                "parser": "hermes",
+                "parserVersion": 1,
+                "aggregated": true,
+            }),
+        );
+        record["stream"] = json!({
+            "sourceKind": pending.source_kind,
+            "chunkCount": pending.chunk_count,
+            "startSeq": pending.start_seq,
+            "endSeq": pending.end_seq,
+        });
+        record["time"]["startedAtMs"] = json!(pending.started_at_ms);
+        record["time"]["endedAtMs"] = json!(pending.ended_at_ms);
+        vec![record]
     }
 
     fn record(&mut self, kind: &str, payload: Value, raw: Value) -> Value {
@@ -939,6 +1207,7 @@ impl HermesAcpFormatter {
             "runtime": {
                 "jobId": self.job_id,
                 "executionMode": "pipe_stream",
+                "resultParser": "hermes",
                 "inputFormat": "hermes-acp-json-rpc",
                 "outputFormat": "hermes-acp-json-rpc",
                 "cwd": self.cwd,
@@ -948,6 +1217,8 @@ impl HermesAcpFormatter {
             "raw": {
                 "source": "stdout",
                 "protocol": "acp-json-rpc",
+                "parser": "hermes",
+                "parserVersion": 1,
                 "json": raw,
             },
         });
@@ -955,7 +1226,7 @@ impl HermesAcpFormatter {
             record["agent"]["agentSessionId"] = json!(session_id);
         }
         match kind {
-            "llm_call_delta" | "llm_call_end" => record["llmResponse"] = payload,
+            "llm_message" | "llm_call_delta" | "llm_call_end" => record["llmResponse"] = payload,
             "tool_call_start" | "tool_call_output" | "tool_call_end" => {
                 record["toolCall"] = payload;
             }
@@ -963,6 +1234,7 @@ impl HermesAcpFormatter {
             "status" => record["status"] = payload,
             "permission_request" => record["permission"] = payload,
             "policy_decision" => record["policy"] = payload,
+            "plan_update" => record["plan"] = payload,
             _ => {}
         }
         record
@@ -1086,6 +1358,12 @@ fn permission_payload(value: &Value) -> Value {
         payload["message"] = json!(text);
     }
     payload
+}
+
+fn plan_payload(value: &Value) -> Value {
+    json!({
+        "entries": value.get("entries").cloned().unwrap_or_else(|| json!([])),
+    })
 }
 
 fn usage_payload(value: &Value) -> Value {
@@ -1291,7 +1569,25 @@ mod tests {
     }
 
     #[test]
-    fn formatter_emits_session_and_text_observations() {
+    fn config_converts_mcp_config_body_to_hermes_servers() {
+        let mut req = req();
+        req.env.insert(
+            MCP_CONFIG_ENV.to_string(),
+            r#"{"mcpServers":{"fs":{"command":"npx","args":["-y","server"],"env":{"TOKEN":"secret"}}}}"#
+                .to_string(),
+        );
+        let config = HermesAcpConfig::from_job(&req).unwrap();
+        let servers = config.mcp_config.unwrap().hermes_servers().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["name"], "fs");
+        assert_eq!(servers[0]["command"], "npx");
+        assert_eq!(servers[0]["args"][1], "server");
+        assert_eq!(servers[0]["env"][0]["name"], "TOKEN");
+        assert_eq!(servers[0]["env"][0]["value"], "secret");
+    }
+
+    #[test]
+    fn formatter_aggregates_text_observations() {
         let req = req();
         let config = HermesAcpConfig::from_job(&req).unwrap();
         let mut formatter = HermesAcpFormatter::new(&req, &config);
@@ -1311,8 +1607,34 @@ mod tests {
                 }
             }
         }));
-        assert_eq!(records[0]["kind"], "llm_call_delta");
-        assert_eq!(records[0]["llmResponse"]["responseText"], "hi");
+        assert!(records.is_empty());
+
+        let records = formatter.format_event(json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "s-1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": { "type": "text", "text": " there" }
+                }
+            }
+        }));
+        assert!(records.is_empty());
+
+        let records = formatter.format_event(json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "s-1",
+                "update": {
+                    "sessionUpdate": "agent_thought_chunk",
+                    "content": { "type": "text", "text": "thinking" }
+                }
+            }
+        }));
+        assert_eq!(records[0]["kind"], "llm_message");
+        assert_eq!(records[0]["llmResponse"]["channel"], "message");
+        assert_eq!(records[0]["llmResponse"]["responseText"], "hi there");
+        assert_eq!(records[0]["stream"]["chunkCount"], 2);
     }
 
     #[test]
@@ -1320,6 +1642,36 @@ mod tests {
         let req = req();
         let config = HermesAcpConfig::from_job(&req).unwrap();
         let mut formatter = HermesAcpFormatter::new(&req, &config);
+        let records = formatter.format_event(json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "tc-start-end",
+                    "title": "terminal: python3 script.py",
+                    "kind": "execute",
+                    "rawInput": {"cmd": "python3 script.py"}
+                }
+            }
+        }));
+        assert_eq!(records[0]["kind"], "tool_call_start");
+        assert_eq!(records[0]["toolCall"]["toolName"], "terminal");
+        let records = formatter.format_event(json!({
+            "method": "session/update",
+            "params": {
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-start-end",
+                    "kind": "execute",
+                    "status": "completed",
+                    "content": [{"type": "content", "content": {"type": "text", "text": "done"}}]
+                }
+            }
+        }));
+        assert_eq!(records[0]["kind"], "tool_call_end");
+        assert_eq!(records[0]["toolCall"]["toolName"], "terminal");
+        assert_eq!(records[0]["toolCall"]["input"]["cmd"], "python3 script.py");
+
         let records = formatter.format_event(json!({
             "method": "session/update",
             "params": {
@@ -1369,7 +1721,12 @@ mod tests {
                 }
             }
         }));
-        assert_eq!(records[0]["kind"], "llm_call_delta");
+        assert!(records.is_empty());
+        let records = formatter.format_prompt_result(&json!({
+            "stopReason": "end_turn",
+            "usage": { "inputTokens": 1, "outputTokens": 1 }
+        }));
+        assert_eq!(records[0]["kind"], "llm_message");
         let text = records[0]["llmResponse"]["responseText"].as_str().unwrap();
         assert!(text.contains("changed"));
         assert!(text.contains("src/main.rs"));
@@ -1398,6 +1755,17 @@ mod tests {
         assert_eq!(records[0]["kind"], "error");
         assert_eq!(records[0]["error"]["code"], "provider_rate_limited");
         assert_eq!(records[0]["error"]["isProviderError"], true);
+
+        assert!(
+            detect_provider_error(
+                "Tool mcp_capability_hub_youtube_find_creator_email returned error: HTTP 404"
+            )
+            .is_none()
+        );
+        let error =
+            detect_provider_error("API call failed after 3 retries. HTTP 402: quota exceeded")
+                .unwrap();
+        assert_eq!(error.code, "provider_quota_exceeded");
     }
 
     #[tokio::test]

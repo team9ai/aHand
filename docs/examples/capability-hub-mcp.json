@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "capability-hub": {
+      "command": "docker",
+      "args": [
+        "compose",
+        "--env-file",
+        "/Users/mew/Documents/GitHub/capability-hub/.env",
+        "-f",
+        "/Users/mew/Documents/GitHub/capability-hub/docker-compose.yml",
+        "-f",
+        "/Users/mew/Documents/GitHub/capability-hub/docker-compose.mcp.external-env.yml",
+        "run",
+        "--rm",
+        "-T",
+        "--env-from-file",
+        "/Users/mew/.config/capability-hub/mcp.env",
+        "mcp"
+      ]
+    }
+  }
+}
