@@ -79,6 +79,12 @@ pub struct JobChannels {
     pub started_at: Instant,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlJobAccess {
+    pub device_id: String,
+    pub external_user_id: String,
+}
+
 impl JobChannels {
     /// Subscribe for incoming events. The returned receiver lives
     /// independently of this channel handle and is dropped by the
@@ -106,6 +112,7 @@ impl JobChannels {
 #[derive(Default)]
 pub struct ControlJobTracker {
     jobs: DashMap<String, Arc<JobChannels>>,
+    completed_access: DashMap<String, ControlJobAccess>,
     correlation_index: DashMap<String, String>,
 }
 
@@ -136,12 +143,23 @@ impl ControlJobTracker {
             self.correlation_index
                 .insert(correlation_key(&external_user_id, &cid), job_id.clone());
         }
+        self.completed_access.remove(&job_id);
         self.jobs.insert(job_id, channels.clone());
         channels
     }
 
     pub fn get(&self, job_id: &str) -> Option<Arc<JobChannels>> {
         self.jobs.get(job_id).map(|entry| entry.clone())
+    }
+
+    pub fn access(&self, job_id: &str) -> Option<ControlJobAccess> {
+        if let Some(channels) = self.jobs.get(job_id) {
+            return Some(ControlJobAccess {
+                device_id: channels.device_id.clone(),
+                external_user_id: channels.external_user_id.clone(),
+            });
+        }
+        self.completed_access.get(job_id).map(|entry| entry.clone())
     }
 
     /// Returns the existing `job_id` if the `(external_user_id,
@@ -185,6 +203,13 @@ impl ControlJobTracker {
             return;
         };
         channels.send(event);
+        self.completed_access.insert(
+            job_id.to_string(),
+            ControlJobAccess {
+                device_id: channels.device_id.clone(),
+                external_user_id: channels.external_user_id.clone(),
+            },
+        );
         if let Some(cid) = &channels.correlation_id {
             let key = correlation_key(&channels.external_user_id, cid);
             // Only remove if the correlation entry still points at
@@ -311,6 +336,13 @@ mod tests {
             }
         );
         assert!(t.get("job-1").is_none());
+        assert_eq!(
+            t.access("job-1"),
+            Some(ControlJobAccess {
+                device_id: "dev".into(),
+                external_user_id: "user".into(),
+            })
+        );
         assert_eq!(t.find_by_correlation("user", "corr"), None);
         assert!(t.is_empty());
     }

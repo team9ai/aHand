@@ -1726,6 +1726,103 @@ async fn sse_late_joiner_after_terminal_event_gets_empty_stream() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn control_job_output_stream_replays_after_terminal_event() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-output", "user-output").await;
+    let token = mint_cp_jwt(&server, "user-output");
+
+    let job_id = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({ "deviceId": "cp-output", "tool": "echo" }),
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await
+    .unwrap()["jobId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = recv_job_request(&mut device).await;
+
+    send_envelope(
+        &mut device,
+        ahand_protocol::Envelope {
+            device_id: "cp-output".into(),
+            msg_id: "output-1".into(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::JobEvent(ahand_protocol::JobEvent {
+                job_id: job_id.clone(),
+                event: Some(ahand_protocol::job_event::Event::StdoutChunk(
+                    b"streamed line\n".to_vec(),
+                )),
+            })),
+            ..Default::default()
+        },
+    )
+    .await;
+    send_envelope(
+        &mut device,
+        ahand_protocol::Envelope {
+            device_id: "cp-output".into(),
+            msg_id: "output-finished".into(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if server.state().control_jobs.get(&job_id).is_none() {
+            break;
+        }
+    }
+    assert!(
+        server.state().control_jobs.get(&job_id).is_none(),
+        "control job tracker should be finalized before late output subscribe"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/output",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut stream = resp.bytes_stream();
+    let mut body = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        body.push_str(&String::from_utf8_lossy(&chunk));
+        if body.contains("event: finished") {
+            break;
+        }
+    }
+
+    assert!(body.contains("id: 1"), "body was: {body}");
+    assert!(body.contains("event: stdout"), "body was: {body}");
+    assert!(body.contains("data: streamed line"), "body was: {body}");
+    assert!(body.contains("event: finished"), "body was: {body}");
+    assert!(body.contains(r#""exit_code":0"#), "body was: {body}");
+
+    drop(device);
+    server.shutdown().await;
+}
+
 // ── R2-1: device_ids allowlist enforcement ────────────────────────────────────
 
 #[tokio::test]
