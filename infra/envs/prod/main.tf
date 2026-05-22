@@ -21,8 +21,8 @@ module "ahand_hub" {
   # Prod team9 gateway is published at api.team9.ai (Railway public domain).
   # gateway.team9.ai does not resolve — the hub's outbound WEBHOOK_URL is
   # built from this value and posts events to ${gateway_public_url}/api/v1/ahand/hub-webhook.
-  gateway_public_url             = "https://api.team9.ai"
-  redis_mode                     = "create"
+  gateway_public_url = "https://api.team9.ai"
+  redis_mode         = "create"
 }
 
 output "execution_role_arn" {
@@ -31,6 +31,10 @@ output "execution_role_arn" {
 
 output "task_role_arn" {
   value = module.ahand_hub.task_role_arn
+}
+
+output "file_ops_bucket_name" {
+  value = module.ahand_hub.file_ops_bucket_name
 }
 
 output "traefik_lb_dns_name" {

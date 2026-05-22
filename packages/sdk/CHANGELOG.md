@@ -1,5 +1,14 @@
 # @ahandai/sdk Changelog
 
+## 0.2.2 — 2026-05-13
+
+### Added
+
+- Added `CloudClient.readPdf(params)` and PDF-aware `readFile()` routing.
+  PDF reads now return metadata plus mode-specific payloads: raw PDF bytes,
+  rendered page images, page-separated text, or the default first-5-page
+  preview.
+
 ## 0.2.0 — 2026-04-30
 
 Released alongside `@ahandai/proto@0.2.0`. Both packages are now published

@@ -98,11 +98,43 @@ resource "aws_iam_role_policy" "task" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid      = "Noop"
-      Effect   = "Allow"
-      Action   = ["sts:GetCallerIdentity"]
-      Resource = "*"
-    }]
+    Statement = [
+      {
+        Sid      = "Noop"
+        Effect   = "Allow"
+        Action   = ["sts:GetCallerIdentity"]
+        Resource = "*"
+      },
+      {
+        Sid      = "FileOpsBucketLocation"
+        Effect   = "Allow"
+        Action   = ["s3:GetBucketLocation"]
+        Resource = aws_s3_bucket.file_ops.arn
+      },
+      {
+        Sid      = "FileOpsBucketList"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.file_ops.arn
+        Condition = {
+          StringLike = {
+            "s3:prefix" = [
+              "file-ops/",
+              "file-ops/*",
+            ]
+          }
+        }
+      },
+      {
+        Sid    = "FileOpsObjects"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+        ]
+        Resource = "${aws_s3_bucket.file_ops.arn}/file-ops/*"
+      },
+    ]
   })
 }

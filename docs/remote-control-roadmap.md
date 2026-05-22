@@ -86,7 +86,7 @@ List, read, upload, download, and modify files on the device.
 | Delete | Remove files (with policy enforcement) |
 
 **Current status:**
-- [x] File operation protocol messages — `proto/ahand/v1/file_ops.proto` (14 oneof variants on FileRequest / FileResponse, full FileError taxonomy, helper messages)
+- [x] File operation protocol messages — `proto/ahand/v1/file_ops.proto` (15 oneof variants on FileRequest / FileResponse, full FileError taxonomy, helper messages)
 - [x] Daemon file handler with policy enforcement — `crates/ahandd/src/file_manager/` (allowlist + denylist + dangerous_paths + STRICT-mode approval, traversal + symlink TOCTOU mitigations)
 - [x] Hub HTTP forwarding — `POST /api/devices/{id}/files` correlates the FileRequest/FileResponse pair across the WebSocket gateway with admission control + RAII slot cleanup
 - [ ] TODO: Dashboard file browser UI

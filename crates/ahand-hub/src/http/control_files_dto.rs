@@ -7,7 +7,7 @@
 //! The wire shape is intentionally a thin re-spelling of the proto
 //! schema (snake_case field names, same nullability semantics) so the
 //! SDK's typed surface and the daemon's typed surface stay in lock
-//! step. All 14 file operations are covered.
+//! step. All file operations are covered.
 //!
 //! ## Wire format
 //!
@@ -132,6 +132,14 @@ pub fn build_request_operation(
             Operation::ReadImage(parse!(ReadImageParams).try_into().map_err(|msg: String| {
                 DtoError::InvalidParams {
                     op: "read_image".into(),
+                    message: msg,
+                }
+            })?)
+        }
+        "read_pdf" => {
+            Operation::ReadPdf(parse!(ReadPdfParams).try_into().map_err(|msg: String| {
+                DtoError::InvalidParams {
+                    op: "read_pdf".into(),
                     message: msg,
                 }
             })?)
@@ -374,6 +382,59 @@ impl TryFrom<ReadImageParams> for proto::FileReadImage {
             max_bytes: p.max_bytes,
             quality: p.quality,
             output_format: Some(output_format),
+            no_follow_symlink: p.no_follow_symlink,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ReadPdfParams {
+    pub path: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub page_range: Option<PdfPageRangeJson>,
+    #[serde(default)]
+    pub no_follow_symlink: bool,
+}
+
+#[derive(Deserialize)]
+pub struct PdfPageRangeJson {
+    pub start_page: u32,
+    pub end_page: u32,
+}
+
+impl From<PdfPageRangeJson> for proto::PdfPageRange {
+    fn from(p: PdfPageRangeJson) -> Self {
+        Self {
+            start_page: p.start_page,
+            end_page: p.end_page,
+        }
+    }
+}
+
+impl TryFrom<ReadPdfParams> for proto::FileReadPdf {
+    type Error = String;
+    fn try_from(p: ReadPdfParams) -> Result<Self, Self::Error> {
+        let mode = match p.mode.as_deref() {
+            None | Some("") | Some("auto") => proto::FileReadPdfMode::Auto as i32,
+            Some(s) => match s.to_ascii_lowercase().as_str() {
+                "auto" => proto::FileReadPdfMode::Auto as i32,
+                "metadata" => proto::FileReadPdfMode::Metadata as i32,
+                "raw" => proto::FileReadPdfMode::Raw as i32,
+                "imgs" => proto::FileReadPdfMode::Imgs as i32,
+                "text" => proto::FileReadPdfMode::Text as i32,
+                other => {
+                    return Err(format!(
+                        "mode '{other}' is not one of: auto, metadata, raw, imgs, text"
+                    ));
+                }
+            },
+        };
+        Ok(Self {
+            path: p.path,
+            mode,
+            page_range: p.page_range.map(Into::into),
             no_follow_symlink: p.no_follow_symlink,
         })
     }
@@ -811,6 +872,7 @@ pub fn build_response_envelope(
         Some(R::ReadText(r)) => (true, Some(read_text_result_to_json(r)), None),
         Some(R::ReadBinary(r)) => (true, Some(read_binary_result_to_json(r)), None),
         Some(R::ReadImage(r)) => (true, Some(read_image_result_to_json(r)), None),
+        Some(R::ReadPdf(r)) => (true, Some(read_pdf_result_to_json(r)), None),
         Some(R::Write(r)) => (true, Some(write_result_to_json(r)), None),
         Some(R::Edit(r)) => (true, Some(edit_result_to_json(r)), None),
         Some(R::Delete(r)) => (true, Some(delete_result_to_json(r)), None),
@@ -930,6 +992,16 @@ fn image_format_to_str(f: i32) -> &'static str {
         proto::ImageFormat::Jpeg => "jpeg",
         proto::ImageFormat::Png => "png",
         proto::ImageFormat::Webp => "webp",
+    }
+}
+
+fn read_pdf_mode_to_str(f: i32) -> &'static str {
+    match proto::FileReadPdfMode::try_from(f).unwrap_or(proto::FileReadPdfMode::Auto) {
+        proto::FileReadPdfMode::Auto => "auto",
+        proto::FileReadPdfMode::Metadata => "metadata",
+        proto::FileReadPdfMode::Raw => "raw",
+        proto::FileReadPdfMode::Imgs => "imgs",
+        proto::FileReadPdfMode::Text => "text",
     }
 }
 
@@ -1056,6 +1128,40 @@ fn read_image_result_to_json(r: proto::FileReadImageResult) -> serde_json::Value
     })
 }
 
+fn read_pdf_result_to_json(r: proto::FileReadPdfResult) -> serde_json::Value {
+    use base64::Engine as _;
+    let raw_content_b64 = if r.raw_content.is_empty() {
+        None
+    } else {
+        Some(base64::engine::general_purpose::STANDARD.encode(&r.raw_content))
+    };
+    serde_json::json!({
+        "mode": read_pdf_mode_to_str(r.mode),
+        "metadata": r.metadata.as_ref().map(|m| serde_json::json!({
+            "path": m.path,
+            "total_file_bytes": m.total_file_bytes,
+            "total_pages": m.total_pages,
+        })),
+        "page_range": r.page_range.as_ref().map(|p| serde_json::json!({
+            "start_page": p.start_page,
+            "end_page": p.end_page,
+        })),
+        "raw_content_b64": raw_content_b64,
+        "images": r.images.iter().map(|img| serde_json::json!({
+            "page_number": img.page_number,
+            "content_b64": base64::engine::general_purpose::STANDARD.encode(&img.content),
+            "format": image_format_to_str(img.format),
+            "width": img.width,
+            "height": img.height,
+            "output_bytes": img.output_bytes,
+        })).collect::<Vec<_>>(),
+        "text_pages": r.text_pages.iter().map(|page| serde_json::json!({
+            "page_number": page.page_number,
+            "content": page.content,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn write_result_to_json(r: proto::FileWriteResult) -> serde_json::Value {
     serde_json::json!({
         "path": r.path,
@@ -1099,7 +1205,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // ── Request direction: build_request_operation (14 ops) ───────────
+    // ── Request direction: build_request_operation ────────────────────
 
     #[test]
     fn build_stat_maps_path_and_no_follow() {
@@ -1343,6 +1449,45 @@ mod tests {
             DtoError::InvalidParams { op, message } => {
                 assert_eq!(op, "read_image");
                 assert!(message.contains("tiff"), "message={message}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_read_pdf_maps_mode_and_page_range() {
+        let op = build_request_operation(
+            "read_pdf",
+            json!({
+                "path": "/doc.pdf",
+                "mode": "imgs",
+                "page_range": { "start_page": 2, "end_page": 4 },
+                "no_follow_symlink": true,
+            }),
+        )
+        .unwrap();
+        match op {
+            proto::file_request::Operation::ReadPdf(r) => {
+                assert_eq!(r.path, "/doc.pdf");
+                assert_eq!(r.mode, proto::FileReadPdfMode::Imgs as i32);
+                assert!(r.no_follow_symlink);
+                let range = r.page_range.expect("page_range should be set");
+                assert_eq!(range.start_page, 2);
+                assert_eq!(range.end_page, 4);
+            }
+            other => panic!("expected ReadPdf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_read_pdf_rejects_unknown_mode() {
+        let err =
+            build_request_operation("read_pdf", json!({ "path": "/doc.pdf", "mode": "pages" }))
+                .unwrap_err();
+        match err {
+            DtoError::InvalidParams { op, message } => {
+                assert_eq!(op, "read_pdf");
+                assert!(message.contains("pages"), "message={message}");
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -2068,6 +2213,60 @@ mod tests {
                 .unwrap();
             assert_eq!(decoded, b"abc");
         }
+    }
+
+    #[test]
+    fn envelope_read_pdf_result_encodes_raw_images_and_text() {
+        use base64::Engine as _;
+        let env = build_response_envelope(
+            make_response(proto::file_response::Result::ReadPdf(
+                proto::FileReadPdfResult {
+                    mode: proto::FileReadPdfMode::Auto as i32,
+                    metadata: Some(proto::PdfMetadata {
+                        path: "/doc.pdf".into(),
+                        total_file_bytes: 123,
+                        total_pages: 7,
+                    }),
+                    page_range: Some(proto::PdfPageRange {
+                        start_page: 1,
+                        end_page: 5,
+                    }),
+                    raw_content: b"%PDF-1.4".to_vec(),
+                    images: vec![proto::PdfPageImage {
+                        page_number: 1,
+                        content: b"png".to_vec(),
+                        format: proto::ImageFormat::Png as i32,
+                        width: 10,
+                        height: 20,
+                        output_bytes: 3,
+                    }],
+                    text_pages: vec![proto::PdfPageText {
+                        page_number: 1,
+                        content: "hello".into(),
+                    }],
+                },
+            )),
+            "read_pdf",
+            1,
+        );
+        let r = env.result.unwrap();
+        assert_eq!(r["mode"], "auto");
+        assert_eq!(r["metadata"]["total_pages"], 7);
+        assert_eq!(r["page_range"]["end_page"], 5);
+        assert_eq!(r["images"][0]["format"], "png");
+        assert_eq!(r["text_pages"][0]["content"], "hello");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(r["raw_content_b64"].as_str().unwrap())
+                .unwrap(),
+            b"%PDF-1.4"
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(r["images"][0]["content_b64"].as_str().unwrap())
+                .unwrap(),
+            b"png"
+        );
     }
 
     #[test]

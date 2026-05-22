@@ -1670,6 +1670,7 @@ fn file_op_name(op: &ahand_protocol::file_request::Operation) -> &'static str {
         Operation::ReadText(_) => "read_text",
         Operation::ReadBinary(_) => "read_binary",
         Operation::ReadImage(_) => "read_image",
+        Operation::ReadPdf(_) => "read_pdf",
         Operation::Write(_) => "write",
         Operation::Edit(_) => "edit",
         Operation::Delete(_) => "delete",
