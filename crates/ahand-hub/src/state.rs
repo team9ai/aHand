@@ -191,7 +191,11 @@ impl AppState {
         ));
 
         let browser_pending = Arc::new(DashMap::new());
-        let control_jobs = Arc::new(crate::control_jobs::ControlJobTracker::new());
+        let control_jobs = Arc::new(
+            crate::control_jobs::ControlJobTracker::new_with_completed_access_retention(
+                finished_retention,
+            ),
+        );
         let control_rate_limiter = Arc::new(default_control_plane_rate_limiter());
 
         // Webhook dispatcher — always present. When the URL/secret are
