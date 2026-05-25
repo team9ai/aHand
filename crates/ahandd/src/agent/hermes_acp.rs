@@ -596,12 +596,14 @@ impl HermesRpcClient {
         };
 
         let response = if method == "session/request_permission" {
+            let option_id =
+                select_permission_option_id(frame).unwrap_or_else(|| "approve_for_session".into());
             emit_records(
                 emit.device_id,
                 emit.job_id,
                 emit.tx,
                 emit.store,
-                formatter.format_permission_request(frame, "approve_for_session"),
+                formatter.format_permission_request(frame, &option_id),
             );
             json!({
                 "jsonrpc": "2.0",
@@ -609,7 +611,7 @@ impl HermesRpcClient {
                 "result": {
                     "outcome": {
                         "outcome": "selected",
-                        "optionId": "approve_for_session",
+                        "optionId": option_id,
                     }
                 }
             })
@@ -744,6 +746,9 @@ impl ProviderError {
 
 fn detect_provider_error(text: &str) -> Option<ProviderError> {
     let lower = text.to_ascii_lowercase();
+    if is_transient_provider_retry_warning(&lower) {
+        return None;
+    }
     if lower.contains("tool ") && lower.contains(" returned error") {
         return None;
     }
@@ -791,6 +796,25 @@ fn detect_provider_error(text: &str) -> Option<ProviderError> {
         code: code.to_string(),
         message: text.trim().to_string(),
     })
+}
+
+fn is_transient_provider_retry_warning(lower: &str) -> bool {
+    let stream_retry = lower.contains("stream drop")
+        || lower.contains("readtimeout")
+        || lower.contains("read operation timed out");
+    if !stream_retry {
+        return false;
+    }
+
+    let retry_in_progress = lower.contains("retrying")
+        || lower.contains("reconnecting")
+        || lower.contains("attempt 2/")
+        || lower.contains("attempt 3/");
+    let retry_exhausted = lower.contains("failed after")
+        || lower.contains("exhausted")
+        || lower.contains("giving up");
+
+    retry_in_progress && !retry_exhausted
 }
 
 struct HermesAcpFormatter {
@@ -1360,6 +1384,54 @@ fn permission_payload(value: &Value) -> Value {
     payload
 }
 
+fn select_permission_option_id(frame: &Value) -> Option<String> {
+    let options = frame
+        .get("params")
+        .and_then(|params| params.get("options"))
+        .or_else(|| frame.get("options"))?
+        .as_array()?;
+
+    let option_matches = |option: &Value, candidates: &[&str]| -> bool {
+        ["optionId", "option_id", "id", "kind", "name"]
+            .iter()
+            .filter_map(|key| option.get(*key).and_then(Value::as_str))
+            .any(|value| {
+                let normalized = value.to_ascii_lowercase();
+                candidates
+                    .iter()
+                    .any(|candidate| normalized == *candidate || normalized.contains(candidate))
+            })
+    };
+
+    let option_id = |option: &Value| -> Option<String> {
+        find_string(option, &["optionId", "option_id", "id"]).map(str::to_string)
+    };
+
+    for candidate in ["allow_session", "approve_for_session", "allow_always"] {
+        if let Some(id) = options
+            .iter()
+            .find(|option| option_matches(option, &[candidate]))
+            .and_then(option_id)
+        {
+            return Some(id);
+        }
+    }
+
+    options
+        .iter()
+        .find(|option| {
+            option_matches(option, &["allow", "approve"])
+                && !option_matches(option, &["deny", "reject"])
+        })
+        .and_then(option_id)
+        .or_else(|| {
+            options
+                .iter()
+                .find(|option| !option_matches(option, &["deny", "reject"]))
+                .and_then(option_id)
+        })
+}
+
 fn plan_payload(value: &Value) -> Value {
     json!({
         "entries": value.get("entries").cloned().unwrap_or_else(|| json!([])),
@@ -1762,10 +1834,68 @@ mod tests {
             )
             .is_none()
         );
+        assert!(
+            detect_provider_error(
+                "Stream drop mid tool-call on attempt 2/3 — retrying. error_type=ReadTimeout error=The read operation timed out"
+            )
+            .is_none()
+        );
+        assert!(
+            detect_provider_error(
+                "custom stream drop (ReadTimeout) after 127.0s — reconnecting, retry 3/3"
+            )
+            .is_none()
+        );
         let error =
             detect_provider_error("API call failed after 3 retries. HTTP 402: quota exceeded")
                 .unwrap();
         assert_eq!(error.code, "provider_quota_exceeded");
+        let error =
+            detect_provider_error("API call failed after 3 retries: ReadTimeout provider error")
+                .unwrap();
+        assert_eq!(error.code, "provider_error");
+    }
+
+    #[test]
+    fn permission_option_selection_uses_actual_hermes_options() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "session/request_permission",
+            "params": {
+                "options": [
+                    {"kind": "allow_once", "name": "Allow once", "optionId": "allow_once"},
+                    {"kind": "allow_always", "name": "Allow for session", "optionId": "allow_session"},
+                    {"kind": "allow_always", "name": "Allow always", "optionId": "allow_always"},
+                    {"kind": "reject_once", "name": "Deny", "optionId": "deny"}
+                ]
+            }
+        });
+        assert_eq!(
+            select_permission_option_id(&frame).as_deref(),
+            Some("allow_session")
+        );
+    }
+
+    #[test]
+    fn permission_option_selection_keeps_legacy_approve_id() {
+        let frame = json!({
+            "params": {
+                "options": [
+                    {"id": "approve_for_session"},
+                    {"id": "deny"}
+                ]
+            }
+        });
+        assert_eq!(
+            select_permission_option_id(&frame).as_deref(),
+            Some("approve_for_session")
+        );
+    }
+
+    #[test]
+    fn permission_option_selection_falls_back_without_options() {
+        assert_eq!(select_permission_option_id(&json!({})), None);
     }
 
     #[tokio::test]
