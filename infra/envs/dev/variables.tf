@@ -15,12 +15,12 @@ variable "traefik_alb_name" {
 
 variable "traefik_security_group_id" {
   type    = string
-  default = "sg-040876c89a7a65ec4"
+  default = "sg-0368318519318a4ba"
 }
 
 variable "openclaw_rds_host" {
   type    = string
-  default = null
+  default = "openclaw-hive-dev.c89gkagwy37d.us-east-1.rds.amazonaws.com"
 }
 
 variable "openclaw_rds_security_group_id" {
