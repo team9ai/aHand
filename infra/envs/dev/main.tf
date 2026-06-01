@@ -5,6 +5,8 @@ data "aws_lb" "traefik" {
 module "ahand_hub" {
   source = "../../modules/ahand-hub"
 
+  # t9 dev uses fresh state plus the bootstrap-owned S3 bucket. Do not migrate
+  # old ww dev state into this backend.
   env                            = "dev"
   ecs_cluster_name               = "openclaw-hive-dev"
   api_domain                     = "ahand-hub.dev.team9.ai"

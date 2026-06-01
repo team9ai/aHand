@@ -16,7 +16,7 @@ variable "aws_region" {
 variable "aws_account_id" {
   description = "AWS account ID"
   type        = string
-  default     = "471112576951"
+  default     = "149614785083"
 }
 
 variable "ecs_cluster_name" {
@@ -94,13 +94,25 @@ variable "s3_url_expiration_secs" {
 }
 
 variable "s3_file_ops_lifecycle_days" {
-  description = "Days to keep staged file-ops objects before S3 lifecycle expiration"
+  description = "Days to keep staged file-ops objects before S3 lifecycle expiration when this module manages the bucket"
   type        = number
   default     = 7
 }
 
+variable "file_ops_bucket_name" {
+  description = "Existing or managed S3 bucket name used by hub file operation staging. Defaults to the t9 bootstrap-owned bucket name."
+  type        = string
+  default     = null
+}
+
+variable "manage_file_ops_bucket" {
+  description = "Whether this module manages the file-ops S3 bucket and its controls. Leave false for t9 bootstrap-owned buckets."
+  type        = bool
+  default     = false
+}
+
 locals {
-  file_ops_bucket_name = "ahand-hub-${var.env}"
+  file_ops_bucket_name = coalesce(var.file_ops_bucket_name, "team9-ahand-hub-${var.env}")
 
   common_tags = {
     Environment = var.env
