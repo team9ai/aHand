@@ -11,8 +11,11 @@ module "ahand_hub" {
   source = "../../modules/ahand-hub"
 
   env                            = "prod"
+  aws_account_id                 = "471112576951"
   ecs_cluster_name               = "openclaw-hive"
   api_domain                     = "ahand-hub.team9.ai"
+  file_ops_bucket_name           = "ahand-hub-prod"
+  manage_file_ops_bucket         = true
   openclaw_rds_host              = var.openclaw_rds_host
   openclaw_rds_security_group_id = var.openclaw_rds_security_group_id
   vpc_id                         = var.vpc_id

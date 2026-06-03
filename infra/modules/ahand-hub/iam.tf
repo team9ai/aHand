@@ -109,13 +109,13 @@ resource "aws_iam_role_policy" "task" {
         Sid      = "FileOpsBucketLocation"
         Effect   = "Allow"
         Action   = ["s3:GetBucketLocation"]
-        Resource = aws_s3_bucket.file_ops.arn
+        Resource = local.selected_file_ops_bucket_arn
       },
       {
         Sid      = "FileOpsBucketList"
         Effect   = "Allow"
         Action   = ["s3:ListBucket"]
-        Resource = aws_s3_bucket.file_ops.arn
+        Resource = local.selected_file_ops_bucket_arn
         Condition = {
           StringLike = {
             "s3:prefix" = [
@@ -133,7 +133,7 @@ resource "aws_iam_role_policy" "task" {
           "s3:PutObject",
           "s3:DeleteObject",
         ]
-        Resource = "${aws_s3_bucket.file_ops.arn}/file-ops/*"
+        Resource = "${local.selected_file_ops_bucket_arn}/file-ops/*"
       },
     ]
   })
