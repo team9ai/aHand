@@ -1,6 +1,7 @@
 mod ahand_client;
 mod approval;
 mod browser;
+mod browser_cdp;
 mod browser_setup;
 mod cli;
 mod config;

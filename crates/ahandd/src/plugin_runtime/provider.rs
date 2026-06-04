@@ -36,12 +36,15 @@ pub async fn build_provider_registry(
     file_mgr: &FileManager,
 ) -> anyhow::Result<CapabilityProviderRegistry> {
     let snapshot = super::get_host_resource().await?;
+    let browser_providers = browser_mgr.available_providers();
     Ok(CapabilityProviderRegistry::from_plugins(
         &snapshot.plugins,
         ActivationConfig {
             browser_enabled: browser_mgr.is_enabled(),
             file_enabled: file_mgr.is_enabled(),
             system_browser_available: browser_mgr.has_system_browser(),
+            playwright_provider_enabled: browser_mgr.playwright_provider_enabled(),
+            cdp_provider_available: browser_providers.contains(&"cdp"),
         },
     ))
 }
@@ -185,6 +188,8 @@ mod tests {
                 browser_enabled: false,
                 file_enabled: false,
                 system_browser_available: false,
+                playwright_provider_enabled: false,
+                cdp_provider_available: false,
             },
         );
 

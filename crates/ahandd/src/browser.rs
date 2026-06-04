@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::browser_cdp::{CdpProvider, CdpRuntimeState, endpoint_is_loopback};
 use crate::config::BrowserConfig;
 
 /// Result of executing a browser command via playwright-cli.
@@ -32,6 +33,23 @@ impl Default for BrowserCommandResult {
 pub struct BrowserManager {
     config: BrowserConfig,
     active_sessions: Mutex<HashSet<String>>,
+    cdp_state: Mutex<CdpRuntimeState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserProvider {
+    Playwright,
+    Cdp,
+}
+
+impl BrowserProvider {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "playwright" | "browser-playwright-cli" => Some(Self::Playwright),
+            "cdp" => Some(Self::Cdp),
+            _ => None,
+        }
+    }
 }
 
 impl BrowserManager {
@@ -39,6 +57,7 @@ impl BrowserManager {
         let mgr = Self {
             config,
             active_sessions: Mutex::new(HashSet::new()),
+            cdp_state: Mutex::new(CdpRuntimeState::default()),
         };
         if mgr.is_enabled() {
             mgr.check_prerequisites();
@@ -48,11 +67,70 @@ impl BrowserManager {
 
     /// Whether browser capabilities are enabled.
     pub fn is_enabled(&self) -> bool {
-        self.config.enabled.unwrap_or(false)
+        self.config.enabled.unwrap_or(false) && (self.playwright_enabled() || self.cdp_enabled())
     }
 
     pub fn has_system_browser(&self) -> bool {
+        (self.playwright_enabled() || self.cdp_enabled())
+            && self.resolve_executable_path().is_some()
+    }
+
+    pub fn playwright_available(&self) -> bool {
+        self.config.enabled.unwrap_or(false)
+            && self.playwright_enabled()
+            && self.has_system_browser()
+    }
+
+    pub fn cdp_available(&self) -> bool {
+        if !self.config.enabled.unwrap_or(false) || !self.cdp_enabled() {
+            return false;
+        }
+        if let Some(endpoint) = self.config.cdp_endpoint.as_deref() {
+            if !endpoint.trim().is_empty() {
+                return endpoint_is_loopback(endpoint);
+            }
+        }
         self.resolve_executable_path().is_some()
+    }
+
+    pub fn available_providers(&self) -> Vec<&'static str> {
+        let mut providers = Vec::new();
+        if self.cdp_available() {
+            providers.push("cdp");
+        }
+        if self.playwright_available() {
+            providers.push("playwright");
+        }
+        providers
+    }
+
+    fn playwright_enabled(&self) -> bool {
+        self.config.playwright_enabled.unwrap_or(true)
+    }
+
+    pub fn playwright_provider_enabled(&self) -> bool {
+        self.config.enabled.unwrap_or(false) && self.playwright_enabled()
+    }
+
+    fn cdp_enabled(&self) -> bool {
+        self.config.cdp_enabled.unwrap_or(false)
+    }
+
+    fn selected_provider(&self, params_json: &str) -> Result<BrowserProvider, String> {
+        if let Ok(params) = serde_json::from_str::<serde_json::Value>(params_json) {
+            if let Some(raw) = params.get("selected_provider").and_then(|v| v.as_str()) {
+                return BrowserProvider::parse(raw)
+                    .ok_or_else(|| format!("unknown browser provider '{raw}'"));
+            }
+        }
+
+        if let Some(raw) = self.config.selected_provider.as_deref() {
+            return BrowserProvider::parse(raw).ok_or_else(|| {
+                format!("unknown browser provider configured in browser.selected_provider: '{raw}'")
+            });
+        }
+
+        Ok(BrowserProvider::Playwright)
     }
 
     /// Resolve the downloads directory (for download/pdf output files).
@@ -87,14 +165,16 @@ impl BrowserManager {
 
     /// Log warnings for missing prerequisites at startup.
     fn check_prerequisites(&self) {
-        let bin = self.binary_path();
-        if !bin.exists() {
-            warn!(
-                path = %bin.display(),
-                "playwright-cli not found — run: ahandd browser-init"
-            );
-        } else {
-            info!(path = %bin.display(), "playwright-cli found");
+        if self.playwright_enabled() {
+            let bin = self.binary_path();
+            if !bin.exists() {
+                warn!(
+                    path = %bin.display(),
+                    "playwright-cli not found — run: ahandd browser-init"
+                );
+            } else {
+                info!(path = %bin.display(), "playwright-cli found");
+            }
         }
 
         if let Some(exe) = self.resolve_executable_path() {
@@ -118,6 +198,41 @@ impl BrowserManager {
         params_json: &str,
         timeout_ms: u64,
     ) -> anyhow::Result<BrowserCommandResult> {
+        match self.selected_provider(params_json) {
+            Ok(BrowserProvider::Playwright) if !self.playwright_enabled() => {
+                return Ok(BrowserCommandResult {
+                    success: false,
+                    error: "browser provider 'playwright' is disabled".to_string(),
+                    ..Default::default()
+                });
+            }
+            Ok(BrowserProvider::Playwright) => {}
+            Ok(BrowserProvider::Cdp) => {
+                if !self.cdp_enabled() {
+                    return Ok(BrowserCommandResult {
+                        success: false,
+                        error: "browser provider 'cdp' is disabled".to_string(),
+                        ..Default::default()
+                    });
+                }
+                let mut state = self.cdp_state.lock().await;
+                return Ok(CdpProvider::new(&self.config)
+                    .execute(&mut state, session_id, action, params_json, timeout_ms)
+                    .await);
+            }
+            Err(error) => {
+                return Ok(BrowserCommandResult {
+                    success: false,
+                    error,
+                    ..Default::default()
+                });
+            }
+        }
+
+        if action == "wait" {
+            return self.execute_wait(session_id, params_json, timeout_ms).await;
+        }
+
         // Check session limit.
         {
             let mut sessions = self.active_sessions.lock().await;
@@ -199,6 +314,36 @@ impl BrowserManager {
         };
 
         self.parse_output(&output, action, output_file.as_deref())
+            .await
+    }
+
+    /// Execute a standard BrowserRequest `wait` action.
+    pub async fn execute_wait(
+        &self,
+        session_id: &str,
+        params_json: &str,
+        timeout_ms: u64,
+    ) -> anyhow::Result<BrowserCommandResult> {
+        let params = serde_json::from_str::<serde_json::Value>(params_json).unwrap_or_default();
+        let text = params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        if !text.is_empty() {
+            return self
+                .execute_wait_for_text(session_id, text, timeout_ms)
+                .await;
+        }
+
+        let delay_ms = params
+            .get("timeMs")
+            .or_else(|| params.get("timeout"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1000);
+        let js = format!("() => new Promise(r => setTimeout(r, {}))", delay_ms);
+        let eval_params = serde_json::json!({ "expression": js });
+        self.execute_single(session_id, "eval", &eval_params.to_string(), timeout_ms)
             .await
     }
 
@@ -415,6 +560,10 @@ impl BrowserManager {
     /// Remove a session from tracking (e.g. after "close" command).
     pub async fn release_session(&self, session_id: &str) {
         self.active_sessions.lock().await.remove(session_id);
+        let mut state = self.cdp_state.lock().await;
+        let _ = CdpProvider::new(&self.config)
+            .close_session(&mut state, session_id)
+            .await;
     }
 
     fn binary_path(&self) -> PathBuf {
@@ -893,5 +1042,63 @@ mod tests {
         let resolved = BrowserManager::resolve_binary_path(None, Some(managed));
 
         assert_eq!(resolved, PathBuf::from("playwright-cli"));
+    }
+
+    #[test]
+    fn selected_provider_defaults_to_playwright() {
+        let mgr = BrowserManager::new(BrowserConfig::default());
+
+        assert_eq!(
+            mgr.selected_provider(r#"{"url":"https://example.com"}"#)
+                .unwrap(),
+            BrowserProvider::Playwright
+        );
+    }
+
+    #[test]
+    fn selected_provider_params_override_config() {
+        let mgr = BrowserManager::new(BrowserConfig {
+            selected_provider: Some("playwright".to_string()),
+            ..BrowserConfig::default()
+        });
+
+        assert_eq!(
+            mgr.selected_provider(r#"{"selected_provider":"cdp"}"#)
+                .unwrap(),
+            BrowserProvider::Cdp
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_non_loopback_cdp_endpoint_before_spawning_browser() {
+        let mgr = BrowserManager::new(BrowserConfig {
+            enabled: Some(true),
+            cdp_enabled: Some(true),
+            cdp_endpoint: Some("http://192.168.1.20:9222".to_string()),
+            selected_provider: Some("cdp".to_string()),
+            ..BrowserConfig::default()
+        });
+
+        let result = mgr
+            .execute("session-cdp", "open", r#"{"url":"https://example.com"}"#, 1)
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.contains("localhost"));
+    }
+
+    #[test]
+    fn cdp_provider_status_omits_non_loopback_endpoint() {
+        let mgr = BrowserManager::new(BrowserConfig {
+            enabled: Some(true),
+            cdp_enabled: Some(true),
+            cdp_endpoint: Some("http://192.168.1.20:9222".to_string()),
+            playwright_enabled: Some(false),
+            ..BrowserConfig::default()
+        });
+
+        assert!(!mgr.cdp_available());
+        assert!(mgr.available_providers().is_empty());
     }
 }

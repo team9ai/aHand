@@ -11,6 +11,8 @@ pub struct ActivationConfig {
     pub browser_enabled: bool,
     pub file_enabled: bool,
     pub system_browser_available: bool,
+    pub playwright_provider_enabled: bool,
+    pub cdp_provider_available: bool,
 }
 
 pub async fn build_router(
@@ -18,12 +20,15 @@ pub async fn build_router(
     file_mgr: &FileManager,
 ) -> anyhow::Result<CapabilityRouter> {
     let snapshot = super::get_host_resource().await?;
+    let browser_providers = browser_mgr.available_providers();
     Ok(router_from_plugins(
         &snapshot.plugins,
         ActivationConfig {
             browser_enabled: browser_mgr.is_enabled(),
             file_enabled: file_mgr.is_enabled(),
             system_browser_available: browser_mgr.has_system_browser(),
+            playwright_provider_enabled: browser_mgr.playwright_provider_enabled(),
+            cdp_provider_available: browser_providers.contains(&"cdp"),
         },
     ))
 }
@@ -110,6 +115,23 @@ fn browser_entry(plugins: &[InstalledPluginResource], config: ActivationConfig) 
             reason: "host configuration disabled browser capabilities".to_string(),
             remediation: CapabilityRemediation::HostConfiguration {
                 message: "enable browser capabilities in host configuration".to_string(),
+            },
+        });
+    }
+
+    if config.cdp_provider_available {
+        return CapabilityEntry::active(CapabilityKind::Browser, "browser");
+    }
+
+    if !config.playwright_provider_enabled {
+        return CapabilityEntry::unavailable(CapabilityUnavailable {
+            capability: CapabilityKind::Browser,
+            plugin_id: "browser".to_string(),
+            status: PluginStatus::Blocked,
+            reason: "no enabled browser provider is available".to_string(),
+            remediation: CapabilityRemediation::HostConfiguration {
+                message: "enable and configure either cdp or playwright browser provider"
+                    .to_string(),
             },
         });
     }
@@ -287,16 +309,23 @@ mod tests {
         ]
     }
 
+    fn activation_config(
+        browser_enabled: bool,
+        file_enabled: bool,
+        system_browser_available: bool,
+    ) -> ActivationConfig {
+        ActivationConfig {
+            browser_enabled,
+            file_enabled,
+            system_browser_available,
+            playwright_provider_enabled: browser_enabled,
+            cdp_provider_available: false,
+        }
+    }
+
     #[test]
     fn file_disabled_by_host_config_is_not_installable() {
-        let router = router_from_plugins(
-            &base_plugins(),
-            ActivationConfig {
-                browser_enabled: true,
-                file_enabled: false,
-                system_browser_available: true,
-            },
-        );
+        let router = router_from_plugins(&base_plugins(), activation_config(true, false, true));
 
         let err = router.ensure(CapabilityKind::File).unwrap_err();
         assert_eq!(err.plugin_id, "file");
@@ -314,14 +343,7 @@ mod tests {
         plugins[2].status = PluginStatus::Missing;
         plugins[3].status = PluginStatus::Blocked;
 
-        let router = router_from_plugins(
-            &plugins,
-            ActivationConfig {
-                browser_enabled: true,
-                file_enabled: true,
-                system_browser_available: true,
-            },
-        );
+        let router = router_from_plugins(&plugins, activation_config(true, true, true));
 
         let err = router.ensure(CapabilityKind::Browser).unwrap_err();
         assert_eq!(err.plugin_id, "browser-playwright-cli");
@@ -336,14 +358,7 @@ mod tests {
 
     #[test]
     fn browser_disabled_by_host_config_does_not_suggest_install() {
-        let router = router_from_plugins(
-            &base_plugins(),
-            ActivationConfig {
-                browser_enabled: false,
-                file_enabled: true,
-                system_browser_available: true,
-            },
-        );
+        let router = router_from_plugins(&base_plugins(), activation_config(false, true, true));
 
         let err = router.ensure(CapabilityKind::Browser).unwrap_err();
         assert_eq!(
@@ -366,14 +381,7 @@ mod tests {
             },
         );
 
-        let router = router_from_plugins(
-            &plugins,
-            ActivationConfig {
-                browser_enabled: true,
-                file_enabled: true,
-                system_browser_available: true,
-            },
-        );
+        let router = router_from_plugins(&plugins, activation_config(true, true, true));
 
         assert!(router.ensure(CapabilityKind::NodeExec).is_ok());
     }
@@ -382,14 +390,7 @@ mod tests {
     fn python_exec_missing_recommends_installing_python_plugin() {
         let plugins = base_plugins();
 
-        let router = router_from_plugins(
-            &plugins,
-            ActivationConfig {
-                browser_enabled: true,
-                file_enabled: true,
-                system_browser_available: true,
-            },
-        );
+        let router = router_from_plugins(&plugins, activation_config(true, true, true));
 
         let err = router.ensure(CapabilityKind::PythonExec).unwrap_err();
         assert_eq!(err.plugin_id, "python");
@@ -401,14 +402,7 @@ mod tests {
 
     #[test]
     fn missing_system_browser_is_host_environment_error() {
-        let router = router_from_plugins(
-            &base_plugins(),
-            ActivationConfig {
-                browser_enabled: true,
-                file_enabled: true,
-                system_browser_available: false,
-            },
-        );
+        let router = router_from_plugins(&base_plugins(), activation_config(true, true, false));
 
         let err = router.ensure(CapabilityKind::Browser).unwrap_err();
         assert_eq!(
@@ -416,6 +410,26 @@ mod tests {
             CapabilityRemediation::HostEnvironment {
                 message: "install or configure a supported system browser".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn cdp_provider_can_activate_browser_without_playwright_plugin() {
+        let router = router_from_plugins(
+            &[plugin("shell", PluginStatus::Installed, &[])],
+            ActivationConfig {
+                browser_enabled: true,
+                file_enabled: true,
+                system_browser_available: true,
+                playwright_provider_enabled: false,
+                cdp_provider_available: true,
+            },
+        );
+
+        assert!(router.ensure(CapabilityKind::Browser).is_ok());
+        assert_eq!(
+            router.active_wire_capabilities(),
+            vec!["exec", "browser", "browser-playwright-cli"]
         );
     }
 }

@@ -16,9 +16,19 @@ impl CapabilityKind {
         match self {
             Self::Exec => "exec",
             Self::File => "file",
-            Self::Browser => "browser-playwright-cli",
+            Self::Browser => "browser",
             Self::NodeExec => "node-exec",
             Self::PythonExec => "python-exec",
+        }
+    }
+
+    pub fn wire_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Browser => &["browser", "browser-playwright-cli"],
+            Self::Exec => &["exec"],
+            Self::File => &["file"],
+            Self::NodeExec => &["node-exec"],
+            Self::PythonExec => &["python-exec"],
         }
     }
 
@@ -163,7 +173,7 @@ impl CapabilityRouter {
         ]
         .into_iter()
         .filter(|capability| self.ensure(*capability).is_ok())
-        .map(CapabilityKind::wire_name)
+        .flat_map(|capability| capability.wire_names().iter().copied())
         .collect()
     }
 }
@@ -209,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn active_wire_capabilities_use_existing_protocol_names() {
+    fn active_wire_capabilities_include_stable_browser_and_legacy_alias() {
         let router = CapabilityRouter::new(vec![
             CapabilityEntry::active(CapabilityKind::Exec, "shell"),
             CapabilityEntry::active(CapabilityKind::File, "file"),
@@ -218,7 +228,7 @@ mod tests {
 
         assert_eq!(
             router.active_wire_capabilities(),
-            vec!["exec", "file", "browser-playwright-cli"]
+            vec!["exec", "file", "browser", "browser-playwright-cli"]
         );
     }
 

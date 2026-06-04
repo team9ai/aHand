@@ -192,6 +192,23 @@ pub struct BrowserConfig {
     /// Enable browser capabilities (default: false).
     pub enabled: Option<bool>,
 
+    /// Default browser provider for local requests: "playwright" or "cdp".
+    pub selected_provider: Option<String>,
+
+    /// Enable the Chrome DevTools Protocol provider (default: false).
+    pub cdp_enabled: Option<bool>,
+
+    /// CDP operating mode. Phase 1 accepts flat string values for forward
+    /// compatibility with agent-pi params_json.
+    pub cdp_mode: Option<String>,
+
+    /// Optional explicit CDP websocket/http endpoint.
+    pub cdp_endpoint: Option<String>,
+
+    /// Enable the existing playwright-cli provider (default: true when
+    /// browser capabilities are enabled).
+    pub playwright_enabled: Option<bool>,
+
     /// Path to the playwright-cli binary (default: ~/.ahand/node/bin/playwright-cli).
     pub binary_path: Option<String>,
 

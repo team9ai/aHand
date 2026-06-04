@@ -130,7 +130,16 @@ Recommended Hub/Gateway capability payload:
 }
 ```
 
-Recommended local provider status returned by Team9 Tauri/aHand browser status:
+Recommended raw local provider status returned by aHand/Tauri browser status:
+
+```ts
+{
+  browserProviders: Array<"cdp" | "playwright">;
+}
+```
+
+Team9 combines that raw provider availability with the per-user/per-device
+selection stored in `useAhandStore` to produce the effective local UI state:
 
 ```ts
 {
@@ -228,13 +237,13 @@ Planned work:
 
 - Keep using the existing Tauri command surface for browser runtime setup.
 - Extend browser status if needed to include CDP-specific readiness.
-- Extend Tauri `browser_status` to return local provider availability and the
-  selected provider, for example:
+- Extend Tauri `browser_status` to return local provider availability. Team9
+  reads the selected provider from `useAhandStore` and computes the effective
+  provider used for UI and message `clientContext`.
 
 ```ts
 {
   browserProviders: Array<"cdp" | "playwright">;
-  selectedProvider?: "cdp" | "playwright";
 }
 ```
 
@@ -306,6 +315,9 @@ Provider selection ownership:
 - Team9 desktop is authoritative for the local user-level selected provider.
   The setting is stored locally per user/device because available providers
   change when the user switches machines.
+- If a local aHand config also contains `selected_provider`, Team9 treats it as
+  a daemon default/backward-compatibility value, not as the authoritative
+  per-user Team9 selection.
 - agent-pi is a transport layer for provider selection: it receives Team9's
   selected provider in session config and passes it through on browser jobs.
   agent-pi should not choose or rewrite providers.
@@ -538,12 +550,29 @@ Planned work:
 - Do not keep or register the old `browser-playwright-cli` skill as a
   transitional model-facing surface. The only model-facing browser surface for
   this plan is the generic browser tool/skill surface.
-- Define generic model-facing browser tools, for example:
+- Add a new provider-agnostic browser skill, for example
+  `packages/agent-components/skills/browser/SKILL.md`, that documents the
+  generic browser tools. This skill replaces `browser-playwright-cli` as the
+  browser guidance surface and must not instruct the model to run
+  `playwright-cli` or choose a provider.
+- agent-pi may expose generic model-facing browser tools, for example:
   - `browser_navigate`
   - `browser_click`
   - `browser_type`
   - `browser_evaluate`
   - `browser_wait_for`
+- agent-pi must not invent new `BrowserRequest.action` names. It should translate
+  any model-facing wrapper tool into the existing Playwright-compatible
+  `BrowserRequest.action` contract:
+  - `browser_navigate` -> `action: "open"`;
+  - `browser_click` -> `action: "click"`;
+  - `browser_type` -> `action: "fill"` when a selector/ref is provided, or
+    `action: "type"` when typing into the focused element;
+  - `browser_evaluate` -> `action: "eval"`;
+  - `browser_wait_for` -> `action: "wait"`.
+- aHand already has `wait` semantics in the OpenClaw browser path. Phase 1
+  should expose the same `wait` behavior through the `BrowserRequest` path
+  instead of inventing a new action name.
 - `browser_screenshot` is deferred from this plan.
 - Do not make agent-pi responsible for provider availability policy beyond the
   existence of the `browser` capability. agent-pi may pass
@@ -657,7 +686,7 @@ The existing aHand `BrowserRequest` shape can remain the transport envelope:
 ```json
 {
   "session_id": "agent-browser-session",
-  "action": "goto",
+  "action": "open",
   "params_json": "{\"url\":\"https://example.com\"}",
   "timeout_ms": 30000
 }
@@ -667,6 +696,8 @@ For the first implementation, provider selection lives in `params_json` to
 avoid changing the protobuf/browser transport in the same phase. Include the
 Team9 user-level selected provider when it exists. Keep `action` as the
 top-level `BrowserRequest.action`; do not duplicate it inside `params_json`.
+Phase 1 should not add new `BrowserRequest.action` names. Both Playwright and
+CDP providers should implement the same existing action subset.
 
 Initial `params_json` convention:
 
@@ -690,7 +721,7 @@ Full Playwright-style request examples:
 ```json
 {
   "session_id": "agent-browser-session",
-  "action": "goto",
+  "action": "open",
   "params_json": "{\"selected_provider\":\"playwright\",\"url\":\"https://example.com\"}",
   "timeout_ms": 30000
 }
@@ -710,7 +741,7 @@ Full CDP request examples:
 ```json
 {
   "session_id": "agent-browser-session",
-  "action": "goto",
+  "action": "open",
   "params_json": "{\"selected_provider\":\"cdp\",\"target\":{\"mode\":\"new_tab\"},\"url\":\"https://example.com\"}",
   "timeout_ms": 30000
 }
@@ -719,7 +750,7 @@ Full CDP request examples:
 ```json
 {
   "session_id": "agent-browser-session",
-  "action": "evaluate",
+  "action": "eval",
   "params_json": "{\"selected_provider\":\"cdp\",\"target\":{\"mode\":\"session_tab\"},\"expression\":\"document.title\"}",
   "timeout_ms": 10000
 }
@@ -731,7 +762,7 @@ data can move out of `params_json`:
 ```json
 {
   "session_id": "agent-browser-session",
-  "action": "goto",
+  "action": "open",
   "selected_provider": "cdp",
   "target": {
     "mode": "new_tab"
@@ -799,6 +830,9 @@ Policy behavior:
   available on the current device, Team9 picks an available provider from the
   latest local aHand browser runtime status and passes that provider as the new
   selected provider.
+- Provider fallback can happen only before a browser job is created; once a job
+  reaches aHand with `selected_provider`, aHand validates that provider and must
+  return an error instead of falling back.
 - agent-pi does not decide whether `cdp` or `playwright` is available and does
   not choose fallbacks. It passes Team9's selected provider through.
 - aHand performs final validation at execution time. If the passed provider is
@@ -871,7 +905,10 @@ Policy behavior:
   - create and track new tabs;
   - close Chrome during session/daemon cleanup only when aHand launched that
     Chrome process;
-  - navigate, click, type, evaluate, and wait;
+  - support the existing `BrowserRequest.action` values used by phase 1:
+    `open`, `click`, `fill`, `type`, `eval`, and `wait`;
+  - expose `wait` through the `BrowserRequest` path using the existing OpenClaw
+    wait semantics (`text` polling or delay);
   - reuse the endpoint's browser profile/session/cookie state.
 - Keep the existing Playwright provider and report it in `browserProviders`.
 - Publish a new `ahandd` tag.
@@ -884,6 +921,10 @@ Policy behavior:
 - Remove `browser-playwright-cli` skill registration from the browser path. A
   legacy capability alias may still enable the generic browser surface, but it
   must not expose the old Playwright-specific skill to the model.
+- Register the new provider-agnostic browser skill alongside the generic
+  browser tools when the `browser` capability is present. The skill should
+  explain how to use the tools and how to handle browser/provider errors, but it
+  should not expose provider selection to the model.
 - Keep provider choice transparent to the model.
 - Implement tool routing to aHand browser jobs, passing Team9's selected
   provider through as metadata.
@@ -1122,7 +1163,15 @@ coordination.
    - `cdp_endpoint`
    - `playwright_enabled`
 
-2. Team9 local provider-status response:
+2. Raw aHand/Tauri local provider-status response:
+
+```ts
+{
+  browserProviders: Array<"cdp" | "playwright">;
+}
+```
+
+3. Team9 effective local provider state:
 
 ```ts
 {
@@ -1131,17 +1180,27 @@ coordination.
 }
 ```
 
-3. agent-pi generic browser tools:
-   - `browser_navigate`
-   - `browser_click`
-   - `browser_type`
-   - `browser_evaluate`
-   - `browser_wait_for`
+4. agent-pi generic browser tools:
+   - agent-pi may expose generic model-facing tool names, but it must not
+     create new `BrowserRequest.action` names for phase 1.
+   - agent-pi should add a provider-agnostic browser skill that documents these
+     generic tools. The skill is instruction-only; the callable surface is the
+     registered browser tools.
+   - The browser skill must not mention `playwright-cli` as the execution
+     mechanism and must not ask the model to choose `cdp` or `playwright`.
+   - `browser_navigate` sends `BrowserRequest.action = "open"`.
+   - `browser_click` sends `BrowserRequest.action = "click"`.
+   - `browser_type` sends `BrowserRequest.action = "fill"` when a selector/ref
+     is provided, or `BrowserRequest.action = "type"` when typing into the
+     focused element.
+   - `browser_evaluate` sends `BrowserRequest.action = "eval"`.
+   - `browser_wait_for` sends `BrowserRequest.action = "wait"`; aHand should
+     expose the existing OpenClaw wait behavior through BrowserRequest for this.
    - `browser_screenshot` is deferred from this discussion. Phase 1 can proceed
      with navigation/click/type/evaluate/wait and existing non-screenshot result
      handling.
 
-4. agent-pi tool result metadata:
+5. agent-pi tool result metadata:
 
 This metadata is for Team9/internal event display and diagnostics. It is not
 part of the model-facing browser tool input schema, and the model does not

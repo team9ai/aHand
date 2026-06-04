@@ -25,6 +25,33 @@ private_key_path = "/tmp/ahand/id_ed25519"
     );
 }
 
+#[test]
+fn config_parses_flat_browser_provider_fields() {
+    let cfg: Config = toml::from_str(
+        r#"
+[browser]
+enabled = true
+selected_provider = "cdp"
+cdp_enabled = true
+cdp_mode = "user_profile"
+cdp_endpoint = "http://127.0.0.1:9222"
+playwright_enabled = false
+"#,
+    )
+    .unwrap();
+
+    let browser = cfg.browser.unwrap();
+    assert_eq!(browser.enabled, Some(true));
+    assert_eq!(browser.selected_provider.as_deref(), Some("cdp"));
+    assert_eq!(browser.cdp_enabled, Some(true));
+    assert_eq!(browser.cdp_mode.as_deref(), Some("user_profile"));
+    assert_eq!(
+        browser.cdp_endpoint.as_deref(),
+        Some("http://127.0.0.1:9222")
+    );
+    assert_eq!(browser.playwright_enabled, Some(false));
+}
+
 #[tokio::test]
 async fn build_hello_envelope_includes_file_capability_when_enabled() {
     // R21: Hello.capabilities must contain "file" when file_enabled=true,
@@ -52,11 +79,48 @@ async fn build_hello_envelope_includes_file_capability_when_enabled() {
         payload.capabilities
     );
     assert!(
+        !payload.capabilities.iter().any(|c| c == "browser"),
+        "capabilities must NOT contain 'browser' when browser_enabled=false"
+    );
+    assert!(
         !payload
             .capabilities
             .iter()
             .any(|c| c == "browser-playwright-cli"),
         "capabilities must NOT contain 'browser-playwright-cli' when browser_enabled=false"
+    );
+}
+
+#[tokio::test]
+async fn build_hello_envelope_reports_stable_browser_and_legacy_alias() {
+    let identity = DeviceIdentity::generate_for_tests();
+    let hello = ahandd::ahand_client::build_hello_envelope(
+        "device-browser",
+        &identity,
+        0,
+        true,
+        false,
+        &[0xBA, 0xAD],
+        None,
+    );
+
+    let payload = match hello.payload.unwrap() {
+        ahand_protocol::envelope::Payload::Hello(hello) => hello,
+        other => panic!("unexpected payload: {other:?}"),
+    };
+
+    assert!(
+        payload.capabilities.iter().any(|c| c == "browser"),
+        "capabilities must contain stable 'browser' when browser_enabled=true: {:?}",
+        payload.capabilities
+    );
+    assert!(
+        payload
+            .capabilities
+            .iter()
+            .any(|c| c == "browser-playwright-cli"),
+        "capabilities must contain legacy 'browser-playwright-cli' while compatibility is required: {:?}",
+        payload.capabilities
     );
 }
 

@@ -785,12 +785,9 @@ pub fn build_hello_envelope(
 ) -> Envelope {
     let mut capabilities = vec!["exec".to_string()];
     if browser_enabled {
-        // Device-reported capability name binds to the concrete
-        // implementation. Format: `browser-<backend>`. Currently only
-        // playwright-cli is supported. A future non-playwright backend
-        // (e.g. native WebView, chromedp) would report `browser-<that>`
-        // instead; worker-side `deriveCaps` in team9-agent-pi maps all
-        // legacy / future variants to the same HostCapability.
+        // Report the stable browser capability and the legacy concrete alias
+        // during the compatibility window.
+        capabilities.push("browser".to_string());
         capabilities.push("browser-playwright-cli".to_string());
     }
     if file_enabled {
@@ -1276,8 +1273,8 @@ async fn handle_browser_request<T>(
     // Session mode check using a synthetic JobRequest.
     // `tool: "browser"` here is the proto field that routes the request
     // to the daemon's browser handler. It is NOT the same as the
-    // device-advertised capability string (see the block above where we
-    // push "browser-playwright-cli"). This proto field stays unchanged
+    // device-advertised capability string (see the Hello capability builder
+    // above). This proto field stays unchanged
     // for wire-compat with the deprecated /api/control/browser endpoint;
     // see that endpoint's module-level deprecation banner.
     let synthetic_req = ahand_protocol::JobRequest {
@@ -1821,10 +1818,14 @@ mod tests {
         let capabilities = hello_capabilities_from_wire_names(vec![
             "exec".to_string(),
             "file".to_string(),
+            "browser".to_string(),
             "browser-playwright-cli".to_string(),
         ]);
 
-        assert_eq!(capabilities, vec!["exec", "file", "browser-playwright-cli"]);
+        assert_eq!(
+            capabilities,
+            vec!["exec", "file", "browser", "browser-playwright-cli"]
+        );
     }
 
     #[test]
