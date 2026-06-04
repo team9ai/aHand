@@ -1,6 +1,5 @@
 import { EventEmitter } from "node:events";
 import type WebSocket from "ws";
-import { ExecutionMode } from "@ahandai/proto";
 import type {
   Hello as HelloMsg,
   Envelope as EnvelopeMsg,
@@ -97,7 +96,7 @@ export class DeviceConnection extends EventEmitter {
         // `interactive` is a proto field for future PTY sessions. SDK callers
         // cannot opt in yet; default to non-interactive.
         interactive: false,
-        executionMode: ExecutionMode.EXECUTION_MODE_UNSPECIFIED,
+        executionMode: 0,
         resultParser: "",
         format: "",
         inputFormat: "",
