@@ -77,16 +77,20 @@ pub struct IpcListener {
     inner: tokio::net::UnixListener,
 
     /// The pending server instance waiting for `.connect()`.
+    ///
     /// On Windows, named pipe accept is a two-step process:
-    ///   1. Create a server instance (the "slot").
-    ///   2. Call `.connect()` to wait for a client.
+    ///
+    /// 1. Create a server instance (the "slot").
+    /// 2. Call `.connect()` to wait for a client.
+    ///
     /// We pre-create the *next* slot immediately after each accept so there is
     /// no window where the pipe name has zero live instances.
     ///
     /// The field is `Option` so we can `take()` it before `.connect()`.  It
-    /// should always be `Some` between calls to `accept()`; it is `None`
-    /// only transiently inside `accept()`.  An error that leaves it `None`
-    /// puts the listener into an unusable state — callers should drop it.
+    /// should always be `Some` between calls to `accept()`; if a previous
+    /// accept left it `None` (e.g. transient pipe exhaustion), the next call
+    /// recreates the instance lazily so a log-and-continue accept loop
+    /// self-heals instead of panicking the daemon.
     #[cfg(windows)]
     next: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
 
@@ -145,11 +149,11 @@ impl IpcListener {
     ///
     /// The listener holds a pre-created pipe instance in `self.next`.  On
     /// entry we take it (leaving `None`), await the client, then immediately
-    /// pre-create the *next* instance.  If the pre-creation fails we return
-    /// the error but the listener is left in an unusable state (`next` is
-    /// `None`).  Callers should drop the listener on any `Err` return because
-    /// a subsequent call would panic on the `.expect()`.  This is intentional:
-    /// failing to open a new pipe instance is a fatal resource error.
+    /// pre-create the *next* instance.  If `self.next` is `None` on entry
+    /// (because a previous accept failed to pre-create it), the instance is
+    /// recreated lazily so a log-and-continue accept loop self-heals.
+    /// If the pre-creation fails after a successful connect we return that
+    /// error, leaving `next` as `None` for the next lazy-recreate attempt.
     pub async fn accept(&mut self) -> Result<(IpcServerStream, String)> {
         #[cfg(unix)]
         {
@@ -163,12 +167,20 @@ impl IpcListener {
         #[cfg(windows)]
         {
             use tokio::net::windows::named_pipe::ServerOptions;
-            // Take the pending instance.  This field is always Some between
-            // successful accept calls; it is only transiently None here.
-            let server = self
-                .next
-                .take()
-                .expect("IpcListener is in a broken state (next is None); drop and rebind");
+            // Take the pending instance.  It is normally Some between accept
+            // calls; if a previous accept() failed to pre-create the next
+            // instance (e.g. transient pipe exhaustion), recreate it lazily so
+            // a log-and-continue accept loop self-heals instead of panicking.
+            let server = match self.next.take() {
+                Some(s) => s,
+                // A previous accept() failed to pre-create the next instance
+                // (e.g. transient pipe exhaustion). Recreate lazily so a
+                // log-and-continue accept loop self-heals instead of
+                // panicking the daemon.
+                None => ServerOptions::new()
+                    .create(&self.name)
+                    .with_context(|| format!("lazy recreate named pipe {}", self.name))?,
+            };
 
             // Wait for a client to connect.
             let connect_result = server.connect().await.context("IPC pipe connect");
