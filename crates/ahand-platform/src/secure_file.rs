@@ -1,11 +1,14 @@
 //! Owner-only secret-file writes.
 //!
-//! Unix: open with mode 0o600 *before* writing (no chmod-after-write window),
-//! fsync, atomic rename. Windows: write a temp file, strip ACL inheritance
-//! and grant only the current user via `icacls`, then rename into place; the
-//! temp file briefly exists with default ACLs inside the target directory,
-//! which is itself under the user profile — accepted and documented in the
-//! design spec ("Behavioral decisions").
+//! Unix: stale/staged tmp is removed, then a new file is created exclusively
+//! (`O_CREAT|O_EXCL`) with mode `0o600` before writing (no chmod-after-write
+//! window; pre-existing tmp can never donate its permissions). fsync, atomic
+//! rename. Windows: write a temp file, strip ACL inheritance and grant only
+//! the current user via `icacls`, then rename into place; the temp file
+//! briefly exists with default ACLs inside the target directory, which is
+//! itself under the user profile — accepted and documented in the design spec
+//! ("Behavioral decisions"). Parent directories are created with mode `0o700`
+//! on Unix (newly created dirs only; existing dirs are untouched).
 
 use anyhow::{Context, Result};
 use std::io::Write;
@@ -13,9 +16,14 @@ use std::path::Path;
 
 /// Write `contents` to `path` with owner-only permissions, atomically.
 ///
-/// - Creates parent directories if they do not exist.
-/// - Unix: the file is opened with mode `0o600` *before* any bytes are
-///   written, eliminating the chmod-after-write window.
+/// - Creates parent directories if they do not exist (Unix: mode `0o700`;
+///   existing dirs are untouched).
+/// - Unix: any stale or attacker-staged tmp is removed first, then the tmp
+///   file is created exclusively (`O_CREAT|O_EXCL`) with mode `0o600` before
+///   any bytes are written — the mode always applies to a fresh file and a
+///   pre-existing tmp can never donate its permissions. A concurrent second
+///   writer loses the `create_new` race and errors out cleanly (fail-fast;
+///   documented M1 accepted window in the design spec "Behavioral decisions").
 /// - Windows: a temp file is created in the same directory, then
 ///   `icacls /inheritance:r /grant:r <USERNAME>:F` is applied to strip
 ///   inheritance and grant only the current user full control. If `icacls`
@@ -23,12 +31,24 @@ use std::path::Path;
 ///   with default ACLs is never left in place silently.
 /// - Both platforms: the temp file is renamed over `path` atomically (on
 ///   Windows this is a remove-then-rename because Windows cannot atomically
-///   replace a file that another process holds open; these files are
-///   single-writer same-user so this is acceptable).
+///   replace a file that another process holds open; a concurrent reader may
+///   observe a missing file during the window — documented M1 accepted window
+///   in the design spec "Behavioral decisions").
 pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("secure file path has no parent: {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+    #[cfg(not(unix))]
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create directory {}", parent.display()))?;
 
@@ -40,8 +60,16 @@ pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
     ));
 
     {
+        // Remove any stale tmp (crashed run or staged file), then create
+        // exclusively: with O_EXCL/create_new the file is guaranteed fresh, so
+        // the 0o600 mode (Unix) always applies and we never inherit foreign
+        // permissions or contents. A concurrent writer of the same secret loses
+        // the create_new race and errors out cleanly instead of truncating our
+        // tmp mid-write (these files have no cross-process lock; fail-fast is
+        // the accepted M1 behavior).
+        let _ = std::fs::remove_file(&tmp);
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -63,8 +91,10 @@ pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
     }
 
     // Windows: rename-over-existing of a file another process holds open can
-    // fail; these files are single-writer same-user, so remove-then-rename
-    // is acceptable (documented in the design spec).
+    // fail; remove-then-rename is acceptable for these secret files — a
+    // concurrent reader may observe a missing file during the window
+    // (documented M1 accepted window in the design spec "Behavioral
+    // decisions"; a concurrent writer fails fast on create_new above).
     #[cfg(windows)]
     if path.exists() {
         std::fs::remove_file(path)
@@ -151,5 +181,36 @@ mod tests {
         write_secure_file(&path, b"one").unwrap();
         write_secure_file(&path, b"two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_world_readable_tmp_cannot_leak_into_secret() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("secret");
+        // Stage a world-readable tmp file the way an attacker (or crashed
+        // run) would.
+        let staged = tmp.path().join(".secret.tmp");
+        std::fs::write(&staged, b"stale").unwrap();
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o666)).unwrap();
+        write_secure_file(&path, b"fresh").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "staged tmp permissions leaked");
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_created_parent_dir_has_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("newdir").join("secret");
+        write_secure_file(&path, b"s").unwrap();
+        let mode = std::fs::metadata(tmp.path().join("newdir"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "newly created parent dir is not 0700");
     }
 }

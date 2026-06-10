@@ -119,6 +119,15 @@ three platforms; bootstrap scripts stay thin.
   (fail-closed; recorded decision, not a bug). Windows glob matching is
   case-sensitive while the filesystem is not — case-mismatch hardening and
   tests land in M4.
+- **Secret files** (`device identity ×2, pairing state, exec approvals`) are
+  written via `ahand-platform::secure_file`: exclusive tmp creation
+  (`create_new`) with pre-write 0o600 on Unix / post-write owner-only `icacls`
+  ACL on Windows, then rename. Accepted M1 windows: the Windows tmp briefly
+  carries default ACLs inside the (user-profile) target directory; Windows
+  replace is remove-then-rename, so concurrent readers can observe a missing
+  file; there is no cross-process write lock — a concurrent second writer
+  fails fast on `create_new`. chmod/ACL failure is a hard error (fail-closed;
+  previously chmod failures were silently ignored). Pulled forward from M4.
 
 ## CI / Release
 
