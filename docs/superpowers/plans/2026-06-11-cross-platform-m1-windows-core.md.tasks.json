@@ -37,7 +37,7 @@
     {
       "id": 5,
       "subject": "Task 5: Policy verbatim-prefix fix (\\\\?\\)",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         1
       ],

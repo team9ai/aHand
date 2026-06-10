@@ -112,6 +112,13 @@ three platforms; bootstrap scripts stay thin.
 - Symlink file ops on Windows use `std::os::windows::fs::symlink_file/dir`;
   where privilege is missing (non-developer-mode), return a clear error rather
   than silently skipping.
+- **Policy patterns must be written as plain paths** (`C:\Users\...`, never a
+  `\\?\` verbatim prefix). Paths that dunce cannot simplify — verbatim-UNC
+  (`\\?\UNC\...`) network shares and over-MAX_PATH paths — keep their prefix
+  and therefore fail allowlist matching: such ops **deny by default** in M1
+  (fail-closed; recorded decision, not a bug). Windows glob matching is
+  case-sensitive while the filesystem is not — case-mismatch hardening and
+  tests land in M4.
 
 ## CI / Release
 
