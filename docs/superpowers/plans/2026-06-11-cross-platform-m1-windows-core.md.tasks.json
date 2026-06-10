@@ -46,7 +46,7 @@
     {
       "id": 6,
       "subject": "Task 6: platform::secure_file + route all three secret writers",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         1
       ],
