@@ -205,7 +205,9 @@ impl FilePolicyChecker {
 /// the canonicalized parent.
 fn canonicalize_or_parent(path: &Path) -> io::Result<PathBuf> {
     match std::fs::canonicalize(path) {
-        Ok(p) => return Ok(p),
+        // Strip the Windows verbatim prefix (`\\?\`) before returning so
+        // the result is always comparable with plain config patterns.
+        Ok(p) => return Ok(ahand_platform::paths::simplify(&p)),
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         Err(_) => {}
     }
@@ -229,7 +231,9 @@ fn canonicalize_or_parent(path: &Path) -> io::Result<PathBuf> {
         }
         match std::fs::canonicalize(&current) {
             Ok(canonical) => {
-                let mut rebuilt = canonical;
+                // Strip the Windows verbatim prefix before rebuilding so
+                // the re-joined path is pattern-matchable without a prefix.
+                let mut rebuilt = ahand_platform::paths::simplify(&canonical);
                 for part in suffix.iter().rev() {
                     rebuilt.push(part);
                 }
@@ -250,12 +254,7 @@ fn canonicalize_or_parent(path: &Path) -> io::Result<PathBuf> {
 fn canonicalize_no_follow(path: &Path) -> io::Result<PathBuf> {
     let file_name = path
         .file_name()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "path has no final component",
-            )
-        })?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no final component"))?
         .to_os_string();
     let parent = path.parent().unwrap_or_else(|| Path::new("/"));
     let canonical_parent = canonicalize_or_parent(parent)?;
@@ -364,7 +363,9 @@ mod tests {
         let link = root.join("escape_link");
         std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
         let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &[], &[]));
-        let err = checker.check_path(&link.to_string_lossy(), false, false).unwrap_err();
+        let err = checker
+            .check_path(&link.to_string_lossy(), false, false)
+            .unwrap_err();
         assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
     }
 
@@ -378,7 +379,9 @@ mod tests {
         std::fs::write(&key, "fake").unwrap();
         let denylist = vec![format!("{}/.ssh/**", root.display())];
         let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &denylist, &[]));
-        let err = checker.check_path(&key.to_string_lossy(), false, false).unwrap_err();
+        let err = checker
+            .check_path(&key.to_string_lossy(), false, false)
+            .unwrap_err();
         assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
     }
 
@@ -390,7 +393,9 @@ mod tests {
         std::fs::write(&bashrc, "x").unwrap();
         let dangerous = vec![format!("{}/.bashrc", root.display())];
         let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &[], &dangerous));
-        let result = checker.check_path(&bashrc.to_string_lossy(), false, false).unwrap();
+        let result = checker
+            .check_path(&bashrc.to_string_lossy(), false, false)
+            .unwrap();
         assert!(result.needs_approval);
     }
 
@@ -402,7 +407,9 @@ mod tests {
         std::fs::write(&docs, "x").unwrap();
         let dangerous = vec![format!("{}/.bashrc", root.display())];
         let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &[], &dangerous));
-        let result = checker.check_path(&docs.to_string_lossy(), false, false).unwrap();
+        let result = checker
+            .check_path(&docs.to_string_lossy(), false, false)
+            .unwrap();
         assert!(!result.needs_approval);
     }
 
@@ -421,7 +428,9 @@ mod tests {
             max_write_bytes: 100_000_000,
             dangerous_paths: Vec::new(),
         });
-        let err = checker.check_path(&file.to_string_lossy(), false, false).unwrap_err();
+        let err = checker
+            .check_path(&file.to_string_lossy(), false, false)
+            .unwrap_err();
         assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
     }
 
@@ -443,7 +452,9 @@ mod tests {
         let checker = FilePolicyChecker::new(&config);
         let file = root.join("foo.txt");
         std::fs::write(&file, "x").unwrap();
-        let err = checker.check_path(&file.to_string_lossy(), false, false).unwrap_err();
+        let err = checker
+            .check_path(&file.to_string_lossy(), false, false)
+            .unwrap_err();
         assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
     }
 
@@ -454,5 +465,56 @@ mod tests {
         let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &[], &[]));
         let err = checker.check_path("", false, false).unwrap_err();
         assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+    }
+
+    /// Regression test for the Windows verbatim-prefix policy bug: on
+    /// Windows, std::fs::canonicalize returns \\?\-prefixed paths which can
+    /// never glob-match the (unprefixed) config patterns, denying every file
+    /// op. This test is the cross-platform pin: on unix it's trivially green;
+    /// on windows CI it proves the dunce::simplify fix works.
+    #[test]
+    fn allowlisted_canonical_tempdir_passes_check_path() {
+        let tmp = TempDir::new().unwrap();
+        // Build the pattern the way operators do: from a plain
+        // (non-verbatim) absolute path + /**.
+        let root = ahand_platform::paths::canonicalize_simplified(tmp.path()).unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+        let allowlist = vec![format!("{}/**", root_str.trim_end_matches('/')), root_str];
+        let config = FilePolicyConfig {
+            enabled: true,
+            path_allowlist: allowlist,
+            path_denylist: Vec::new(),
+            max_read_bytes: 100_000_000,
+            max_write_bytes: 100_000_000,
+            dangerous_paths: Vec::new(),
+        };
+        let checker = FilePolicyChecker::new(&config);
+        let file = root.join("hello.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        let result = checker.check_path(&file.to_string_lossy(), false, false);
+        assert!(
+            result.is_ok(),
+            "check_path denied an allowlisted path: {result:?}"
+        );
+    }
+
+    /// canonicalize_or_parent must return simplified (non-verbatim) paths —
+    /// the policy matcher's contract with ahand_platform::paths::simplify.
+    #[test]
+    fn canonicalize_or_parent_returns_simplified_existing_path() {
+        let tmp = TempDir::new().unwrap();
+        let got = canonicalize_or_parent(tmp.path()).unwrap();
+        assert!(!got.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(got, ahand_platform::paths::simplify(&got));
+    }
+
+    /// Same contract for the not-yet-existing-suffix branch.
+    #[test]
+    fn canonicalize_or_parent_returns_simplified_for_missing_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("not").join("yet").join("here.txt");
+        let got = canonicalize_or_parent(&missing).unwrap();
+        assert!(!got.to_string_lossy().starts_with(r"\\?\"));
+        assert!(got.ends_with("not/yet/here.txt") || got.ends_with(r"not\yet\here.txt"));
     }
 }
