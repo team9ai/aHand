@@ -51,11 +51,12 @@ pub struct ResolvedTool {
 /// Resolve `tool` against the daemon's environment.
 ///
 /// Special tokens `"$SHELL"` and `"shell"` mean "the user's default login
-/// shell" — caller passes `std::env::var("SHELL").ok().as_deref()` for
-/// `shell_env`. Resolution falls back to `/bin/sh` when `$SHELL` is unset.
-/// Sentinel mode also prepends `-l` so the spawned shell sources the user's
-/// profile / rc files (gives spawned commands the same PATH the user sees
-/// in their terminal — brew, nvm, pyenv shims, etc.).
+/// shell" — caller passes `ahand_platform::shell::env_shell().as_deref()` for
+/// `shell_env`. Resolution falls back to the platform default shell when the
+/// environment variable is unset. Sentinel mode also prepends the platform
+/// login args (`-l` on Unix; none on Windows) so the spawned shell sources the
+/// user's profile / rc files (gives spawned commands the same PATH the user
+/// sees in their terminal — brew, nvm, pyenv shims, etc.).
 ///
 /// Any other `tool` value is treated as a literal executable path or
 /// PATH-resolvable binary name; no leading args.
@@ -64,9 +65,10 @@ pub struct ResolvedTool {
 /// surface validated by `tests/job_request_tool.rs`.
 pub fn resolve_tool(tool: &str, shell_env: Option<&str>) -> ResolvedTool {
     if tool == "$SHELL" || tool == "shell" {
+        let fallback = ahand_platform::shell::default_shell();
         ResolvedTool {
-            path: shell_env.unwrap_or("/bin/sh").to_string(),
-            leading_args: vec!["-l".to_string()],
+            path: shell_env.map(str::to_string).unwrap_or(fallback.path),
+            leading_args: fallback.login_args,
         }
     } else {
         ResolvedTool {
@@ -101,7 +103,7 @@ where
         s.start_run(&job_id, &req);
     }
 
-    let resolved = resolve_tool(&req.tool, std::env::var("SHELL").ok().as_deref());
+    let resolved = resolve_tool(&req.tool, ahand_platform::shell::env_shell().as_deref());
 
     let mut cmd = Command::new(&resolved.path);
     for leading in &resolved.leading_args {
@@ -298,7 +300,7 @@ where
     // `resolve_tool`, so the SDK's `$SHELL` / `shell` sentinels work the
     // same for `interactive=false` (run_job) and `interactive=true` (here).
     // Skipping this here would silently break interactive jobs with ENOENT.
-    let resolved = resolve_tool(&req.tool, std::env::var("SHELL").ok().as_deref());
+    let resolved = resolve_tool(&req.tool, ahand_platform::shell::env_shell().as_deref());
 
     let mut cmd = CommandBuilder::new(&resolved.path);
     for leading in &resolved.leading_args {
@@ -543,11 +545,15 @@ mod tool_resolution_tests {
     #[test]
     fn dollar_shell_sentinel_resolves_to_shell_env_with_login_flag() {
         let r = resolve_tool("$SHELL", Some("/bin/zsh"));
+        #[cfg(unix)]
+        let expected_leading_args = vec!["-l".to_string()];
+        #[cfg(windows)]
+        let expected_leading_args: Vec<String> = vec![];
         assert_eq!(
             r,
             ResolvedTool {
                 path: "/bin/zsh".to_string(),
-                leading_args: vec!["-l".to_string()],
+                leading_args: expected_leading_args,
             }
         );
     }
@@ -557,27 +563,31 @@ mod tool_resolution_tests {
         // The bare `"shell"` form (without `$`) is also accepted for
         // ergonomics; older callers may emit either.
         let r = resolve_tool("shell", Some("/bin/bash"));
+        #[cfg(unix)]
+        let expected_leading_args = vec!["-l".to_string()];
+        #[cfg(windows)]
+        let expected_leading_args: Vec<String> = vec![];
         assert_eq!(
             r,
             ResolvedTool {
                 path: "/bin/bash".to_string(),
-                leading_args: vec!["-l".to_string()],
+                leading_args: expected_leading_args,
             }
         );
     }
 
     #[test]
-    fn shell_sentinel_falls_back_to_bin_sh_when_shell_env_is_unset() {
+    fn shell_sentinel_falls_back_to_platform_shell_when_env_is_unset() {
         // Tauri/launchctl normally propagate $SHELL from the user's
         // session, but if for some reason it isn't set the daemon must
-        // still spawn _something_ — `/bin/sh` is POSIX-mandated, so
-        // it's the safe fallback rather than failing with ENOENT.
+        // still spawn _something_ using the platform default shell.
         let r = resolve_tool("$SHELL", None);
+        let fallback = ahand_platform::shell::default_shell();
         assert_eq!(
             r,
             ResolvedTool {
-                path: "/bin/sh".to_string(),
-                leading_args: vec!["-l".to_string()],
+                path: fallback.path,
+                leading_args: fallback.login_args,
             }
         );
     }

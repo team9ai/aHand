@@ -259,8 +259,10 @@ impl OpenClawHandler {
 
         debug!(shell_cmd = %shell_cmd, command_len = params.command.len(), "executing command via shell");
 
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(&shell_cmd);
+        let shell = ahand_platform::shell::env_shell()
+            .unwrap_or_else(|| ahand_platform::shell::default_shell().path);
+        let mut cmd = Command::new(shell);
+        cmd.arg(ahand_platform::shell::shell_c_flag()).arg(&shell_cmd);
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
