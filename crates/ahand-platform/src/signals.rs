@@ -1,5 +1,8 @@
-//! Unified shutdown signal: SIGTERM/SIGINT on Unix, Ctrl-C (incl. console
-//! close) on Windows. Returns the *name* of the signal that fired, for logs.
+//! Unified shutdown signal: SIGTERM/SIGINT on Unix; Ctrl-C and console-close
+//! on Windows (Ctrl-Break/logoff/shutdown events are NOT handled). Handlers
+//! are registered eagerly when `shutdown_signal()` is called; installation
+//! failure is returned as an error (fail-closed on both platforms). The
+//! returned future yields the *name* of the signal that fired, for logs.
 
 use anyhow::Result;
 use std::future::Future;
@@ -20,10 +23,17 @@ pub fn shutdown_signal() -> Result<impl Future<Output = &'static str>> {
 
 #[cfg(windows)]
 pub fn shutdown_signal() -> Result<impl Future<Output = &'static str>> {
-    Ok(async {
-        // ctrl_c covers Ctrl-C / Ctrl-Break delivery for console processes.
-        let _ = tokio::signal::ctrl_c().await;
-        "ctrl-c"
+    use anyhow::Context as _;
+    use tokio::signal::windows::{ctrl_c, ctrl_close};
+    // Register eagerly so install failures surface at startup (parity with
+    // the Unix path) instead of resolving into a spurious instant shutdown.
+    let mut c = ctrl_c().context("install Ctrl-C handler")?;
+    let mut close = ctrl_close().context("install console-close handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = c.recv() => "ctrl-c",
+            _ = close.recv() => "console-close",
+        }
     })
 }
 
@@ -42,6 +52,8 @@ mod tests {
             "shutdown_signal() must not fail: {:?}",
             result.err()
         );
-        // Drop the future immediately; the handlers are unregistered with it.
+        // Drop the future without polling; this only checks handler installation
+        // succeeds — OS-level dispositions remain installed process-wide (tokio
+        // semantics).
     }
 }
