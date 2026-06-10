@@ -65,7 +65,7 @@ async fn handle_ipc_conn<S>(
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     device_id: String,
-    caller_uid: String,
+    caller_id: String,
     browser_mgr: Arc<BrowserManager>,
 ) -> anyhow::Result<()>
 where
@@ -74,10 +74,10 @@ where
     let (reader, writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(reader);
 
-    info!(caller_uid = %caller_uid, "IPC: new connection");
+    info!(caller_id = %caller_id, "IPC: new connection");
 
     // Register the IPC caller so session queries return it.
-    session_mgr.register_caller(&caller_uid).await;
+    session_mgr.register_caller(&caller_id).await;
 
     // Channel for sending responses back through the IPC stream.
     let (tx, mut rx) = mpsc::unbounded_channel::<Envelope>();
@@ -169,7 +169,7 @@ where
                 }
 
                 // Session mode check.
-                match session_mgr.check(&req, &caller_uid).await {
+                match session_mgr.check(&req, &caller_id).await {
                     SessionDecision::Deny(reason) => {
                         warn!(job_id = %req.job_id, reason = %reason, "IPC: job rejected by session mode");
                         let reject_env = Envelope {
@@ -212,7 +212,7 @@ where
                         info!(job_id = %req.job_id, reason = %reason, "IPC: job needs approval (strict mode)");
 
                         let (approval_req, approval_rx) = approval_mgr
-                            .submit(req.clone(), &caller_uid, reason, previous_refusals)
+                            .submit(req.clone(), &caller_id, reason, previous_refusals)
                             .await;
 
                         // Send ApprovalRequest to this IPC client.
@@ -237,7 +237,7 @@ where
                         let smgr = Arc::clone(&session_mgr);
                         let timeout = amgr.default_timeout();
                         let job_id = req.job_id.clone();
-                        let cuid = caller_uid.clone();
+                        let cuid = caller_id.clone();
 
                         tokio::spawn(async move {
                             let result = tokio::time::timeout(timeout, approval_rx).await;
@@ -307,7 +307,7 @@ where
                 if !resp.approved && !resp.reason.is_empty() {
                     if let Some((req, _)) = approval_mgr.resolve(&resp).await {
                         session_mgr
-                            .record_refusal(&caller_uid, &req.tool, &resp.reason)
+                            .record_refusal(&caller_id, &req.tool, &resp.reason)
                             .await;
                     }
                 } else {

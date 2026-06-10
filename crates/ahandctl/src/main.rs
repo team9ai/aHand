@@ -2,6 +2,7 @@ use ahand_protocol::{
     ApprovalResponse, CancelJob, Envelope, Hello, JobRequest, PolicyQuery, PolicyUpdate,
     SessionQuery, SetSessionMode, envelope,
 };
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -303,7 +304,9 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> s
 
 async fn ipc_exec(ipc_path: &str, tool: &str, args: &[String]) -> anyhow::Result<()> {
     let endpoint = ahand_platform::ipc::IpcEndpoint::from_path(std::path::PathBuf::from(ipc_path));
-    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await?;
+    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await.context(
+        "could not reach ahandd over IPC — is the daemon running? (try: ahandctl start)",
+    )?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
@@ -398,7 +401,9 @@ async fn ipc_exec(ipc_path: &str, tool: &str, args: &[String]) -> anyhow::Result
 
 async fn ipc_cancel(ipc_path: &str, job_id: &str) -> anyhow::Result<()> {
     let endpoint = ahand_platform::ipc::IpcEndpoint::from_path(std::path::PathBuf::from(ipc_path));
-    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await?;
+    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await.context(
+        "could not reach ahandd over IPC — is the daemon running? (try: ahandctl start)",
+    )?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
@@ -621,7 +626,9 @@ async fn ws_ping(url: &str) -> anyhow::Result<()> {
 
 async fn ipc_approve(ipc_path: &str) -> anyhow::Result<()> {
     let endpoint = ahand_platform::ipc::IpcEndpoint::from_path(std::path::PathBuf::from(ipc_path));
-    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await?;
+    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await.context(
+        "could not reach ahandd over IPC — is the daemon running? (try: ahandctl start)",
+    )?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
@@ -726,7 +733,9 @@ async fn ipc_approve(ipc_path: &str) -> anyhow::Result<()> {
 
 async fn ipc_policy(ipc_path: &str, action: PolicyAction) -> anyhow::Result<()> {
     let endpoint = ahand_platform::ipc::IpcEndpoint::from_path(std::path::PathBuf::from(ipc_path));
-    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await?;
+    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await.context(
+        "could not reach ahandd over IPC — is the daemon running? (try: ahandctl start)",
+    )?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
@@ -829,7 +838,9 @@ async fn ws_policy(url: &str, action: PolicyAction) -> anyhow::Result<()> {
 
 async fn ipc_session(ipc_path: &str, action: SessionAction) -> anyhow::Result<()> {
     let endpoint = ahand_platform::ipc::IpcEndpoint::from_path(std::path::PathBuf::from(ipc_path));
-    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await?;
+    let stream = ahand_platform::ipc::ipc_connect(&endpoint).await.context(
+        "could not reach ahandd over IPC — is the daemon running? (try: ahandctl start)",
+    )?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(&mut reader);
 
