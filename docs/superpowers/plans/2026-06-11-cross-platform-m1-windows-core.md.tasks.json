@@ -19,7 +19,7 @@
     {
       "id": 3,
       "subject": "Task 3: platform::signals + adopt in ahandd main",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         1
       ],
