@@ -1401,6 +1401,10 @@ mod tests {
         (handler, session_mgr, approval_mgr, approval_broadcast_tx)
     }
 
+    // Only used in tests that actually execute a `sh -c printf …` command,
+    // which requires a POSIX shell; gated to unix to avoid dead-code warnings
+    // on Windows and to match the tests that call it.
+    #[cfg(unix)]
     fn unique_output_path() -> PathBuf {
         PathBuf::from(format!("/tmp/ahand-openclaw-{}", uuid::Uuid::new_v4()))
     }
@@ -1462,6 +1466,9 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
+    // Executes a real `sh -c 'printf …'` and asserts the output file was
+    // created; `sh` and `/tmp` are not available on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn strict_mode_preapproved_request_executes_without_local_wait() {
         let (handler, session_mgr, _approval_mgr, approval_broadcast_tx) = test_handler(1);
@@ -1491,6 +1498,9 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
+    // Executes a real `sh -c 'printf …'` and asserts the output file was
+    // created; `sh` and `/tmp` are not available on Windows.
+    #[cfg(unix)]
     #[tokio::test]
     async fn strict_mode_waits_for_local_approval_before_running() {
         let (handler, session_mgr, approval_mgr, approval_broadcast_tx) = test_handler(1);
