@@ -251,8 +251,8 @@ mod linux {
     /// - `flags`   — same bits as the second arg of `openat()`.
     /// - `mode`    — file-creation mode (only with O_CREAT/O_TMPFILE).
     /// - `resolve` — `RESOLVE_*` bitset constraining how the kernel
-    ///               walks the path. We set `RESOLVE_NO_SYMLINKS` so any
-    ///               symlink in the resolution path → ELOOP, atomically.
+    ///   walks the path. We set `RESOLVE_NO_SYMLINKS` so any
+    ///   symlink in the resolution path → ELOOP, atomically.
     #[repr(C)]
     #[derive(Default)]
     struct OpenHow {

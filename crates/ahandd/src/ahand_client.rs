@@ -1660,25 +1660,24 @@ mod tests {
             "SO_KEEPALIVE must be on after connect_tcp_with_keepalive",
         );
 
-        // Linux/BSDs path: socket2 exposes typed getters.
-        // Windows exposes neither keepalive_time/interval/retries nor raw
-        // TCP_KEEPIDLE/KEEPINTVL/KEEPCNT getsockopt — skip the detailed
-        // assertions there; SO_KEEPALIVE is still verified above.
+        // Linux/BSDs path: socket2 0.6 exposes typed getters with `tcp_` prefix.
+        // Windows and macOS are excluded here (Windows: no typed getters;
+        // macOS: uses raw getsockopt below).
         #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
         {
             assert_eq!(
-                sock.keepalive_time().expect("read keepalive idle time"),
+                sock.tcp_keepalive_time().expect("read keepalive idle time"),
                 std::time::Duration::from_secs(30),
                 "TCP_KEEPIDLE must be 30s",
             );
             assert_eq!(
-                sock.keepalive_interval()
+                sock.tcp_keepalive_interval()
                     .expect("read keepalive probe interval"),
                 std::time::Duration::from_secs(10),
                 "TCP_KEEPINTVL must be 10s",
             );
             assert_eq!(
-                sock.keepalive_retries()
+                sock.tcp_keepalive_retries()
                     .expect("read keepalive retry count"),
                 3,
                 "TCP_KEEPCNT must be 3",
