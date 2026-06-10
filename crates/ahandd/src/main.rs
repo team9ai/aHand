@@ -273,6 +273,9 @@ async fn main() -> anyhow::Result<()> {
         info!(pid = std::process::id(), path = %p.display(), "wrote PID file");
     }
 
+    // Clean up any stale binary left by a previous Windows self-update.
+    updater::cleanup_old_binary();
+
     let session_mgr = Arc::new(session::SessionManager::new(
         cfg.trust_timeout_mins.unwrap_or(60),
     ));

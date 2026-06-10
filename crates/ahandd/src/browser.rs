@@ -56,7 +56,7 @@ impl BrowserManager {
         let base = match &self.config.downloads_dir {
             Some(p) => PathBuf::from(p),
             None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
+                .unwrap_or_else(std::env::temp_dir)
                 .join(".ahand")
                 .join("browser")
                 .join("downloads"),
@@ -419,7 +419,7 @@ impl BrowserManager {
             None => {
                 // Prefer the aHand-managed Node.js installation
                 let ahand_path = dirs::home_dir()
-                    .unwrap_or_else(|| PathBuf::from("/tmp"))
+                    .unwrap_or_else(std::env::temp_dir)
                     .join(".ahand")
                     .join("node")
                     .join("bin")

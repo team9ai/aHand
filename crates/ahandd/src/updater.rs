@@ -299,11 +299,20 @@ fn verify_signature(data: &[u8], signature_bytes: &[u8]) -> anyhow::Result<()> {
 fn install_binary(data: &[u8], target_version: &str) -> anyhow::Result<()> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let bin_dir = home.join(".ahand").join("bin");
+    install_binary_into(&home.join(".ahand"), data, target_version)
+}
+
+pub fn install_binary_into(
+    ahand_home: &std::path::Path,
+    data: &[u8],
+    target_version: &str,
+) -> anyhow::Result<()> {
+    let bin_dir = ahand_home.join("bin");
     std::fs::create_dir_all(&bin_dir)?;
 
-    let target_path = bin_dir.join("ahandd");
-    let tmp_path = bin_dir.join("ahandd.update.tmp");
+    let bin_name = ahand_platform::paths::exe_name("ahandd");
+    let target_path = bin_dir.join(&bin_name);
+    let tmp_path = bin_dir.join(format!("{bin_name}.update.tmp"));
 
     // Write to temp file, then atomically rename.
     std::fs::write(&tmp_path, data)?;
@@ -316,23 +325,59 @@ fn install_binary(data: &[u8], target_version: &str) -> anyhow::Result<()> {
         std::fs::set_permissions(&tmp_path, perms)?;
     }
 
+    // On Windows, rename over a running exe fails unless we move it aside
+    // first. Renaming a running exe aside IS allowed on Windows (NTFS
+    // allows rename as long as the file isn't deleted while open).
+    #[cfg(windows)]
+    {
+        let old_path = bin_dir.join(format!("{bin_name}.old"));
+        // Remove stale .old if present.
+        if old_path.exists() {
+            let _ = std::fs::remove_file(&old_path);
+        }
+        if target_path.exists() {
+            std::fs::rename(&target_path, &old_path)?;
+        }
+    }
+
     std::fs::rename(&tmp_path, &target_path)?;
     info!(path = %target_path.display(), "installed new binary");
 
     // Write version marker.
-    let version_path = home.join(".ahand").join("version");
+    let version_path = ahand_home.join("version");
     std::fs::write(&version_path, target_version)?;
     info!(version = %target_version, "wrote version marker");
 
     Ok(())
 }
 
+/// Remove the stale `.old` binary left by a previous Windows self-update.
+/// Resolves the home directory and delegates to [`cleanup_old_binary_in`].
+pub fn cleanup_old_binary() {
+    if let Some(home) = dirs::home_dir() {
+        cleanup_old_binary_in(&home.join(".ahand"));
+    }
+}
+
+fn cleanup_old_binary_in(ahand_home: &std::path::Path) {
+    let bin_name = ahand_platform::paths::exe_name("ahandd");
+    let old_path = ahand_home.join("bin").join(format!("{bin_name}.old"));
+    if old_path.exists() {
+        if let Err(e) = std::fs::remove_file(&old_path) {
+            warn!(path = %old_path.display(), error = %e, "failed to remove stale .old binary");
+        } else {
+            info!(path = %old_path.display(), "removed stale .old binary");
+        }
+    }
+}
+
 fn restart_daemon() -> anyhow::Result<()> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    let bin_path = home.join(".ahand").join("bin").join("ahandd");
+    let bin_name = ahand_platform::paths::exe_name("ahandd");
+    let bin_path = home.join(".ahand").join("bin").join(&bin_name);
 
-    info!(path = %bin_path.display(), "exec()-ing new daemon binary");
+    info!(path = %bin_path.display(), "restarting daemon binary");
 
     #[cfg(unix)]
     {
@@ -344,9 +389,21 @@ fn restart_daemon() -> anyhow::Result<()> {
         anyhow::bail!("exec() failed: {}", err);
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        anyhow::bail!("restart via exec() is only supported on Unix");
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mut cmd = std::process::Command::new(&bin_path);
+        cmd.args(&args);
+        ahand_platform::process::configure_detached(&mut cmd);
+        cmd.spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn new daemon: {e}"))?;
+        info!("spawned new daemon binary; exiting current process");
+        std::process::exit(0);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        anyhow::bail!("restart not supported on this platform");
     }
 }
 
@@ -375,6 +432,50 @@ fn send_status<T: EnvelopeSink>(
     };
     if tx.send(envelope).is_err() {
         warn!("failed to send update status — channel closed");
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    #[test]
+    fn install_binary_into_writes_exe_named_binary_and_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_binary_into(tmp.path(), b"fake-binary", "9.9.9").unwrap();
+        let bin = tmp
+            .path()
+            .join("bin")
+            .join(ahand_platform::paths::exe_name("ahandd"));
+        assert_eq!(std::fs::read(&bin).unwrap(), b"fake-binary");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("version")).unwrap(),
+            "9.9.9"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&bin).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "binary not executable");
+        }
+    }
+
+    #[test]
+    fn install_binary_into_replaces_existing_and_cleanup_removes_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_binary_into(tmp.path(), b"v1", "1").unwrap();
+        install_binary_into(tmp.path(), b"v2", "2").unwrap();
+        let bin = tmp
+            .path()
+            .join("bin")
+            .join(ahand_platform::paths::exe_name("ahandd"));
+        assert_eq!(std::fs::read(&bin).unwrap(), b"v2");
+        cleanup_old_binary_in(tmp.path());
+        let old = tmp
+            .path()
+            .join("bin")
+            .join(format!("{}.old", ahand_platform::paths::exe_name("ahandd")));
+        assert!(!old.exists());
     }
 }
 

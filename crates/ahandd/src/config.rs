@@ -419,9 +419,10 @@ impl Config {
                 .map_err(|e| anyhow::anyhow!("failed to fsync {}: {e}", tmp_path.display()))?;
         }
 
-        // Rename (atomic on POSIX; on Windows `rename` fails if target exists,
-        // so on Windows we'd need a different strategy — but ahandd is
-        // Unix-only for now, so this is sufficient).
+        // Rename (atomic on POSIX; on Windows std::fs::rename replaces an
+        // existing target via MoveFileExW(MOVEFILE_REPLACE_EXISTING), which
+        // can still fail if another process holds the file open — the
+        // overwrite test pins the replace behavior on all platforms).
         if let Err(e) = std::fs::rename(&tmp_path, path) {
             // Best-effort cleanup of the tmp file
             let _ = std::fs::remove_file(&tmp_path);
@@ -806,5 +807,21 @@ allowed_domains = ["example.com", "example.org"]
             !tmp_path.exists(),
             "tmp file should not be left behind after successful write"
         );
+    }
+
+    #[test]
+    fn save_atomic_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Build a minimal Config the same way other tests do.
+        std::fs::write(&path, "[browser]\nenabled = true\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        // First save creates the file.
+        cfg.save_atomic(&path).unwrap();
+        // Second save must not error (replace semantics).
+        cfg.save_atomic(&path).unwrap();
+        assert!(path.exists());
+        // No stale .tmp left behind.
+        assert!(!path.with_extension("toml.tmp").exists());
     }
 }
