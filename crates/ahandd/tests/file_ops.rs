@@ -8,15 +8,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ahand_protocol::{
-    ByteRangeReplace, DeleteMode, FileAppend, FileCopy, FileDelete, FileEdit, FileErrorCode,
-    FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary, FileReadImage,
-    FileReadPdf, FileReadPdfMode, FileReadText, FileRequest, FileStat, FileType, FileWrite,
-    FullWrite, ImageFormat, LineCol, LineRangeReplace, PdfPageRange, StopReason, StringReplace,
-    WriteAction, file_edit, file_position, file_read_text, file_request, file_response, file_write,
-    full_write,
+    ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy, FileDelete, FileEdit,
+    FileErrorCode, FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary,
+    FileReadImage, FileReadPdf, FileReadPdfMode, FileReadText, FileRequest, FileStat, FileType,
+    FileWrite, FullWrite, ImageFormat, LineCol, LineRangeReplace, PdfPageRange, StopReason,
+    StringReplace, WriteAction, file_edit, file_position, file_read_text, file_request,
+    file_response, file_write, full_write,
 };
+// FileCreateSymlink, UnixPermission and file_chmod are only used in #[cfg(unix)] tests.
 #[cfg(unix)]
-use ahand_protocol::{FileChmod, FileCreateSymlink, UnixPermission, file_chmod};
+use ahand_protocol::{FileCreateSymlink, UnixPermission, file_chmod};
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
 use tempfile::TempDir;
