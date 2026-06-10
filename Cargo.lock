@@ -124,6 +124,7 @@ dependencies = [
 name = "ahandctl"
 version = "0.1.2"
 dependencies = [
+ "ahand-platform",
  "ahand-protocol",
  "anyhow",
  "clap",
