@@ -5,6 +5,7 @@
 //! guarantees; anything it cannot make equivalent is documented at the call
 //! site it serves.
 
+pub mod ipc;
 pub mod paths;
 pub mod process;
 pub mod secure_file;
