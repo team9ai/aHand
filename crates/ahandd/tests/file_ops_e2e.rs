@@ -9,12 +9,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ahand_protocol::{
-    ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy, FileCreateSymlink, FileDelete,
-    FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary,
-    FileReadImage, FileReadText, FileRequest, FileResponse, FileStat, FileType, FileWrite,
-    FullWrite, ImageFormat, LineRangeReplace, StringReplace, UnixPermission, file_chmod, file_edit,
-    file_position, file_request, file_response, file_write, full_write,
+    ByteRangeReplace, DeleteMode, FileAppend, FileCopy, FileDelete, FileEdit, FileErrorCode,
+    FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary, FileReadImage,
+    FileReadText, FileRequest, FileResponse, FileStat, FileType, FileWrite, FullWrite, ImageFormat,
+    LineRangeReplace, StringReplace, file_edit, file_position, file_request, file_response,
+    file_write, full_write,
 };
+#[cfg(unix)]
+use ahand_protocol::{FileChmod, FileCreateSymlink, UnixPermission, file_chmod};
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
 use prost::Message;

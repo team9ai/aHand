@@ -8,13 +8,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ahand_protocol::{
-    ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy, FileCreateSymlink, FileDelete,
-    FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary,
-    FileReadImage, FileReadPdf, FileReadPdfMode, FileReadText, FileRequest, FileStat, FileType,
-    FileWrite, FullWrite, ImageFormat, LineCol, LineRangeReplace, PdfPageRange, StopReason,
-    StringReplace, UnixPermission, WriteAction, file_chmod, file_edit, file_position,
-    file_read_text, file_request, file_response, file_write, full_write,
+    ByteRangeReplace, DeleteMode, FileAppend, FileCopy, FileDelete, FileEdit, FileErrorCode,
+    FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary, FileReadImage,
+    FileReadPdf, FileReadPdfMode, FileReadText, FileRequest, FileStat, FileType, FileWrite,
+    FullWrite, ImageFormat, LineCol, LineRangeReplace, PdfPageRange, StopReason, StringReplace,
+    WriteAction, file_edit, file_position, file_read_text, file_request, file_response, file_write,
+    full_write,
 };
+#[cfg(unix)]
+use ahand_protocol::{FileChmod, FileCreateSymlink, UnixPermission, file_chmod};
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
 use tempfile::TempDir;
@@ -57,6 +59,7 @@ fn stat_request(path: &Path) -> FileRequest {
     }
 }
 
+#[cfg(unix)]
 fn stat_request_no_follow(path: &Path) -> FileRequest {
     FileRequest {
         request_id: "test".to_string(),
@@ -258,6 +261,7 @@ fn expect_move(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileMoveRe
     }
 }
 
+#[cfg(unix)]
 fn expect_symlink(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileCreateSymlinkResult {
     match resp.result {
         Some(file_response::Result::CreateSymlink(r)) => r,
@@ -265,6 +269,7 @@ fn expect_symlink(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileCre
     }
 }
 
+#[cfg(unix)]
 fn expect_chmod(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileChmodResult {
     match resp.result {
         Some(file_response::Result::Chmod(r)) => r,
