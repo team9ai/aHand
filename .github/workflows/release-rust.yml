@@ -31,10 +31,9 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
             suffix: darwin-x64
-          # TODO: Windows support needs cross-platform IPC (see feat/windows-support branch)
-          # - os: windows-latest
-          #   target: x86_64-pc-windows-msvc
-          #   suffix: windows-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x64
 
     runs-on: ${{ matrix.os }}
 
@@ -49,11 +48,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      # - name: Install protoc (Windows)
-      #   if: runner.os == 'Windows'
-      #   uses: arduino/setup-protoc@v3
-      #   with:
-      #     repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -75,11 +74,19 @@ jobs:
         run: cross build --release --target ${{ matrix.target }} -p ahandd -p ahandctl
 
       - name: Prepare artifacts
+        shell: bash
         run: |
           mkdir -p release
-          cp target/${{ matrix.target }}/release/ahandd release/ahandd-${{ matrix.suffix }}
-          cp target/${{ matrix.target }}/release/ahandctl release/ahandctl-${{ matrix.suffix }}
-          cd release && shasum -a 256 * > checksums-rust-${{ matrix.suffix }}.txt
+          EXT=""
+          if [ "${{ runner.os }}" = "Windows" ]; then EXT=".exe"; fi
+          cp "target/${{ matrix.target }}/release/ahandd$EXT" "release/ahandd-${{ matrix.suffix }}$EXT"
+          cp "target/${{ matrix.target }}/release/ahandctl$EXT" "release/ahandctl-${{ matrix.suffix }}$EXT"
+          cd release
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum * > "checksums-rust-${{ matrix.suffix }}.txt"
+          else
+            shasum -a 256 * > "checksums-rust-${{ matrix.suffix }}.txt"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
