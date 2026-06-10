@@ -1401,12 +1401,8 @@ mod tests {
         (handler, session_mgr, approval_mgr, approval_broadcast_tx)
     }
 
-    // Only used in tests that actually execute a `sh -c printf …` command,
-    // which requires a POSIX shell; gated to unix to avoid dead-code warnings
-    // on Windows and to match the tests that call it.
-    #[cfg(unix)]
     fn unique_output_path() -> PathBuf {
-        PathBuf::from(format!("/tmp/ahand-openclaw-{}", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!("ahand-openclaw-{}", uuid::Uuid::new_v4()))
     }
 
     fn system_run_invoke(
