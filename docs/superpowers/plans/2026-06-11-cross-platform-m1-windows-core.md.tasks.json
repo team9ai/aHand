@@ -10,7 +10,7 @@
     {
       "id": 2,
       "subject": "Task 2: platform::process + adopt in ahandctl daemon lifecycle",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         1
       ],
