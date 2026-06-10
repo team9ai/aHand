@@ -294,7 +294,7 @@ pub async fn handle_glob(
     }
 
     // Sort by mtime desc for consistency with `list`.
-    entries.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    entries.sort_by_key(|b| Reverse(b.modified_ms));
 
     let has_more = total_matches as usize > entries.len();
 
@@ -751,6 +751,7 @@ async fn copy_single_file(source: &Path, dest: &Path, overwrite: bool) -> Result
     }
     #[cfg(not(unix))]
     {
+        let _ = overwrite; // on Windows the caller checks existence before calling us
         tokio::fs::copy(source, dest)
             .await
             .map_err(|e| io_to_file_error(e, dest))?;
@@ -1005,18 +1006,26 @@ pub async fn handle_create_symlink(
             )
         })??;
     }
+    // On Unix: spawn_blocking succeeded (errors would have propagated above),
+    // return the symlink result. The cfg guard matches the guard on the block
+    // above so `link_resolved` is always consumed by exactly one arm.
+    #[cfg(unix)]
+    return Ok(FileCreateSymlinkResult {
+        link_path: link_resolved.to_string_lossy().into_owned(),
+        target: req.target.clone(),
+    });
+
+    // Non-Unix fallback — symlinks not yet supported. TODO(M4): port to Windows.
+    // `link_resolved` is consumed here only when the unix arm above is absent.
     #[cfg(not(unix))]
     {
+        let _ = link_resolved;
         return Err(file_error(
             FileErrorCode::Unspecified,
             &req.link_path,
             "symlinks are not supported on this platform",
         ));
     }
-    Ok(FileCreateSymlinkResult {
-        link_path: link_resolved.to_string_lossy().into_owned(),
-        target: req.target.clone(),
-    })
 }
 
 // ── Chmod ──────────────────────────────────────────────────────────────────

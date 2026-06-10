@@ -1661,7 +1661,10 @@ mod tests {
         );
 
         // Linux/BSDs path: socket2 exposes typed getters.
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        // Windows exposes neither keepalive_time/interval/retries nor raw
+        // TCP_KEEPIDLE/KEEPINTVL/KEEPCNT getsockopt — skip the detailed
+        // assertions there; SO_KEEPALIVE is still verified above.
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
         {
             assert_eq!(
                 sock.keepalive_time().expect("read keepalive idle time"),

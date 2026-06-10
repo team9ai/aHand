@@ -225,7 +225,9 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceIdentity, write_secure_file};
+    use super::DeviceIdentity;
+    #[cfg(unix)]
+    use super::write_secure_file;
 
     #[cfg(unix)]
     #[test]
