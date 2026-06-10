@@ -141,7 +141,10 @@ jobs:
 
       - name: Get tag
         id: tag
-        run: echo "tag=${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}" >> "$GITHUB_OUTPUT"
+        run: |
+          TAG="${{ github.event.inputs.tag }}"
+          TAG="${TAG:-$GITHUB_REF_NAME}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v3
