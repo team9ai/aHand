@@ -28,7 +28,7 @@
     {
       "id": 4,
       "subject": "Task 4: platform::shell + adopt in executor and openclaw handler",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         1
       ],
