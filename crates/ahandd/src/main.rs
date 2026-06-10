@@ -23,7 +23,6 @@ use ahand_protocol::Envelope;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use config::ConnectionMode;
-use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 
 #[derive(Parser)]
@@ -304,9 +303,9 @@ async fn main() -> anyhow::Result<()> {
     // Broadcast channel for pushing approval requests to all IPC clients.
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
 
-    // Set up signal handlers for graceful shutdown.
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
+    // Set up signal handlers for graceful shutdown (SIGTERM/SIGINT on Unix,
+    // Ctrl-C on Windows).
+    let shutdown = ahand_platform::signals::shutdown_signal()?;
 
     let main_future = async {
         match connection_mode {
@@ -420,12 +419,8 @@ async fn main() -> anyhow::Result<()> {
     // Race main event loop against shutdown signals.
     let result = tokio::select! {
         r = main_future => r,
-        _ = sigterm.recv() => {
-            info!("received SIGTERM, shutting down");
-            Ok(())
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT, shutting down");
+        sig = shutdown => {
+            info!(signal = sig, "received shutdown signal, shutting down");
             Ok(())
         }
     };

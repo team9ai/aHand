@@ -148,6 +148,7 @@ dependencies = [
 name = "ahandd"
 version = "0.1.2"
 dependencies = [
+ "ahand-platform",
  "ahand-protocol",
  "anyhow",
  "axum",
