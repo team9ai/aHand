@@ -9,24 +9,13 @@ use tracing::{info, warn};
 use crate::config::BrowserConfig;
 
 /// Result of executing a browser command via playwright-cli.
+#[derive(Default)]
 pub struct BrowserCommandResult {
     pub success: bool,
     pub result_json: String,
     pub error: String,
     pub binary_data: Vec<u8>,
     pub binary_mime: String,
-}
-
-impl Default for BrowserCommandResult {
-    fn default() -> Self {
-        Self {
-            success: false,
-            result_json: String::new(),
-            error: String::new(),
-            binary_data: Vec::new(),
-            binary_mime: String::new(),
-        }
-    }
 }
 
 pub struct BrowserManager {
@@ -443,10 +432,10 @@ impl BrowserManager {
         let mut args = vec![format!("-s={}", session_id), action.to_string()];
 
         // Parse params_json and convert to CLI positional/flag arguments.
-        if let Ok(params) = serde_json::from_str::<serde_json::Value>(params_json) {
-            if let Some(obj) = params.as_object() {
-                args.extend(params_to_cli_args(action, obj));
-            }
+        if let Ok(params) = serde_json::from_str::<serde_json::Value>(params_json)
+            && let Some(obj) = params.as_object()
+        {
+            args.extend(params_to_cli_args(action, obj));
         }
 
         // Inject --filename for actions that produce file output.
@@ -790,8 +779,7 @@ fn extract_domain(url: &str) -> String {
 
 /// Check if a domain matches a pattern (supports wildcard prefix like "*.example.com").
 fn domain_matches(domain: &str, pattern: &str) -> bool {
-    if pattern.starts_with("*.") {
-        let suffix = &pattern[2..];
+    if let Some(suffix) = pattern.strip_prefix("*.") {
         domain == suffix || domain.ends_with(&format!(".{}", suffix))
     } else {
         domain == pattern

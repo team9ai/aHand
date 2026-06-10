@@ -2,7 +2,7 @@
 //!
 //! Generates and manages Ed25519 keypairs for device authentication.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -107,7 +107,7 @@ impl DeviceIdentity {
     }
 
     /// Save to file
-    fn save(&self, path: &PathBuf) -> Result<()> {
+    fn save(&self, path: &Path) -> Result<()> {
         let stored = StoredIdentity {
             version: 1,
             device_id: self.device_id.clone(),
@@ -161,6 +161,7 @@ pub fn default_identity_path() -> PathBuf {
 }
 
 /// Build the auth payload for signing
+#[allow(clippy::too_many_arguments)] // protocol-dictated fields; grouping would obscure the spec
 pub fn build_auth_payload(
     device_id: &str,
     client_id: &str,

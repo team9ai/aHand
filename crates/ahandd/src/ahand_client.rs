@@ -62,6 +62,7 @@ struct QueuedEnvelope {
 /// replied by tungstenite per RFC 6455) before its watchdog timeout
 /// fires — that's how we detect zombie TCP connections that survived
 /// macOS sleep/wake or NAT timeout without any visible socket error.
+#[allow(clippy::large_enum_variant)] // Envelope is the hot path; boxing adds indirection cost
 enum OutboundFrame {
     Envelope(QueuedEnvelope),
     WsPing(Vec<u8>),
@@ -94,6 +95,7 @@ impl crate::executor::EnvelopeSink for BufferedEnvelopeSender {
 /// Coarse outcome of a single `connect()` attempt, used by library callers
 /// that want to observe handshake success/failure without scraping logs.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // variant fields carried for future observers / SDK consumers
 pub enum ConnectOutcome {
     /// The Hello handshake was accepted.
     HandshakeAccepted,
@@ -1619,8 +1621,8 @@ mod tests {
     use crate::outbox::Outbox;
 
     use super::{
-        BufferedEnvelopeSender, ConnectError, OutboundFrame, QueuedEnvelope,
-        classify_hello_accepted_message, connect_tcp_with_keepalive,
+        BufferedEnvelopeSender, ConnectError, OutboundFrame, classify_hello_accepted_message,
+        connect_tcp_with_keepalive,
     };
 
     /// Spinning up a real `spawn(...)` daemon and reaching into its private

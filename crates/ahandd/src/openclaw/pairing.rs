@@ -2,7 +2,7 @@
 //!
 //! Manages node registration and authentication with the Gateway.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ pub fn default_pairing_path() -> PathBuf {
 }
 
 /// Load pairing state from file
-pub fn load_pairing_state(path: &PathBuf) -> Result<Option<PairingState>> {
+pub fn load_pairing_state(path: &Path) -> Result<Option<PairingState>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -68,7 +68,7 @@ pub fn load_pairing_state(path: &PathBuf) -> Result<Option<PairingState>> {
 }
 
 /// Save pairing state to file
-pub fn save_pairing_state(path: &PathBuf, state: &PairingState) -> Result<()> {
+pub fn save_pairing_state(path: &Path, state: &PairingState) -> Result<()> {
     let content =
         serde_json::to_string_pretty(state).context("failed to serialize pairing state")?;
 

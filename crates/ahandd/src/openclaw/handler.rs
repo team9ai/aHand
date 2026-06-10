@@ -55,6 +55,7 @@ pub(crate) struct ExecEvent {
 }
 
 /// Handler for OpenClaw node invocations
+#[allow(dead_code)] // registry + store consumed via Arc; fields read in future methods
 pub struct OpenClawHandler {
     node_id: String,
     registry: Arc<JobRegistry>,
@@ -66,6 +67,7 @@ pub struct OpenClawHandler {
     browser_mgr: Arc<BrowserManager>,
 }
 
+#[allow(clippy::too_many_arguments)] // constructor mirrors the struct fields 1:1; grouping would obscure intent
 impl OpenClawHandler {
     pub fn new(
         node_id: String,
@@ -262,7 +264,8 @@ impl OpenClawHandler {
         let shell = ahand_platform::shell::env_shell()
             .unwrap_or_else(|| ahand_platform::shell::default_shell().path);
         let mut cmd = Command::new(shell);
-        cmd.arg(ahand_platform::shell::shell_c_flag()).arg(&shell_cmd);
+        cmd.arg(ahand_platform::shell::shell_c_flag())
+            .arg(&shell_cmd);
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
@@ -328,7 +331,7 @@ impl OpenClawHandler {
         });
 
         // Wait with timeout
-        let timeout = timeout_ms.map(|ms| Duration::from_millis(ms));
+        let timeout = timeout_ms.map(Duration::from_millis);
         let (exit_code, timed_out) = if let Some(dur) = timeout {
             match tokio::time::timeout(dur, child.wait()).await {
                 Ok(Ok(status)) => (status.code(), false),
@@ -647,21 +650,15 @@ impl OpenClawHandler {
                     .browser_mgr
                     .execute(&session_id, &action, &action_params_json, timeout_ms)
                     .await;
-                if submit {
-                    if let Ok(ref r) = result {
-                        if r.success {
-                            let press_params = serde_json::json!({ "key": "Enter" });
-                            let _ = self
-                                .browser_mgr
-                                .execute(
-                                    &session_id,
-                                    "press",
-                                    &press_params.to_string(),
-                                    timeout_ms,
-                                )
-                                .await;
-                        }
-                    }
+                if submit
+                    && let Ok(ref r) = result
+                    && r.success
+                {
+                    let press_params = serde_json::json!({ "key": "Enter" });
+                    let _ = self
+                        .browser_mgr
+                        .execute(&session_id, "press", &press_params.to_string(), timeout_ms)
+                        .await;
                 }
                 result
             }
@@ -1189,13 +1186,13 @@ fn translate_act_kind(kind: &str, body: &serde_json::Value) -> Result<(String, S
             // OpenClaw sends { fields: [{ref, type, value}, ...] }.
             // Use the first field for playwright-cli `fill <ref> <text>`.
             let fields = body.get("fields").and_then(|v| v.as_array());
-            if let Some(fields) = fields {
-                if let Some(first) = fields.first() {
-                    let ref_val = first.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-                    let value = first.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                    let params = serde_json::json!({ "ref": ref_val, "text": value });
-                    return Ok(("fill".to_string(), params.to_string()));
-                }
+            if let Some(fields) = fields
+                && let Some(first) = fields.first()
+            {
+                let ref_val = first.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                let value = first.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                let params = serde_json::json!({ "ref": ref_val, "text": value });
+                return Ok(("fill".to_string(), params.to_string()));
             }
             Ok(("fill".to_string(), "{}".to_string()))
         }

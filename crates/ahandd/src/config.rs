@@ -12,6 +12,7 @@ pub enum ConnectionMode {
 }
 
 impl ConnectionMode {
+    #[allow(clippy::should_implement_trait)] // simple value constructor; no FromStr err type needed
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "openclaw-gateway" | "openclaw" => Self::OpenClawGateway,
@@ -319,13 +320,14 @@ fn expand_tilde(pattern: &str) -> anyhow::Result<String> {
 
 /// Apply [`expand_tilde`] to every entry in a mutable string list in place.
 /// Stops on the first failure so the caller sees the offending pattern.
-fn expand_tildes_in_place(list: &mut Vec<String>) -> anyhow::Result<()> {
+fn expand_tildes_in_place(list: &mut [String]) -> anyhow::Result<()> {
     for item in list.iter_mut() {
         *item = expand_tilde(item)?;
     }
     Ok(())
 }
 
+#[allow(dead_code)] // public API surface used by future CLI sub-commands
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;

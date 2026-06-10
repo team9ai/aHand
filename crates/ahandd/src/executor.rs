@@ -22,6 +22,7 @@ pub enum StdinInput {
 pub type StdinSender = mpsc::UnboundedSender<StdinInput>;
 
 pub trait EnvelopeSink: Clone + Send + Sync + 'static {
+    #[allow(clippy::result_unit_err)] // () is sufficient; no error info needed across channel boundary
     fn send(&self, envelope: Envelope) -> Result<(), ()>;
 }
 

@@ -24,6 +24,7 @@ struct StoredIdentity {
     private_key_base64: String,
 }
 
+#[allow(dead_code)] // generate_for_tests + public_key_b64 are test/SDK helpers
 impl DeviceIdentity {
     pub fn generate() -> Self {
         Self {

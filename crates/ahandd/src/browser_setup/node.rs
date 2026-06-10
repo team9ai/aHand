@@ -8,6 +8,7 @@ pub const NODE_MIN_VERSION: u32 = 20;
 pub const NODE_LTS_VERSION: &str = "24.13.0";
 
 pub struct Dirs {
+    #[allow(dead_code)] // base dir kept for future sub-path helpers
     pub ahand: PathBuf,
     pub node: PathBuf,
 }
@@ -95,20 +96,20 @@ pub async fn ensure(
     let dirs = Dirs::new()?;
     let local_node = dirs.node.join("bin").join("node");
 
-    if !force && local_node.exists() {
-        if let Some(ver) = read_node_major_version(&local_node).await {
-            if ver >= NODE_MIN_VERSION {
-                emit(
-                    progress,
-                    Phase::Done,
-                    format!(
-                        "Node.js v{ver}.x already installed at {}",
-                        dirs.node.display()
-                    ),
-                );
-                return Ok(inspect().await);
-            }
-        }
+    if !force
+        && local_node.exists()
+        && let Some(ver) = read_node_major_version(&local_node).await
+        && ver >= NODE_MIN_VERSION
+    {
+        emit(
+            progress,
+            Phase::Done,
+            format!(
+                "Node.js v{ver}.x already installed at {}",
+                dirs.node.display()
+            ),
+        );
+        return Ok(inspect().await);
     }
 
     // Remove the old installation (whether --force was set or version was too low)
@@ -351,10 +352,7 @@ mod tests {
         );
 
         // Verify the phase sequence matches install_node()'s order
-        let phases: Vec<String> = events
-            .iter()
-            .map(|e| format!("{:?}", e.phase))
-            .collect();
+        let phases: Vec<String> = events.iter().map(|e| format!("{:?}", e.phase)).collect();
         assert_eq!(
             phases,
             vec!["Starting", "Downloading", "Extracting", "Verifying", "Done"]
@@ -373,28 +371,25 @@ mod tests {
         let bin_dir = dir.path().join("bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let node_bin = bin_dir.join("node");
-        std::fs::write(
-            &node_bin,
-            "#!/bin/sh\necho 'v24.13.0'\n",
-        )
-        .unwrap();
+        std::fs::write(&node_bin, "#!/bin/sh\necho 'v24.13.0'\n").unwrap();
         let mut perms = std::fs::metadata(&node_bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&node_bin, perms).unwrap();
 
         // read_node_major_version reads the binary directly, so test it in isolation
         let version = read_node_major_version(&node_bin).await;
-        assert_eq!(version, Some(24), "fake node binary should report major version 24");
+        assert_eq!(
+            version,
+            Some(24),
+            "fake node binary should report major version 24"
+        );
     }
 
     /// Confirms read_node_major_version returns None for a binary that fails to run.
     #[tokio::test]
     async fn read_node_major_version_returns_none_for_nonexistent_bin() {
         let version = read_node_major_version(std::path::Path::new("/nonexistent/node")).await;
-        assert_eq!(
-            version, None,
-            "nonexistent binary should return None"
-        );
+        assert_eq!(version, None, "nonexistent binary should return None");
     }
 
     /// Confirms read_node_major_version returns None when output is unparseable.
@@ -411,10 +406,7 @@ mod tests {
         std::fs::set_permissions(&bin, perms).unwrap();
 
         let version = read_node_major_version(&bin).await;
-        assert_eq!(
-            version, None,
-            "garbage version output should return None"
-        );
+        assert_eq!(version, None, "garbage version output should return None");
     }
 
     /// Confirms read_node_major_version parses the standard `vMAJOR.MINOR.PATCH` format.
@@ -443,9 +435,6 @@ mod tests {
             ["darwin", "linux", "win"].contains(&os),
             "unexpected os: {os}"
         );
-        assert!(
-            ["arm64", "x64"].contains(&arch),
-            "unexpected arch: {arch}"
-        );
+        assert!(["arm64", "x64"].contains(&arch), "unexpected arch: {arch}");
     }
 }

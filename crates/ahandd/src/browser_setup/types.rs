@@ -34,6 +34,7 @@ pub enum CheckStatus {
 /// Where a detected component comes from.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Preinstalled will be used for Windows Edge detection (M4)
 pub enum CheckSource {
     /// Installed by ahandd under ~/.ahand/...
     Managed,

@@ -46,6 +46,7 @@ pub struct FilePolicyChecker {
     max_write_bytes: u64,
 }
 
+#[allow(dead_code)] // is_enabled() is a public accessor used by future policy auditing
 impl FilePolicyChecker {
     pub fn new(config: &FilePolicyConfig) -> Self {
         Self {

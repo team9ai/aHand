@@ -137,6 +137,7 @@ pub fn safe_open_parent_dirfd_for(canonical: &Path) -> Result<DirHandle, FileErr
 /// but for the directory itself rather than its parent — used by
 /// recursive ops (e.g. `mkdir -p`'s last step, recursive walks) that
 /// need a dirfd to the leaf after it has been created.
+#[allow(dead_code)] // used by recursive walk ops planned for future file manager ops
 pub fn safe_open_dir(canonical: &Path) -> Result<OwnedFd, FileError> {
     open_dir_no_symlinks(canonical).map_err(|e| io_to_safe_open_error(e, canonical))
 }
@@ -378,6 +379,7 @@ pub fn safe_mkdirp(canonical: &Path, mode: u32) -> io::Result<()> {
 /// distinguish "path exists as a dir → no-op success" from "path exists
 /// as a non-dir → AlreadyExists error" without re-walking the parent
 /// chain through path-based syscalls.
+#[allow(dead_code)] // used by directory-exists checks in planned rename/mkdir handlers
 pub fn fstatat_nofollow(parent: &OwnedFd, name: &OsStr) -> io::Result<Option<libc::stat>> {
     let cstr = name_cstr(name)?;
     // SAFETY: zero-init is valid for libc::stat (POD); kernel populates on success.
@@ -404,11 +406,13 @@ pub fn fstatat_nofollow(parent: &OwnedFd, name: &OsStr) -> io::Result<Option<lib
 
 /// Convenience: classify what an [`fstatat_nofollow`] result represents,
 /// for handlers that only need the file-type bit.
+#[allow(dead_code)] // companion to fstatat_nofollow; used together in planned handlers
 pub fn stat_is_dir(st: &libc::stat) -> bool {
     (st.st_mode & libc::S_IFMT) == libc::S_IFDIR
 }
 
 /// Same as [`stat_is_dir`] but for symlinks.
+#[allow(dead_code)] // companion to fstatat_nofollow; used together in planned handlers
 pub fn stat_is_symlink(st: &libc::stat) -> bool {
     (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
 }

@@ -909,7 +909,7 @@ async fn read_text_respects_max_bytes() {
     let result = expect_read_text(resp);
     assert_eq!(result.stop_reason, StopReason::MaxBytes as i32);
     assert!(result.lines.len() <= 3); // at most 2-3 lines
-    assert!(result.lines.len() >= 1);
+    assert!(!result.lines.is_empty());
 }
 
 #[tokio::test]
@@ -1797,7 +1797,7 @@ async fn write_exceeds_max_bytes_returns_too_large() {
     let file = tmp_root.join("too_big.bin");
 
     let resp = mgr
-        .handle(&write_request_full(&file, &vec![0u8; 100], false))
+        .handle(&write_request_full(&file, &[0u8; 100], false))
         .await;
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::TooLarge as i32);

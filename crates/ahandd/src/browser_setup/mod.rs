@@ -13,9 +13,7 @@ pub mod node;
 pub mod playwright;
 pub mod types;
 
-pub use browser_detect::{
-    detect as detect_browser, detect_all as detect_all_browsers, tried_browsers,
-};
+pub use browser_detect::{detect as detect_browser, tried_browsers};
 pub use types::*;
 
 /// Classify an `anyhow::Error` produced by an install step into a
@@ -82,6 +80,7 @@ pub async fn inspect_all() -> Vec<CheckReport> {
 }
 
 /// Inspect a single component by name.
+#[allow(dead_code)] // future CLI diagnostics sub-command
 pub async fn inspect(name: &str) -> Option<CheckReport> {
     match name {
         "node" => Some(node::inspect().await),

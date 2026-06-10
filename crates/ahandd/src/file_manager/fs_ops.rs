@@ -556,7 +556,7 @@ pub fn guess_trash_path(original: &Path) -> Option<String> {
         let mut p = PathBuf::from(home);
         p.push(".Trash");
         p.push(basename);
-        return Some(p.to_string_lossy().into_owned());
+        Some(p.to_string_lossy().into_owned())
     }
 
     #[cfg(all(
