@@ -55,7 +55,7 @@
     {
       "id": 7,
       "subject": "Task 7: platform::ipc module (transport only, loopback tests)",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         1
       ],
