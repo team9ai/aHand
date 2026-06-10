@@ -73,7 +73,7 @@
     {
       "id": 9,
       "subject": "Task 9: Updater + remaining /tmp fallbacks + save_atomic",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         2
       ],
