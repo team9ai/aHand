@@ -1,3 +1,4 @@
+use ahand_platform::process;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::convert::Infallible;
@@ -451,7 +452,7 @@ async fn get_status(config_path: &Path) -> Result<StatusResponse> {
     let (daemon_running, daemon_pid) = if pid_file.exists() {
         let pid_str = tokio::fs::read_to_string(&pid_file).await?;
         let pid: u32 = pid_str.trim().parse().unwrap_or(0);
-        (is_process_running(pid), Some(pid))
+        (process::is_process_running(pid), Some(pid))
     } else {
         (false, None)
     };
@@ -724,35 +725,4 @@ fn calculate_dir_size(
 
         Ok(total)
     })
-}
-
-#[cfg(target_os = "linux")]
-fn is_process_running(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{}", pid)).exists()
-}
-
-#[cfg(windows)]
-fn is_process_running(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-        .output()
-        .map(|output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Check if the PID appears as a word in the output (locale-independent)
-            output.status.success()
-                && stdout
-                    .split_whitespace()
-                    .any(|w| w == pid.to_string().as_str())
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn is_process_running(pid: u32) -> bool {
-    use std::process::Command;
-    Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
 }
