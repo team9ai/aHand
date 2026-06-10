@@ -142,6 +142,17 @@ fn sentinels_always_inject_platform_login_args() {
     // commands silently lose their PATH (no brew/nvm/pyenv shims on Unix)
     // — exactly the failure mode that today's debugging chased down.
     let expected_login_args = default_shell().login_args;
+
+    // Anchor: on Unix the platform contract is exactly `-l`; this literal
+    // check makes the test self-sufficient even if default_shell() ever
+    // regresses to an empty slice.
+    #[cfg(unix)]
+    assert_eq!(
+        expected_login_args,
+        vec!["-l".to_string()],
+        "Unix sentinel must inject -l"
+    );
+
     for sentinel in ["$SHELL", "shell"] {
         for shell_env in [Some("/bin/zsh"), Some("/bin/bash"), None] {
             let r = resolve_tool(sentinel, shell_env);
@@ -162,7 +173,7 @@ fn non_sentinel_tools_never_inject_leading_args() {
     // arbitrary tools, the SDK's understanding of how `JobRequest.args`
     // ends up on argv silently diverges from reality.
     let pass_through = [
-        "/bin/sh",
+        "/bin/sh", // literal path — asserts resolution shape, not runnability on Windows
         "/bin/bash",
         "/usr/bin/whoami",
         "git",
