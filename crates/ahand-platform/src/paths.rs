@@ -16,8 +16,10 @@ pub fn exe_name(base: &str) -> String {
     }
 }
 
-/// Strip Windows verbatim prefixes (`\\?\`, `\\?\UNC\`) so the result is
-/// comparable with user-written config patterns. Identity on Unix.
+/// Strip the Windows verbatim disk prefix (`\\?\C:\...`) so the result is
+/// comparable with user-written config patterns. Verbatim UNC paths
+/// (`\\?\UNC\...`) are intentionally left unchanged (dunce semantics, legacy
+/// consumers can't take bare UNC). Identity on Unix.
 pub fn simplify(path: &Path) -> PathBuf {
     dunce::simplified(path).to_path_buf()
 }
@@ -57,6 +59,16 @@ mod tests {
             let p = std::path::Path::new(r"\\?\C:\Users\x");
             assert_eq!(simplify(p), std::path::PathBuf::from(r"C:\Users\x"));
         }
+    }
+
+    #[test]
+    fn simplify_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let canon = std::fs::canonicalize(tmp.path()).unwrap();
+        let once = simplify(&canon);
+        assert_eq!(simplify(&once), once);
+        // An already-simplified path round-trips unchanged.
+        assert_eq!(simplify(&once), once);
     }
 
     #[test]
