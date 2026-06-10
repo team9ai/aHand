@@ -7,5 +7,6 @@
 
 pub mod paths;
 pub mod process;
+pub mod secure_file;
 pub mod shell;
 pub mod signals;

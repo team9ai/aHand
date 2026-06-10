@@ -69,25 +69,11 @@ pub fn load_pairing_state(path: &PathBuf) -> Result<Option<PairingState>> {
 
 /// Save pairing state to file
 pub fn save_pairing_state(path: &PathBuf, state: &PairingState) -> Result<()> {
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-
     let content =
         serde_json::to_string_pretty(state).context("failed to serialize pairing state")?;
 
-    std::fs::write(path, format!("{}\n", content))
+    ahand_platform::secure_file::write_secure_file(path, format!("{}\n", content).as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
-
-    // Set file permissions to 0600 (user read/write only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
-    }
 
     Ok(())
 }

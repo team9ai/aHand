@@ -108,12 +108,6 @@ impl DeviceIdentity {
 
     /// Save to file
     fn save(&self, path: &PathBuf) -> Result<()> {
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
-        }
-
         let stored = StoredIdentity {
             version: 1,
             device_id: self.device_id.clone(),
@@ -127,16 +121,8 @@ impl DeviceIdentity {
         let content =
             serde_json::to_string_pretty(&stored).context("failed to serialize identity")?;
 
-        std::fs::write(path, format!("{}\n", content))
+        ahand_platform::secure_file::write_secure_file(path, format!("{}\n", content).as_bytes())
             .with_context(|| format!("failed to write {}", path.display()))?;
-
-        // Set file permissions to 0600 (user read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            let _ = std::fs::set_permissions(path, perms);
-        }
 
         Ok(())
     }
