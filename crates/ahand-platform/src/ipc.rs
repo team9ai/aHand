@@ -119,6 +119,10 @@ impl IpcListener {
                 .with_context(|| format!("bind {}", path.display()))?;
             // Apply requested file mode.
             use std::os::unix::fs::PermissionsExt;
+            // The bind→chmod window (socket briefly at umask-default perms) is
+            // intentional parity with the previous ahandd behavior; the socket
+            // lives under the user's home directory, so the exposure window is
+            // acceptable.
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
                 .with_context(|| format!("chmod {:04o} {}", mode, path.display()))?;
             Ok(Self { inner })
@@ -130,7 +134,7 @@ impl IpcListener {
             let first = ServerOptions::new()
                 .first_pipe_instance(true)
                 .create(&name)
-                .with_context(|| format!("create named pipe {name}"))?;
+                .with_context(|| format!("create named pipe {name} (already exists? another daemon or a squatter may hold the name)"))?;
             Ok(Self {
                 next: Some(first),
                 name,
@@ -225,12 +229,22 @@ pub async fn ipc_connect(endpoint: &IpcEndpoint) -> Result<IpcClientStream> {
     {
         use tokio::net::windows::named_pipe::ClientOptions;
         // ERROR_PIPE_BUSY: all pipe instances are busy; retry after a short sleep.
+        // A missing daemon still fails fast via the catch-all arm below.
         const ERROR_PIPE_BUSY: i32 = 231;
+        const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
         let name = endpoint.as_path().to_string_lossy().into_owned();
+        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
         loop {
             match ClientOptions::new().open(&name) {
                 Ok(client) => return Ok(client),
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "IPC pipe busy: all instances of {name} still in use after {CONNECT_TIMEOUT:?}"
+                            )
+                        });
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
                 Err(e) => return Err(e).with_context(|| format!("connect {name}")),
