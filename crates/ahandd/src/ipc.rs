@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ahand_platform::ipc::{IpcEndpoint, IpcListener};
 use ahand_protocol::{BrowserResponse, Envelope, JobFinished, JobRejected, SessionMode, envelope};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
@@ -15,10 +14,10 @@ use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::RunStore;
 
-/// Start the IPC server on the given Unix socket path.
+/// Start the IPC server on the given endpoint.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_ipc(
-    socket_path: PathBuf,
+    endpoint: IpcEndpoint,
     socket_mode: u32,
     registry: Arc<JobRegistry>,
     store: Option<Arc<RunStore>>,
@@ -28,33 +27,12 @@ pub async fn serve_ipc(
     device_id: String,
     browser_mgr: Arc<BrowserManager>,
 ) -> anyhow::Result<()> {
-    // Remove stale socket file if it exists.
-    let _ = std::fs::remove_file(&socket_path);
-
-    // Ensure parent directory exists.
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let listener = UnixListener::bind(&socket_path)?;
-
-    // Set socket permissions.
-    set_permissions(&socket_path, socket_mode)?;
-
-    info!(path = %socket_path.display(), mode = format!("{:04o}", socket_mode), "IPC server listening");
+    let mut listener = IpcListener::bind(&endpoint, socket_mode)?;
+    info!(endpoint = %endpoint.as_path().display(), "IPC server listening");
 
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
-                // Get peer credentials before splitting the stream.
-                let caller_uid = match stream.peer_cred() {
-                    Ok(cred) => format!("uid:{}", cred.uid()),
-                    Err(e) => {
-                        warn!(error = %e, "IPC: failed to get peer credentials");
-                        "uid:unknown".to_string()
-                    }
-                };
-
+            Ok((stream, caller_id)) => {
                 let reg = Arc::clone(&registry);
                 let st = store.clone();
                 let smgr = Arc::clone(&session_mgr);
@@ -64,7 +42,7 @@ pub async fn serve_ipc(
                 let bmgr = Arc::clone(&browser_mgr);
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_ipc_conn(stream, reg, st, smgr, amgr, bcast, did, caller_uid, bmgr)
+                        handle_ipc_conn(stream, reg, st, smgr, amgr, bcast, did, caller_id, bmgr)
                             .await
                     {
                         warn!(error = %e, "IPC connection error");
@@ -79,8 +57,8 @@ pub async fn serve_ipc(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_ipc_conn(
-    stream: UnixStream,
+async fn handle_ipc_conn<S>(
+    stream: S,
     registry: Arc<JobRegistry>,
     store: Option<Arc<RunStore>>,
     session_mgr: Arc<SessionManager>,
@@ -89,8 +67,11 @@ async fn handle_ipc_conn(
     device_id: String,
     caller_uid: String,
     browser_mgr: Arc<BrowserManager>,
-) -> anyhow::Result<()> {
-    let (reader, writer) = stream.into_split();
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (reader, writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(reader);
 
     info!(caller_uid = %caller_uid, "IPC: new connection");
@@ -474,12 +455,6 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> s
     writer.write_all(data).await?;
     writer.flush().await?;
     Ok(())
-}
-
-fn set_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, perms)
 }
 
 fn now_ms() -> u64 {

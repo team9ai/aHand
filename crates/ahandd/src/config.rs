@@ -438,14 +438,12 @@ impl Config {
         self.device_id.clone().unwrap_or_else(uuid_v4)
     }
 
-    /// Resolve the IPC socket path. Default: ~/.ahand/ahandd.sock.
-    pub fn ipc_socket_path(&self) -> PathBuf {
+    /// Resolve the IPC endpoint. Default: per-user platform endpoint
+    /// (`~/.ahand/ahandd.sock` on Unix, `\\.\pipe\ahandd-<user>` on Windows).
+    pub fn ipc_socket_path(&self) -> ahand_platform::ipc::IpcEndpoint {
         match &self.ipc_socket_path {
-            Some(p) => PathBuf::from(p),
-            None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".ahand")
-                .join("ahandd.sock"),
+            Some(p) => ahand_platform::ipc::IpcEndpoint::from_path(PathBuf::from(p)),
+            None => ahand_platform::ipc::IpcEndpoint::default_for_user(),
         }
     }
 
