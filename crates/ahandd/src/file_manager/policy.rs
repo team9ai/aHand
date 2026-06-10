@@ -303,9 +303,11 @@ mod tests {
         }
     }
 
-    /// Canonicalize `tmp.path()` to its real path (macOS /var symlink handling).
+    /// Canonicalize `tmp.path()` to its real path (macOS /var symlink handling)
+    /// and strip the Windows verbatim prefix (`\\?\`) so the path can be used
+    /// directly as a config pattern and compared with check_path results.
     fn canon_root(tmp: &TempDir) -> PathBuf {
-        tmp.path().canonicalize().unwrap()
+        ahand_platform::paths::canonicalize_simplified(tmp.path()).unwrap()
     }
 
     #[test]

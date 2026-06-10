@@ -485,9 +485,12 @@ mod tilde_tests {
     #[test]
     fn expand_tilde_for_home_rooted_patterns() {
         let home = dirs::home_dir().expect("home dir required for this test");
+        // Use Path::join to produce the platform-native separator (backslash on
+        // Windows, forward slash on Unix) so the assertion matches what
+        // expand_tilde_with returns via `home.join(rest).to_string_lossy()`.
         assert_eq!(
             expand_tilde("~/.ssh/**").unwrap(),
-            format!("{}/.ssh/**", home.display())
+            home.join(".ssh/**").to_string_lossy().to_string()
         );
         assert_eq!(
             expand_tilde("~").unwrap(),
@@ -594,10 +597,20 @@ dangerous_paths = ["~/.ssh/**"]
         let path = write_config(&dir, body);
         let cfg = Config::load(&path).expect("config should load");
         let fp = cfg.file_policy.expect("file_policy should be present");
-        let home_str = home.to_string_lossy();
-        assert_eq!(fp.path_allowlist, vec![format!("{home_str}/projects/**")]);
-        assert_eq!(fp.path_denylist, vec![format!("{home_str}/private/**")]);
-        assert_eq!(fp.dangerous_paths, vec![format!("{home_str}/.ssh/**")]);
+        // Use Path::join to produce the expected pattern with the native
+        // path separator so the assertion is correct on all platforms.
+        assert_eq!(
+            fp.path_allowlist,
+            vec![home.join("projects/**").to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            fp.path_denylist,
+            vec![home.join("private/**").to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            fp.dangerous_paths,
+            vec![home.join(".ssh/**").to_string_lossy().into_owned()]
+        );
     }
 
     #[test]
@@ -677,8 +690,12 @@ path_allowlist = ["/etc/passwd", "/var/log/**"]
         let path = dir.path().join("definitely_does_not_exist.toml");
         let err = Config::load(&path).unwrap_err();
         let msg = err.to_string();
+        // Accept both Unix ("No such file") and Windows ("cannot find the file")
+        // phrasing for OS-level "file not found" errors.
         assert!(
-            msg.to_lowercase().contains("no such file") || msg.to_lowercase().contains("not found"),
+            msg.to_lowercase().contains("no such file")
+                || msg.to_lowercase().contains("not found")
+                || msg.to_lowercase().contains("cannot find"),
             "expected NotFound IO error, got: {msg}"
         );
     }
