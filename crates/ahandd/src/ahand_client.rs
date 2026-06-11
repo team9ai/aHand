@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tokio::sync::watch;
 
@@ -65,14 +65,15 @@ struct QueuedEnvelope {
 /// fires — that's how we detect zombie TCP connections that survived
 /// macOS sleep/wake or NAT timeout without any visible socket error.
 ///
-/// `DirectEnvelope` bypasses the outbox entirely — used for idempotent
-/// push messages (e.g. `AppToolsUpdate` snapshots) that must NOT be
-/// buffered for replay because on reconnect a fresh snapshot is always
-/// generated from the live registry.
+/// `DirectEnvelope` bypasses outbox SEQUENCING/replay (the snapshot is
+/// idempotent and re-generated fresh at the start of every new connection),
+/// but is still trace-logged to RunStore so the operator can observe it.
+/// Encoding happens inside the send task so the unencoded `Envelope` is
+/// available for store logging.
 enum OutboundFrame {
     Envelope(QueuedEnvelope),
     WsPing(Vec<u8>),
-    DirectEnvelope(Vec<u8>),
+    DirectEnvelope(Envelope),
 }
 
 impl BufferedEnvelopeSender {
@@ -86,14 +87,19 @@ impl BufferedEnvelopeSender {
         self.tx.send(OutboundFrame::WsPing(payload)).map_err(|_| ())
     }
 
-    /// Send an already-encoded envelope frame WITHOUT going through the
-    /// outbox.  Used for idempotent push messages (e.g. `AppToolsUpdate`
+    /// Send an envelope WITHOUT going through the outbox sequencing/replay
+    /// pipeline. Used for idempotent push messages (e.g. `AppToolsUpdate`
     /// snapshots) that must not be replayed on reconnect because a fresh
-    /// snapshot is generated at the start of every new connection.
+    /// snapshot is generated at the start of every new connection. The
+    /// envelope is still trace-logged to RunStore; encoding happens in the
+    /// send task.
+    ///
+    /// do NOT use for traffic requiring at-least-once delivery — anything
+    /// that must survive reconnect goes through send(); direct frames carry
+    /// seq=0 and sit outside the ack/dedup window.
     fn send_direct(&self, envelope: Envelope) -> Result<(), ()> {
-        let data = envelope.encode_to_vec();
         self.tx
-            .send(OutboundFrame::DirectEnvelope(data))
+            .send(OutboundFrame::DirectEnvelope(envelope))
             .map_err(|_| ())
     }
 }
@@ -440,6 +446,11 @@ async fn connect_with_auth(
         // NOT added to the outbox — snapshots are idempotent and must not be
         // replayed on reconnect (a fresh snapshot is generated each time).
         let initial_snap = app_tools.snapshot().await;
+        debug!(
+            revision = initial_snap.revision,
+            tool_count = initial_snap.tools.len(),
+            "advertising app tools snapshot"
+        );
         let _ = tx.send_direct(app_tools_snapshot_envelope(device_id, initial_snap));
 
         // Spawn a connection-scoped watcher that re-sends the snapshot on
@@ -452,13 +463,21 @@ async fn connect_with_auth(
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = watcher_close_rx.changed() => break,
+                    _ = watcher_close_rx.changed() => {
+                        debug!("app-tools watcher exiting");
+                        break;
+                    }
                     changed = revision_rx.changed() => {
-                        if changed.is_err() { break; }
+                        if changed.is_err() {
+                            debug!("app-tools watcher exiting");
+                            break;
+                        }
                         let snap = watcher_app_tools.snapshot().await;
+                        debug!(revision = snap.revision, tool_count = snap.tools.len(), "advertising app tools snapshot");
                         // send_direct: snapshots are idempotent, must not be
                         // added to the outbox for replay on reconnect.
                         if watcher_tx.send_direct(app_tools_snapshot_envelope(&watcher_device_id, snap)).is_err() {
+                            debug!("app-tools watcher exiting");
                             break;
                         }
                     }
@@ -480,9 +499,14 @@ async fn connect_with_auth(
                     tungstenite::Message::Binary(queued.frame)
                 }
                 OutboundFrame::WsPing(payload) => tungstenite::Message::Ping(payload),
-                // Direct frames (e.g. AppToolsUpdate snapshots) are sent as-is,
-                // without outbox stamping or store logging — they are idempotent.
-                OutboundFrame::DirectEnvelope(data) => tungstenite::Message::Binary(data),
+                // Direct envelopes (e.g. AppToolsUpdate snapshots) bypass
+                // outbox sequencing/replay but are still trace-logged.
+                OutboundFrame::DirectEnvelope(envelope) => {
+                    if let Some(s) = &store_send {
+                        s.log_envelope(&envelope, Direction::Outbound).await;
+                    }
+                    tungstenite::Message::Binary(envelope.encode_to_vec())
+                }
             };
             if sink.send(msg).await.is_err() {
                 break;
@@ -710,7 +734,7 @@ async fn connect_with_auth(
         }
     }
 
-    // Teardown order matters here. Three independent things still hold
+    // Teardown order matters here. Four independent things still hold
     // sender clones and could wedge `send_handle.await`:
     //
     // 1. Detached file-approval tasks spawned by handle_file_request hold
@@ -725,6 +749,11 @@ async fn connect_with_auth(
     //    `rx.recv()` indefinitely until the WS broke naturally. Aborting
     //    the task drops its clone.
     // 3. Same logic for `ws_ping_task`.
+    // 4. The app-tools watcher task holds `watcher_tx` (a clone of `tx`)
+    //    and exits via `watcher_close_rx.changed()`. Dropping `_close_guard`
+    //    fires `close_tx`, which wakes the watcher so it releases its clone
+    //    before `send_handle.await` is reached. The guard drop MUST precede
+    //    `send_handle.await` for this reason.
     drop(_close_guard);
     heartbeat_task.abort();
     let _ = heartbeat_task.await;

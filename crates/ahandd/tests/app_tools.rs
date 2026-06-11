@@ -8,7 +8,7 @@
 //!   * Unregistering removes the tool and increments the revision.
 //!   * Tools registered before the connection is established arrive in the
 //!     initial snapshot (or at least with strictly increasing revisions —
-//!     see note in `pre_connect_registration_arrives_in_initial_snapshot`).
+//!     see note in `registration_racing_connect_yields_monotonic_revisions`).
 //!   * Reconnect after a hub-initiated close re-sends the snapshot.
 
 use std::sync::Arc;
@@ -72,17 +72,10 @@ async fn snapshot_sent_after_hello_and_on_register() {
     wait_online(&handle).await;
 
     // The initial snapshot (revision 0, no tools) should arrive quickly.
-    let updates = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let u = mock.captured_app_tools_updates();
-            if !u.is_empty() {
-                return u;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("initial AppToolsUpdate not received within 5s");
+    let updates = mock
+        .wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial AppToolsUpdate not received within 5s");
 
     let initial = &updates[0];
     assert_eq!(initial.revision, 0, "initial revision must be 0");
@@ -98,17 +91,10 @@ async fn snapshot_sent_after_hello_and_on_register() {
         .expect("register_app_tool should succeed");
 
     // A second snapshot with revision=1 and the new tool should arrive.
-    let updates = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let u = mock.captured_app_tools_updates();
-            if u.len() >= 2 {
-                return u;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("second AppToolsUpdate (after register) not received within 5s");
+    let updates = mock
+        .wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("second AppToolsUpdate (after register) not received within 5s");
 
     let after_register = &updates[1];
     assert_eq!(
@@ -146,16 +132,9 @@ async fn unregister_pushes_snapshot_without_tool() {
     wait_online(&handle).await;
 
     // Wait for initial snapshot.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if !mock.captured_app_tools_updates().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("initial snapshot not received within 5s");
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial snapshot not received within 5s");
 
     // Register.
     handle
@@ -164,17 +143,9 @@ async fn unregister_pushes_snapshot_without_tool() {
         .expect("register ok");
 
     // Wait for revision=1 snapshot.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let u = mock.captured_app_tools_updates();
-            if u.len() >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("snapshot after register not received within 5s");
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("snapshot after register not received within 5s");
 
     // Unregister.
     let existed = handle.unregister_app_tool("demo_echo").await;
@@ -184,17 +155,10 @@ async fn unregister_pushes_snapshot_without_tool() {
     );
 
     // Wait for revision=2 snapshot (empty tools).
-    let updates = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let u = mock.captured_app_tools_updates();
-            if u.len() >= 3 {
-                return u;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("snapshot after unregister not received within 5s");
+    let updates = mock
+        .wait_for_app_tools_updates(3, Duration::from_secs(5))
+        .await
+        .expect("snapshot after unregister not received within 5s");
 
     let final_snap = &updates[2];
     assert_eq!(
@@ -209,7 +173,9 @@ async fn unregister_pushes_snapshot_without_tool() {
     handle.shutdown().await.expect("shutdown clean");
 }
 
-/// Test that revisions are strictly increasing across all received snapshots.
+/// Registering immediately after `spawn` may race the first connection attempt.
+/// Regardless of timing, all received revisions must be strictly increasing and
+/// the last snapshot must contain `demo_echo`.
 ///
 /// Note: Because `DaemonHandle` is only available after `spawn()` returns,
 /// strictly-before-connect registration is not constructible via the public
@@ -222,7 +188,7 @@ async fn unregister_pushes_snapshot_without_tool() {
 /// snapshot will have revision=1 (not 0). If registered after, revisions will
 /// be 0, then 1. Either way, revisions must be strictly increasing.
 #[tokio::test]
-async fn pre_connect_registration_arrives_in_initial_snapshot() {
+async fn registration_racing_connect_yields_monotonic_revisions() {
     let mock = mock_hub::start_accepting().await;
     let tmp = TempDir::new().unwrap();
     let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
@@ -239,25 +205,31 @@ async fn pre_connect_registration_arrives_in_initial_snapshot() {
 
     wait_online(&handle).await;
 
-    // Wait until we receive at least one snapshot. For the pre-connect case
-    // the first snapshot should already contain the tool.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // Poll until a snapshot containing demo_echo appears.
+    let found_snap = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let u = mock.captured_app_tools_updates();
-            if !u.is_empty() {
-                return;
+            let updates = mock.captured_app_tools_updates();
+            if let Some(snap) = updates
+                .iter()
+                .find(|u| u.tools.iter().any(|t| t.name == "demo_echo"))
+            {
+                return snap.clone();
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("at least one AppToolsUpdate not received within 5s");
+    .expect("snapshot containing demo_echo not received within 5s");
 
-    // Wait briefly for any additional snapshots.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        found_snap.tools.len(),
+        1,
+        "snapshot must contain the registered tool"
+    );
+    assert_eq!(found_snap.tools[0].name, "demo_echo");
+
+    // Revisions across all received snapshots must be strictly increasing.
     let updates = mock.captured_app_tools_updates();
-
-    // Revisions must be strictly increasing.
     for window in updates.windows(2) {
         assert!(
             window[1].revision > window[0].revision,
@@ -266,15 +238,6 @@ async fn pre_connect_registration_arrives_in_initial_snapshot() {
             window[1].revision
         );
     }
-
-    // The last snapshot must contain the demo_echo tool.
-    let last = updates.last().expect("at least one snapshot must exist");
-    assert_eq!(
-        last.tools.len(),
-        1,
-        "last snapshot must contain the registered tool"
-    );
-    assert_eq!(last.tools[0].name, "demo_echo");
 
     handle.shutdown().await.expect("shutdown clean");
 }
@@ -299,17 +262,10 @@ async fn snapshot_resent_after_reconnect() {
     // Wait for the initial snapshot to be received AND for the mock to drop
     // the connection (the mock drops after 1 snapshot). We can detect the
     // drop by waiting for the daemon to transition back to Connecting.
-    let updates_after_first_conn = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let u = mock.captured_app_tools_updates();
-            if !u.is_empty() {
-                return u;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("initial snapshot not received within 5s");
+    let updates_after_first_conn = mock
+        .wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial snapshot not received within 5s");
     assert_eq!(
         updates_after_first_conn[0].revision, 0,
         "first snapshot should be rev=0"

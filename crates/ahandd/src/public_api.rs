@@ -273,6 +273,16 @@ impl DaemonHandle {
     /// Register an app-defined tool. The daemon will advertise an updated
     /// snapshot to the hub immediately (if connected) and after every
     /// subsequent reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `def.name` does not match `^[a-z0-9_-]{1,64}$`
+    /// - `def.input_schema` is not a JSON object
+    /// - a tool with the same name is already registered
+    ///
+    /// A failed registration does not change the advertised catalog; the hub
+    /// sees no new snapshot and the revision is not incremented.
     pub async fn register_app_tool(
         &self,
         def: AppToolDef,
