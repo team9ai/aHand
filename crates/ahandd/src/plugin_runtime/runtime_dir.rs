@@ -86,15 +86,18 @@ impl RuntimeDirs {
     /// Return the program + leading args needed to invoke playwright-cli.
     ///
     /// On Unix the CLI is a native wrapper at `node/bin/playwright-cli`, so the
-    /// invocation is just `(node/bin/playwright-cli, [])`.
+    /// invocation is `(node/bin/playwright-cli, [])`.  Returns `Err` when that
+    /// binary does not exist on disk so callers can fall back to a bare PATH
+    /// lookup or surface `CheckStatus::Missing`.
     ///
     /// On Windows `npm install -g --prefix <node_dir>` creates shims at
     /// `<node_dir>\playwright-cli.cmd` but no native exe. The actual JS entry
-    /// lives at `<node_dir>\node_modules\@playwright\cli\<bin>`. We resolve it
-    /// by reading the package.json `"bin"` map at invocation time; if that fails
-    /// we fall back to the conventional path
-    /// `node_modules/@playwright/cli/cli.js`. If neither exists we return an
-    /// error so callers can surface `CheckStatus::Missing`.
+    /// lives at `<node_dir>\node_modules\@playwright\cli\<bin>` (single-bin
+    /// package by assumption — @playwright/cli). We resolve it by reading the
+    /// package.json `"bin"` map at invocation time; if that fails we fall back
+    /// to the conventional path `node_modules/@playwright/cli/cli.js`. If
+    /// neither exists we return an error so callers can surface
+    /// `CheckStatus::Missing`.
     pub fn playwright_cli_invocation(&self) -> anyhow::Result<(PathBuf, Vec<OsString>)> {
         let node_dir = self.node_dir();
         if cfg!(windows) {
@@ -104,7 +107,16 @@ impl RuntimeDirs {
             let entry = resolve_playwright_cli_entry(&node_dir)?;
             Ok((program, vec![entry.into()]))
         } else {
-            Ok((node_dir.join("bin").join("playwright-cli"), vec![]))
+            let bin = node_dir.join("bin").join("playwright-cli");
+            if bin.exists() {
+                Ok((bin, vec![]))
+            } else {
+                anyhow::bail!(
+                    "playwright-cli binary not found at {}; \
+                     run `ahandd browser-init --step playwright` to install it",
+                    bin.display()
+                )
+            }
         }
     }
 
@@ -153,9 +165,8 @@ fn resolve_playwright_cli_entry(node_dir: &std::path::Path) -> anyhow::Result<Pa
         });
 
         if let Some(rel) = entry_rel {
-            // BTreeMap iteration order is alphabetical by key, so for a
-            // single-bin package like @playwright/cli the first (and only)
-            // value is always the correct entry point.
+            // @playwright/cli is a single-bin package by assumption, so the
+            // first (and only) value in the "bin" map is the correct entry.
             // Normalise: strip leading "./" if present.
             let rel = rel.trim_start_matches("./");
             let candidate = pkg_dir.join(rel);

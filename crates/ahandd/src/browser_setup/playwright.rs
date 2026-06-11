@@ -273,13 +273,10 @@ pub async fn ensure(
         "Verifying playwright-cli".into(),
     );
 
-    // Post-install verification:
-    // - Windows: playwright_cli_invocation() confirms the entry JS exists.
-    // - Unix: the CLI is a native wrapper; additionally check it exists on disk.
+    // Post-install verification: playwright_cli_invocation() returns Ok only
+    // when the binary (unix) or entry JS (windows) actually exists on disk.
     let cli_invocation = dirs.playwright_cli_invocation();
-    let install_ok =
-        cli_invocation.is_ok() && (cfg!(windows) || dirs.playwright_cli_bin().exists());
-    if !install_ok {
+    if cli_invocation.is_err() {
         let cli = dirs.playwright_cli_bin();
         anyhow::bail!(
             "playwright-cli was installed but binary not found at {}",
