@@ -16,6 +16,10 @@ path = "$SHELL"
 prompt = "Provides local command execution, PTY sessions, stdin forwarding, terminal resize, cwd/env propagation, and stdout/stderr streaming."
 "#;
 
+// NOTE: The static `npm` path below (`dependencies/node/bin/npm`) is the Unix
+// layout.  On Windows there is no `npm` executable; `host_resource.rs` uses
+// `RuntimeDirs::npm_invocation()` at runtime, which overrides this entry with
+// the platform-correct invocation (`node.exe npm-cli.js`).
 const NODE: &str = r#"
 id = "node"
 version = "0.1.0"

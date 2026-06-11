@@ -153,6 +153,9 @@ fn resolve_playwright_cli_entry(node_dir: &std::path::Path) -> anyhow::Result<Pa
         });
 
         if let Some(rel) = entry_rel {
+            // BTreeMap iteration order is alphabetical by key, so for a
+            // single-bin package like @playwright/cli the first (and only)
+            // value is always the correct entry point.
             // Normalise: strip leading "./" if present.
             let rel = rel.trim_start_matches("./");
             let candidate = pkg_dir.join(rel);

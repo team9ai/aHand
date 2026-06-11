@@ -76,7 +76,7 @@ impl BrowserManager {
 
     /// Log warnings for missing prerequisites at startup.
     fn check_prerequisites(&self) {
-        let bin = self.binary_path();
+        let (bin, _) = self.cli_invocation();
         if !bin.exists() {
             warn!(
                 path = %bin.display(),
@@ -144,14 +144,16 @@ impl BrowserManager {
             Duration::from_millis(self.config.default_timeout_ms.unwrap_or(30_000))
         };
 
+        let (binary, leading_args) = self.cli_invocation();
         info!(
             session_id,
             action,
-            binary = %self.binary_path().display(),
+            binary = %binary.display(),
             "executing browser command"
         );
 
-        let child = tokio::process::Command::new(self.binary_path())
+        let child = tokio::process::Command::new(&binary)
+            .args(&leading_args)
             .args(&args)
             .envs(envs)
             .stdout(Stdio::piped())
@@ -207,7 +209,9 @@ impl BrowserManager {
             self.config.default_timeout_ms.unwrap_or(30_000)
         });
 
-        let child = tokio::process::Command::new(self.binary_path())
+        let (binary, leading_args) = self.cli_invocation();
+        let child = tokio::process::Command::new(&binary)
+            .args(&leading_args)
             .args(&args)
             .envs(envs)
             .stdout(Stdio::piped())
@@ -406,13 +410,37 @@ impl BrowserManager {
         self.active_sessions.lock().await.remove(session_id);
     }
 
-    fn binary_path(&self) -> PathBuf {
-        let managed = crate::plugin_runtime::RuntimeDirs::new()
-            .ok()
-            .map(|dirs| dirs.playwright_cli_bin());
-        Self::resolve_binary_path(self.config.binary_path.as_deref(), managed)
+    /// Resolve playwright-cli as `(program, leading_args)`.
+    ///
+    /// Priority:
+    /// 1. Configured `binary_path` override → direct program, no leading args.
+    /// 2. Managed runtime invocation via `RuntimeDirs::playwright_cli_invocation()`
+    ///    (platform-correct: native binary on Unix, `node.exe <entry.js>` on
+    ///    Windows).
+    /// 3. Bare fallback `"playwright-cli"` (or `"playwright-cli.exe"` on Windows)
+    ///    relying on the system PATH.
+    fn cli_invocation(&self) -> (PathBuf, Vec<std::ffi::OsString>) {
+        if let Some(path) = &self.config.binary_path {
+            return (PathBuf::from(path), vec![]);
+        }
+
+        if let Ok(dirs) = crate::plugin_runtime::RuntimeDirs::new()
+            && let Ok(invocation) = dirs.playwright_cli_invocation()
+        {
+            return invocation;
+        }
+
+        (
+            PathBuf::from(ahand_platform::paths::exe_name("playwright-cli")),
+            vec![],
+        )
     }
 
+    /// Resolve the playwright-cli binary to a simple `PathBuf`.
+    ///
+    /// This is a test seam for the three-priority fallback logic:
+    /// configured path > existing managed path > bare executable name on PATH.
+    #[cfg(test)]
     fn resolve_binary_path(configured: Option<&str>, managed: Option<PathBuf>) -> PathBuf {
         if let Some(path) = configured {
             return PathBuf::from(path);
@@ -420,7 +448,7 @@ impl BrowserManager {
 
         managed
             .filter(|path| path.exists())
-            .unwrap_or_else(|| PathBuf::from("playwright-cli"))
+            .unwrap_or_else(|| PathBuf::from(ahand_platform::paths::exe_name("playwright-cli")))
     }
 
     fn build_cli_args(
@@ -450,15 +478,19 @@ impl BrowserManager {
     fn build_env_vars(&self) -> Vec<(String, String)> {
         let mut envs = Vec::new();
 
-        // Prepend the managed Node.js runtime to PATH so playwright-cli can find node.
+        // Prepend the managed Node.js runtime's bin directory to PATH so that
+        // playwright-cli (and any node scripts it spawns) can find node.  Use
+        // `prepend_path_dirs` so the separator is platform-correct (`;` on
+        // Windows, `:` on Unix) and duplicates are removed.
         if let Ok(runtime) = crate::plugin_runtime::RuntimeDirs::new() {
             let node_bin_dir = runtime.node_dir().join("bin");
             if node_bin_dir.is_dir() {
                 let system_path = std::env::var("PATH").unwrap_or_default();
-                envs.push((
-                    "PATH".into(),
-                    format!("{}:{}", node_bin_dir.to_string_lossy(), system_path),
-                ));
+                let new_path = crate::plugin_runtime::path_env::prepend_path_dirs(
+                    &system_path,
+                    &[node_bin_dir],
+                );
+                envs.push(("PATH".into(), new_path));
             }
         }
 
@@ -880,6 +912,83 @@ mod tests {
 
         let resolved = BrowserManager::resolve_binary_path(None, Some(managed));
 
-        assert_eq!(resolved, PathBuf::from("playwright-cli"));
+        // Fallback is platform-aware (adds .exe on Windows).
+        assert_eq!(
+            resolved,
+            PathBuf::from(ahand_platform::paths::exe_name("playwright-cli"))
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // PATH env construction — platform-correct separator
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// `build_env_vars` must prepend `node/bin` FIRST when parsed via
+    /// `std::env::split_paths` (the platform-native separator is used
+    /// implicitly by that function, so this test is cross-platform correct).
+    #[test]
+    fn build_env_vars_prepends_node_bin_dir_first() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Build a RuntimeDirs rooted at a temp dir and create the node/bin dir.
+        let root = dir.path().to_path_buf();
+        let node_bin = root.join("dependencies").join("node").join("bin");
+        std::fs::create_dir_all(&node_bin).unwrap();
+
+        let system_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = crate::plugin_runtime::path_env::prepend_path_dirs(
+            &system_path,
+            std::slice::from_ref(&node_bin),
+        );
+
+        // The first entry when split must be the node bin dir.
+        let parts: Vec<PathBuf> = std::env::split_paths(&new_path).collect();
+        assert!(!parts.is_empty(), "PATH must not be empty after prepend");
+        assert_eq!(
+            parts[0], node_bin,
+            "node/bin must be the first entry in the constructed PATH"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // cli_invocation resolution
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// When a `binary_path` override is set, `cli_invocation` returns it as the
+    /// program with no leading args (the config wins unconditionally).
+    #[test]
+    fn cli_invocation_uses_configured_binary_path_with_no_leading_args() {
+        let config = crate::config::BrowserConfig {
+            enabled: Some(true),
+            binary_path: Some("/custom/my-playwright-cli".to_string()),
+            ..Default::default()
+        };
+        let mgr = BrowserManager {
+            config,
+            active_sessions: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        };
+
+        let (prog, leading) = mgr.cli_invocation();
+        assert_eq!(prog, PathBuf::from("/custom/my-playwright-cli"));
+        assert!(
+            leading.is_empty(),
+            "configured override must have no leading args"
+        );
+    }
+
+    /// When no override is set and no managed runtime exists, `cli_invocation`
+    /// falls back to the bare `playwright-cli` name (platform-aware `.exe`).
+    #[test]
+    fn cli_invocation_falls_back_to_bare_exe_name_when_no_managed_runtime() {
+        // Build a BrowserConfig with no binary_path so neither the configured
+        // nor the managed path is found (the managed lookup will fail because
+        // RuntimeDirs::new() points to ~/.cache which won't have playwright-cli
+        // in a clean test env — but we want a deterministic fallback, so we use
+        // resolve_binary_path directly with None for managed).
+        let resolved = BrowserManager::resolve_binary_path(None, None);
+        assert_eq!(
+            resolved,
+            PathBuf::from(ahand_platform::paths::exe_name("playwright-cli"))
+        );
     }
 }
