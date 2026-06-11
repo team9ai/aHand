@@ -1,3 +1,4 @@
+use ahand_platform::process;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::convert::Infallible;
@@ -153,19 +154,18 @@ fn with_auth(token: Arc<String>) -> impl Filter<Extract = (), Error = Rejection>
                 let token = token.clone();
                 async move {
                     // Check Authorization header
-                    if let Some(header) = auth_header {
-                        if let Some(bearer) = header.strip_prefix("Bearer ") {
-                            if bearer == token.as_str() {
-                                return Ok::<_, Rejection>(());
-                            }
-                        }
+                    if let Some(header) = auth_header
+                        && let Some(bearer) = header.strip_prefix("Bearer ")
+                        && bearer == token.as_str()
+                    {
+                        return Ok::<_, Rejection>(());
                     }
 
                     // Check query parameter
-                    if let Some(query_token) = query.get("token") {
-                        if query_token == token.as_str() {
-                            return Ok(());
-                        }
+                    if let Some(query_token) = query.get("token")
+                        && query_token == token.as_str()
+                    {
+                        return Ok(());
                     }
 
                     Err(reject::custom(Unauthorized))
@@ -470,7 +470,7 @@ async fn get_status(config_path: &Path) -> Result<StatusResponse> {
     let (daemon_running, daemon_pid) = if pid_file.exists() {
         let pid_str = tokio::fs::read_to_string(&pid_file).await?;
         let pid: u32 = pid_str.trim().parse().unwrap_or(0);
-        (is_process_running(pid), Some(pid))
+        (process::is_process_running(pid), Some(pid))
     } else {
         (false, None)
     };
@@ -589,7 +589,7 @@ async fn list_runs(limit: usize, offset: usize) -> Result<RunsResponse> {
     }
 
     // Sort by created_at descending
-    runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    runs.sort_by_key(|b| std::cmp::Reverse(b.created_at));
 
     let total = runs.len();
     let runs = runs.into_iter().skip(offset).take(limit).collect();
@@ -743,35 +743,4 @@ fn calculate_dir_size(
 
         Ok(total)
     })
-}
-
-#[cfg(target_os = "linux")]
-fn is_process_running(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{}", pid)).exists()
-}
-
-#[cfg(windows)]
-fn is_process_running(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-        .output()
-        .map(|output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Check if the PID appears as a word in the output (locale-independent)
-            output.status.success()
-                && stdout
-                    .split_whitespace()
-                    .any(|w| w == pid.to_string().as_str())
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn is_process_running(pid: u32) -> bool {
-    use std::process::Command;
-    Command::new("ps")
-        .args(&["-p", &pid.to_string()])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
 }

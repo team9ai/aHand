@@ -458,7 +458,10 @@ fn build_inner_config(cfg: &DaemonConfig, identity_path: &Path) -> Config {
 fn permissive_embedded_file_policy() -> FilePolicyConfig {
     FilePolicyConfig {
         enabled: true,
-        path_allowlist: vec!["/**".to_string()],
+        // "/**" matches Unix absolute paths; "**" matches Windows
+        // drive-letter paths (glob components carry no leading separator on
+        // Windows, so "/**" alone would deny everything there).
+        path_allowlist: vec!["/**".to_string(), "**".to_string()],
         ..FilePolicyConfig::default()
     }
 }
@@ -776,6 +779,43 @@ mod tests {
         assert_eq!(a.public_key_bytes(), b.public_key_bytes());
         // Cleanup
         let _ = std::fs::remove_file(dir.join(IDENTITY_FILE_NAME));
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn permissive_embedded_policy_admits_native_paths() {
+        // Regression pin for the Windows port: the permissive allowlist used
+        // to be only "/**", which never matches drive-letter paths
+        // (C:\...), so every embedded-library file op was PolicyDenied on
+        // Windows. This must pass on all three CI platforms.
+        use ahand_protocol::{FileRequest, FileStat, file_request, file_response};
+        let dir = std::env::temp_dir().join(format!(
+            "ahandd-public-api-permissive-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.txt");
+        std::fs::write(&probe, "ok").unwrap();
+
+        let mgr = crate::file_manager::FileManager::new(&permissive_embedded_file_policy());
+        let req = FileRequest {
+            request_id: "permissive".into(),
+            operation: Some(file_request::Operation::Stat(FileStat {
+                path: probe.to_string_lossy().into_owned(),
+                no_follow_symlink: false,
+            })),
+        };
+        let resp = mgr.handle(&req).await;
+        assert!(
+            matches!(resp.result, Some(file_response::Result::Stat(_))),
+            "permissive policy denied a native path: {:?}",
+            resp.result
+        );
+        // Cleanup
+        let _ = std::fs::remove_file(&probe);
         let _ = std::fs::remove_dir(&dir);
     }
 }

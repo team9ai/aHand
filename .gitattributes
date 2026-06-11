@@ -1,0 +1,6 @@
+* text=auto
+*.sh text eol=lf
+*.bats text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.proto text eol=lf

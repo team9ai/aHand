@@ -8,6 +8,7 @@ pub const NODE_MIN_VERSION: u32 = 20;
 pub const NODE_LTS_VERSION: &str = "24.13.0";
 
 pub struct Dirs {
+    #[allow(dead_code)] // base dir kept for future sub-path helpers
     pub ahand: PathBuf,
     pub node: PathBuf,
     runtime: crate::plugin_runtime::RuntimeDirs,
@@ -19,6 +20,8 @@ impl Dirs {
         Ok(Self::from_runtime(runtime))
     }
 
+    // Plugin-runtime API surface; consumed by later plugin stages/tests.
+    #[allow(dead_code)]
     pub fn from_runtime_root(root: PathBuf) -> Self {
         Self::from_runtime(crate::plugin_runtime::RuntimeDirs::from_root(root))
     }
@@ -119,20 +122,20 @@ pub async fn ensure(
     let dirs = Dirs::new()?;
     let local_node = dirs.local_node_bin();
 
-    if !force && local_node.exists() {
-        if let Some(ver) = read_node_major_version(&local_node).await {
-            if ver >= NODE_MIN_VERSION {
-                emit(
-                    progress,
-                    Phase::Done,
-                    format!(
-                        "Node.js v{ver}.x already installed at {}",
-                        dirs.node.display()
-                    ),
-                );
-                return Ok(inspect().await);
-            }
-        }
+    if !force
+        && local_node.exists()
+        && let Some(ver) = read_node_major_version(&local_node).await
+        && ver >= NODE_MIN_VERSION
+    {
+        emit(
+            progress,
+            Phase::Done,
+            format!(
+                "Node.js v{ver}.x already installed at {}",
+                dirs.node.display()
+            ),
+        );
+        return Ok(inspect().await);
     }
 
     // Remove the old installation (whether --force was set or version was too low)
@@ -315,9 +318,10 @@ mod tests {
             dirs.node,
             PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node")
         );
+        let node_bin = if cfg!(windows) { "node.exe" } else { "node" };
         assert_eq!(
             dirs.local_node_bin(),
-            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node/bin/node")
+            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node/bin").join(node_bin)
         );
     }
 

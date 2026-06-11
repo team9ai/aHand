@@ -22,6 +22,7 @@ pub enum StdinInput {
 pub type StdinSender = mpsc::UnboundedSender<StdinInput>;
 
 pub trait EnvelopeSink: Clone + Send + Sync + 'static {
+    #[allow(clippy::result_unit_err)] // () is sufficient; no error info needed across channel boundary
     fn send(&self, envelope: Envelope) -> Result<(), ()>;
 }
 
@@ -66,11 +67,12 @@ impl From<ResolvedTool> for ExecutionTarget {
 /// Resolve `tool` against the daemon's environment.
 ///
 /// Special tokens `"$SHELL"` and `"shell"` mean "the user's default login
-/// shell" — caller passes `std::env::var("SHELL").ok().as_deref()` for
-/// `shell_env`. Resolution falls back to `/bin/sh` when `$SHELL` is unset.
-/// Sentinel mode also prepends `-l` so the spawned shell sources the user's
-/// profile / rc files (gives spawned commands the same PATH the user sees
-/// in their terminal — brew, nvm, pyenv shims, etc.).
+/// shell" — caller passes `ahand_platform::shell::env_shell().as_deref()` for
+/// `shell_env`. Resolution falls back to the platform default shell when the
+/// environment variable is unset. Sentinel mode also prepends the platform
+/// login args (`-l` on Unix; none on Windows) so the spawned shell sources the
+/// user's profile / rc files (gives spawned commands the same PATH the user
+/// sees in their terminal — brew, nvm, pyenv shims, etc.).
 ///
 /// Any other `tool` value is treated as a literal executable path or
 /// PATH-resolvable binary name; no leading args.
@@ -79,9 +81,10 @@ impl From<ResolvedTool> for ExecutionTarget {
 /// surface validated by `tests/job_request_tool.rs`.
 pub fn resolve_tool(tool: &str, shell_env: Option<&str>) -> ResolvedTool {
     if tool == "$SHELL" || tool == "shell" {
+        let fallback = ahand_platform::shell::default_shell();
         ResolvedTool {
-            path: shell_env.unwrap_or("/bin/sh").to_string(),
-            leading_args: vec!["-l".to_string()],
+            path: shell_env.map(str::to_string).unwrap_or(fallback.path),
+            leading_args: fallback.login_args,
         }
     } else {
         ResolvedTool {
@@ -111,7 +114,7 @@ where
 {
     let target = ExecutionTarget::from(resolve_tool(
         &req.tool,
-        std::env::var("SHELL").ok().as_deref(),
+        ahand_platform::shell::env_shell().as_deref(),
     ));
     run_job_with_target(device_id, req, target, tx, cancel_rx, store).await
 }
@@ -333,7 +336,7 @@ where
     // `resolve_tool`, so the SDK's `$SHELL` / `shell` sentinels work the
     // same for `interactive=false` (run_job) and `interactive=true` (here).
     // Skipping this here would silently break interactive jobs with ENOENT.
-    let resolved = resolve_tool(&req.tool, std::env::var("SHELL").ok().as_deref());
+    let resolved = resolve_tool(&req.tool, ahand_platform::shell::env_shell().as_deref());
 
     let mut cmd = CommandBuilder::new(&resolved.path);
     for leading in &resolved.leading_args {
@@ -579,11 +582,15 @@ mod tool_resolution_tests {
     #[test]
     fn dollar_shell_sentinel_resolves_to_shell_env_with_login_flag() {
         let r = resolve_tool("$SHELL", Some("/bin/zsh"));
+        #[cfg(unix)]
+        let expected_leading_args = vec!["-l".to_string()];
+        #[cfg(windows)]
+        let expected_leading_args: Vec<String> = vec![];
         assert_eq!(
             r,
             ResolvedTool {
                 path: "/bin/zsh".to_string(),
-                leading_args: vec!["-l".to_string()],
+                leading_args: expected_leading_args,
             }
         );
     }
@@ -593,27 +600,31 @@ mod tool_resolution_tests {
         // The bare `"shell"` form (without `$`) is also accepted for
         // ergonomics; older callers may emit either.
         let r = resolve_tool("shell", Some("/bin/bash"));
+        #[cfg(unix)]
+        let expected_leading_args = vec!["-l".to_string()];
+        #[cfg(windows)]
+        let expected_leading_args: Vec<String> = vec![];
         assert_eq!(
             r,
             ResolvedTool {
                 path: "/bin/bash".to_string(),
-                leading_args: vec!["-l".to_string()],
+                leading_args: expected_leading_args,
             }
         );
     }
 
     #[test]
-    fn shell_sentinel_falls_back_to_bin_sh_when_shell_env_is_unset() {
+    fn shell_sentinel_falls_back_to_platform_shell_when_env_is_unset() {
         // Tauri/launchctl normally propagate $SHELL from the user's
         // session, but if for some reason it isn't set the daemon must
-        // still spawn _something_ — `/bin/sh` is POSIX-mandated, so
-        // it's the safe fallback rather than failing with ENOENT.
+        // still spawn _something_ using the platform default shell.
         let r = resolve_tool("$SHELL", None);
+        let fallback = ahand_platform::shell::default_shell();
         assert_eq!(
             r,
             ResolvedTool {
-                path: "/bin/sh".to_string(),
-                leading_args: vec!["-l".to_string()],
+                path: fallback.path,
+                leading_args: fallback.login_args,
             }
         );
     }
@@ -674,6 +685,9 @@ mod tool_resolution_tests {
         );
     }
 
+    // Uses a #!/bin/sh shebang script + Unix permission bits; Windows has no
+    // direct equivalent of an extensionless executable script.
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_job_with_target_uses_explicit_executable_path() {
         use std::os::unix::fs::PermissionsExt;
@@ -713,12 +727,104 @@ mod tool_resolution_tests {
 
         let mut saw_stdout = false;
         while let Ok(env) = rx.try_recv() {
-            if let Some(ahand_protocol::envelope::Payload::JobEvent(event)) = env.payload {
-                if let Some(ahand_protocol::job_event::Event::StdoutChunk(bytes)) = event.event {
-                    saw_stdout |= String::from_utf8_lossy(&bytes).contains("managed:ok");
-                }
+            if let Some(ahand_protocol::envelope::Payload::JobEvent(event)) = env.payload
+                && let Some(ahand_protocol::job_event::Event::StdoutChunk(bytes)) = event.event
+            {
+                saw_stdout |= String::from_utf8_lossy(&bytes).contains("managed:ok");
             }
         }
         assert!(saw_stdout, "managed runtime stdout should be streamed");
+    }
+
+    // ── timeout path (#20) ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_job_with_target_timeout_kills_process_and_returns_minus1_timeout() {
+        use tokio::sync::mpsc;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+
+        #[cfg(unix)]
+        let (cmd, args): (&str, Vec<String>) = ("sleep", vec!["5".into()]);
+        #[cfg(windows)]
+        let (cmd, args): (&str, Vec<String>) =
+            ("cmd.exe", vec!["/C".into(), "ping -n 6 127.0.0.1".into()]);
+
+        let req = JobRequest {
+            job_id: "timeout-job".to_string(),
+            tool: cmd.to_string(),
+            args: args.clone(),
+            timeout_ms: 100,
+            ..Default::default()
+        };
+
+        let (exit_code, error) = run_job_with_target(
+            "device-timeout".to_string(),
+            req,
+            ExecutionTarget {
+                path: cmd.to_string(),
+                leading_args: vec![],
+            },
+            tx,
+            cancel_rx,
+            None,
+        )
+        .await;
+
+        assert_eq!(exit_code, -1, "timed-out job must return exit code -1");
+        assert_eq!(
+            error, "timeout",
+            "timed-out job must return error=\"timeout\""
+        );
+    }
+
+    // ── cancel path (#21) ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_job_with_target_cancel_returns_cancelled() {
+        use tokio::sync::mpsc;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel(1);
+
+        #[cfg(unix)]
+        let (cmd, args): (&str, Vec<String>) = ("sleep", vec!["30".into()]);
+        #[cfg(windows)]
+        let (cmd, args): (&str, Vec<String>) =
+            ("cmd.exe", vec!["/C".into(), "ping -n 60 127.0.0.1".into()]);
+
+        let req = JobRequest {
+            job_id: "cancel-job".to_string(),
+            tool: cmd.to_string(),
+            args: args.clone(),
+            timeout_ms: 0, // no timeout — rely on cancel
+            ..Default::default()
+        };
+
+        // Send cancel after a brief delay.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = cancel_tx.send(()).await;
+        });
+
+        let (exit_code, error) = run_job_with_target(
+            "device-cancel".to_string(),
+            req,
+            ExecutionTarget {
+                path: cmd.to_string(),
+                leading_args: vec![],
+            },
+            tx,
+            cancel_rx,
+            None,
+        )
+        .await;
+
+        assert_eq!(exit_code, -1, "cancelled job must return exit code -1");
+        assert_eq!(
+            error, "cancelled",
+            "cancelled job must return error=\"cancelled\""
+        );
     }
 }

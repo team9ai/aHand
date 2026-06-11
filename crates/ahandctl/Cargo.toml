@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 ahand-protocol = { path = "../ahand-protocol" }
+ahand-platform = { path = "../ahand-platform" }
 ahandd = { path = "../ahandd" }
 tokio.workspace = true
 prost.workspace = true
@@ -25,3 +26,6 @@ open = "5"
 toml = "0.8"
 rand = "0.8"
 dirs = "5"
+
+[dev-dependencies]
+tempfile = "3"

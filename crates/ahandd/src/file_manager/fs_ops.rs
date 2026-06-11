@@ -294,7 +294,7 @@ pub async fn handle_glob(
     }
 
     // Sort by mtime desc for consistency with `list`.
-    entries.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    entries.sort_by_key(|b| Reverse(b.modified_ms));
 
     let has_more = total_matches as usize > entries.len();
 
@@ -542,6 +542,13 @@ pub async fn handle_delete(
 /// (currently Windows and any Unix other than macOS / freedesktop-compatible
 /// Linux) or when the required environment variables (`HOME`,
 /// `XDG_DATA_HOME`) are unset.
+// The `return` statements inside cfg-gated blocks are load-bearing: each
+// platform-specific block must use explicit `return` rather than a tail
+// expression so the block itself doesn't become a statement whose value gets
+// silently dropped when the subsequent cfg blocks are invisible to the
+// compiler. The alternative would be nesting all platforms in a single
+// `cfg_if!` macro (which isn't a direct dependency).
+#[allow(clippy::needless_return)]
 pub fn guess_trash_path(original: &Path) -> Option<String> {
     let basename = original.file_name()?;
 
@@ -751,6 +758,7 @@ async fn copy_single_file(source: &Path, dest: &Path, overwrite: bool) -> Result
     }
     #[cfg(not(unix))]
     {
+        let _ = overwrite; // on Windows the caller checks existence before calling us
         tokio::fs::copy(source, dest)
             .await
             .map_err(|e| io_to_file_error(e, dest))?;
@@ -982,6 +990,9 @@ fn is_cross_device_error(e: &io::Error) -> bool {
 /// target string is stored verbatim; whether it resolves to an
 /// allowlisted path is the dispatch layer's concern (see
 /// `policy.check_path` for the link's parent + `R2` for the target).
+// Explicit `return` in each cfg arm is load-bearing (same pattern as
+// `guess_trash_path` above — see its comment for the full explanation).
+#[allow(clippy::needless_return)]
 pub async fn handle_create_symlink(
     req: &FileCreateSymlink,
     link_resolved: &Path,
@@ -1005,18 +1016,29 @@ pub async fn handle_create_symlink(
             )
         })??;
     }
+    // The explicit `return` in the unix arm is load-bearing: each cfg block
+    // appears as a statement to the compiler on the other platform (the
+    // cfg-eliminated block leaves a `()` hole), so a plain tail expression
+    // would yield `()` instead of the declared return type. `return` forces
+    // the function to return from inside the block on the matching platform.
+    #[cfg(unix)]
+    {
+        return Ok(FileCreateSymlinkResult {
+            link_path: link_resolved.to_string_lossy().into_owned(),
+            target: req.target.clone(),
+        });
+    }
+
+    // Non-Unix fallback — symlinks not yet supported. TODO(M4): port to Windows.
     #[cfg(not(unix))]
     {
+        let _ = link_resolved;
         return Err(file_error(
             FileErrorCode::Unspecified,
             &req.link_path,
             "symlinks are not supported on this platform",
         ));
     }
-    Ok(FileCreateSymlinkResult {
-        link_path: link_resolved.to_string_lossy().into_owned(),
-        target: req.target.clone(),
-    })
 }
 
 // ── Chmod ──────────────────────────────────────────────────────────────────
@@ -1077,7 +1099,7 @@ pub async fn handle_chmod(req: &FileChmod, resolved: &Path) -> Result<FileChmodR
             }
             #[cfg(windows)]
             {
-                // TODO: wire up real Windows ACL setting. For now, report
+                // TODO(M4): wire up real Windows ACL setting. For now, report
                 // that only mode-based chmod is implemented.
                 Err(file_error(
                     FileErrorCode::Unspecified,

@@ -100,6 +100,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ahand-platform"
+version = "0.1.14"
+dependencies = [
+ "anyhow",
+ "dunce",
+ "libc",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ahand-protocol"
 version = "0.1.14"
 dependencies = [
@@ -112,6 +124,7 @@ dependencies = [
 name = "ahandctl"
 version = "0.1.14"
 dependencies = [
+ "ahand-platform",
  "ahand-protocol",
  "ahandd",
  "anyhow",
@@ -124,6 +137,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
  "toml",
@@ -136,6 +150,7 @@ dependencies = [
 name = "ahandd"
 version = "0.1.14"
 dependencies = [
+ "ahand-platform",
  "ahand-protocol",
  "anyhow",
  "axum",

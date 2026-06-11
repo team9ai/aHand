@@ -68,7 +68,7 @@ pub async fn handle_read_pdf(
 
     let mode = FileReadPdfMode::try_from(req.mode).unwrap_or(FileReadPdfMode::Auto);
     let path = req.path.clone();
-    let requested_range = req.page_range.clone();
+    let requested_range = req.page_range;
 
     tokio::task::spawn_blocking(move || {
         read_pdf_blocking(path, bytes, total_file_bytes, mode, requested_range)

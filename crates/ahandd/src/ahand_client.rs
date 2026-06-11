@@ -63,6 +63,7 @@ struct QueuedEnvelope {
 /// replied by tungstenite per RFC 6455) before its watchdog timeout
 /// fires — that's how we detect zombie TCP connections that survived
 /// macOS sleep/wake or NAT timeout without any visible socket error.
+#[allow(clippy::large_enum_variant)] // Envelope is the hot path; boxing adds indirection cost
 enum OutboundFrame {
     Envelope(QueuedEnvelope),
     WsPing(Vec<u8>),
@@ -95,6 +96,7 @@ impl crate::executor::EnvelopeSink for BufferedEnvelopeSender {
 /// Coarse outcome of a single `connect()` attempt, used by library callers
 /// that want to observe handshake success/failure without scraping logs.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // variant fields carried for future observers / SDK consumers
 pub enum ConnectOutcome {
     /// The Hello handshake was accepted.
     HandshakeAccepted,
@@ -774,6 +776,9 @@ fn set_tcp_keepcnt_macos(stream: &tokio::net::TcpStream, count: u32) -> std::io:
     Ok(())
 }
 
+// Bin target never calls this directly; exercised via lib integration tests
+// (hub_handshake) and external SDK consumers.
+#[allow(dead_code)]
 pub fn build_hello_envelope(
     device_id: &str,
     identity: &DeviceIdentity,
@@ -1811,9 +1816,8 @@ mod tests {
     use crate::outbox::Outbox;
 
     use super::{
-        BufferedEnvelopeSender, ConnectError, OutboundFrame, QueuedEnvelope,
-        classify_hello_accepted_message, connect_tcp_with_keepalive,
-        hello_capabilities_from_wire_names,
+        BufferedEnvelopeSender, ConnectError, OutboundFrame, classify_hello_accepted_message,
+        connect_tcp_with_keepalive, hello_capabilities_from_wire_names,
     };
 
     #[test]
@@ -1947,22 +1951,24 @@ mod tests {
             "SO_KEEPALIVE must be on after connect_tcp_with_keepalive",
         );
 
-        // Linux/BSDs path: socket2 exposes typed getters.
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        // Linux/BSDs path: socket2 0.6 exposes typed getters with `tcp_` prefix.
+        // Windows and macOS are excluded here (Windows: no typed getters;
+        // macOS: uses raw getsockopt below).
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
         {
             assert_eq!(
-                sock.keepalive_time().expect("read keepalive idle time"),
+                sock.tcp_keepalive_time().expect("read keepalive idle time"),
                 std::time::Duration::from_secs(30),
                 "TCP_KEEPIDLE must be 30s",
             );
             assert_eq!(
-                sock.keepalive_interval()
+                sock.tcp_keepalive_interval()
                     .expect("read keepalive probe interval"),
                 std::time::Duration::from_secs(10),
                 "TCP_KEEPINTVL must be 10s",
             );
             assert_eq!(
-                sock.keepalive_retries()
+                sock.tcp_keepalive_retries()
                     .expect("read keepalive retry count"),
                 3,
                 "TCP_KEEPCNT must be 3",
