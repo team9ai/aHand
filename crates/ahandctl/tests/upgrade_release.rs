@@ -5,6 +5,12 @@
 //! `resolve_latest` / `run_with_bases` stack without any network calls.
 //! Pattern mirrors `ahandd/tests/file_ops_s3_write.rs`.
 
+// On Windows the #[cfg(unix)] full-flow tests vanish, leaving some shared
+// helpers/imports unreferenced; allow that for this test-support-heavy file
+// instead of cfg-gating every import (windows still compiles + runs the
+// platform-neutral subset).
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,6 +99,9 @@ async fn spawn_stub(mode: StubMode) -> StubServer {
 
 /// Assets served by the download stub.
 /// Key: URL path (e.g. "/rust-v0.2.0/ahandd-linux-x64"), Value: bytes.
+// Used only by the #[cfg(unix)] full-flow upgrade tests below; gate to
+// keep the windows clippy lane (-D dead-code) clean.
+#[cfg(unix)]
 #[derive(Clone)]
 struct DownloadState {
     /// API releases JSON body.
@@ -101,6 +110,9 @@ struct DownloadState {
     assets: Arc<HashMap<String, Vec<u8>>>,
 }
 
+// Used only by the #[cfg(unix)] full-flow upgrade tests below; gate to
+// keep the windows clippy lane (-D dead-code) clean.
+#[cfg(unix)]
 async fn download_stub_handler(
     AxumPath(tail): AxumPath<String>,
     State(state): State<Arc<DownloadState>>,
@@ -112,16 +124,25 @@ async fn download_stub_handler(
     }
 }
 
+// Used only by the #[cfg(unix)] full-flow upgrade tests below; gate to
+// keep the windows clippy lane (-D dead-code) clean.
+#[cfg(unix)]
 async fn download_releases_handler(State(state): State<Arc<DownloadState>>) -> impl IntoResponse {
     (StatusCode::OK, state.releases_json.clone()).into_response()
 }
 
+// Used only by the #[cfg(unix)] full-flow upgrade tests below; gate to
+// keep the windows clippy lane (-D dead-code) clean.
+#[cfg(unix)]
 struct FullStub {
     addr: std::net::SocketAddr,
     shutdown: oneshot::Sender<()>,
     handle: tokio::task::JoinHandle<()>,
 }
 
+// Used only by the #[cfg(unix)] full-flow upgrade tests below; gate to
+// keep the windows clippy lane (-D dead-code) clean.
+#[cfg(unix)]
 impl FullStub {
     fn api_base(&self) -> String {
         format!("http://{}", self.addr)
@@ -137,6 +158,9 @@ impl FullStub {
     }
 }
 
+// Used only by the #[cfg(unix)] full-flow upgrade tests below; gate to
+// keep the windows clippy lane (-D dead-code) clean.
+#[cfg(unix)]
 async fn spawn_full_stub(releases_json: String, assets: HashMap<String, Vec<u8>>) -> FullStub {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -199,11 +223,17 @@ fn fixture_malformed() -> String {
 }
 
 /// Returns the platform suffix that the upgrade code will use.
+// Used only by the #[cfg(unix)] full-flow upgrade tests below; gate to
+// keep the windows clippy lane (-D dead-code) clean.
+#[cfg(unix)]
 fn platform_suffix() -> String {
     ahand_platform::paths::release_suffix()
 }
 
 /// Build fake binary bytes (not real ELF/PE, just enough to verify we wrote them).
+// Used only by the #[cfg(unix)] full-flow upgrade tests below; gate to
+// keep the windows clippy lane (-D dead-code) clean.
+#[cfg(unix)]
 fn fake_binary_bytes(name: &str) -> Vec<u8> {
     format!("fake-binary-content-for-{name}").into_bytes()
 }
@@ -289,6 +319,9 @@ fn make_raw_tar_gz_with_path(path: &str, data: &[u8]) -> Vec<u8> {
 }
 
 /// Build a checksums-rust.txt line in shasum-a-256 format.
+// Used only by the #[cfg(unix)] full-flow upgrade tests below; gate to
+// keep the windows clippy lane (-D dead-code) clean.
+#[cfg(unix)]
 fn make_checksum_line(filename: &str, data: &[u8]) -> String {
     let hex = hex::encode(Sha256::digest(data));
     format!("{hex}  {filename}\n")
