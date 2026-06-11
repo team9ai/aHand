@@ -64,10 +64,10 @@ function Resolve-Versions {
 
     foreach ($rel in $releases) {
         $tag = $rel.tag_name
-        if ((-not $rustVer) -and ($tag -match '^rust-v(.+)$')) {
+        if ((-not $rustVer) -and ($tag -match '^rust-v([0-9A-Za-z.\-]+)$')) {
             $rustVer = $Matches[1]
         }
-        if ((-not $adminVer) -and ($tag -match '^admin-v(.+)$')) {
+        if ((-not $adminVer) -and ($tag -match '^admin-v([0-9A-Za-z.\-]+)$')) {
             $adminVer = $Matches[1]
         }
         if ($rustVer -and $adminVer) {

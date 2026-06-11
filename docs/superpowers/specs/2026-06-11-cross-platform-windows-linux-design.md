@@ -275,7 +275,7 @@ these):
 ## M2 Completion Record (2026-06-11)
 
 M2 landed on `feat/cross-platform-m2` (plan:
-`docs/superpowers/plans/2026-05-13-ahand-plugin-runtime-stage1.md`).
+`docs/superpowers/plans/2026-06-11-cross-platform-m2-lifecycle-install.md`).
 
 **What landed:**
 

@@ -51,7 +51,7 @@ curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/ins
 irm https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.ps1 | iex
 ```
 
-Requires Windows 10 1809 or later.
+Requires Windows 10 1809 or later (daemon PTY support; the installer itself works on 1803+).
 
 This installs `ahandd`, `ahandctl`, and the admin panel to `~/.ahand/` (macOS/Linux) or `%USERPROFILE%\.ahand\` (Windows).
 
