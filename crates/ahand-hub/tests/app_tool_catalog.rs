@@ -31,7 +31,8 @@ use reqwest::StatusCode;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use support::{
-    read_hello_accepted, read_hello_challenge, signed_hello, spawn_server_with_state, test_state,
+    attach_owned_device, mint_cp_jwt, mint_cp_jwt_with_options, read_hello_accepted,
+    read_hello_challenge, signed_hello, spawn_server_with_state, test_state,
     test_state_with_webhook_persistent,
 };
 
@@ -591,53 +592,6 @@ async fn empty_tools_snapshot_is_accepted() {
 // Task 8 tests: GET /api/devices/{device_id}/app-tools
 // ─────────────────────────────────────────────────────────────────────────────
 
-const JWT_SECRET: &str = "service-test-secret";
-
-/// Mint a control-plane JWT for `external_user_id` with `jobs:execute` scope.
-fn mint_cp_jwt(external_user_id: &str) -> String {
-    use ahand_hub_core::auth::mint_control_plane_jwt;
-    let (token, _) = mint_control_plane_jwt(
-        JWT_SECRET.as_bytes(),
-        external_user_id,
-        "jobs:execute",
-        None,
-        Duration::from_secs(60),
-    )
-    .unwrap();
-    token
-}
-
-/// Register a device with `external_user_id`, attach it via WS, and return
-/// the socket so the caller can keep the connection alive.
-async fn attach_owned_device(
-    server: &support::TestServer,
-    device_id: &str,
-    external_user_id: &str,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let verifying = SigningKey::from_bytes(&[7u8; 32])
-        .verifying_key()
-        .to_bytes();
-    server
-        .state()
-        .devices
-        .pre_register(device_id, &verifying, external_user_id)
-        .await
-        .unwrap();
-    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
-        .await
-        .unwrap();
-    let challenge = read_hello_challenge(&mut socket).await;
-    let hello = signed_hello(device_id, &challenge.nonce);
-    socket
-        .send(WsMessage::Binary(hello.encode_to_vec().into()))
-        .await
-        .unwrap();
-    let _ = read_hello_accepted(&mut socket).await;
-    // Small grace so the hub finishes registering the WS connection.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    socket
-}
-
 /// GET /api/devices/{device_id}/app-tools happy path:
 /// - connect device, send AppToolsUpdate rev=1 with all fields
 /// - GET returns 200 with correct camelCase JSON body
@@ -829,6 +783,93 @@ async fn get_app_tools_stale_by_offline() {
     );
     assert_eq!(body["revision"], 5);
 
+    server.shutdown().await;
+}
+
+/// GET /api/devices/{device_id}/app-tools: token owned by a different user → 403.
+#[tokio::test]
+async fn get_app_tools_wrong_owner_returns_403() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    // Register device owned by "user-owner".
+    let mut socket = attach_owned_device(&server, "cp-device-owner-403", "user-owner").await;
+
+    // Token minted for a different user → must 403.
+    let attacker_token = mint_cp_jwt("user-attacker");
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/devices/cp-device-owner-403/app-tools",
+            server.http_base_url()
+        ))
+        .bearer_auth(&attacker_token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
+/// GET /api/devices/{device_id}/app-tools: token has device_ids allowlist that
+/// excludes the target device → 403.
+#[tokio::test]
+async fn get_app_tools_device_not_in_allowlist_returns_403() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    let mut socket = attach_owned_device(&server, "cp-device-allowlist", "user-al").await;
+
+    // Token scoped to a different device but same user → 403.
+    let restricted_token =
+        mint_cp_jwt_with_options("user-al", "jobs:execute", Some(vec!["other-device".into()]));
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/devices/cp-device-allowlist/app-tools",
+            server.http_base_url()
+        ))
+        .bearer_auth(&restricted_token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
+/// GET /api/devices/{device_id}/app-tools: token with wrong scope → 403.
+#[tokio::test]
+async fn get_app_tools_wrong_scope_returns_403() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    let mut socket = attach_owned_device(&server, "cp-device-scope", "user-scope").await;
+
+    // Token with "other:scope" instead of "jobs:execute" → 403 before any DB work.
+    let bad_scope_token = mint_cp_jwt_with_options("user-scope", "other:scope", None);
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/devices/cp-device-scope/app-tools",
+            server.http_base_url()
+        ))
+        .bearer_auth(&bad_scope_token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "FORBIDDEN");
+
+    let _ = socket.close(None).await;
     server.shutdown().await;
 }
 

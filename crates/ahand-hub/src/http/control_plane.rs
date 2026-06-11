@@ -10,6 +10,9 @@
 //!   * `POST /api/control/browser`         — synchronous browser command
 //!   * `POST /api/control/files`           — synchronous file operation
 //!
+//! Device-resource read endpoints (e.g. `GET /api/devices/{id}/app-tools`)
+//! also live in this router because they share the control-plane JWT
+//! middleware.
 //! Auth: **control-plane JWT** (`token_type = ControlPlane`) only —
 //! device JWTs are rejected by [`verify_control_plane_jwt`]. The JWT's
 //! `external_user_id` is the ownership anchor: a request only succeeds
@@ -576,6 +579,21 @@ async fn get_device_app_tools(
     Extension(claims): Extension<ControlPlaneJwtClaims>,
     Path(device_id): Path<String>,
 ) -> Result<Json<AppToolsResponse>, ControlError> {
+    // Validate the scope claim before any DB access.
+    if claims.scope != "jobs:execute" {
+        return Err(ControlError::Forbidden);
+    }
+
+    // Rate-limit BEFORE the expensive ownership lookup so a storm of
+    // bogus GETs can't DOS the device store.
+    if state
+        .control_rate_limiter
+        .check_key(&claims.external_user_id)
+        .is_err()
+    {
+        return Err(ControlError::RateLimited);
+    }
+
     // Verify the device exists (may be offline but must be registered).
     let device = state
         .devices
@@ -604,7 +622,7 @@ async fn get_device_app_tools(
         .app_tools
         .get_catalog(&device_id)
         .await
-        .map_err(|err| ControlError::Internal(err.to_string()))?;
+        .map_err(|err| ControlError::Internal(format!("get_catalog({device_id}): {err}")))?;
 
     let response = match catalog {
         Some(c) => AppToolsResponse {

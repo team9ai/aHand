@@ -5,6 +5,7 @@ use std::time::Duration;
 use ahand_hub::config::{Config, S3Config, StoreConfig};
 use ahand_hub::state::AppState;
 use ahand_hub_core::device::NewDevice;
+use ahand_hub_core::traits::DeviceAdminStore;
 use ahand_hub_core::traits::DeviceStore;
 use ahand_hub_store::test_support::TestStack;
 use axum::body::Body;
@@ -23,6 +24,76 @@ use ahand_protocol::{
     FileResponse, Hello, HelloAccepted, HelloChallenge, JobEvent, JobFinished, JobRequest,
     envelope, hello, job_event,
 };
+
+/// JWT secret shared by all test configs (matches `test_config().jwt_secret`).
+pub const CP_JWT_SECRET: &str = "service-test-secret";
+
+/// Mint a control-plane JWT for `external_user_id` with `jobs:execute` scope.
+/// No device_ids restriction.
+pub fn mint_cp_jwt(external_user_id: &str) -> String {
+    use ahand_hub_core::auth::mint_control_plane_jwt;
+    let (token, _) = mint_control_plane_jwt(
+        CP_JWT_SECRET.as_bytes(),
+        external_user_id,
+        "jobs:execute",
+        None,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    token
+}
+
+/// Mint a control-plane JWT with a custom scope and/or device_ids allowlist.
+pub fn mint_cp_jwt_with_options(
+    external_user_id: &str,
+    scope: &str,
+    device_ids: Option<Vec<String>>,
+) -> String {
+    use ahand_hub_core::auth::mint_control_plane_jwt;
+    let (token, _) = mint_control_plane_jwt(
+        CP_JWT_SECRET.as_bytes(),
+        external_user_id,
+        scope,
+        device_ids,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    token
+}
+
+/// Register a device with `external_user_id`, attach it via WS, and return
+/// the socket so the caller can keep the connection alive (keeping the device
+/// online in `state.connections`).
+pub async fn attach_owned_device(
+    server: &TestServer,
+    device_id: &str,
+    external_user_id: &str,
+) -> tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
+    let verifying = SigningKey::from_bytes(&[7u8; 32])
+        .verifying_key()
+        .to_bytes();
+    server
+        .state()
+        .devices
+        .pre_register(device_id, &verifying, external_user_id)
+        .await
+        .unwrap();
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello(device_id, &challenge.nonce);
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+    // Small grace so the hub finishes registering the WS connection.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    socket
+}
 
 pub fn service_request(uri: &str) -> Request<Body> {
     Request::builder()
