@@ -1472,7 +1472,7 @@ async fn invoke_app_tool(
 
             Ok((StatusCode::OK, Json(response)))
         }
-        Err(AppToolServiceError::DeviceOffline { .. } | AppToolServiceError::SendFailed { .. }) => {
+        Err(AppToolServiceError::DeviceOffline { .. }) => {
             state
                 .append_audit_entry(
                     "app_tool.invoked",
@@ -1489,7 +1489,10 @@ async fn invoke_app_tool(
                 .await;
             Err(ControlError::DeviceOfflineConflict)
         }
-        Err(AppToolServiceError::Timeout { .. }) => {
+        Err(AppToolServiceError::SendFailed { tool_call_id, .. }) => {
+            // UUID was minted before the send attempt — use it so operators
+            // can correlate hub-side failure with any daemon-side trace that
+            // may have been written before the connection dropped.
             state
                 .append_audit_entry(
                     "app_tool.invoked",
@@ -1498,7 +1501,27 @@ async fn invoke_app_tool(
                     &claims.external_user_id,
                     serde_json::json!({
                         "name": req.name,
-                        "toolCallId": "<timeout>",
+                        "toolCallId": tool_call_id,
+                        "outcome": "offline",
+                        "durationMs": duration_ms,
+                    }),
+                )
+                .await;
+            Err(ControlError::DeviceOfflineConflict)
+        }
+        Err(AppToolServiceError::Timeout { tool_call_id, .. }) => {
+            // Use the real UUID that was dispatched to the daemon so that
+            // hub-side timeout audit entries can be correlated with daemon
+            // logs for the same invocation.
+            state
+                .append_audit_entry(
+                    "app_tool.invoked",
+                    "device",
+                    &device.id,
+                    &claims.external_user_id,
+                    serde_json::json!({
+                        "name": req.name,
+                        "toolCallId": tool_call_id,
                         "outcome": "timeout",
                         "durationMs": duration_ms,
                     }),
@@ -1511,7 +1534,7 @@ async fn invoke_app_tool(
             // above — but handle it gracefully.
             Err(ControlError::DeviceNotFound)
         }
-        Err(AppToolServiceError::ChannelClosed) => {
+        Err(AppToolServiceError::ChannelClosed { .. }) => {
             Err(ControlError::Internal("response channel closed".into()))
         }
     }

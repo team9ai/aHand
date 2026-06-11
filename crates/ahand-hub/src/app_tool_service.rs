@@ -103,14 +103,22 @@ pub enum AppToolServiceError {
     /// WS send failed after the online check succeeded (the device went
     /// away in the narrow window between the check and the dispatch).
     /// Mapped to the same 409 as `DeviceOffline`.
+    /// `tool_call_id` is the UUID that was minted before the send attempt —
+    /// it appears in daemon logs if the frame was partially delivered.
     #[error("failed to send to device {device_id}: {reason}")]
-    SendFailed { device_id: String, reason: String },
+    SendFailed {
+        device_id: String,
+        reason: String,
+        tool_call_id: String,
+    },
     /// No response received within `timeout_ms + GRACE_MS`. Mapped to 504.
+    /// `tool_call_id` is the UUID sent to the daemon — use it to correlate
+    /// hub-side timeout events with daemon-side execution logs.
     #[error("app tool invocation timed out after {ms}ms")]
-    Timeout { ms: u64 },
+    Timeout { ms: u64, tool_call_id: String },
     /// Oneshot receiver was dropped without a value (internal inconsistency).
     #[error("response channel closed unexpectedly")]
-    ChannelClosed,
+    ChannelClosed { tool_call_id: String },
 }
 
 /// Invoke an app tool on a device and await its response.
@@ -168,6 +176,7 @@ pub async fn invoke(
         return Err(AppToolServiceError::SendFailed {
             device_id: input.device_id.clone(),
             reason: err.to_string(),
+            tool_call_id: tool_call_id.clone(),
         });
     }
 
@@ -176,8 +185,13 @@ pub async fn invoke(
     let wait = Duration::from_millis(clamped + GRACE_MS);
     match tokio::time::timeout(wait, rx).await {
         Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(_)) => Err(AppToolServiceError::ChannelClosed),
-        Err(_) => Err(AppToolServiceError::Timeout { ms: clamped }),
+        Ok(Err(_)) => Err(AppToolServiceError::ChannelClosed {
+            tool_call_id: tool_call_id.clone(),
+        }),
+        Err(_) => Err(AppToolServiceError::Timeout {
+            ms: clamped,
+            tool_call_id: tool_call_id.clone(),
+        }),
     }
 }
 

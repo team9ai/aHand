@@ -28,6 +28,9 @@ use support::{
     attach_owned_device, mint_cp_jwt, mint_cp_jwt_with_options, spawn_server_with_state, test_state,
 };
 
+// Re-export for use in clamping tests.
+use ahand_hub::app_tool_service::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -602,9 +605,19 @@ async fn audit_entry_written_for_timeout() {
     let state = test_state().await;
     let server = spawn_server_with_state(state.clone()).await;
 
-    // Attach device but never reply.
-    let _socket = attach_owned_device(&server, "audit-timeout-dev", "user-audit-timeout").await;
+    // Attach device. It will receive the AppToolRequest but intentionally
+    // never reply, causing the hub to time out.
+    let mut socket = attach_owned_device(&server, "audit-timeout-dev", "user-audit-timeout").await;
     let token = mint_cp_jwt("user-audit-timeout");
+
+    // Concurrently: device captures the tool_call_id from the request but
+    // does NOT send a response, so the hub times out.
+    let device_task = tokio::spawn(async move {
+        let req = recv_app_tool_request(&mut socket).await;
+        // Keep socket alive (do not drop) so the hub sees a live connection;
+        // the oneshot simply never resolves.
+        (req.tool_call_id, socket)
+    });
 
     let resp = post_invoke(
         &server,
@@ -618,6 +631,10 @@ async fn audit_entry_written_for_timeout() {
     .await;
     assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
 
+    // The device task should have captured the tool_call_id already (the
+    // hub dispatches before waiting, so the device receives it immediately).
+    let (dispatched_tool_call_id, _socket) = device_task.await.unwrap();
+
     let entries = poll_audit(
         server.state(),
         "app_tool.invoked",
@@ -628,6 +645,148 @@ async fn audit_entry_written_for_timeout() {
     let entry = &entries[0];
     assert_eq!(entry.detail["outcome"], "timeout");
     assert_eq!(entry.detail["name"], "slow_tool");
+
+    // The audit entry must carry the real UUID, not a placeholder.
+    let audit_tool_call_id = entry.detail["toolCallId"]
+        .as_str()
+        .expect("toolCallId must be a string");
+    uuid::Uuid::parse_str(audit_tool_call_id)
+        .expect("toolCallId in audit entry must be a valid UUID");
+    assert_eq!(
+        audit_tool_call_id, dispatched_tool_call_id,
+        "audit toolCallId must equal the UUID the device received"
+    );
+
+    server.shutdown().await;
+}
+
+// ────────────────────────────────────────────────────────────
+// Timeout clamping: MIN / MAX / default
+// ────────────────────────────────────────────────────────────
+
+/// Verifies that the hub applies the [MIN, MAX] clamp to the caller-supplied
+/// `timeoutMs`, and that omitting `timeoutMs` sends the default.
+///
+/// Three invocations share one device socket (the device replies immediately
+/// each time so the handler doesn't block on the timeout):
+///   1. timeoutMs=500  → device receives timeout_ms == MIN_TIMEOUT_MS (1 000)
+///   2. timeoutMs=400000 → device receives timeout_ms == MAX_TIMEOUT_MS (300 000)
+///   3. omitted timeoutMs  → device receives timeout_ms == DEFAULT_TIMEOUT_MS (60 000)
+#[tokio::test]
+async fn timeout_clamping_is_applied_before_dispatch() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    let mut socket = attach_owned_device(&server, "clamp-dev", "user-clamp").await;
+    let token = mint_cp_jwt("user-clamp");
+
+    // Helper closure: POST the request then immediately have the device
+    // capture and echo back so the handler resolves successfully.
+    async fn invoke_and_capture(
+        server: &support::TestServer,
+        token: &str,
+        socket: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        body: serde_json::Value,
+    ) -> u32 {
+        let device_id = body["deviceId"].as_str().unwrap().to_string();
+        let device_id_clone = device_id.clone();
+
+        // Spawn device side: capture timeout_ms, reply with ResultJson.
+        let device_task = tokio::spawn({
+            // We can't move the socket into spawn, so we drive it manually below.
+            // Instead, use a channel to coordinate.
+            // (We poll the socket inline after posting.)
+            async move { () }
+        });
+        // Drop placeholder task immediately.
+        drop(device_task);
+
+        // Post from HTTP side in a separate task so we can drive the socket
+        // concurrently.
+        let post_fut = post_invoke(server, token, body);
+
+        // Drive both concurrently: first await the HTTP request (which blocks
+        // until device responds), but we need the device side to run too.
+        // Use tokio::join! with the device-side driven inline.
+        let captured_timeout_ms = tokio::sync::OnceCell::<u32>::new();
+        let captured_timeout_ms_clone = &captured_timeout_ms;
+
+        let (resp, received_timeout_ms) = tokio::join!(post_fut, async {
+            let req = recv_app_tool_request(socket).await;
+            let tm = req.timeout_ms;
+            let tcid = req.tool_call_id.clone();
+            send_app_tool_response(
+                &device_id_clone,
+                socket,
+                AppToolResponse {
+                    tool_call_id: tcid,
+                    result: Some(app_tool_response::Result::ResultJson("{}".into())),
+                },
+            )
+            .await;
+            tm
+        });
+
+        let _ = captured_timeout_ms_clone.set(received_timeout_ms);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "expected 200 OK for clamping test"
+        );
+        received_timeout_ms
+    }
+
+    // 1. Below minimum → clamped up to MIN_TIMEOUT_MS.
+    let tm1 = invoke_and_capture(
+        &server,
+        &token,
+        &mut socket,
+        serde_json::json!({
+            "deviceId": "clamp-dev",
+            "name": "tool_a",
+            "timeoutMs": 500,
+        }),
+    )
+    .await;
+    assert_eq!(
+        tm1, MIN_TIMEOUT_MS as u32,
+        "500ms should be clamped to MIN ({MIN_TIMEOUT_MS})"
+    );
+
+    // 2. Above maximum → clamped down to MAX_TIMEOUT_MS.
+    let tm2 = invoke_and_capture(
+        &server,
+        &token,
+        &mut socket,
+        serde_json::json!({
+            "deviceId": "clamp-dev",
+            "name": "tool_b",
+            "timeoutMs": 400_000u64,
+        }),
+    )
+    .await;
+    assert_eq!(
+        tm2, MAX_TIMEOUT_MS as u32,
+        "400 000ms should be clamped to MAX ({MAX_TIMEOUT_MS})"
+    );
+
+    // 3. Omitted → default.
+    let tm3 = invoke_and_capture(
+        &server,
+        &token,
+        &mut socket,
+        serde_json::json!({
+            "deviceId": "clamp-dev",
+            "name": "tool_c",
+        }),
+    )
+    .await;
+    assert_eq!(
+        tm3, DEFAULT_TIMEOUT_MS as u32,
+        "omitted timeoutMs should default to DEFAULT ({DEFAULT_TIMEOUT_MS})"
+    );
 
     server.shutdown().await;
 }
