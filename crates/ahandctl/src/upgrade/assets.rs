@@ -387,14 +387,20 @@ pub fn extract_admin_spa(data: &[u8], dist_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Return `Err` if `p` contains any `..` component or is absolute.
+/// Return `Err` if `p` contains any `..` component, is absolute, or is
+/// rooted/prefixed. Component-level checks keep the policy platform-uniform:
+/// on Windows `/etc/x` is "rooted" but NOT `is_absolute()` (no drive letter),
+/// and `C:\x` carries a `Prefix` component — both must be rejected too.
 fn guard_path_traversal(p: &Path) -> anyhow::Result<()> {
-    if p.is_absolute() {
-        anyhow::bail!("absolute path in archive: {}", p.display());
-    }
     for component in p.components() {
-        if matches!(component, Component::ParentDir) {
-            anyhow::bail!("parent-dir component (..) in archive path: {}", p.display());
+        match component {
+            Component::ParentDir => {
+                anyhow::bail!("parent-dir component (..) in archive path: {}", p.display());
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("absolute path in archive: {}", p.display());
+            }
+            _ => {}
         }
     }
     Ok(())
