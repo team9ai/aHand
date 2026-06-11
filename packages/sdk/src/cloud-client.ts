@@ -417,6 +417,46 @@ export interface BrowserResult {
   durationMs: number;
 }
 
+// ---------------------------------------------------------------------------
+// App-tool types
+// ---------------------------------------------------------------------------
+
+/**
+ * Metadata for a single app-defined tool registered by a host app embedding
+ * `ahandd`. The `inputSchemaJson` field is a JSON-encoded JSON Schema
+ * (string, not an object) matching the shape the tool expects as `args`.
+ */
+export interface AppToolInfo {
+  name: string;
+  description: string;
+  inputSchemaJson: string;
+  requiresApproval: boolean;
+}
+
+/**
+ * The full catalog of app-defined tools registered by a device. `revision`
+ * is a monotonically-increasing counter bumped by the daemon each time the
+ * catalog changes. `stale` is `true` when the hub's cached copy has not
+ * been refreshed since the last heartbeat timeout.
+ */
+export interface AppToolCatalog {
+  revision: number;
+  stale: boolean;
+  updatedAtMs: number;
+  tools: AppToolInfo[];
+}
+
+/** Options for `listAppTools()`. */
+export interface ListAppToolsOptions {
+  signal?: AbortSignal;
+}
+
+/** Options for `invokeAppTool()`. */
+export interface InvokeAppToolOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
 /** Discriminated error codes surfaced by `CloudClient`. */
 export type CloudClientErrorCode =
   | "unauthorized"
@@ -432,7 +472,8 @@ export type CloudClientErrorCode =
   | "timeout"
   | "device_offline"
   | "policy_denied"
-  | "s3_disabled";
+  | "s3_disabled"
+  | "app_tool_error";
 
 /**
  * Typed error raised by `CloudClient`. Use `.code` to discriminate,
@@ -1960,6 +2001,179 @@ export class CloudClient {
    * surface as `abort`; everything else as `network` with the original
    * error attached as `cause`.
    */
+  /**
+   * `GET /api/devices/{deviceId}/app-tools`. Returns the catalog of
+   * application-defined tools registered by the host app embedding
+   * `ahandd` on the target device. Hub-level failures (auth, not found,
+   * timeout) throw `CloudClientError`; use the code to discriminate.
+   *
+   * The hub returns camelCase JSON matching `AppToolCatalog` directly.
+   * A minimal shape check (root must be an object with a numeric
+   * `revision`) is applied defensively to catch wire-contract drift
+   * early.
+   */
+  async listAppTools(
+    deviceId: string,
+    opts?: ListAppToolsOptions,
+  ): Promise<AppToolCatalog> {
+    if (opts?.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted before request");
+    }
+
+    const fetchImpl = this.fetchImpl();
+    const token = await this.opts.getAuthToken();
+    if (opts?.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
+
+    let res: Response;
+    try {
+      res = await fetchImpl(
+        `${this.opts.hubUrl}/api/devices/${encodeURIComponent(deviceId)}/app-tools`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+          signal: opts?.signal,
+        },
+      );
+    } catch (err) {
+      throw this.normalizeFetchError(err, opts?.signal);
+    }
+    if (!res.ok) throw await toTypedHttpError(res, opts?.signal);
+
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch (e: unknown) {
+      if (isAbortError(e)) {
+        throw new CloudClientError(
+          "abort",
+          "listAppTools request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw new CloudClientError("network", String(e), { cause: e });
+    }
+
+    // Defensive shape check: root must be an object with a numeric `revision`.
+    if (
+      json === null ||
+      typeof json !== "object" ||
+      Array.isArray(json) ||
+      typeof (json as { revision?: unknown }).revision !== "number"
+    ) {
+      throw new CloudClientError(
+        "server_error",
+        "Hub response malformed: expected AppToolCatalog with numeric revision",
+      );
+    }
+
+    return json as AppToolCatalog;
+  }
+
+  /**
+   * `POST /api/control/app-tool`. Invokes an application-defined tool on
+   * the target device and waits for the result. The hub forwards the call
+   * to the daemon and blocks until the tool completes or the timeout
+   * fires.
+   *
+   * Hub-level errors (auth, offline, timeout) throw `CloudClientError`.
+   * Daemon-level failures (e.g. `APPROVAL_DENIED`, `EXECUTION_TIMEOUT`)
+   * come back in the 200 body as `{toolCallId, error: {code, message}}`
+   * and are thrown as `CloudClientError("app_tool_error")` with the
+   * daemon's code in `jobErrorCode`.
+   *
+   * Returns `body.result` on success. When the daemon returns a
+   * successful response but omits the `result` field, `null` is returned
+   * for a stable contract (callers can always do `result ?? default`).
+   */
+  async invokeAppTool(
+    deviceId: string,
+    name: string,
+    args?: Record<string, unknown>,
+    opts?: InvokeAppToolOptions,
+  ): Promise<unknown> {
+    if (opts?.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted before request");
+    }
+
+    const fetchImpl = this.fetchImpl();
+    const token = await this.opts.getAuthToken();
+    if (opts?.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
+
+    // camelCase body; omit undefined optional fields
+    const requestBody: Record<string, unknown> = { deviceId, name };
+    if (args !== undefined) requestBody.args = args;
+    if (opts?.timeoutMs !== undefined) requestBody.timeoutMs = opts.timeoutMs;
+
+    let res: Response;
+    try {
+      res = await fetchImpl(`${this.opts.hubUrl}/api/control/app-tool`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+        signal: opts?.signal,
+      });
+    } catch (err) {
+      throw this.normalizeFetchError(err, opts?.signal);
+    }
+    if (!res.ok) throw await toTypedHttpError(res, opts?.signal);
+
+    let json: {
+      toolCallId?: string;
+      result?: unknown;
+      error?: { code?: string; message?: string } | null;
+    };
+    try {
+      json = (await res.json()) as typeof json;
+    } catch (e: unknown) {
+      if (isAbortError(e)) {
+        throw new CloudClientError(
+          "abort",
+          "invokeAppTool request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw new CloudClientError("network", String(e), { cause: e });
+    }
+
+    // A 200 with an `error` field is a daemon-level failure.
+    if (json.error != null) {
+      throw new CloudClientError(
+        "app_tool_error",
+        json.error.message ?? "app tool failed",
+        {
+          jobErrorCode: json.error.code,
+          jobErrorMessage: json.error.message,
+        },
+      );
+    }
+
+    // Return `null` when `result` is missing for a stable contract.
+    return json.result !== undefined ? json.result : null;
+  }
+
   private normalizeFetchError(
     err: unknown,
     signal?: AbortSignal,

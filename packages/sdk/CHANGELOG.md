@@ -1,5 +1,16 @@
 # @ahandai/sdk Changelog
 
+## 0.3.0 — 2026-06-11
+
+Released alongside `@ahandai/proto@0.3.0`.
+
+### Added
+
+- **`listAppTools()` / `invokeAppTool()`** — discover and invoke
+  application-defined tools registered by host apps embedding `ahandd`.
+  Daemon-level failures throw `CloudClientError("app_tool_error")` with the
+  daemon code in `jobErrorCode` (e.g. `APPROVAL_DENIED`, `EXECUTION_TIMEOUT`).
+
 ## 0.2.2 — 2026-05-13
 
 ### Added
