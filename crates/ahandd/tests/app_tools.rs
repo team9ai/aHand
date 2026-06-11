@@ -10,10 +10,22 @@
 //!     initial snapshot (or at least with strictly increasing revisions —
 //!     see note in `registration_racing_connect_yields_monotonic_revisions`).
 //!   * Reconnect after a hub-initiated close re-sends the snapshot.
+//!
+//! Also covers AppToolRequest dispatch (Task 5):
+//!   * Happy path: result_json returned.
+//!   * Unknown tool → TOOL_NOT_FOUND.
+//!   * Invalid JSON args / non-object args → INVALID_ARGS.
+//!   * Handler sleeping past clamped timeout → EXECUTION_TIMEOUT.
+//!   * Panicking handler → HANDLER_PANIC; daemon survives.
+//!   * 5 concurrent slow calls → exactly one CONCURRENCY_LIMIT.
+//!   * Duplicate tool_call_id while running → ignored; after completion →
+//!     cached response re-sent with identical payload.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use ahand_protocol::app_tool_response;
 use ahandd::{AppToolDef, AppToolHandler, DaemonConfig, DaemonStatus, spawn};
 use serde_json::json;
 use tempfile::TempDir;
@@ -321,6 +333,445 @@ async fn snapshot_resent_after_reconnect() {
 
     assert_eq!(found_tool_snapshot.tools.len(), 1);
     assert_eq!(found_tool_snapshot.tools[0].name, "demo_echo");
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Task 5: AppToolRequest dispatch tests ─────────────────────────────────────
+
+/// Helper: build a DaemonConfig with AutoAccept mode and no heartbeat noise.
+fn dispatch_config(ws_url: String, jwt: String, tmp: &TempDir) -> DaemonConfig {
+    DaemonConfig::builder(ws_url, jwt, tmp.path())
+        .heartbeat_interval(Duration::from_secs(60))
+        .build()
+}
+
+/// Helper: register a simple echo tool that returns `{"result": args}`.
+async fn register_echo(handle: &ahandd::DaemonHandle, name: &str) {
+    let def = AppToolDef {
+        name: name.to_string(),
+        description: "Echo tool".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let handler: AppToolHandler =
+        Arc::new(|args| Box::pin(async move { Ok(json!({"result": args})) }));
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register_app_tool ok");
+}
+
+/// Happy path: AppToolRequest → handler runs with parsed args → AppToolResponse result_json.
+#[tokio::test]
+async fn happy_path_invocation() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = spawn(dispatch_config(mock.ws_url(), mock.valid_jwt(), &tmp))
+        .await
+        .expect("spawn ok");
+    wait_online(&handle).await;
+
+    register_echo(&handle, "echo_tool").await;
+
+    // Wait for initial snapshot so inject channel is set up.
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial snapshot");
+
+    mock.send_app_tool_request("call-1", "echo_tool", r#"{"key":"val"}"#, 5000)
+        .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-1");
+    match &resp.result {
+        Some(app_tool_response::Result::ResultJson(json_str)) => {
+            let v: serde_json::Value = serde_json::from_str(json_str).expect("valid json");
+            assert_eq!(v["result"]["key"], "val", "handler should echo the args");
+        }
+        other => panic!("expected ResultJson, got {other:?}"),
+    }
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Unknown tool → TOOL_NOT_FOUND error code.
+#[tokio::test]
+async fn unknown_tool_returns_tool_not_found() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = spawn(dispatch_config(mock.ws_url(), mock.valid_jwt(), &tmp))
+        .await
+        .expect("spawn ok");
+    wait_online(&handle).await;
+
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial snapshot");
+
+    mock.send_app_tool_request("call-missing", "no_such_tool", r#"{}"#, 5000)
+        .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-missing");
+    match &resp.result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(err.code, "TOOL_NOT_FOUND", "expected TOOL_NOT_FOUND code");
+            assert!(
+                err.message.contains("no_such_tool"),
+                "error message should mention the tool name: {}",
+                err.message
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Non-JSON args_json → INVALID_ARGS; valid JSON but non-object → INVALID_ARGS.
+#[tokio::test]
+async fn invalid_args_returns_invalid_args() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = spawn(dispatch_config(mock.ws_url(), mock.valid_jwt(), &tmp))
+        .await
+        .expect("spawn ok");
+    wait_online(&handle).await;
+
+    register_echo(&handle, "echo2").await;
+
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial snapshot");
+
+    // Case 1: args_json is not valid JSON.
+    mock.send_app_tool_request("call-bad-json", "echo2", "not json!", 5000)
+        .expect("send ok");
+
+    // Case 2: args_json is valid JSON but not an object (it's an array).
+    mock.send_app_tool_request("call-bad-obj", "echo2", r#"[1,2,3]"#, 5000)
+        .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(2, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponses not received within 5s");
+
+    let codes: Vec<&str> = responses
+        .iter()
+        .map(|r| match &r.result {
+            Some(app_tool_response::Result::Error(e)) => e.code.as_str(),
+            _ => "NOT_ERROR",
+        })
+        .collect();
+
+    assert!(
+        codes.iter().all(|&c| c == "INVALID_ARGS"),
+        "both responses must be INVALID_ARGS, got: {codes:?}"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Handler sleeping past clamped timeout → EXECUTION_TIMEOUT.
+/// Uses timeout_ms=1000, handler sleeps 3s. Total test time ~3s.
+#[tokio::test]
+async fn timeout_returns_execution_timeout() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = spawn(dispatch_config(mock.ws_url(), mock.valid_jwt(), &tmp))
+        .await
+        .expect("spawn ok");
+    wait_online(&handle).await;
+
+    let def = AppToolDef {
+        name: "slow_tool".into(),
+        description: "Sleeps for 3s".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let handler: AppToolHandler = Arc::new(|_args| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(json!({"done": true}))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register ok");
+
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial snapshot");
+
+    // Request with timeout_ms=1000 (will be clamped to MIN 1000ms = 1s).
+    mock.send_app_tool_request("call-timeout", "slow_tool", r#"{}"#, 1000)
+        .expect("send ok");
+
+    // Should receive EXECUTION_TIMEOUT within ~2s.
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(8))
+        .await
+        .expect("AppToolResponse not received within 8s");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-timeout");
+    match &resp.result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(
+                err.code, "EXECUTION_TIMEOUT",
+                "expected EXECUTION_TIMEOUT, got: {}",
+                err.code
+            );
+            assert!(
+                err.message.contains("1000ms"),
+                "message should mention timeout value: {}",
+                err.message
+            );
+        }
+        other => panic!("expected EXECUTION_TIMEOUT error, got {other:?}"),
+    }
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Panicking handler → HANDLER_PANIC error; daemon survives and subsequent
+/// calls succeed.
+#[tokio::test]
+async fn panic_isolated_daemon_survives() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = spawn(dispatch_config(mock.ws_url(), mock.valid_jwt(), &tmp))
+        .await
+        .expect("spawn ok");
+    wait_online(&handle).await;
+
+    // Register the panicking tool.
+    let panic_def = AppToolDef {
+        name: "panic_tool".into(),
+        description: "Always panics".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let panic_handler: AppToolHandler = Arc::new(|_args| {
+        Box::pin(async move {
+            panic!("intentional test panic");
+        })
+    });
+    handle
+        .register_app_tool(panic_def, panic_handler)
+        .await
+        .expect("register panic_tool ok");
+
+    // Also register a healthy tool for the survivability check.
+    register_echo(&handle, "healthy_tool").await;
+
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial snapshot");
+
+    // Fire the panicking tool.
+    mock.send_app_tool_request("call-panic", "panic_tool", r#"{}"#, 5000)
+        .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("panic response not received within 5s");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-panic");
+    match &resp.result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(err.code, "HANDLER_PANIC", "expected HANDLER_PANIC");
+        }
+        other => panic!("expected HANDLER_PANIC, got {other:?}"),
+    }
+
+    // Daemon should still be alive — fire a healthy call.
+    mock.send_app_tool_request("call-after-panic", "healthy_tool", r#"{"x":1}"#, 5000)
+        .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(2, Duration::from_secs(5))
+        .await
+        .expect("healthy response after panic not received within 5s");
+
+    let healthy_resp = &responses[1];
+    assert_eq!(healthy_resp.tool_call_id, "call-after-panic");
+    assert!(
+        matches!(
+            &healthy_resp.result,
+            Some(app_tool_response::Result::ResultJson(_))
+        ),
+        "healthy call should succeed after panic, got: {:?}",
+        healthy_resp.result
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// 5 concurrent slow calls → 4 succeed + exactly 1 CONCURRENCY_LIMIT immediately.
+/// MAX_CONCURRENT_APP_TOOLS is 4.
+#[tokio::test]
+async fn concurrency_limit_fifth_call() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = spawn(dispatch_config(mock.ws_url(), mock.valid_jwt(), &tmp))
+        .await
+        .expect("spawn ok");
+    wait_online(&handle).await;
+
+    // Register a slow tool that sleeps ~2s.
+    let def = AppToolDef {
+        name: "slow_concurrent".into(),
+        description: "Slow concurrent tool".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let handler: AppToolHandler = Arc::new(|_args| {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            Ok(json!({"done": true}))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register ok");
+
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial snapshot");
+
+    // Fire 5 requests back-to-back before any complete.
+    for i in 0..5 {
+        mock.send_app_tool_request(
+            format!("call-concurrent-{i}"),
+            "slow_concurrent",
+            r#"{}"#,
+            10_000,
+        )
+        .expect("send ok");
+    }
+
+    // Wait for all 5 responses with generous timeout (slow_tool ~2.5s + buffer).
+    let responses = mock
+        .wait_for_app_tool_responses(5, Duration::from_secs(15))
+        .await
+        .expect("5 responses not received within 15s");
+
+    let concurrency_errors = responses
+        .iter()
+        .filter(|r| {
+            matches!(
+                &r.result,
+                Some(app_tool_response::Result::Error(e)) if e.code == "CONCURRENCY_LIMIT"
+            )
+        })
+        .count();
+    let successes = responses
+        .iter()
+        .filter(|r| matches!(&r.result, Some(app_tool_response::Result::ResultJson(_))))
+        .count();
+
+    assert_eq!(
+        concurrency_errors,
+        1,
+        "exactly 1 CONCURRENCY_LIMIT expected, got {concurrency_errors} out of 5 responses: {:?}",
+        responses.iter().map(|r| &r.result).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        successes, 4,
+        "exactly 4 successes expected, got {successes}"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Duplicate tool_call_id while running → silently ignored.
+/// After completion → cached response re-sent with identical payload.
+/// Also verifies handler runs only once (AtomicUsize counter).
+#[tokio::test]
+async fn duplicate_call_id_replays_cached_response() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = spawn(dispatch_config(mock.ws_url(), mock.valid_jwt(), &tmp))
+        .await
+        .expect("spawn ok");
+    wait_online(&handle).await;
+
+    // Register a tool that tracks how many times it ran.
+    let run_count = Arc::new(AtomicUsize::new(0));
+    let run_count_clone = Arc::clone(&run_count);
+    let def = AppToolDef {
+        name: "counted_tool".into(),
+        description: "Counts invocations".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let handler: AppToolHandler = Arc::new(move |_args| {
+        let counter = Arc::clone(&run_count_clone);
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"invocation_count": 1}))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register ok");
+
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial snapshot");
+
+    // First invocation.
+    mock.send_app_tool_request("call-dup-1", "counted_tool", r#"{}"#, 5000)
+        .expect("send ok");
+
+    // Wait for the first response.
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("first response not received within 5s");
+    let first_result = responses[0].result.clone();
+
+    // Send the same tool_call_id again — should replay cached response.
+    mock.send_app_tool_request("call-dup-1", "counted_tool", r#"{}"#, 5000)
+        .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(2, Duration::from_secs(5))
+        .await
+        .expect("second response not received within 5s");
+
+    // Both responses must carry identical result payloads.
+    assert_eq!(
+        responses[1].result, responses[0].result,
+        "replayed response must be identical to the original"
+    );
+    assert_eq!(responses[0].result, first_result);
+
+    // Handler should have run exactly once.
+    assert_eq!(
+        run_count.load(Ordering::SeqCst),
+        1,
+        "handler should run exactly once; got {}",
+        run_count.load(Ordering::SeqCst)
+    );
 
     handle.shutdown().await.expect("shutdown clean");
 }

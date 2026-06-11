@@ -690,6 +690,19 @@ async fn connect_with_auth(
                 )
                 .await;
             }
+            Some(envelope::Payload::AppToolRequest(req)) => {
+                handle_app_tool_request(
+                    device_id,
+                    caller_uid,
+                    req,
+                    &tx,
+                    session_mgr,
+                    approval_mgr,
+                    approval_broadcast_tx,
+                    app_tools,
+                )
+                .await;
+            }
             Some(envelope::Payload::UpdateCommand(cmd)) => {
                 info!(update_id = %cmd.update_id, target = %cmd.target_version,
                     "received update command from hub");
@@ -1785,6 +1798,337 @@ async fn handle_file_request<T>(
             }
         }
     });
+}
+
+// ── AppTool envelope helpers ──────────────────────────────────────────────────
+
+fn app_tool_error_envelope(
+    device_id: &str,
+    tool_call_id: &str,
+    code: &str,
+    message: String,
+) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolResponse(
+            ahand_protocol::AppToolResponse {
+                tool_call_id: tool_call_id.to_string(),
+                result: Some(ahand_protocol::app_tool_response::Result::Error(
+                    ahand_protocol::AppToolError {
+                        code: code.to_string(),
+                        message,
+                    },
+                )),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: String) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolResponse(
+            ahand_protocol::AppToolResponse {
+                tool_call_id: tool_call_id.to_string(),
+                result: Some(ahand_protocol::app_tool_response::Result::ResultJson(
+                    result_json,
+                )),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+// ── AppTool handler ───────────────────────────────────────────────────────────
+
+/// Handle an incoming AppToolRequest.
+///
+/// Steps 1-5 run inline (they are fast O(1) memory ops or cheap semaphore
+/// try-acquires). Step 6 (execute_app_tool) is spawned onto a dedicated
+/// tokio task so the read loop is never blocked waiting up to 300s for a
+/// long-running handler. mark_running is called BEFORE returning to the loop
+/// so that any duplicate request arriving before the spawned task starts
+/// still sees Running and is silently ignored (idempotency holds).
+///
+/// Contrast with handle_file_request (which also spawns its approval-wait leg):
+/// file requests front-load a quick policy check inline and only spawn the
+/// approval waiter; here the entire execution is spawned because handler
+/// duration is unbounded (up to MAX_TIMEOUT_MS = 300s).
+#[allow(clippy::too_many_arguments)]
+async fn handle_app_tool_request<T>(
+    device_id: &str,
+    caller_uid: &str,
+    req: ahand_protocol::AppToolRequest,
+    tx: &T,
+    session_mgr: &Arc<SessionManager>,
+    approval_mgr: &Arc<ApprovalManager>,
+    approval_broadcast_tx: &broadcast::Sender<Envelope>,
+    app_tools: &Arc<AppToolRegistry>,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    debug!(
+        tool_call_id = %req.tool_call_id,
+        name = %req.name,
+        "received AppToolRequest"
+    );
+
+    // ── Step 1: idempotency check ─────────────────────────────────────────
+    match app_tools.call_state(&req.tool_call_id).await {
+        crate::app_tool_registry::CallState::Running => {
+            warn!(
+                tool_call_id = %req.tool_call_id,
+                "duplicate tool_call_id while running — ignoring"
+            );
+            return;
+        }
+        crate::app_tool_registry::CallState::Completed(cached) => {
+            debug!(
+                tool_call_id = %req.tool_call_id,
+                "duplicate tool_call_id after completion — replaying cached response"
+            );
+            // Replay the cached response (error or result).
+            let envelope = match (cached.result_json, cached.error) {
+                (Some(json), _) => app_tool_result_envelope(device_id, &req.tool_call_id, json),
+                (None, Some(err)) => {
+                    app_tool_error_envelope(device_id, &req.tool_call_id, &err.code, err.message)
+                }
+                (None, None) => {
+                    // Shouldn't happen in practice but treat as HANDLER_ERROR.
+                    app_tool_error_envelope(
+                        device_id,
+                        &req.tool_call_id,
+                        "HANDLER_ERROR",
+                        "cached result had no outcome".to_string(),
+                    )
+                }
+            };
+            let _ = tx.send(envelope);
+            return;
+        }
+        crate::app_tool_registry::CallState::Unknown => {}
+    }
+
+    // ── Step 2: session-mode gate (Task 6) inserts here, before lookup ────
+    // TODO(task-6): check session mode and approval for app tools.
+    let _ = (session_mgr, approval_mgr, approval_broadcast_tx, caller_uid);
+
+    // ── Step 3: lookup ────────────────────────────────────────────────────
+    let (descriptor, handler) = match app_tools.lookup(&req.name).await {
+        Some(pair) => pair,
+        None => {
+            let _ = tx.send(app_tool_error_envelope(
+                device_id,
+                &req.tool_call_id,
+                "TOOL_NOT_FOUND",
+                format!(
+                    "no app tool named {:?} is registered on this device",
+                    req.name
+                ),
+            ));
+            return;
+        }
+    };
+    // descriptor is used for potential future logging; suppress unused warning.
+    let _ = &descriptor;
+
+    // ── Step 4: parse args ────────────────────────────────────────────────
+    let args: serde_json::Value = match serde_json::from_str(&req.args_json) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = tx.send(app_tool_error_envelope(
+                device_id,
+                &req.tool_call_id,
+                "INVALID_ARGS",
+                format!("args_json is not valid JSON: {err}"),
+            ));
+            return;
+        }
+    };
+    if !args.is_object() {
+        let _ = tx.send(app_tool_error_envelope(
+            device_id,
+            &req.tool_call_id,
+            "INVALID_ARGS",
+            "args_json must be a JSON object".to_string(),
+        ));
+        return;
+    }
+
+    // ── Step 5: concurrency permit (fail-fast) ────────────────────────────
+    let permit = match app_tools.try_acquire_permit() {
+        Some(p) => p,
+        None => {
+            let _ = tx.send(app_tool_error_envelope(
+                device_id,
+                &req.tool_call_id,
+                "CONCURRENCY_LIMIT",
+                "too many app tool calls in flight on this device; retry shortly".to_string(),
+            ));
+            return;
+        }
+    };
+
+    // ── Step 6: execute (spawned so the read loop stays unblocked) ────────
+    // mark_running BEFORE spawning so any duplicate that arrives before the
+    // task starts still sees Running (idempotency window is closed here).
+    app_tools.mark_running(&req.tool_call_id).await;
+
+    let tx_clone = (*tx).clone();
+    let did = device_id.to_string();
+    let app_tools_clone = Arc::clone(app_tools);
+    let timeout_ms = AppToolRegistry::clamp_timeout(req.timeout_ms);
+
+    tokio::spawn(async move {
+        execute_app_tool(
+            &did,
+            req.tool_call_id,
+            req.name,
+            args,
+            handler,
+            permit,
+            timeout_ms,
+            &tx_clone,
+            &app_tools_clone,
+        )
+        .await;
+    });
+}
+
+/// Execute an app tool handler with panic isolation, timeout, and idempotency
+/// recording. Called from a spawned task (not the read loop).
+///
+/// The permit is moved into the spawned handler task (not held by this fn).
+/// If timeout fires before the handler completes, we do NOT abort the spawned
+/// handler task — it may hold app-owned locks or resources. The permit releases
+/// naturally when the handler task eventually finishes (or drops).
+#[allow(clippy::too_many_arguments)]
+async fn execute_app_tool<T>(
+    device_id: &str,
+    tool_call_id: String,
+    tool_name: String,
+    args: serde_json::Value,
+    handler: crate::app_tool_registry::AppToolHandler,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    timeout_ms: u32,
+    tx: &T,
+    app_tools: &Arc<AppToolRegistry>,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+
+    // Spawn the handler inside its own task for panic isolation.
+    // The permit is moved into the task so it is released when the task
+    // finishes (or is eventually garbage-collected after a timeout — we do NOT
+    // abort() the task because the handler may hold app-owned locks).
+    let handler_task = tokio::spawn(async move {
+        let _permit = permit; // keep permit alive until handler completes
+        handler(args).await
+    });
+
+    let (code, message, result_json) = match tokio::time::timeout(timeout, handler_task).await {
+        // Handler completed successfully.
+        Ok(Ok(Ok(value))) => {
+            debug!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                outcome = "success",
+                "app tool call completed"
+            );
+            (None, None, Some(value.to_string()))
+        }
+        // Handler returned an error.
+        Ok(Ok(Err(app_err))) => {
+            let code = if app_err.code.is_empty() {
+                "HANDLER_ERROR".to_string()
+            } else {
+                app_err.code.clone()
+            };
+            debug!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                outcome = %code,
+                "app tool call returned handler error"
+            );
+            (Some(code), Some(app_err.message), None)
+        }
+        // Handler task panicked.
+        Ok(Err(join_err)) if join_err.is_panic() => {
+            warn!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                "app tool handler panicked; the app may be in a bad state"
+            );
+            (
+                Some("HANDLER_PANIC".to_string()),
+                Some("app tool handler panicked; the app may be in a bad state".to_string()),
+                None,
+            )
+        }
+        // Handler task was cancelled (should not happen with our spawn pattern).
+        Ok(Err(_)) => {
+            warn!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                "app tool task was cancelled"
+            );
+            (
+                Some("HANDLER_ERROR".to_string()),
+                Some("app tool task was cancelled".to_string()),
+                None,
+            )
+        }
+        // Timeout — handler task is still running but we stop waiting.
+        // We do NOT abort the spawned task: it may hold app-owned locks.
+        // The permit releases when the handler task eventually finishes.
+        Err(_) => {
+            warn!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                timeout_ms = timeout_ms,
+                "app tool timed out"
+            );
+            (
+                Some("EXECUTION_TIMEOUT".to_string()),
+                Some(format!("app tool did not finish within {timeout_ms}ms")),
+                None,
+            )
+        }
+    };
+
+    // Record outcome in the idempotency cache (required on every path).
+    let completed = crate::app_tool_registry::CompletedAppToolCall {
+        result_json: result_json.clone(),
+        error: match (&code, &message) {
+            (Some(c), Some(m)) => Some(crate::app_tool_registry::AppToolError {
+                code: c.clone(),
+                message: m.clone(),
+            }),
+            _ => None,
+        },
+    };
+    app_tools
+        .mark_completed(tool_call_id.clone(), completed)
+        .await;
+
+    // Send wire response.
+    let envelope = match (result_json, code, message) {
+        (Some(json), _, _) => app_tool_result_envelope(device_id, &tool_call_id, json),
+        (None, Some(c), Some(m)) => app_tool_error_envelope(device_id, &tool_call_id, &c, m),
+        _ => app_tool_error_envelope(
+            device_id,
+            &tool_call_id,
+            "HANDLER_ERROR",
+            "internal: no outcome recorded".to_string(),
+        ),
+    };
+    let _ = tx.send(envelope);
 }
 
 fn file_op_name(op: &ahand_protocol::file_request::Operation) -> &'static str {
