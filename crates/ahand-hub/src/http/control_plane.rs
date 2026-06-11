@@ -70,6 +70,10 @@ pub fn router(state: AppState) -> Router<AppState> {
             post(control_files_upload_url),
         )
         .route("/api/control/files", post(control_files))
+        .route(
+            "/api/devices/{device_id}/app-tools",
+            get(get_device_app_tools),
+        )
         .layer(middleware::from_fn_with_state(
             state,
             require_control_plane_jwt,
@@ -535,6 +539,98 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Response body for `GET /api/devices/{device_id}/app-tools`.
+/// Field names are camelCase per the wire contract.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppToolsResponse {
+    revision: u64,
+    stale: bool,
+    updated_at_ms: u64,
+    tools: Vec<AppToolItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppToolItem {
+    name: String,
+    description: String,
+    input_schema_json: String,
+    requires_approval: bool,
+}
+
+/// `GET /api/devices/{device_id}/app-tools` — returns the per-device app tool
+/// catalog. Auth: control-plane JWT (same middleware as the other routes).
+///
+/// Presence: `stale` is set when either the stored catalog is stale **or** the
+/// device is currently offline (not in `state.connections`). This mirrors the
+/// online-ness source used by `create_job` (`state.connections.is_online`),
+/// ensuring both paths agree on whether the device is live.
+///
+/// - Unknown device (not in `state.devices`) → 404 `DEVICE_NOT_FOUND`.
+/// - Known device, no catalog yet → 200 with `{revision:0, stale:true, updatedAtMs:0, tools:[]}`.
+async fn get_device_app_tools(
+    State(state): State<AppState>,
+    Extension(claims): Extension<ControlPlaneJwtClaims>,
+    Path(device_id): Path<String>,
+) -> Result<Json<AppToolsResponse>, ControlError> {
+    // Verify the device exists (may be offline but must be registered).
+    let device = state
+        .devices
+        .find_by_id(&device_id)
+        .await
+        .map_err(|err| ControlError::Internal(err.to_string()))?
+        .ok_or(ControlError::DeviceNotFound)?;
+
+    // Ownership: the calling user must own this device.
+    if device.external_user_id.as_deref() != Some(claims.external_user_id.as_str()) {
+        return Err(ControlError::Forbidden);
+    }
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&device_id)
+    {
+        return Err(ControlError::Forbidden);
+    }
+
+    // Online check: use state.connections.is_online — the same authoritative
+    // source create_job uses. If the device is offline, the response is
+    // stale regardless of what the store says.
+    let device_online = state.connections.is_online(&device_id);
+
+    // Fetch the catalog; store errors surface as 500.
+    let catalog = state
+        .app_tools
+        .get_catalog(&device_id)
+        .await
+        .map_err(|err| ControlError::Internal(err.to_string()))?;
+
+    let response = match catalog {
+        Some(c) => AppToolsResponse {
+            revision: c.revision,
+            stale: c.stale || !device_online,
+            updated_at_ms: c.updated_at_ms,
+            tools: c
+                .tools
+                .into_iter()
+                .map(|t| AppToolItem {
+                    name: t.name,
+                    description: t.description,
+                    input_schema_json: t.input_schema_json,
+                    requires_approval: t.requires_approval,
+                })
+                .collect(),
+        },
+        None => AppToolsResponse {
+            revision: 0,
+            stale: true,
+            updated_at_ms: 0,
+            tools: vec![],
+        },
+    };
+
+    Ok(Json(response))
 }
 
 #[cfg(test)]

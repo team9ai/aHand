@@ -197,6 +197,26 @@ pub async fn test_state_with_webhook() -> AppState {
     state
 }
 
+/// Like [`test_state_with_webhook`] but with a high `max_retries` (100) so
+/// the background worker never exhausts retries and deletes rows during the
+/// test window. Used by tests that need to inspect the webhook delivery
+/// store contents after an event fires — the `max_retries = 1` config in
+/// `test_state_with_webhook` causes the worker to DLQ+delete rows after the
+/// first failed attempt (very quickly on ECONNREFUSED), which races with
+/// `lease_due` inspection.
+pub async fn test_state_with_webhook_persistent() -> AppState {
+    let mut config = test_config();
+    config.webhook_url = Some("http://127.0.0.1:1/webhook".into());
+    config.webhook_secret = Some("test-webhook-secret".into());
+    config.webhook_max_retries = 100;
+    config.webhook_max_concurrency = 2;
+    let state = AppState::from_config(config)
+        .await
+        .expect("test state should build");
+    state.devices.mark_offline("device-2").await.ok();
+    state
+}
+
 pub async fn test_state_with_browser_device() -> AppState {
     let state = AppState::from_config(test_config())
         .await

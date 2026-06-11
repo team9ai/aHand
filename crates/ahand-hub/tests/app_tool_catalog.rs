@@ -1,6 +1,6 @@
-//! Integration tests for Task 7: per-device app tool catalog with stale semantics.
+//! Integration tests for Task 7 + Task 8: per-device app tool catalog.
 //!
-//! Verifies:
+//! Task 7:
 //! - Inbound AppToolsUpdate is stored and clears the `stale` flag.
 //! - Duplicate revision on a fresh catalog is ignored.
 //! - Disconnect marks the catalog stale (content retained).
@@ -9,18 +9,30 @@
 //! - Hello-time staleness: catalog is marked stale on new connection before
 //!   the daemon re-advertises (covers hub-crash / revision-reset scenarios).
 //! - Empty tools snapshot is accepted as a valid catalog state.
+//!
+//! Task 8:
+//! - GET /api/devices/{device_id}/app-tools returns full camelCase catalog.
+//! - GET unknown device → 404 standard envelope.
+//! - GET known device, no catalog → 200 empty-catalog shape.
+//! - GET stale-by-offline: catalog fresh in store but device offline → stale=true.
+//! - Webhook enqueued on accepted update with correct payload.
+//! - Webhook NOT enqueued on ignored (duplicate-revision) update.
 
 mod support;
 
 use std::time::Duration;
 
+use ahand_hub_core::traits::DeviceAdminStore;
 use ahand_protocol::{AppToolDescriptor, AppToolsUpdate, Envelope, envelope};
+use ed25519_dalek::SigningKey;
 use futures_util::SinkExt;
 use prost::Message;
+use reqwest::StatusCode;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use support::{
     read_hello_accepted, read_hello_challenge, signed_hello, spawn_server_with_state, test_state,
+    test_state_with_webhook_persistent,
 };
 
 fn now_ms() -> u64 {
@@ -75,10 +87,10 @@ async fn poll_stale(
 ) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(Some(catalog)) = state.app_tools.get_catalog(device_id).await {
-            if catalog.stale {
-                return true;
-            }
+        if let Ok(Some(catalog)) = state.app_tools.get_catalog(device_id).await
+            && catalog.stale
+        {
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
@@ -96,10 +108,11 @@ async fn poll_fresh(
 ) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(Some(catalog)) = state.app_tools.get_catalog(device_id).await {
-            if !catalog.stale && catalog.revision == expected_revision {
-                return true;
-            }
+        if let Ok(Some(catalog)) = state.app_tools.get_catalog(device_id).await
+            && !catalog.stale
+            && catalog.revision == expected_revision
+        {
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;
@@ -572,6 +585,512 @@ async fn empty_tools_snapshot_is_accepted() {
 
     let _ = socket.close(None).await;
     server.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 8 tests: GET /api/devices/{device_id}/app-tools
+// ─────────────────────────────────────────────────────────────────────────────
+
+const JWT_SECRET: &str = "service-test-secret";
+
+/// Mint a control-plane JWT for `external_user_id` with `jobs:execute` scope.
+fn mint_cp_jwt(external_user_id: &str) -> String {
+    use ahand_hub_core::auth::mint_control_plane_jwt;
+    let (token, _) = mint_control_plane_jwt(
+        JWT_SECRET.as_bytes(),
+        external_user_id,
+        "jobs:execute",
+        None,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    token
+}
+
+/// Register a device with `external_user_id`, attach it via WS, and return
+/// the socket so the caller can keep the connection alive.
+async fn attach_owned_device(
+    server: &support::TestServer,
+    device_id: &str,
+    external_user_id: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let verifying = SigningKey::from_bytes(&[7u8; 32])
+        .verifying_key()
+        .to_bytes();
+    server
+        .state()
+        .devices
+        .pre_register(device_id, &verifying, external_user_id)
+        .await
+        .unwrap();
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello(device_id, &challenge.nonce);
+    socket
+        .send(WsMessage::Binary(hello.encode_to_vec().into()))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+    // Small grace so the hub finishes registering the WS connection.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    socket
+}
+
+/// GET /api/devices/{device_id}/app-tools happy path:
+/// - connect device, send AppToolsUpdate rev=1 with all fields
+/// - GET returns 200 with correct camelCase JSON body
+#[tokio::test]
+async fn get_app_tools_happy_path() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    let mut socket = attach_owned_device(&server, "cp-device-1", "user-cp-1").await;
+
+    // Send AppToolsUpdate rev=1.
+    let update = Envelope {
+        device_id: "cp-device-1".into(),
+        msg_id: "app-tools-1".into(),
+        seq: 1,
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolsUpdate(AppToolsUpdate {
+            revision: 1,
+            tools: vec![AppToolDescriptor {
+                name: "my_tool".into(),
+                description: "A cool tool".into(),
+                input_schema_json: r#"{"type":"object","properties":{}}"#.into(),
+                requires_approval: true,
+            }],
+        })),
+        ..Default::default()
+    };
+    socket
+        .send(WsMessage::Binary(update.encode_to_vec().into()))
+        .await
+        .unwrap();
+
+    // Wait for the catalog to land.
+    let catalog_present = poll_catalog(server.state(), "cp-device-1", Duration::from_secs(3)).await;
+    assert!(catalog_present.is_some(), "catalog must be stored");
+
+    // GET via control-plane JWT.
+    let token = mint_cp_jwt("user-cp-1");
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/devices/cp-device-1/app-tools",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(body["revision"], 1);
+    assert_eq!(body["stale"], false);
+    assert!(body["updatedAtMs"].as_u64().unwrap_or(0) > 0);
+    let tools = body["tools"].as_array().expect("tools must be array");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["name"], "my_tool");
+    assert_eq!(tools[0]["description"], "A cool tool");
+    assert_eq!(
+        tools[0]["inputSchemaJson"],
+        r#"{"type":"object","properties":{}}"#
+    );
+    assert_eq!(tools[0]["requiresApproval"], true);
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
+/// GET /api/devices/{device_id}/app-tools for an unknown device → 404.
+#[tokio::test]
+async fn get_app_tools_unknown_device_returns_404() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    let token = mint_cp_jwt("user-nobody");
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/devices/nonexistent-device/app-tools",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "DEVICE_NOT_FOUND");
+
+    server.shutdown().await;
+}
+
+/// GET /api/devices/{device_id}/app-tools for a known device with no catalog
+/// → 200 with empty-catalog shape.
+#[tokio::test]
+async fn get_app_tools_no_catalog_returns_empty_shape() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    // Register device with external_user_id but don't send AppToolsUpdate.
+    let mut socket = attach_owned_device(&server, "cp-device-nocatalog", "user-cp-2").await;
+
+    let token = mint_cp_jwt("user-cp-2");
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/devices/cp-device-nocatalog/app-tools",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["revision"], 0);
+    assert_eq!(body["stale"], true);
+    assert_eq!(body["updatedAtMs"], 0);
+    let tools = body["tools"].as_array().expect("tools must be array");
+    assert_eq!(tools.len(), 0);
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
+/// GET /api/devices/{device_id}/app-tools: catalog is fresh in the store but
+/// device is offline → stale=true.
+///
+/// To isolate the `stale = stored_stale || !online` OR logic without relying
+/// on disconnect-time stale-marking (which also sets `stored.stale = true`),
+/// we inject a catalog directly into the store with `stale: false`, then
+/// assert that the HTTP response still returns `stale: true` because the device
+/// is offline. This tests the `!device_online` branch of the OR expression.
+#[tokio::test]
+async fn get_app_tools_stale_by_offline() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    // Register device without connecting (stays offline).
+    let verifying = SigningKey::from_bytes(&[7u8; 32])
+        .verifying_key()
+        .to_bytes();
+    server
+        .state()
+        .devices
+        .pre_register("cp-device-offline", &verifying, "user-cp-3")
+        .await
+        .unwrap();
+
+    // Inject a "fresh" (stale=false) catalog directly so the stored stale
+    // flag is false, isolating the online-state contribution to the OR.
+    server
+        .state()
+        .app_tools
+        .put_catalog(
+            "cp-device-offline",
+            ahand_hub_store::app_tool_store::StoredAppToolCatalog {
+                revision: 5,
+                stale: false,
+                tools: vec![ahand_hub_store::app_tool_store::StoredAppTool {
+                    name: "offline_tool".into(),
+                    description: "Tool from offline device".into(),
+                    input_schema_json: r#"{"type":"object"}"#.into(),
+                    requires_approval: false,
+                }],
+                updated_at_ms: 1_000_000,
+            },
+        )
+        .await
+        .expect("put_catalog");
+
+    let token = mint_cp_jwt("user-cp-3");
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/devices/cp-device-offline/app-tools",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // Device is offline → stale must be true even though stored.stale=false.
+    assert_eq!(
+        body["stale"], true,
+        "offline device must make catalog stale"
+    );
+    assert_eq!(body["revision"], 5);
+
+    server.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Task 8 webhook tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Helper: poll the webhook delivery store for a row matching the predicate,
+/// up to the given deadline (wall clock). Returns true if found.
+async fn poll_webhook_delivery<F>(
+    store: &std::sync::Arc<dyn ahand_hub_store::webhook_delivery_store::WebhookDeliveryStore>,
+    predicate: F,
+    deadline: Duration,
+) -> bool
+where
+    F: Fn(&serde_json::Value) -> bool,
+{
+    let end = tokio::time::Instant::now() + deadline;
+    while tokio::time::Instant::now() < end {
+        let rows = store
+            .lease_due(chrono::Utc::now() + chrono::Duration::seconds(3600), 20)
+            .await
+            .unwrap_or_default();
+        // Release the leased rows so the background worker can still process them.
+        for row in &rows {
+            let _ = store
+                .mark_failed(
+                    &row.event_id,
+                    row.next_retry_at,
+                    row.attempts,
+                    row.last_error.as_deref().unwrap_or(""),
+                )
+                .await;
+        }
+        if rows.iter().any(|r| predicate(&r.payload)) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    false
+}
+
+/// Accepted AppToolsUpdate must enqueue a `device.app_tools.updated` webhook
+/// with `{revision, toolCount}` in the data field.
+#[tokio::test]
+async fn webhook_enqueued_on_accepted_update() {
+    // Use webhook_persistent so the background worker doesn't DLQ+delete rows
+    // before we can inspect them (max_retries=1 exhausts on first attempt).
+    let state = test_state_with_webhook_persistent().await;
+    let server = spawn_server_with_state(state).await;
+
+    // Register device with external_user_id before connecting.
+    let verifying = SigningKey::from_bytes(&[7u8; 32])
+        .verifying_key()
+        .to_bytes();
+    server
+        .state()
+        .devices
+        .pre_register("wh-device-1", &verifying, "user-wh-1")
+        .await
+        .unwrap();
+
+    // Connect.
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("wh-device-1", &challenge.nonce);
+    socket
+        .send(WsMessage::Binary(hello.encode_to_vec().into()))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+
+    // Send AppToolsUpdate rev=1.
+    let update = make_app_tools_update_for("wh-device-1", 1, "wh_tool");
+    socket
+        .send(WsMessage::Binary(update.encode_to_vec().into()))
+        .await
+        .unwrap();
+
+    // Wait for catalog to land.
+    poll_catalog(server.state(), "wh-device-1", Duration::from_secs(3))
+        .await
+        .expect("catalog must be stored before webhook check");
+
+    let wh_store = server
+        .state()
+        .webhook
+        .store()
+        .expect("webhook store must be present");
+
+    let found = poll_webhook_delivery(
+        &wh_store,
+        |payload| {
+            payload["eventType"] == "device.app_tools.updated"
+                && payload["deviceId"] == "wh-device-1"
+                && payload["data"]["revision"] == 1
+                && payload["data"]["toolCount"] == 1
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+
+    assert!(
+        found,
+        "device.app_tools.updated webhook must be enqueued with revision=1, toolCount=1"
+    );
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
+/// Duplicate-revision (ignored) AppToolsUpdate must NOT enqueue a webhook.
+#[tokio::test]
+async fn webhook_not_enqueued_on_duplicate_revision() {
+    // Use webhook_persistent so the background worker doesn't DLQ+delete rows
+    // before we can inspect them (max_retries=1 exhausts on first attempt).
+    let state = test_state_with_webhook_persistent().await;
+    let server = spawn_server_with_state(state).await;
+
+    let verifying = SigningKey::from_bytes(&[7u8; 32])
+        .verifying_key()
+        .to_bytes();
+    server
+        .state()
+        .devices
+        .pre_register("wh-device-2", &verifying, "user-wh-2")
+        .await
+        .unwrap();
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("wh-device-2", &challenge.nonce);
+    socket
+        .send(WsMessage::Binary(hello.encode_to_vec().into()))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+
+    // Send first update (rev=1) — accepted.
+    let first = make_app_tools_update_for("wh-device-2", 1, "tool_a");
+    socket
+        .send(WsMessage::Binary(first.encode_to_vec().into()))
+        .await
+        .unwrap();
+    poll_catalog(server.state(), "wh-device-2", Duration::from_secs(3))
+        .await
+        .expect("first catalog must land");
+
+    // Wait for the first webhook to appear so we have a stable baseline count.
+    let wh_store = server
+        .state()
+        .webhook
+        .store()
+        .expect("webhook store must be present");
+    let _ = poll_webhook_delivery(
+        &wh_store,
+        |p| p["eventType"] == "device.app_tools.updated" && p["deviceId"] == "wh-device-2",
+        Duration::from_secs(3),
+    )
+    .await;
+
+    // Count how many `device.app_tools.updated` rows exist for this device now.
+    let rows_before: usize = {
+        let rows = wh_store
+            .lease_due(chrono::Utc::now() + chrono::Duration::seconds(3600), 50)
+            .await
+            .unwrap_or_default();
+        for row in &rows {
+            let _ = wh_store
+                .mark_failed(
+                    &row.event_id,
+                    row.next_retry_at,
+                    row.attempts,
+                    row.last_error.as_deref().unwrap_or(""),
+                )
+                .await;
+        }
+        rows.iter()
+            .filter(|r| {
+                r.payload["eventType"] == "device.app_tools.updated"
+                    && r.payload["deviceId"] == "wh-device-2"
+            })
+            .count()
+    };
+
+    // Send duplicate (same rev=1, fresh catalog) — must be ignored.
+    let dup = make_app_tools_update_for("wh-device-2", 1, "tool_a_dup");
+    socket
+        .send(WsMessage::Binary(dup.encode_to_vec().into()))
+        .await
+        .unwrap();
+
+    // Send sentinel rev=2 so we know the hub processed the duplicate frame.
+    let sentinel = make_app_tools_update_for("wh-device-2", 2, "tool_b");
+    socket
+        .send(WsMessage::Binary(sentinel.encode_to_vec().into()))
+        .await
+        .unwrap();
+    // Wait until sentinel lands in the catalog.
+    poll_fresh(server.state(), "wh-device-2", 2, Duration::from_secs(3)).await;
+
+    // Give a bit more time for any spurious webhook row.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Count again.
+    let rows_after: usize = {
+        let rows = wh_store
+            .lease_due(chrono::Utc::now() + chrono::Duration::seconds(3600), 50)
+            .await
+            .unwrap_or_default();
+        for row in &rows {
+            let _ = wh_store
+                .mark_failed(
+                    &row.event_id,
+                    row.next_retry_at,
+                    row.attempts,
+                    row.last_error.as_deref().unwrap_or(""),
+                )
+                .await;
+        }
+        rows.iter()
+            .filter(|r| {
+                r.payload["eventType"] == "device.app_tools.updated"
+                    && r.payload["deviceId"] == "wh-device-2"
+            })
+            .count()
+    };
+
+    // Exactly one additional row for the sentinel (rev=2); duplicate must not
+    // have added one.
+    assert_eq!(
+        rows_after,
+        rows_before + 1,
+        "duplicate update must not enqueue a webhook; expected exactly one new row (sentinel)"
+    );
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
+/// Helper variant of `make_app_tools_update` that takes a device_id.
+fn make_app_tools_update_for(device_id: &str, revision: u64, tool_name: &str) -> Envelope {
+    Envelope {
+        device_id: device_id.into(),
+        msg_id: format!("app-tools-{device_id}-{revision}"),
+        seq: revision,
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolsUpdate(AppToolsUpdate {
+            revision,
+            tools: vec![AppToolDescriptor {
+                name: tool_name.into(),
+                description: "A webhook test tool".into(),
+                input_schema_json: r#"{"type":"object"}"#.into(),
+                requires_approval: false,
+            }],
+        })),
+        ..Default::default()
+    }
 }
 
 /// 256 KiB size guard: an oversized catalog must be rejected (not stored).

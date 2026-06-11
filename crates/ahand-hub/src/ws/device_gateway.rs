@@ -931,7 +931,26 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                                             "toolCount": tool_count,
                                         }),
                                     ).await;
-                                    // Webhook enqueue lands in Task 8.
+                                    // Enqueue webhook: guard on is_enabled()
+                                    // and use the cached online_external_user_id
+                                    // (same approach as enqueue_heartbeat above).
+                                    if state.webhook.is_enabled()
+                                        && let Err(err) = state
+                                            .webhook
+                                            .enqueue_app_tools_updated(
+                                                &device_id,
+                                                online_external_user_id.as_deref(),
+                                                revision,
+                                                tool_count,
+                                            )
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            device_id = %device_id,
+                                            error = %err,
+                                            "failed to enqueue device.app_tools.updated webhook",
+                                        );
+                                    }
                                 }
                             } else {
                                 let incoming_revision = update.revision;
