@@ -388,6 +388,22 @@ fn extract_node_zip(zip_bytes: &[u8], dest_dir: &Path) -> Result<()> {
         let raw_name = file.name().to_owned();
         let raw_path = PathBuf::from(&raw_name);
 
+        // Validate the RAW path BEFORE stripping: reject any entry whose
+        // first or subsequent components are ParentDir, RootDir, or Prefix.
+        // An entry like `../evil` or `/etc/passwd` must error here, not be
+        // silently neutralised into the root by skip(1).
+        // Require at least one component so zero-component entries are also
+        // rejected (empty name).
+        {
+            let comp_count = raw_path.components().count();
+            if comp_count < 1 {
+                anyhow::bail!("Node.js zip entry has an empty path: '{raw_name}'");
+            }
+            // Check every component in the raw path (including the first).
+            guard_zip_path_traversal(&raw_path)
+                .with_context(|| format!("Path traversal in raw zip entry path '{raw_name}'"))?;
+        }
+
         // Strip first component (the versioned top-level directory).
         let stripped: PathBuf = raw_path.components().skip(1).collect();
         if stripped.as_os_str().is_empty() {
@@ -395,7 +411,7 @@ fn extract_node_zip(zip_bytes: &[u8], dest_dir: &Path) -> Result<()> {
             continue;
         }
 
-        // Component-level traversal guard.
+        // Component-level traversal guard (post-strip, defence-in-depth).
         guard_zip_path_traversal(&stripped).with_context(|| {
             format!("Path traversal detected in Node.js zip entry '{raw_name}'")
         })?;
@@ -913,6 +929,92 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Raw-path validation tests (pre-strip guard — item 1)
+    // These confirm that malicious raw paths are ERROR-ed rather than
+    // silently neutralised into the root by skip(1).
+    // -------------------------------------------------------------------------
+
+    /// A raw entry `../evil` — ParentDir as first component — must be rejected
+    /// with an error BEFORE stripping, not silently normalised to `evil`.
+    #[test]
+    fn zip_extraction_raw_parent_dir_rejected_before_strip() {
+        use zip::write::SimpleFileOptions;
+
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zw = zip::ZipWriter::new(buf);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        // Entry whose raw path starts with `..` — skipping the versioned
+        // first component would otherwise land the content in the root.
+        zw.start_file("../evil.txt", opts).unwrap();
+        {
+            use std::io::Write as _;
+            zw.write_all(b"evil").unwrap();
+        }
+
+        let cursor = zw.finish().unwrap();
+        let zip_bytes = cursor.into_inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("node");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let result = extract_node_zip(&zip_bytes, &dest);
+        assert!(
+            result.is_err(),
+            "raw '../evil' entry must be rejected before strip; got Ok"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("..") || msg.contains("parent-dir") || msg.contains("traversal"),
+            "error must mention traversal: {msg}"
+        );
+    }
+
+    /// A raw entry `/evil` — RootDir as first component — must be rejected
+    /// with an error BEFORE stripping, not silently normalised to `evil`.
+    ///
+    /// Note: most zip writers normalise paths so absolute entries cannot be
+    /// crafted via `start_file`; we build a raw entry directly to exercise the
+    /// guard.
+    #[test]
+    fn zip_extraction_raw_rooted_path_rejected_before_strip() {
+        use zip::write::SimpleFileOptions;
+
+        // Build a zip with a raw absolute path entry.  The `zip` writer
+        // accepts arbitrary byte strings for file names so we can inject
+        // `/evil.txt` directly.
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zw = zip::ZipWriter::new(buf);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        // Use a path that PathBuf::from will parse as RootDir on unix.
+        zw.start_file("/evil.txt", opts).unwrap();
+        {
+            use std::io::Write as _;
+            zw.write_all(b"evil").unwrap();
+        }
+
+        let cursor = zw.finish().unwrap();
+        let zip_bytes = cursor.into_inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("node");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        let result = extract_node_zip(&zip_bytes, &dest);
+        assert!(
+            result.is_err(),
+            "raw '/evil.txt' entry must be rejected before strip; got Ok"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("absolute") || msg.contains("traversal") || msg.contains("parent-dir"),
+            "error must mention absolute/traversal: {msg}"
+        );
     }
 
     /// guard_zip_path_traversal: parent-dir components are rejected.

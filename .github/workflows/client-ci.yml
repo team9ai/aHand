@@ -62,7 +62,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -70,6 +70,10 @@ jobs:
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
@@ -108,7 +112,7 @@ jobs:
 
           exit $STATUS
 
-      - name: browser-doctor (assert healthy)
+      - name: browser-doctor (assert healthy after init)
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
@@ -144,5 +148,70 @@ jobs:
             echo "ERROR: doctor output missing 'all checks passed'"
             exit 1
           fi
+          # Also fail if any error marker is present in the output.
+          if echo "$OUTPUT" | grep -qF "✗"; then
+            echo "ERROR: doctor output contains '✗' (failed check)"
+            exit 1
+          fi
+          if echo "$OUTPUT" | grep -qiF "Failed"; then
+            echo "ERROR: doctor output contains 'Failed'"
+            exit 1
+          fi
 
           echo "=== browser-doctor: all assertions passed ==="
+
+      - name: browser-init --force (pin force-reinstall path on real runners)
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            AHANDD="target/debug/ahandd.exe"
+          else
+            AHANDD="target/debug/ahandd"
+          fi
+
+          echo "=== browser-init --force ==="
+          "$AHANDD" browser-init --force
+
+      - name: browser-doctor (assert healthy after force re-init)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            AHANDD="target/debug/ahandd.exe"
+          else
+            AHANDD="target/debug/ahandd"
+          fi
+
+          OUTPUT=$("$AHANDD" browser-doctor 2>&1)
+          STATUS=$?
+
+          echo "$OUTPUT"
+
+          if [ $STATUS -ne 0 ]; then
+            echo "ERROR: browser-doctor exited with status $STATUS after force re-init"
+            exit 1
+          fi
+
+          if ! echo "$OUTPUT" | grep -qF "Node.js:"; then
+            echo "ERROR: doctor output missing 'Node.js:' after force re-init"
+            exit 1
+          fi
+          if ! echo "$OUTPUT" | grep -qF "playwright-cli:"; then
+            echo "ERROR: doctor output missing 'playwright-cli:' after force re-init"
+            exit 1
+          fi
+          if ! echo "$OUTPUT" | grep -qF "all checks passed"; then
+            echo "ERROR: doctor output missing 'all checks passed' after force re-init"
+            exit 1
+          fi
+          # Also fail if any error marker is present.
+          if echo "$OUTPUT" | grep -qF "✗"; then
+            echo "ERROR: doctor output contains '✗' after force re-init"
+            exit 1
+          fi
+          if echo "$OUTPUT" | grep -qiF "Failed"; then
+            echo "ERROR: doctor output contains 'Failed' after force re-init"
+            exit 1
+          fi
+
+          echo "=== browser-doctor (post-force): all assertions passed ==="

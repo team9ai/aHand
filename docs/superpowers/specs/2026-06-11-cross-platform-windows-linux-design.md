@@ -340,16 +340,22 @@ M3 landed on `feat/cross-platform-m3` (plan:
 - **Admin SSE** — `ahandctl/src/admin.rs` `browser_init_stream` emits
   `ProgressEvent`s as `{"line":"<escaped>"}` SSE events using
   `progress_event_to_sse_line` (which delegates to `format_progress_line`
-  then escapes `\` and `"` for JSON). Wire format is byte-compatible with the
-  old bash-stream implementation. The terminal event is
-  `{"status":"done|error","exit_code":N}`.
+  then serialises via `serde_json::json!` for correct JSON escaping including
+  embedded newlines from multi-line anyhow error chains). Wire format is
+  byte-compatible with the old bash-stream implementation for single-line
+  messages; serde correctly handles the multiline case the old hand-rolled
+  `replace('\\', …).replace('"', …)` did not. The terminal event is
+  `{"status":"done|error","exit_code":N}` (also serialised via serde_json).
 - **Shared progress formatter** — `browser_setup/progress_format.rs` is the
   single rendering surface for both CLI and SSE. Rules: `Phase::Done` → `✓`,
   `Phase::Failed` → `✗`, `Phase::Log` with `LogStream::Stderr` →
   `[stderr] <msg>`, all other phases → message unchanged.
-- **`setup-browser.sh` deprecated** — header updated; no longer downloaded or
-  installed during `ahandctl upgrade` (`upgrade/assets.rs` steps 4 and 10
-  removed). The file is kept in `scripts/dist/` for legacy installs only.
+- **`setup-browser.sh` deprecated** — header updated; no longer shipped by
+  native `ahandctl upgrade` (`upgrade/assets.rs` steps 4 and 10 removed).
+  `install.sh` / release pipelines still distribute it for legacy shell-based
+  installs. The file is kept in `scripts/dist/` for those paths only; no new
+  code should depend on it — all new browser setup must go through
+  `ahandctl browser-init` (native Rust).
 - **`browser-e2e` CI job green on ubuntu-latest + windows-latest** — real
   nodejs.org / npm downloads, `ahandd browser-init` (with one retry on flake),
   then `ahandd browser-doctor` asserting all-pass (`Node.js:`,

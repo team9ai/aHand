@@ -160,7 +160,14 @@ fn node_resource(
                 // Unix: program IS the npm script.
                 npm_program.clone()
             } else {
-                // Windows: first leading arg is npm-cli.js.
+                // Windows: first leading arg is npm-cli.js (the JS entry
+                // for npm under the managed Node runtime).  The path exposed
+                // in the `npm` resource therefore points at `npm-cli.js`, NOT
+                // a native executable.  Consumers MUST use `npm_invocation()`
+                // to obtain the correct (program, leading_args) pair and must
+                // NOT attempt to exec the `npm` resource path directly —
+                // direct execution requires `node.exe` as the program with
+                // the JS file as the first argument.
                 std::path::PathBuf::from(&npm_leading[0])
             };
             resources.insert(

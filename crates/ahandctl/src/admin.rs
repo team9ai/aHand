@@ -381,13 +381,15 @@ fn browser_init_route(
 ///   - `Phase::Log` with `LogStream::Stderr` → `[stderr] <message>`
 ///   - All other phases → `<message>` unchanged
 ///
-/// Escaping rules match the original bash-stream implementation:
-/// backslash → `\\`, double-quote → `\"`.  This function is a pure
-/// transformation and is unit-tested for escaping parity in the tests module.
+/// The JSON envelope is produced by `serde_json::json!` so that any character
+/// that is special in JSON (including embedded newlines from multi-line anyhow
+/// error chains, control characters, additional backslashes, etc.) is correctly
+/// escaped.  The hand-rolled `replace('\\', …).replace('"', …)` was only safe
+/// for single-line messages; multiline failure messages would have broken the
+/// SPA's `JSON.parse`.
 pub fn progress_event_to_sse_line(event: &ahandd::browser_setup::ProgressEvent) -> String {
     let line = ahandd::browser_setup::format_progress_line(event);
-    let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
-    format!(r#"{{"line":"{}"}}"#, escaped)
+    serde_json::json!({"line": line}).to_string()
 }
 
 fn browser_init_stream()
@@ -410,7 +412,7 @@ fn browser_init_stream()
             Ok(_) => (0i32, "done"),
             Err(_) => (1i32, "error"),
         };
-        let data = format!(r#"{{"status":"{}","exit_code":{}}}"#, status_str, exit_code);
+        let data = serde_json::json!({"status": status_str, "exit_code": exit_code}).to_string();
         let _ = tx.send(warp::sse::Event::default().data(data));
     });
 
@@ -856,5 +858,126 @@ mod sse_adapter_tests {
                 "parsed JSON must have 'line' key: {s}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Multiline + control-char tests (serde_json envelope, item 2)
+    // These confirm that embedded newlines (from anyhow error chains) and
+    // control characters are correctly escaped by serde_json so the SPA's
+    // JSON.parse cannot break.
+    // -------------------------------------------------------------------------
+
+    /// A failure message with embedded newlines (anyhow chain) must be
+    /// serialised with `\n` escape sequences, NOT raw newlines, and the
+    /// result must parse as valid JSON.
+    #[test]
+    fn multiline_message_is_valid_json_with_escaped_newlines() {
+        let message = "npm ERR! code EACCES\nnpm ERR! syscall access\nnpm ERR! path /usr/lib";
+        let event = make_event(Phase::Failed, message);
+        let result = progress_event_to_sse_line(&event);
+
+        // Must parse as valid JSON.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("multiline message must produce valid JSON");
+
+        // The "line" value must exist and contain the original text
+        // (serde_json will have decoded the \\n escape back to \n).
+        let line_val = parsed
+            .get("line")
+            .and_then(|v| v.as_str())
+            .expect("'line' key must be a string");
+        // The prefix char (✗) is added by format_progress_line for Phase::Failed.
+        assert!(
+            line_val.contains("EACCES"),
+            "line value should contain original error text: {line_val}"
+        );
+
+        // The raw serialised string must NOT contain a bare newline between
+        // the opening { and closing } — it must use \\n escapes.
+        assert!(
+            !result.contains('\n'),
+            "serialised SSE line must not contain a bare newline: {result:?}"
+        );
+    }
+
+    /// A message with control characters (tab, carriage-return) must also be
+    /// escaped, not emitted as raw control characters, so JSON.parse is safe.
+    #[test]
+    fn control_chars_are_escaped_in_sse_json() {
+        let message = "step\t(tab)\rstep2";
+        let event = make_event(Phase::Log, message);
+        let result = progress_event_to_sse_line(&event);
+
+        // Must parse as valid JSON regardless of any control chars in message.
+        let _parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("control chars must produce valid JSON");
+
+        // Raw CR and TAB must not appear inside the JSON string value.
+        assert!(
+            !result.contains('\r'),
+            "serialised SSE line must not contain raw CR: {result:?}"
+        );
+        assert!(
+            !result.contains('\t'),
+            "serialised SSE line must not contain raw TAB: {result:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Stream-level error-path test (audit TOP-1, item 2)
+    // Drive the part of browser_init_stream that maps Ok/Err → final event
+    // and assert the final event is {"status":"error","exit_code":1}.
+    // -------------------------------------------------------------------------
+
+    /// Helper that simulates the status-event construction in browser_init_stream:
+    /// given a `Result`, build the final SSE data string exactly as the route does.
+    fn make_final_status_event(result: anyhow::Result<()>) -> String {
+        let (exit_code, status_str) = match result {
+            Ok(_) => (0i32, "done"),
+            Err(_) => (1i32, "error"),
+        };
+        serde_json::json!({"status": status_str, "exit_code": exit_code}).to_string()
+    }
+
+    /// When run_all returns Err, the final event must be
+    /// `{"status":"error","exit_code":1}`.
+    #[test]
+    fn stream_error_result_emits_error_status_event() {
+        let data = make_final_status_event(Err(anyhow::anyhow!("simulated failure")));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&data).expect("final event must be valid JSON");
+
+        assert_eq!(
+            parsed.get("status").and_then(|v| v.as_str()),
+            Some("error"),
+            "status must be 'error' on Err: {data}"
+        );
+        assert_eq!(
+            parsed.get("exit_code").and_then(|v| v.as_i64()),
+            Some(1),
+            "exit_code must be 1 on Err: {data}"
+        );
+    }
+
+    /// When run_all returns Ok, the final event must be
+    /// `{"status":"done","exit_code":0}`.
+    #[test]
+    fn stream_ok_result_emits_done_status_event() {
+        let data = make_final_status_event(Ok(()));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&data).expect("final event must be valid JSON");
+
+        assert_eq!(
+            parsed.get("status").and_then(|v| v.as_str()),
+            Some("done"),
+            "status must be 'done' on Ok: {data}"
+        );
+        assert_eq!(
+            parsed.get("exit_code").and_then(|v| v.as_i64()),
+            Some(0),
+            "exit_code must be 0 on Ok: {data}"
+        );
     }
 }

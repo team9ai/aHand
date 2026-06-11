@@ -557,6 +557,16 @@ fn cli_invocation_with(
         return invocation;
     }
 
+    // Bare PATH fallback: resolves `playwright-cli[.exe]` via the system PATH.
+    //
+    // WINDOWS LIMITATION: npm's global package shim on Windows is a `.cmd`
+    // file (`playwright-cli.cmd`), not a native executable.  Windows
+    // `CreateProcess` cannot directly execute `.cmd` files — it requires
+    // `cmd.exe /c playwright-cli.cmd` to work.  A user-global `npm install -g
+    // @playwright/cli` therefore is NOT picked up by this bare fallback.
+    // Remediation: run `ahandd browser-init` (or `ahandctl browser-init`) to
+    // install the managed runtime; the managed path is always used when the
+    // runtime is present (priority 2 above).
     (
         PathBuf::from(ahand_platform::paths::exe_name("playwright-cli")),
         vec![],
@@ -817,6 +827,57 @@ fn domain_matches(domain: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // check_domain deny-wins test (audit TOP-3)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// When a domain appears in BOTH the denied list (as a pattern) AND the
+    /// allowed list, denied must win and check_domain must return Err.
+    #[test]
+    fn check_domain_deny_wins_over_allow() {
+        let config = crate::config::BrowserConfig {
+            enabled: Some(true),
+            // Domain is in both allowed AND denied.
+            allowed_domains: vec!["example.com".to_string()],
+            denied_domains: vec!["example.com".to_string()],
+            ..Default::default()
+        };
+        let mgr = BrowserManager::new(config);
+
+        let params = r#"{"url":"https://example.com/page"}"#;
+        let result = mgr.check_domain("goto", params);
+
+        assert!(
+            result.is_err(),
+            "deny must win over allow when domain appears in both lists; got Ok"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("denied"),
+            "error should mention 'denied': {msg}"
+        );
+    }
+
+    /// Wildcard pattern deny wins over explicit allow for a subdomain.
+    #[test]
+    fn check_domain_wildcard_deny_wins_over_allow() {
+        let config = crate::config::BrowserConfig {
+            enabled: Some(true),
+            allowed_domains: vec!["sub.evil.com".to_string()],
+            denied_domains: vec!["*.evil.com".to_string()],
+            ..Default::default()
+        };
+        let mgr = BrowserManager::new(config);
+
+        let params = r#"{"url":"https://sub.evil.com/"}"#;
+        let result = mgr.check_domain("goto", params);
+
+        assert!(
+            result.is_err(),
+            "wildcard deny must win even when domain is explicitly allowed; got Ok"
+        );
+    }
 
     #[test]
     fn test_extract_domain() {
