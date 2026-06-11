@@ -7,8 +7,8 @@
 #   iex "& { $script } -Version 1.2.3"
 #
 # Environment variables (honoured when using iex form):
-#   AHAND_VERSION — install a specific rust version (e.g. "1.2.3")
-#   AHAND_DIR     — install directory (default: %USERPROFILE%\.ahand)
+#   AHAND_VERSION -- install a specific rust version (e.g. "1.2.3")
+#   AHAND_DIR     -- install directory (default: %USERPROFILE%\.ahand)
 #
 # Requires: PowerShell 5.1 or 7+, Windows 10 1803+ (for in-box tar/bsdtar).
 
@@ -22,7 +22,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# ── Helper: progress line ──────────────────────────────────────────────────────
+# -- Helper: progress line ------------------------------------------------------
 
 function Write-Step {
     param([string]$Message)
@@ -30,7 +30,7 @@ function Write-Step {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
-# ── Detect architecture ────────────────────────────────────────────────────────
+# -- Detect architecture --------------------------------------------------------
 
 function Get-Suffix {
     $arch = $env:PROCESSOR_ARCHITECTURE
@@ -43,7 +43,7 @@ function Get-Suffix {
     throw "ERROR: Unsupported architecture: $arch. Only AMD64 is currently supported on Windows."
 }
 
-# ── Resolve latest release versions ───────────────────────────────────────────
+# -- Resolve latest release versions -------------------------------------------
 
 function Resolve-Versions {
     param([string]$PinnedVersion)
@@ -86,7 +86,7 @@ function Resolve-Versions {
     return $versions
 }
 
-# ── Download a file, with optional tolerance for failures ─────────────────────
+# -- Download a file, with optional tolerance for failures ---------------------
 
 function Invoke-Download {
     param(
@@ -100,7 +100,7 @@ function Invoke-Download {
         Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
     } catch {
         if ($Tolerant) {
-            Write-Host "  (optional) $filename not available — skipping: $_" -ForegroundColor Yellow
+            Write-Host "  (optional) $filename not available -- skipping: $_" -ForegroundColor Yellow
             return $false
         }
         throw
@@ -108,7 +108,7 @@ function Invoke-Download {
     return $true
 }
 
-# ── Verify SHA-256 checksums ───────────────────────────────────────────────────
+# -- Verify SHA-256 checksums ---------------------------------------------------
 # Checksum file format (sha256sum / shasum -a 256):
 #   <hex>  <filename>
 
@@ -129,7 +129,7 @@ function Confirm-Checksums {
             }
         }
         if (-not $expected) {
-            Write-Host "  (checksum) No entry for $name in checksum file — skipping verification for this file." -ForegroundColor Yellow
+            Write-Host "  (checksum) No entry for $name in checksum file -- skipping verification for this file." -ForegroundColor Yellow
             continue
         }
         $actual = (Get-FileHash -Path $filePath -Algorithm SHA256).Hash
@@ -140,7 +140,7 @@ function Confirm-Checksums {
     }
 }
 
-# ── Install admin SPA via tar ─────────────────────────────────────────────────
+# -- Install admin SPA via tar -------------------------------------------------
 # Safe staged extraction:
 #   1. Extract into a fresh temp staging dir.
 #   2. Validate every item: reject reparse points and paths that escape staging root.
@@ -151,7 +151,7 @@ function Install-AdminSpa {
     param(
         [string]$TarPath,
         [string]$AdminDistDir,
-        [string]$ChecksumFile   # optional — path to checksums-admin.txt
+        [string]$ChecksumFile   # optional -- path to checksums-admin.txt
     )
     $tarCmd = Get-Command tar -ErrorAction SilentlyContinue
     if (-not $tarCmd) {
@@ -217,10 +217,10 @@ function Install-AdminSpa {
         }
         throw
     }
-    # staging dir is now AdminDistDir — no separate cleanup needed on success
+    # staging dir is now AdminDistDir -- no separate cleanup needed on success
 }
 
-# ── PATH management ───────────────────────────────────────────────────────────
+# -- PATH management -----------------------------------------------------------
 
 function Update-UserPath {
     param([string]$AddDir)
@@ -257,7 +257,7 @@ function Update-UserPath {
     Write-Host "  NOTE: Open a new terminal (or restart your shell) for the PATH change to take effect." -ForegroundColor Yellow
 }
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ----------------------------------------------------------------------
 
 $stagingDir = $null
 
@@ -304,7 +304,7 @@ try {
         Write-Step "Verifying checksums..."
         Confirm-Checksums -ChecksumFile $checksumFile -FilesToVerify @($daemonSrc, $ctlSrc)
     } else {
-        Write-Host "  (checksum file not available — skipping integrity check)" -ForegroundColor Yellow
+        Write-Host "  (checksum file not available -- skipping integrity check)" -ForegroundColor Yellow
     }
 
     # --- Download admin SPA (optional) ---
@@ -318,7 +318,7 @@ try {
         if (-not $gotAdmin) {
             $adminTar = $null
         } else {
-            # Download admin checksum file (checksums-admin.txt) — optional
+            # Download admin checksum file (checksums-admin.txt) -- optional
             $adminChecksumDest = Join-Path $stagingDir "checksums-admin.txt"
             $gotAdminChecksum  = Invoke-Download -Url "$adminBase/checksums-admin.txt" -Dest $adminChecksumDest -Tolerant
             if ($gotAdminChecksum) {
