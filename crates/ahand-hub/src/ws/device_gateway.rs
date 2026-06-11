@@ -864,6 +864,19 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                         }
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
                         queue_ack_only(&control_tx, &device_id, envelope.seq)?;
+                    } else if let Some(ahand_protocol::envelope::Payload::AppToolResponse(ref resp)) = envelope.payload {
+                        // Resolve the pending oneshot for POST /api/control/app-tool.
+                        // Mirrors the BrowserResponse arm above exactly.
+                        if let Some((_, sender)) = state.app_tool_pending.remove(&resp.tool_call_id) {
+                            let _ = sender.send(resp.clone());
+                        } else {
+                            tracing::warn!(
+                                tool_call_id = %resp.tool_call_id,
+                                "received AppToolResponse with no pending request"
+                            );
+                        }
+                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
                     } else if let Some(ahand_protocol::envelope::Payload::AppToolsUpdate(ref update)) = envelope.payload {
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
                         queue_ack_only(&control_tx, &device_id, envelope.seq)?;

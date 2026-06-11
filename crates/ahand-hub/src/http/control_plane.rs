@@ -52,6 +52,7 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
+use crate::app_tool_service::{self, AppToolInput, AppToolServiceError};
 use crate::browser_service::{self, BrowserCommandInput};
 use crate::control_jobs::ControlJobEvent;
 use crate::http::api_error::{ApiError, ApiResult};
@@ -73,6 +74,7 @@ pub fn router(state: AppState) -> Router<AppState> {
             post(control_files_upload_url),
         )
         .route("/api/control/files", post(control_files))
+        .route("/api/control/app-tool", post(invoke_app_tool))
         .route(
             "/api/devices/{device_id}/app-tools",
             get(get_device_app_tools),
@@ -716,7 +718,21 @@ pub enum ControlError {
     Forbidden,
     BadRequest(String),
     DeviceNotFound,
+    /// Used by `create_job` and legacy paths — maps to **404** `DEVICE_OFFLINE`.
+    /// Do not use for new endpoints; `DeviceOfflineConflict` below is the
+    /// correct variant for synchronous invocation endpoints (app-tool, etc.)
+    /// that must return 409 per the wire contract.
     DeviceOffline,
+    /// Used by `POST /api/control/app-tool` — maps to **409** `DEVICE_OFFLINE`.
+    ///
+    /// Two variants exist because `DeviceOffline` is locked at 404 (create_job
+    /// callers depend on it) while the app-tool wire contract mandates 409 so
+    /// callers can distinguish "device is registered but offline" from "device
+    /// does not exist" (404). Changing the existing variant would be a
+    /// breaking change to deployed SDKs.
+    DeviceOfflineConflict,
+    /// 504 — the hub-side wait for a device response timed out.
+    HubTimeout,
     JobNotFound,
     RateLimited,
     Internal(String),
@@ -756,6 +772,19 @@ impl IntoResponse for ControlError {
                 StatusCode::NOT_FOUND,
                 "DEVICE_OFFLINE",
                 "Device is not currently connected".to_string(),
+            ),
+            // 409 for endpoints that distinguish offline from not-found.
+            // See the comment on `DeviceOfflineConflict` for why this is a
+            // separate variant rather than changing `DeviceOffline`.
+            ControlError::DeviceOfflineConflict => (
+                StatusCode::CONFLICT,
+                "DEVICE_OFFLINE",
+                "Device is not currently connected".to_string(),
+            ),
+            ControlError::HubTimeout => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "TIMEOUT",
+                "Device did not respond within the requested timeout".to_string(),
             ),
             ControlError::JobNotFound => (
                 StatusCode::NOT_FOUND,
@@ -1239,4 +1268,251 @@ pub async fn control_files(
     let envelope =
         control_files_dto::build_response_envelope(response, &body.operation, duration_ms);
     Ok(Json(envelope))
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// `POST /api/control/app-tool` — synchronous app-tool invocation.
+//
+// Dispatches an AppToolRequest to the device over the existing WS and
+// awaits a single AppToolResponse, returning the result inline to the
+// HTTP caller. Daemon-level errors (APPROVAL_DENIED, EXECUTION_TIMEOUT,
+// etc.) are returned as HTTP 200 with an `error` field in the body —
+// matching the `files()` convention — so the SDK can distinguish them
+// from hub-level failures (409 offline, 504 timeout) without parsing
+// HTTP status codes alone.
+// ──────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvokeAppToolRequest {
+    pub device_id: String,
+    pub name: String,
+    /// Tool arguments as a JSON object. Defaults to `{}` when absent.
+    #[serde(default)]
+    pub args: Option<serde_json::Value>,
+    /// Hub-side timeout in milliseconds. Clamped to `[1_000, 300_000]`.
+    /// Defaults to 60_000 (60 s) when absent or zero.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvokeAppToolResponse {
+    pub tool_call_id: String,
+    /// Parsed JSON result on success; `null` if the daemon returned an
+    /// empty result_json.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// Daemon-level error; present iff the daemon replied with an error
+    /// rather than a result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<InvokeAppToolError>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvokeAppToolError {
+    pub code: String,
+    pub message: String,
+}
+
+async fn invoke_app_tool(
+    State(state): State<AppState>,
+    Extension(claims): Extension<ControlPlaneJwtClaims>,
+    body: Result<Json<InvokeAppToolRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<InvokeAppToolResponse>), ControlError> {
+    // Validate scope before any DB / WS work.
+    if claims.scope != "jobs:execute" {
+        return Err(ControlError::Forbidden);
+    }
+
+    let Json(req) = body.map_err(|_| ControlError::BadRequest("invalid JSON body".into()))?;
+
+    if req.device_id.is_empty() {
+        return Err(ControlError::BadRequest(
+            "deviceId must not be empty".into(),
+        ));
+    }
+    if req.name.trim().is_empty() {
+        return Err(ControlError::BadRequest("name must not be empty".into()));
+    }
+
+    // Rate-limit BEFORE the ownership lookup so storms can't DOS the
+    // device store — same order as create_job.
+    if state
+        .control_rate_limiter
+        .check_key(&claims.external_user_id)
+        .is_err()
+    {
+        return Err(ControlError::RateLimited);
+    }
+
+    // Ownership: device must exist and be owned by the calling user.
+    let device = state
+        .devices
+        .find_by_id(&req.device_id)
+        .await
+        .map_err(|err| ControlError::Internal(err.to_string()))?
+        .ok_or(ControlError::DeviceNotFound)?;
+
+    if device.external_user_id.as_deref() != Some(claims.external_user_id.as_str()) {
+        // Return 403 on mismatch — 404 would leak device-id existence across
+        // user boundaries (same rationale as create_job).
+        return Err(ControlError::Forbidden);
+    }
+
+    // Enforce device_ids allowlist if the token is scoped to specific devices.
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&req.device_id)
+    {
+        return Err(ControlError::Forbidden);
+    }
+
+    // Offline fast-fail: 409 (not 404) so the caller can distinguish
+    // "known device, currently offline" from "device does not exist" (404).
+    // Uses DeviceOfflineConflict — see the comment on that variant for why
+    // a separate variant exists rather than reusing DeviceOffline (404).
+    if !state.connections.is_online(&device.id) {
+        let started = std::time::Instant::now();
+        state
+            .append_audit_entry(
+                "app_tool.invoked",
+                "device",
+                &device.id,
+                &claims.external_user_id,
+                serde_json::json!({
+                    "name": req.name,
+                    "toolCallId": "<offline-fast-fail>",
+                    "outcome": "offline",
+                    "durationMs": started.elapsed().as_millis() as u64,
+                }),
+            )
+            .await;
+        return Err(ControlError::DeviceOfflineConflict);
+    }
+
+    // Serialize args; default to `{}` when absent.
+    let args_json = req
+        .args
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+        .unwrap_or_else(|| "{}".into());
+
+    let timeout_ms = req.timeout_ms.unwrap_or(0); // 0 → service default
+
+    let started = std::time::Instant::now();
+    let result = app_tool_service::invoke(
+        &state,
+        AppToolInput {
+            device_id: device.id.clone(),
+            name: req.name.clone(),
+            args_json,
+            timeout_ms,
+        },
+    )
+    .await;
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(resp) => {
+            // Determine the tool_call_id from the response (set by the service).
+            let tool_call_id = resp.tool_call_id.clone();
+
+            let (outcome, response) = match &resp.result {
+                Some(ahand_protocol::app_tool_response::Result::ResultJson(json_str)) => {
+                    let parsed: Option<serde_json::Value> = serde_json::from_str(json_str).ok();
+                    (
+                        "ok".to_string(),
+                        InvokeAppToolResponse {
+                            tool_call_id: tool_call_id.clone(),
+                            result: parsed,
+                            error: None,
+                        },
+                    )
+                }
+                Some(ahand_protocol::app_tool_response::Result::Error(err)) => {
+                    let outcome = format!("daemon_error:{}", err.code);
+                    (
+                        outcome,
+                        InvokeAppToolResponse {
+                            tool_call_id: tool_call_id.clone(),
+                            result: None,
+                            error: Some(InvokeAppToolError {
+                                code: err.code.clone(),
+                                message: err.message.clone(),
+                            }),
+                        },
+                    )
+                }
+                None => (
+                    "ok".to_string(),
+                    InvokeAppToolResponse {
+                        tool_call_id: tool_call_id.clone(),
+                        result: None,
+                        error: None,
+                    },
+                ),
+            };
+
+            state
+                .append_audit_entry(
+                    "app_tool.invoked",
+                    "device",
+                    &device.id,
+                    &claims.external_user_id,
+                    serde_json::json!({
+                        "name": req.name,
+                        "toolCallId": tool_call_id,
+                        "outcome": outcome,
+                        "durationMs": duration_ms,
+                    }),
+                )
+                .await;
+
+            Ok((StatusCode::OK, Json(response)))
+        }
+        Err(AppToolServiceError::DeviceOffline { .. } | AppToolServiceError::SendFailed { .. }) => {
+            state
+                .append_audit_entry(
+                    "app_tool.invoked",
+                    "device",
+                    &device.id,
+                    &claims.external_user_id,
+                    serde_json::json!({
+                        "name": req.name,
+                        "toolCallId": "<dispatch-failed>",
+                        "outcome": "offline",
+                        "durationMs": duration_ms,
+                    }),
+                )
+                .await;
+            Err(ControlError::DeviceOfflineConflict)
+        }
+        Err(AppToolServiceError::Timeout { .. }) => {
+            state
+                .append_audit_entry(
+                    "app_tool.invoked",
+                    "device",
+                    &device.id,
+                    &claims.external_user_id,
+                    serde_json::json!({
+                        "name": req.name,
+                        "toolCallId": "<timeout>",
+                        "outcome": "timeout",
+                        "durationMs": duration_ms,
+                    }),
+                )
+                .await;
+            Err(ControlError::HubTimeout)
+        }
+        Err(AppToolServiceError::DeviceNotFound { .. }) => {
+            // This should not normally occur — we already checked existence
+            // above — but handle it gracefully.
+            Err(ControlError::DeviceNotFound)
+        }
+        Err(AppToolServiceError::ChannelClosed) => {
+            Err(ControlError::Internal("response channel closed".into()))
+        }
+    }
 }

@@ -58,6 +58,11 @@ pub struct AppState {
     pub connections: Arc<crate::ws::device_gateway::ConnectionRegistry>,
     pub browser_pending:
         Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::BrowserResponse>>>,
+    /// Pending `POST /api/control/app-tool` oneshots keyed by `tool_call_id`
+    /// (UUID). The WS gateway resolves these when an `AppToolResponse` arrives
+    /// from the device. Mirrors `browser_pending` exactly.
+    pub app_tool_pending:
+        Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::AppToolResponse>>>,
     pub events: Arc<crate::events::EventBus>,
     pub output_stream: Arc<crate::output_stream::OutputStream>,
     pub bootstrap_tokens: Arc<crate::bootstrap::BootstrapCredentials>,
@@ -195,6 +200,7 @@ impl AppState {
         ));
 
         let browser_pending = Arc::new(DashMap::new());
+        let app_tool_pending = Arc::new(DashMap::new());
         let control_jobs = Arc::new(
             crate::control_jobs::ControlJobTracker::new_with_completed_access_retention(
                 finished_retention,
@@ -248,6 +254,7 @@ impl AppState {
             control_rate_limiter,
             connections,
             browser_pending,
+            app_tool_pending,
             events,
             output_stream,
             bootstrap_tokens: Arc::new(bootstrap_tokens),

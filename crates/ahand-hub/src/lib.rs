@@ -1,3 +1,4 @@
+pub mod app_tool_service;
 pub mod audit_writer;
 pub mod auth;
 pub mod bootstrap;
