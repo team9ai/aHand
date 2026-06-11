@@ -52,6 +52,22 @@
           "valueFrom": "${SSM_PREFIX}/REDIS_URL"
         },
         {
+          "name": "AHAND_HUB_S3_BUCKET",
+          "valueFrom": "${SSM_PREFIX}/S3_BUCKET"
+        },
+        {
+          "name": "AHAND_HUB_S3_REGION",
+          "valueFrom": "${SSM_PREFIX}/S3_REGION"
+        },
+        {
+          "name": "AHAND_HUB_S3_THRESHOLD_BYTES",
+          "valueFrom": "${SSM_PREFIX}/S3_THRESHOLD_BYTES"
+        },
+        {
+          "name": "AHAND_HUB_S3_URL_EXPIRATION_SECS",
+          "valueFrom": "${SSM_PREFIX}/S3_URL_EXPIRATION_SECS"
+        },
+        {
           "name": "AHAND_HUB_DASHBOARD_PASSWORD",
           "valueFrom": "${SSM_PREFIX}/DASHBOARD_PASSWORD"
         },

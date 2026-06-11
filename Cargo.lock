@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "ahand-hub"
-version = "0.1.2"
+version = "0.1.14"
 dependencies = [
  "ahand-hub-core",
  "ahand-hub-store",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "ahand-hub-core"
-version = "0.1.2"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "argon2",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "ahand-hub-store"
-version = "0.1.2"
+version = "0.1.14"
 dependencies = [
  "ahand-hub-core",
  "anyhow",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "ahand-platform"
-version = "0.1.2"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "dunce",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "ahand-protocol"
-version = "0.1.2"
+version = "0.1.14"
 dependencies = [
  "prost",
  "prost-build",
@@ -122,10 +122,11 @@ dependencies = [
 
 [[package]]
 name = "ahandctl"
-version = "0.1.2"
+version = "0.1.14"
 dependencies = [
  "ahand-platform",
  "ahand-protocol",
+ "ahandd",
  "anyhow",
  "clap",
  "dirs 5.0.1",
@@ -146,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "ahandd"
-version = "0.1.2"
+version = "0.1.14"
 dependencies = [
  "ahand-platform",
  "ahand-protocol",

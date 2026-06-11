@@ -1,9 +1,9 @@
 terraform {
   backend "s3" {
-    bucket         = "weightwave-tfstate"
+    bucket         = "team9-tfstate"
     key            = "ahand-hub/envs/dev/terraform.tfstate"
     region         = "us-east-1"
-    profile        = "ww"
+    profile        = "t9"
     dynamodb_table = "terraform-state-lock"
     encrypt        = true
   }

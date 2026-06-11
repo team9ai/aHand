@@ -16,7 +16,7 @@ variable "aws_region" {
 variable "aws_account_id" {
   description = "AWS account ID"
   type        = string
-  default     = "471112576951"
+  default     = "149614785083"
 }
 
 variable "ecs_cluster_name" {
@@ -81,7 +81,39 @@ variable "existing_redis_cluster_id" {
   default     = null
 }
 
+variable "s3_file_transfer_threshold_bytes" {
+  description = "Hub file size threshold above which file operations spill through S3"
+  type        = number
+  default     = 1048576
+}
+
+variable "s3_url_expiration_secs" {
+  description = "Expiration in seconds for hub-generated presigned S3 URLs"
+  type        = number
+  default     = 3600
+}
+
+variable "s3_file_ops_lifecycle_days" {
+  description = "Days to keep staged file-ops objects before S3 lifecycle expiration when this module manages the bucket"
+  type        = number
+  default     = 7
+}
+
+variable "file_ops_bucket_name" {
+  description = "Existing or managed S3 bucket name used by hub file operation staging. Defaults to the t9 bootstrap-owned bucket name."
+  type        = string
+  default     = null
+}
+
+variable "manage_file_ops_bucket" {
+  description = "Whether this module manages the file-ops S3 bucket and its controls. Leave false for t9 bootstrap-owned buckets."
+  type        = bool
+  default     = false
+}
+
 locals {
+  file_ops_bucket_name = coalesce(var.file_ops_bucket_name, "team9-ahand-hub-${var.env}")
+
   common_tags = {
     Environment = var.env
     Service     = "ahand-hub"

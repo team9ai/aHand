@@ -193,6 +193,17 @@ export interface FileResult {
   durationMs: number;
 }
 
+export interface FileUploadUrlParams {
+  deviceId: string;
+  signal?: AbortSignal;
+}
+
+export interface FileUploadUrlResult {
+  objectKey: string;
+  uploadUrl: string;
+  expiresAtMs: number;
+}
+
 export type ReadFileMode = "auto" | "text" | "image" | "binary";
 
 export type ReadPdfMode = "auto" | "metadata" | "raw" | "imgs" | "text";
@@ -415,7 +426,8 @@ export type CloudClientErrorCode =
   | "network"
   | "timeout"
   | "device_offline"
-  | "policy_denied";
+  | "policy_denied"
+  | "s3_disabled";
 
 /**
  * Typed error raised by `CloudClient`. Use `.code` to discriminate,
@@ -467,7 +479,10 @@ interface ParsedSseEvent {
  * parse the hub's `{error: {code, message}}` envelope for a useful
  * message; falls back to the HTTP status text on parse failure.
  */
-async function toTypedHttpError(res: Response): Promise<CloudClientError> {
+async function toTypedHttpError(
+  res: Response,
+  signal?: AbortSignal,
+): Promise<CloudClientError> {
   let code: CloudClientErrorCode;
   switch (res.status) {
     case 400:
@@ -515,8 +530,13 @@ async function toTypedHttpError(res: Response): Promise<CloudClientError> {
       code = "device_offline";
     } else if (res.status === 403 && body?.error?.code === "POLICY_DENIED") {
       code = "policy_denied";
+    } else if (body?.error?.code === "S3_DISABLED") {
+      code = "s3_disabled";
     }
-  } catch {
+  } catch (err) {
+    if (signal?.aborted) {
+      return new CloudClientError("abort", "Aborted", { cause: err });
+    }
     // Body wasn't JSON — keep the status-based message.
   }
   return new CloudClientError(code, message, { httpStatus: res.status });
@@ -1259,9 +1279,9 @@ export class CloudClient {
         signal: params.signal,
       });
     } catch (err) {
-      throw this.normalizeFetchError(err);
+      throw this.normalizeFetchError(err, params.signal);
     }
-    if (!res.ok) throw await toTypedHttpError(res);
+    if (!res.ok) throw await toTypedHttpError(res, params.signal);
 
     let json: {
       success?: boolean;
@@ -1391,9 +1411,9 @@ export class CloudClient {
         signal: params.signal,
       });
     } catch (err) {
-      throw this.normalizeFetchError(err);
+      throw this.normalizeFetchError(err, params.signal);
     }
-    if (!res.ok) throw await toTypedHttpError(res);
+    if (!res.ok) throw await toTypedHttpError(res, params.signal);
 
     let json: {
       request_id?: string;
@@ -1462,6 +1482,86 @@ export class CloudClient {
       result: json.result === null ? undefined : json.result,
       error,
       durationMs: typeof json.duration_ms === "number" ? json.duration_ms : 0,
+    };
+  }
+
+  /**
+   * `POST /api/control/files/upload-url`. Requests a control-plane
+   * object-storage upload URL for the given device and decodes the
+   * snake_case hub response into camelCase.
+   */
+  async createFileUploadUrl(
+    params: FileUploadUrlParams,
+  ): Promise<FileUploadUrlResult> {
+    if (params.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted before request");
+    }
+
+    const fetchImpl = this.fetchImpl();
+    const token = await this.opts.getAuthToken();
+    if (params.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
+
+    let res: Response;
+    try {
+      res = await fetchImpl(`${this.opts.hubUrl}/api/control/files/upload-url`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ device_id: params.deviceId }),
+        signal: params.signal,
+      });
+    } catch (err) {
+      throw this.normalizeFetchError(err, params.signal);
+    }
+    if (!res.ok) throw await toTypedHttpError(res, params.signal);
+
+    let json: {
+      object_key?: unknown;
+      upload_url?: unknown;
+      expires_at_ms?: unknown;
+    };
+    try {
+      json = (await res.json()) as typeof json;
+    } catch (e: unknown) {
+      if (isAbortError(e)) {
+        throw new CloudClientError(
+          "abort",
+          "upload-url request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw this.normalizeFetchError(e, params.signal);
+    }
+
+    if (
+      json === null ||
+      typeof json !== "object" ||
+      Array.isArray(json) ||
+      typeof json.object_key !== "string" ||
+      typeof json.upload_url !== "string" ||
+      typeof json.expires_at_ms !== "number"
+    ) {
+      throw new CloudClientError(
+        "server_error",
+        "Hub response malformed: expected object_key, upload_url, and expires_at_ms",
+      );
+    }
+
+    return {
+      objectKey: json.object_key,
+      uploadUrl: json.upload_url,
+      expiresAtMs: json.expires_at_ms,
     };
   }
 
@@ -1848,8 +1948,11 @@ export class CloudClient {
    * surface as `abort`; everything else as `network` with the original
    * error attached as `cause`.
    */
-  private normalizeFetchError(err: unknown): CloudClientError {
-    if (isAbortError(err)) {
+  private normalizeFetchError(
+    err: unknown,
+    signal?: AbortSignal,
+  ): CloudClientError {
+    if (isAbortError(err) || signal?.aborted) {
       return new CloudClientError("abort", "Aborted", { cause: err });
     }
     const message = err instanceof Error ? err.message : String(err);

@@ -64,6 +64,10 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/api/control/jobs/{id}/stream", get(stream_job))
         .route("/api/control/jobs/{id}/cancel", post(cancel_job))
         .route("/api/control/browser", post(browser_command_control))
+        .route(
+            "/api/control/files/upload-url",
+            post(control_files_upload_url),
+        )
         .route("/api/control/files", post(control_files))
         .layer(middleware::from_fn_with_state(
             state,
@@ -817,6 +821,73 @@ use crate::http::files::map_service_error as map_file_service_error;
 /// (the hub-side hard ceiling) — the smaller of the two wins.
 const DEFAULT_FILE_TIMEOUT_MS: u64 = 30_000;
 
+#[derive(Debug, Deserialize)]
+pub struct ControlFilesUploadUrlRequest {
+    pub device_id: String,
+}
+
+pub async fn control_files_upload_url(
+    Extension(claims): Extension<ControlPlaneJwtClaims>,
+    State(state): State<AppState>,
+    body: Result<Json<ControlFilesUploadUrlRequest>, JsonRejection>,
+) -> ApiResult<Json<crate::http::files::UploadUrlResponse>> {
+    if claims.scope != "jobs:execute" {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT scope does not permit this action",
+        ));
+    }
+    let Json(body) = body.map_err(ApiError::from_json_rejection)?;
+    if body.device_id.is_empty() {
+        return Err(ApiError::validation("device_id must not be empty"));
+    }
+    if state
+        .control_rate_limiter
+        .check_key(&claims.external_user_id)
+        .is_err()
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "RATE_LIMITED",
+            "Rate limit exceeded for this user",
+        ));
+    }
+
+    let device = state
+        .devices
+        .find_by_id(&body.device_id)
+        .await
+        .map_err(|e| ApiError::internal(format!("device store: {e}")))?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::NOT_FOUND,
+                "DEVICE_NOT_FOUND",
+                format!("Device {} not found", body.device_id),
+            )
+        })?;
+    if device.external_user_id.as_deref() != Some(claims.external_user_id.as_str()) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "NOT_DEVICE_OWNER",
+            format!("Caller does not own device {}", body.device_id),
+        ));
+    }
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&body.device_id)
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+            "Control-plane JWT does not grant access to this device",
+        ));
+    }
+
+    Ok(Json(
+        crate::http::files::create_upload_url_for_device(&state, &body.device_id).await?,
+    ))
+}
+
 pub async fn control_files(
     Extension(claims): Extension<ControlPlaneJwtClaims>,
     State(state): State<AppState>,
@@ -921,7 +992,12 @@ pub async fn control_files(
     // the caller (not inside file_service::execute) because the
     // failure modes — 503 S3_DISABLED, 400 INVALID_S3_OBJECT_KEY —
     // shouldn't collapse into 500 Internal.
-    crate::http::files::maybe_inject_full_write_download_url(&state, &mut proto_request).await?;
+    crate::http::files::maybe_inject_full_write_download_url_for_device(
+        &state,
+        &body.device_id,
+        &mut proto_request,
+    )
+    .await?;
 
     // Caller-supplied timeout caps the hub's default but cannot exceed
     // `state.file_request_timeout` (the operator-configured hub-wide

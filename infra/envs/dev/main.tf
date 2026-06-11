@@ -5,6 +5,8 @@ data "aws_lb" "traefik" {
 module "ahand_hub" {
   source = "../../modules/ahand-hub"
 
+  # t9 dev uses fresh state plus the bootstrap-owned S3 bucket. Do not migrate
+  # old ww dev state into this backend.
   env                            = "dev"
   ecs_cluster_name               = "openclaw-hive-dev"
   api_domain                     = "ahand-hub.dev.team9.ai"
@@ -28,6 +30,10 @@ output "execution_role_arn" {
 
 output "task_role_arn" {
   value = module.ahand_hub.task_role_arn
+}
+
+output "file_ops_bucket_name" {
+  value = module.ahand_hub.file_ops_bucket_name
 }
 
 output "traefik_lb_dns_name" {

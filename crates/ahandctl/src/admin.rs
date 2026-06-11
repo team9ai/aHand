@@ -92,6 +92,7 @@ pub async fn serve(port: u16, config_path: Option<String>, no_open: bool) -> Res
 
     let api = warp::path("api").and(
         status_route(token_arc.clone(), config_arc.clone())
+            .or(host_resource_route(token_arc.clone()))
             .or(config_get_route(token_arc.clone(), config_arc.clone()))
             .or(config_put_route(token_arc.clone(), config_arc.clone()))
             .or(logs_route(token_arc.clone()))
@@ -195,6 +196,23 @@ fn status_route(
                         eprintln!("Status error: {}", e);
                         Err(reject::reject())
                     }
+                }
+            }
+        })
+}
+
+fn host_resource_route(
+    token: Arc<String>,
+) -> impl Filter<Extract = impl Reply, Error = Rejection> + Clone {
+    warp::path!("host-resource")
+        .and(warp::get())
+        .and(with_auth(token))
+        .and_then(|| async move {
+            match ahandd::plugin_runtime::get_host_resource().await {
+                Ok(snapshot) => Ok::<_, Rejection>(warp::reply::json(&snapshot)),
+                Err(e) => {
+                    eprintln!("Host resource error: {}", e);
+                    Err(reject::reject())
                 }
             }
         })

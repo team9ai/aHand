@@ -11,22 +11,48 @@ pub struct Dirs {
     #[allow(dead_code)] // base dir kept for future sub-path helpers
     pub ahand: PathBuf,
     pub node: PathBuf,
+    runtime: crate::plugin_runtime::RuntimeDirs,
 }
 
 impl Dirs {
     pub fn new() -> Result<Self> {
-        let home = dirs::home_dir().context("cannot determine home directory")?;
-        let ahand = home.join(".ahand");
-        Ok(Self {
-            node: ahand.join("node"),
+        let runtime = crate::plugin_runtime::RuntimeDirs::new()?;
+        Ok(Self::from_runtime(runtime))
+    }
+
+    // Plugin-runtime API surface; consumed by later plugin stages/tests.
+    #[allow(dead_code)]
+    pub fn from_runtime_root(root: PathBuf) -> Self {
+        Self::from_runtime(crate::plugin_runtime::RuntimeDirs::from_root(root))
+    }
+
+    fn from_runtime(runtime: crate::plugin_runtime::RuntimeDirs) -> Self {
+        let ahand = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".ahand");
+        let node = runtime.node_dir();
+        Self {
             ahand,
-        })
+            node,
+            runtime,
+        }
+    }
+
+    pub fn local_node_bin(&self) -> PathBuf {
+        self.runtime.node_bin()
+    }
+
+    pub fn npm_bin(&self) -> PathBuf {
+        self.runtime.npm_bin()
+    }
+
+    pub fn playwright_cli_bin(&self) -> PathBuf {
+        self.runtime.playwright_cli_bin()
     }
 }
 
 fn local_node_bin() -> Result<PathBuf> {
-    let dirs = Dirs::new()?;
-    Ok(dirs.node.join("bin").join("node"))
+    Ok(Dirs::new()?.local_node_bin())
 }
 
 /// Read-only check: report current Node.js status.
@@ -94,7 +120,7 @@ pub async fn ensure(
     progress: &(dyn Fn(ProgressEvent) + Send + Sync),
 ) -> Result<CheckReport> {
     let dirs = Dirs::new()?;
-    let local_node = dirs.node.join("bin").join("node");
+    let local_node = dirs.local_node_bin();
 
     if !force
         && local_node.exists()
@@ -282,6 +308,21 @@ fn emit(progress: &(dyn Fn(ProgressEvent) + Send + Sync), phase: Phase, message:
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn dirs_use_plugin_runtime_node_directory() {
+        let root = PathBuf::from("/tmp/ahand-primary-runtime");
+        let dirs = Dirs::from_runtime_root(root);
+
+        assert_eq!(
+            dirs.node,
+            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node")
+        );
+        assert_eq!(
+            dirs.local_node_bin(),
+            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node/bin/node")
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // Task 4 verification: node.rs has NO subprocess install calls — the entire
