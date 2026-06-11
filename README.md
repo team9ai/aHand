@@ -39,15 +39,25 @@ The dashboard can be deployed independently first. The compose stack runs the hu
 
 ### 1. Install
 
+**macOS / Linux:**
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.sh | bash
 ```
 
-This installs `ahandd`, `ahandctl`, the admin panel, and browser setup script to `~/.ahand/`.
+**Windows (PowerShell, run as your normal user):**
 
-Environment variables:
+```powershell
+irm https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.ps1 | iex
+```
+
+Requires Windows 10 1809 or later.
+
+This installs `ahandd`, `ahandctl`, and the admin panel to `~/.ahand/` (macOS/Linux) or `%USERPROFILE%\.ahand\` (Windows).
+
+Environment variables (honoured on all platforms):
 - `AHAND_VERSION` — install a specific version (default: latest)
-- `AHAND_DIR` — install directory (default: `~/.ahand`)
+- `AHAND_DIR` — install directory (default: `~/.ahand` / `%USERPROFILE%\.ahand`)
 
 ### 2. Configure
 
@@ -70,10 +80,16 @@ Logs are written to `~/.ahand/data/daemon.log`.
 
 ### Upgrade
 
+`ahandctl upgrade` is implemented natively in Rust and works on all platforms (macOS, Linux, Windows) — no shell required.
+
 ```bash
 ahandctl upgrade            # upgrade to latest
 ahandctl upgrade --check    # check for updates without installing
 ```
+
+`--check` queries the latest release and prints current vs. available versions without downloading or installing anything.
+
+Note: `upgrade.sh` (in `scripts/dist/`) is deprecated and kept only for legacy installs that pre-date native upgrade support.
 
 ### Browser Automation Setup
 
@@ -82,6 +98,8 @@ ahandctl browser-init       # install browser automation dependencies
 ```
 
 This sets up [playwright-cli](https://github.com/microsoft/playwright-cli), a local Node.js runtime (if needed), and detects/installs Chrome/Chromium.
+
+Windows: browser automation lands in a later milestone (M3).
 
 ## Session Modes
 
