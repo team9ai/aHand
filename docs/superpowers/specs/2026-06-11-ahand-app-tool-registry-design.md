@@ -275,8 +275,11 @@ every invocation is visible in the hub audit log.
   isolation, concurrency limit, idempotency. Proto roundtrip tests for the three new messages.
 - **hub**: integration tests — catalog replace, stale-on-disconnect/recover-on-snapshot,
   invoke happy path, offline fast-fail, webhook emission, audit entries.
-- **e2e (this repo)**: a test harness embeds `ahandd`, registers a test tool, and drives the
-  full loop through the hub control API (extends the existing `e2e/` patterns).
+- **e2e (this repo)**: The in-repo full-loop e2e was realized as mirrored per-side integration
+  tests (daemon↔mock-hub in `crates/ahandd/tests/`, hub↔mock-device in
+  `crates/ahand-hub/tests/`), consistent with repo precedent (`file_ops_e2e.rs` is
+  single-sided). Cross-process e2e (embed `ahandd`, drive the full loop through the live hub
+  control API) is deferred to sub-project ③ acceptance.
 - **Wire compat**: Envelope tags 35–37 only; `cargo check --workspace` after every shared
   proto/type change (per workspace convention).
 - **SDK (TS, vitest)**: unit tests for both new `CloudClient` methods (success, timeout,

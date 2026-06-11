@@ -118,20 +118,26 @@ Host applications that embed `ahandd` can register application-defined tools at 
 
 ```rust
 // in the host application that embeds ahandd
-daemon_handle
-    .register_app_tool(
-        AppToolDescriptor {
-            name: "run_analysis".to_string(),
-            description: "Run a data analysis job".to_string(),
-            input_schema_json: r#"{"type":"object","properties":{"dataset":{"type":"string"}}}"#.to_string(),
-            requires_approval: false,
-        },
-        Arc::new(|args| Box::pin(async move {
-            // ... handler logic ...
-            Ok(json!({"status": "done"}))
-        })),
-    )
-    .await?;
+use ahandd::{AppToolDef, AppToolError, AppToolHandler};
+use serde_json::{Value, json};
+use std::sync::Arc;
+
+let def = AppToolDef {
+    name: "run_analysis".to_string(),
+    description: "Run a data analysis job".to_string(),
+    input_schema: json!({
+        "type": "object",
+        "properties": { "dataset": { "type": "string" } }
+    }),
+    requires_approval: false,
+};
+let handler: AppToolHandler = Arc::new(|_args: Value| {
+    Box::pin(async move {
+        // ... handler logic ...
+        Ok(json!({"status": "done"}))
+    })
+});
+daemon_handle.register_app_tool(def, handler).await?;
 ```
 
 ```typescript
@@ -140,7 +146,15 @@ const catalog = await client.listAppTools(deviceId);
 const result  = await client.invokeAppTool(deviceId, "run_analysis", { dataset: "q1" });
 ```
 
-Session-mode gating applies to every invocation. `requires_approval: true` on a descriptor forces explicit approval regardless of the caller's session mode. See `proto/ahand/v1/app_tool.proto` and `docs/remote-control-roadmap.md` (Section 5) for the full capability description.
+Session-mode gating applies to every invocation. `requires_approval: true` on a descriptor forces explicit approval regardless of the caller's session mode.
+
+> **Approval + timeout composition:** the hub waits at most `clamp(timeoutMs)+2 s ≤ 302 s` for
+> the daemon to respond, while the daemon's approval dialog defaults to a 24 h window. For
+> approval-gated tools, set `timeoutMs` ≥ expected approval latency (max 300 000 ms); an
+> approval granted after the hub window still executes the handler, but the result is discarded
+> and the audit `outcome` remains `timeout`. Correlate via a replay of the same call if needed.
+
+See `proto/ahand/v1/app_tool.proto` and `docs/remote-control-roadmap.md` (Section 5) for the full capability description.
 
 ## Repository Structure
 

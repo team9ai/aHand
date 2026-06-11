@@ -1882,6 +1882,11 @@ fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: St
 /// file requests front-load a quick policy check inline and only spawn the
 /// approval waiter; here the entire execution is spawned because handler
 /// duration is unbounded (up to MAX_TIMEOUT_MS = 300s).
+///
+/// The approval waiter intentionally does NOT watch `close_rx` (unlike file-request
+/// waiters): the response rides the stamped outbox so a result produced across a
+/// reconnect is replayed to the hub; the cost is an orphaned waiter for up to
+/// `approval_timeout` (default 24 h) if the hub never responds after disconnect.
 #[allow(clippy::too_many_arguments)]
 async fn handle_app_tool_request<T>(
     device_id: &str,
@@ -2590,9 +2595,8 @@ mod tests {
     use crate::outbox::Outbox;
 
     use super::{
-        BufferedEnvelopeSender, ConnectError, OutboundFrame,
-        classify_hello_accepted_message, connect_tcp_with_keepalive,
-        hello_capabilities_from_wire_names,
+        BufferedEnvelopeSender, ConnectError, OutboundFrame, classify_hello_accepted_message,
+        connect_tcp_with_keepalive, hello_capabilities_from_wire_names,
     };
 
     #[test]

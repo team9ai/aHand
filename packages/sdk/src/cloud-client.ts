@@ -436,8 +436,9 @@ export interface AppToolInfo {
 /**
  * The full catalog of app-defined tools registered by a device. `revision`
  * is a monotonically-increasing counter bumped by the daemon each time the
- * catalog changes. `stale` is `true` when the hub's cached copy has not
- * been refreshed since the last heartbeat timeout.
+ * catalog changes. `stale` is set to `true` on device disconnect or new
+ * connection (and when presence shows the device is offline); it is cleared
+ * by the next accepted AppToolsUpdate snapshot from the daemon.
  */
 export interface AppToolCatalog {
   revision: number;
@@ -457,6 +458,12 @@ export interface InvokeAppToolOptions {
    * Per-request timeout in milliseconds. Defaults to `60_000` (60 s)
    * when omitted. The hub clamps the value to `[1_000, 300_000]`
    * (1 s – 5 min).
+   *
+   * For approval-gated tools, set this to at least the expected approval
+   * latency (max `300_000`). An approval granted after the hub window still
+   * executes the handler on the daemon side, but the result is discarded and
+   * the audit `outcome` remains `"timeout"`. Correlate via a replay of the
+   * same call if needed.
    */
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -1926,11 +1933,18 @@ export class CloudClient {
    *
    * Hub-level errors (auth, offline, timeout) throw `CloudClientError`.
    * Daemon-level failures surface as `CloudClientError("app_tool_error")`
-   * with the daemon error code in `jobErrorCode`. The daemon error code
-   * set is: `TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE |
+   * with the daemon error code in `jobErrorCode`. The well-known daemon
+   * error codes are: `TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE |
    * APPROVAL_DENIED | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT |
-   * HANDLER_PANIC | HANDLER_ERROR | CONCURRENCY_LIMIT`.
-   * See the proto `AppToolErrorCode` enum for the authoritative list.
+   * HANDLER_PANIC | CONCURRENCY_LIMIT`. Handler-supplied codes pass
+   * through verbatim; `HANDLER_ERROR` is only the empty-code fallback.
+   * Do not treat this set as closed — future daemon versions may add
+   * codes. See `proto/ahand/v1/app_tool.proto` comments for details.
+   *
+   * For approval-gated tools, set `opts.timeoutMs` ≥ expected approval
+   * latency (max `300_000`); an approval granted after the hub window
+   * still executes the handler, but the result is discarded and the audit
+   * `outcome` remains `"timeout"`.
    *
    * Returns `body.result` on success. When the daemon returns a
    * successful response but omits the `result` field, `null` is returned

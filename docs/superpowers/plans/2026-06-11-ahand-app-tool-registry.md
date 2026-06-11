@@ -1268,6 +1268,13 @@ git commit -m "feat(hub): POST /api/control/app-tool with offline fast-fail and 
 - **Duration measured from handler entry**: `let started = std::time::Instant::now()` moved to the top of `invoke_app_tool` so `durationMs` in audit entries is accurate for the offline fast-fail path.
 - **Tracing added**: `info!(device_id, tool_name, timeout_ms, "dispatching app tool invocation")` before `invoke()`; `warn!(tool_call_id, timeout_ms, "app tool invocation timed out")` on the `Timeout` arm. Matches gateway style.
 - **Follow-up filed**: extract a shared `PendingMap<T>` abstraction — the browser, app-tool, and file-request pending correlation maps are now three copies of the same pattern; a fourth copy must NOT be added before this is factored out.
+- **Behavioral follow-up filed for sub-project ② planning**: approval-vs-timeout composition:
+  the hub waits at most `clamp(timeoutMs)+2 s ≤ 302 s`, while the daemon approval waiter
+  defaults to 24 h; a LATE approval (granted after the hub window) still executes the handler
+  with the result dropped and the audit `outcome` stuck at `"timeout"`. Decision deferred to
+  agent-pi `DeviceToolsProvider` design: should the daemon bound the approval wait by the
+  invocation deadline (caller always gets `APPROVAL_TIMEOUT` inside the hub window; forfeits
+  late-approval side effects)?
 
 ---
 
