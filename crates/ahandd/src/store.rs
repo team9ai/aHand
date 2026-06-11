@@ -248,6 +248,18 @@ mod tests {
             "FileResponse",
         );
         check(Payload::Heartbeat(Heartbeat::default()), "Heartbeat");
+        check(
+            Payload::AppToolsUpdate(AppToolsUpdate::default()),
+            "AppToolsUpdate",
+        );
+        check(
+            Payload::AppToolRequest(AppToolRequest::default()),
+            "AppToolRequest",
+        );
+        check(
+            Payload::AppToolResponse(AppToolResponse::default()),
+            "AppToolResponse",
+        );
     }
 
     #[test]
