@@ -283,6 +283,15 @@ impl DaemonHandle {
     ///
     /// A failed registration does not change the advertised catalog; the hub
     /// sees no new snapshot and the revision is not incremented.
+    ///
+    /// # Handler contract
+    ///
+    /// Handlers should complete promptly or honor cancellation by finishing.
+    /// A handler that never returns permanently consumes one of the 4
+    /// per-device concurrency slots: a timeout response is sent to the caller
+    /// when the configured `timeout_ms` elapses, but the slot is only released
+    /// when the handler task actually finishes (or is dropped). Four stuck
+    /// handlers will disable app tools on the device until daemon restart.
     pub async fn register_app_tool(
         &self,
         def: AppToolDef,

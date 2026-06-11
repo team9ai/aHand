@@ -1872,7 +1872,7 @@ async fn handle_app_tool_request<T>(
 ) where
     T: crate::executor::EnvelopeSink,
 {
-    debug!(
+    info!(
         tool_call_id = %req.tool_call_id,
         name = %req.name,
         "received AppToolRequest"
@@ -1919,9 +1919,14 @@ async fn handle_app_tool_request<T>(
     let _ = (session_mgr, approval_mgr, approval_broadcast_tx, caller_uid);
 
     // ── Step 3: lookup ────────────────────────────────────────────────────
-    let (descriptor, handler) = match app_tools.lookup(&req.name).await {
+    let (_descriptor, handler) = match app_tools.lookup(&req.name).await {
         Some(pair) => pair,
         None => {
+            warn!(
+                tool_call_id = %req.tool_call_id,
+                name = %req.name,
+                "app tool not found"
+            );
             let _ = tx.send(app_tool_error_envelope(
                 device_id,
                 &req.tool_call_id,
@@ -1934,13 +1939,17 @@ async fn handle_app_tool_request<T>(
             return;
         }
     };
-    // descriptor is used for potential future logging; suppress unused warning.
-    let _ = &descriptor;
 
     // ── Step 4: parse args ────────────────────────────────────────────────
     let args: serde_json::Value = match serde_json::from_str(&req.args_json) {
         Ok(v) => v,
         Err(err) => {
+            warn!(
+                tool_call_id = %req.tool_call_id,
+                name = %req.name,
+                error = %err,
+                "invalid app tool args"
+            );
             let _ = tx.send(app_tool_error_envelope(
                 device_id,
                 &req.tool_call_id,
@@ -1951,6 +1960,11 @@ async fn handle_app_tool_request<T>(
         }
     };
     if !args.is_object() {
+        warn!(
+            tool_call_id = %req.tool_call_id,
+            name = %req.name,
+            "invalid app tool args"
+        );
         let _ = tx.send(app_tool_error_envelope(
             device_id,
             &req.tool_call_id,
@@ -1964,11 +1978,16 @@ async fn handle_app_tool_request<T>(
     let permit = match app_tools.try_acquire_permit() {
         Some(p) => p,
         None => {
+            warn!(
+                tool_call_id = %req.tool_call_id,
+                name = %req.name,
+                "app tool concurrency limit hit"
+            );
             let _ = tx.send(app_tool_error_envelope(
                 device_id,
                 &req.tool_call_id,
                 "CONCURRENCY_LIMIT",
-                "too many app tool calls in flight on this device; retry shortly".to_string(),
+                "too many app tool calls in flight on this device; retry after in-flight calls finish".to_string(),
             ));
             return;
         }
@@ -2021,6 +2040,7 @@ async fn execute_app_tool<T>(
 ) where
     T: crate::executor::EnvelopeSink,
 {
+    let started = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms as u64);
 
     // Spawn the handler inside its own task for panic isolation.
@@ -2035,9 +2055,11 @@ async fn execute_app_tool<T>(
     let (code, message, result_json) = match tokio::time::timeout(timeout, handler_task).await {
         // Handler completed successfully.
         Ok(Ok(Ok(value))) => {
-            debug!(
+            let duration_ms = started.elapsed().as_millis() as u64;
+            info!(
                 tool_call_id = %tool_call_id,
                 tool_name = %tool_name,
+                duration_ms,
                 outcome = "success",
                 "app tool call completed"
             );
@@ -2050,9 +2072,11 @@ async fn execute_app_tool<T>(
             } else {
                 app_err.code.clone()
             };
-            debug!(
+            let duration_ms = started.elapsed().as_millis() as u64;
+            info!(
                 tool_call_id = %tool_call_id,
                 tool_name = %tool_name,
+                duration_ms,
                 outcome = %code,
                 "app tool call returned handler error"
             );
@@ -2060,9 +2084,11 @@ async fn execute_app_tool<T>(
         }
         // Handler task panicked.
         Ok(Err(join_err)) if join_err.is_panic() => {
+            let duration_ms = started.elapsed().as_millis() as u64;
             warn!(
                 tool_call_id = %tool_call_id,
                 tool_name = %tool_name,
+                duration_ms,
                 "app tool handler panicked; the app may be in a bad state"
             );
             (
@@ -2073,9 +2099,11 @@ async fn execute_app_tool<T>(
         }
         // Handler task was cancelled (should not happen with our spawn pattern).
         Ok(Err(_)) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
             warn!(
                 tool_call_id = %tool_call_id,
                 tool_name = %tool_name,
+                duration_ms,
                 "app tool task was cancelled"
             );
             (
@@ -2088,10 +2116,12 @@ async fn execute_app_tool<T>(
         // We do NOT abort the spawned task: it may hold app-owned locks.
         // The permit releases when the handler task eventually finishes.
         Err(_) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
             warn!(
                 tool_call_id = %tool_call_id,
                 tool_name = %tool_name,
-                timeout_ms = timeout_ms,
+                duration_ms,
+                timeout_ms,
                 "app tool timed out"
             );
             (

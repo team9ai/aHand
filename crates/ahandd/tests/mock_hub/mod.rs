@@ -46,8 +46,10 @@ pub struct Mock {
     file_responses: Arc<Mutex<Vec<FileResponse>>>,
     app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>>,
     app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>>,
-    // mpsc sender used to inject envelopes into the active connection.
-    inject_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Envelope>>>>,
+    // mpsc sender used to inject envelopes into the active connection, paired
+    // with a generation counter so stale connection cleanup can't clobber a
+    // newer connection's sender.
+    inject_tx: Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Envelope>)>>>,
     _shutdown: oneshot::Sender<()>,
     _task: JoinHandle<()>,
 }
@@ -131,7 +133,7 @@ impl Mock {
         };
         let guard = self.inject_tx.lock().unwrap();
         match guard.as_ref() {
-            Some(tx) => tx.send(env).map_err(|e| e.to_string()),
+            Some((_gen, tx)) => tx.send(env).map_err(|e| e.to_string()),
             None => Err("no active connection inject channel".to_string()),
         }
     }
@@ -230,14 +232,18 @@ async fn start(behavior: Behavior) -> Mock {
     let file_responses: Arc<Mutex<Vec<FileResponse>>> = Arc::new(Mutex::new(Vec::new()));
     let app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>> = Arc::new(Mutex::new(Vec::new()));
     let app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>> = Arc::new(Mutex::new(Vec::new()));
-    let inject_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Envelope>>>> =
+    let inject_tx: Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Envelope>)>>> =
         Arc::new(Mutex::new(None));
+    // Monotonically increasing connection generation counter.
+    let conn_gen: Arc<std::sync::atomic::AtomicU64> =
+        Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let heartbeats_for_task = heartbeats.clone();
     let file_responses_for_task = file_responses.clone();
     let app_tools_updates_for_task = app_tools_updates.clone();
     let app_tool_responses_for_task = app_tool_responses.clone();
     let inject_tx_for_task = inject_tx.clone();
+    let conn_gen_for_task = conn_gen.clone();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -247,6 +253,9 @@ async fn start(behavior: Behavior) -> Mock {
                         Ok(pair) => pair,
                         Err(_) => break,
                     };
+                    let conn_gen_id = conn_gen_for_task
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
                     tokio::spawn(handle_conn(
                         stream,
                         behavior.clone(),
@@ -255,6 +264,7 @@ async fn start(behavior: Behavior) -> Mock {
                         app_tools_updates_for_task.clone(),
                         app_tool_responses_for_task.clone(),
                         inject_tx_for_task.clone(),
+                        conn_gen_id,
                     ));
                 }
             }
@@ -280,7 +290,8 @@ async fn handle_conn(
     file_responses: Arc<Mutex<Vec<FileResponse>>>,
     app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>>,
     app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>>,
-    inject_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<Envelope>>>>,
+    inject_tx: Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Envelope>)>>>,
+    conn_generation: u64,
 ) {
     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
         return;
@@ -336,7 +347,7 @@ async fn handle_conn(
             // `Mock::send_app_tool_request`.
             let (conn_inject_tx, mut conn_inject_rx) =
                 tokio::sync::mpsc::unbounded_channel::<Envelope>();
-            *inject_tx.lock().unwrap() = Some(conn_inject_tx);
+            *inject_tx.lock().unwrap() = Some((conn_generation, conn_inject_tx));
 
             // Keep the connection open until the client closes it, and
             // record every `Heartbeat`, `AppToolsUpdate`, and
@@ -403,9 +414,13 @@ async fn handle_conn(
                     }
                 }
             }
-            // Clear the inject channel so subsequent calls to
-            // send_app_tool_request return a clean error.
-            *inject_tx.lock().unwrap() = None;
+            // Clear the inject channel only if it still belongs to this
+            // connection (guard against stale cleanup clobbering a newer
+            // connection's sender when the daemon reconnects).
+            let mut guard = inject_tx.lock().unwrap();
+            if matches!(guard.as_ref(), Some((stored_gen, _)) if *stored_gen == conn_generation) {
+                *guard = None;
+            }
         }
         Behavior::RejectAuth => {
             let _ = sink
