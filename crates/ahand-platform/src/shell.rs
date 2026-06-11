@@ -148,9 +148,8 @@ mod tests {
             // SAFETY: guarded by ENV_MUTEX.
             unsafe { std::env::remove_var("COMSPEC") };
             let result = env_shell();
-            match &original {
-                Some(v) => unsafe { std::env::set_var("COMSPEC", v) },
-                None => {}
+            if let Some(v) = &original {
+                unsafe { std::env::set_var("COMSPEC", v) }
             }
             assert!(result.is_none(), "COMSPEC unset should return None");
         }
