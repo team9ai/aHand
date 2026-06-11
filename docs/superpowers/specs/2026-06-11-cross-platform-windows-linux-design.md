@@ -198,3 +198,46 @@ three platforms; bootstrap scripts stay thin.
 - Full Unix-mode→ACL mapping for FileChmod.
 - Hub/dashboard/deploy tooling (server-side, Linux containers by design).
 - musl / armv7 Linux targets (optional follow-up).
+
+## M1 Completion Record (2026-06-11)
+
+M1 landed on `feat/cross-platform-m1` (plan:
+`docs/superpowers/plans/2026-06-11-cross-platform-m1-windows-core.md`).
+Client CI green on ubuntu/macos/windows (fmt, clippy `-D warnings`, full test
+suite); release matrix builds all 5 targets including
+`ahandd-windows-x64.exe`/`ahandctl-windows-x64.exe`.
+
+**Deviation reconciled:** the `restart` row above originally called for a
+platform module; the implementation keeps rename-aside + restart logic inline
+in `updater.rs` with `#[cfg]` arms (plan Task 9 decision). If M2 grows more
+process-swap logic, extract `process::restart_in_place()` then.
+
+**M2 must verify manually on a real Windows host** (green CI does not prove
+these):
+
+1. Live hub connection (real hub, not mock) reaches Online.
+2. A real shell job (`cmd /C`) executes and returns output — the only shell
+   e2e tests are `#[cfg(unix)]`-gated.
+3. Named-pipe IPC on the default `\\.\pipe\ahandd-<user>` endpoint, including
+   cross-user rejection.
+4. `icacls` grant string on a domain-joined account (`DOMAIN\user`).
+5. Self-update rename-aside against a RUNNING `ahandd.exe` + `.old` cleanup on
+   restart.
+6. `ahandctl stop` graceful/force path via taskkill.
+7. The published windows-x64 release artifact actually launches.
+
+**M4 backlog (from per-task reviews + final integration review):**
+
+- Port `create_symlink` to Windows (`fs_ops.rs`, `TODO(M4)`).
+- Implement Windows ACL chmod (`fs_ops.rs`, `TODO(M4)`).
+- Un-gate / port the two `#[cfg(unix)]` shell-execution e2e tests in
+  `openclaw/handler.rs` to `cmd /C`.
+- Windows variants for the `#[cfg(unix)]` file-ops security regression suite
+  (`io_safe` TOCTOU, symlink/junction escapes, mode bits → ACL asserts). When
+  un-gating, route every fixture through
+  `ahand_platform::paths::canonicalize_simplified` — raw `.canonicalize()` in
+  test helpers reintroduces the `\\?\` landmine.
+- `sanitize_env` Windows blocklist (spec M4 item, untouched in M1).
+- Windows glob case-insensitivity hardening for policy matching.
+- Optional: unify `ahandctl admin`'s direct `ctrl_c()` onto
+  `platform::signals`.

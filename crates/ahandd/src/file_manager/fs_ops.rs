@@ -1099,7 +1099,7 @@ pub async fn handle_chmod(req: &FileChmod, resolved: &Path) -> Result<FileChmodR
             }
             #[cfg(windows)]
             {
-                // TODO: wire up real Windows ACL setting. For now, report
+                // TODO(M4): wire up real Windows ACL setting. For now, report
                 // that only mode-based chmod is implemented.
                 Err(file_error(
                     FileErrorCode::Unspecified,
