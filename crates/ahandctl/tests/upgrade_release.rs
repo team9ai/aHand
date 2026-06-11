@@ -906,3 +906,140 @@ fn extract_admin_spa_rejects_absolute_path() {
         "should reject absolute path, got: {msg}"
     );
 }
+
+/// Symlink-escape regression test: tar contains a symlink entry pointing outside
+/// the dist dir, followed by a file entry that traverses through it.
+///
+/// This exercises the second defense layer (tar's `unpack_in` / `validate_inside_dst`
+/// canonicalization) documented on `extract_admin_spa`.  The archive is built with
+/// the `tar` crate's safe `Builder` API so it is a well-formed archive; the guard
+/// must still reject or contain the extraction.
+#[cfg(unix)]
+#[test]
+fn extract_admin_spa_rejects_symlink_escape() {
+    use std::io::Cursor;
+
+    // Build a tar.gz containing:
+    //   1. a symlink entry: `link` -> `/tmp`
+    //   2. a regular file entry: `link/evil.txt` with content "evil"
+    //
+    // If the extractor naively follows the symlink it would write outside dist.
+    let mut tar_buf = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut tar_buf, flate2::Compression::default());
+        let mut ar = tar::Builder::new(enc);
+
+        // Entry 1: symlink `link` -> `/tmp`
+        let mut sym_header = tar::Header::new_gnu();
+        sym_header.set_entry_type(tar::EntryType::Symlink);
+        sym_header.set_size(0);
+        sym_header.set_mode(0o777);
+        sym_header
+            .set_link_name(std::path::Path::new("/tmp"))
+            .unwrap();
+        sym_header.set_cksum();
+        ar.append_data(&mut sym_header, "link", Cursor::new(b""))
+            .unwrap();
+
+        // Entry 2: regular file `link/evil.txt` — would escape through the symlink
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header.set_size(4);
+        file_header.set_mode(0o644);
+        file_header.set_cksum();
+        ar.append_data(&mut file_header, "link/evil.txt", Cursor::new(b"evil"))
+            .unwrap();
+
+        ar.finish().unwrap();
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let dist_dir = tmp.path().join("dist");
+
+    // The call must either return Err OR leave nothing outside dist.
+    let result = ahandctl::upgrade::extract_admin_spa(&tar_buf, &dist_dir);
+
+    // Primary assertion: nothing must have escaped to /tmp/evil.txt or the real /tmp.
+    let escaped = std::path::Path::new("/tmp/evil.txt");
+    assert!(
+        !escaped.exists(),
+        "symlink-escape file must not be created outside dist"
+    );
+
+    // If extraction succeeded (tar crate detected and defused the attack itself),
+    // also verify the file is not reachable via the symlink inside dist.
+    if result.is_ok() {
+        // The symlink inside dist might point to /tmp; following it must not have
+        // written evil.txt there (checked above).  Nothing else to assert here.
+    }
+    // Both Ok (contained) and Err (rejected) are acceptable outcomes.
+}
+
+// ── I-2: version marker only written after BOTH binaries swap ────────────
+
+/// Partial-upgrade error path: stub serves a correct checksums file but the
+/// ahandctl swap is made to fail deterministically by pre-creating the target
+/// binary name as a non-empty directory (renaming a file onto a non-empty
+/// directory fails on Unix).
+///
+/// Asserts:
+/// - `run_with_bases` returns `Err`
+/// - the error message mentions "re-run"
+/// - the version marker is NOT written (marker-only-after-both invariant)
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_marker_absent_when_ahandctl_swap_fails() {
+    let suffix = platform_suffix();
+    let ver = "9.9.9"; // unlikely to collide
+
+    let ahandd_filename = format!("ahandd-{suffix}");
+    let ahandctl_filename = format!("ahandctl-{suffix}");
+
+    let ahandd_bytes = fake_binary_bytes("ahandd");
+    let ahandctl_bytes = fake_binary_bytes("ahandctl");
+
+    let mut cs = String::new();
+    cs.push_str(&make_checksum_line(&ahandd_filename, &ahandd_bytes));
+    cs.push_str(&make_checksum_line(&ahandctl_filename, &ahandctl_bytes));
+
+    let mut assets: HashMap<String, Vec<u8>> = HashMap::new();
+    assets.insert(format!("/rust-v{ver}/checksums-rust.txt"), cs.into_bytes());
+    assets.insert(format!("/rust-v{ver}/{ahandd_filename}"), ahandd_bytes);
+    assets.insert(format!("/rust-v{ver}/{ahandctl_filename}"), ahandctl_bytes);
+
+    let releases_json = format!(r#"[{{"tag_name":"rust-v{ver}"}}]"#);
+    let stub = spawn_full_stub(releases_json, assets).await;
+    let tmp = TempDir::new().unwrap();
+
+    // Pre-create `{ahand_home}/bin/{ahandctl_exe_name}` as a DIRECTORY containing a
+    // file so that rename-onto-it fails (EISDIR / ENOTEMPTY on unix).
+    let bin_dir = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let ahandctl_target = bin_dir.join(ahand_platform::paths::exe_name("ahandctl"));
+    std::fs::create_dir_all(&ahandctl_target).unwrap();
+    std::fs::write(ahandctl_target.join("sentinel"), b"block").unwrap();
+
+    let err = run_with_bases(
+        false,
+        Some(ver),
+        &stub.api_base(),
+        &stub.download_base(),
+        tmp.path(),
+    )
+    .await
+    .expect_err("should fail when ahandctl swap is blocked");
+
+    stub.stop().await;
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("re-run"),
+        "error message should tell the user to re-run, got: {msg}"
+    );
+
+    // Version marker must NOT have been written.
+    assert!(
+        ahand_platform::paths::read_version_marker(tmp.path()).is_none(),
+        "version marker must be absent when ahandctl swap failed"
+    );
+}

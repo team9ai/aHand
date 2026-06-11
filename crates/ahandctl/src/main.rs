@@ -171,11 +171,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Best-effort: remove any stale ahandctl.old left by a previous
     // Windows self-swap.  Mirrors the ahandd startup hook.
-    {
-        let bin_dir = dirs::home_dir().map(|h| h.join(".ahand").join("bin"));
-        if let Some(ref dir) = bin_dir {
-            ahandd::updater::cleanup_old_binary_for(dir, "ahandctl");
-        }
+    // Honors AHAND_DIR exactly like `upgrade::resolve_ahand_home` does.
+    if let Ok(ahand_home) = upgrade::resolve_ahand_home() {
+        ahandd::updater::cleanup_old_binary_for(&ahand_home.join("bin"), "ahandctl");
     }
 
     let args = Args::parse();

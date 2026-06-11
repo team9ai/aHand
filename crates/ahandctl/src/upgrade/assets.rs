@@ -98,8 +98,8 @@ pub async fn perform_upgrade(
     if let Some(ref cs_text) = checksum_text {
         println!();
         println!("==> Verifying checksums...");
-        verify_binary_checksum(cs_text, &ahandd_filename, &ahandd_bytes, &suffix)?;
-        verify_binary_checksum(cs_text, &ahandctl_filename, &ahandctl_bytes, &suffix)?;
+        verify_binary_checksum(cs_text, &ahandd_filename, &ahandd_bytes)?;
+        verify_binary_checksum(cs_text, &ahandctl_filename, &ahandctl_bytes)?;
     }
 
     // ── 6. Stop daemon ──────────────────────────────────────────────────────
@@ -119,8 +119,11 @@ pub async fn perform_upgrade(
         .context("failed to install ahandd")?;
     println!("  ahandd: OK");
 
-    ahandd::updater::swap_binary_into(&bin_dir, "ahandctl", &ahandctl_bytes)
-        .context("failed to install ahandctl")?;
+    ahandd::updater::swap_binary_into(&bin_dir, "ahandctl", &ahandctl_bytes).context(
+        "ahandd was updated but ahandctl could not be replaced; \
+         the daemon is stopped and the version marker was not written \
+         — re-run `ahandctl upgrade` to complete",
+    )?;
     println!("  ahandctl: OK");
 
     // ── 8. macOS: remove quarantine xattr ──────────────────────────────────
@@ -188,12 +191,7 @@ async fn download_optional(url: &str) -> Option<String> {
 ///
 /// If no matching line exists, the check is silently skipped (same behaviour
 /// as upgrade.sh's `if [ -n "$expected" ]` guard).
-fn verify_binary_checksum(
-    checksum_text: &str,
-    filename: &str,
-    data: &[u8],
-    _suffix: &str,
-) -> anyhow::Result<()> {
+fn verify_binary_checksum(checksum_text: &str, filename: &str, data: &[u8]) -> anyhow::Result<()> {
     // Find a line that ends with two-spaces + filename (shasum format).
     // e.g. "abc123...  ahandd-linux-x64"
     let expected_hex = checksum_text.lines().find_map(|line| {
@@ -219,6 +217,15 @@ fn verify_binary_checksum(
 ///
 /// PATH-TRAVERSAL GUARD: any entry whose normalised path escapes `dist_dir`
 /// (contains `..` components or is absolute) is rejected with an error.
+///
+/// SYMLINK-ESCAPE DEFENSE: the two-layer guard below stops both direct traversal
+/// (`../evil`) and the "symlink + follow" attack (`link -> /tmp` then
+/// `link/evil.txt`).  The manual [`guard_path_traversal`] check catches `..` and
+/// absolute paths before anything is written.  The [`tar::Entry::unpack_in`] call
+/// provides a second layer via its internal `validate_inside_dst` canonicalization,
+/// which re-resolves the destination after each entry is written and rejects any
+/// path that has escaped `dist_dir` — this includes symlink-based escapes that
+/// were not visible from the raw header path alone.
 pub fn extract_admin_spa(data: &[u8], dist_dir: &Path) -> anyhow::Result<()> {
     // Create or keep the dist dir; clear its contents.
     std::fs::create_dir_all(dist_dir)

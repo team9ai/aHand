@@ -122,7 +122,10 @@ pub fn build_check_output(
 
 // ── Private helpers ────────────────────────────────────────────────────────
 
-fn resolve_ahand_home() -> anyhow::Result<PathBuf> {
+/// Resolve the aHand home directory.
+///
+/// Checks `AHAND_DIR` first; falls back to `~/.ahand`.
+pub fn resolve_ahand_home() -> anyhow::Result<PathBuf> {
     if let Ok(dir) = std::env::var("AHAND_DIR") {
         return Ok(PathBuf::from(dir));
     }
