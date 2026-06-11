@@ -237,50 +237,66 @@ impl OpenClawHandler {
         (invoke_result, Some(event))
     }
 
-    /// Execute a command and collect output
+    /// Execute a command and collect output.
+    ///
+    /// Two execution paths exist:
+    ///
+    /// **Shell path** (`raw_command` set, or `command` has exactly 1 element):
+    /// The string is passed to the platform shell via `shell -c <string>`, which
+    /// supports shell builtins, pipes, redirections, etc.
+    ///
+    /// **Direct path** (`command` has 2+ elements):
+    /// `Command::new(cmd[0]).args(cmd[1..])` — argv boundaries are preserved
+    /// exactly as the caller specified them.  The shell is never involved, so
+    /// special characters in arguments (`&`, `|`, `>`, `^`, `%`, etc.) are
+    /// passed through to the child process verbatim and cannot smuggle additional
+    /// shell commands regardless of platform.  Shell builtins are not available
+    /// in this form (they were unreliable before too — POSIX escaping only
+    /// approximated safety on Windows cmd.exe).
     async fn run_command(&self, params: &SystemRunParams) -> RunResult {
         let cwd = params.cwd.as_deref().filter(|s| !s.is_empty());
         let env_overrides = params.env.as_ref();
         let timeout_ms = params.timeout_ms.or(Some(120_000)); // default 2 minutes
 
-        // Use raw_command with shell, or command array
-        // If command array has 1 element, it's likely a full shell command string - use directly
-        // If multiple elements, it's argv-style - escape and join
-        let shell_cmd = params
-            .raw_command
-            .clone()
-            .or_else(|| {
-                if params.command.len() == 1 {
-                    // Single element = full shell command, use directly
-                    Some(params.command[0].clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| shell_escape_join(&params.command));
+        let command_env = env_overrides
+            .map(sanitize_env)
+            .unwrap_or_else(|| env::vars().collect());
+        let path_val = crate::plugin_runtime::path_env::child_process_path(&command_env).await;
 
-        debug!(shell_cmd = %shell_cmd, command_len = params.command.len(), "executing command via shell");
+        // Decide between direct spawn (array with 2+ elements) and shell spawn.
+        let use_direct = params.raw_command.is_none() && params.command.len() >= 2;
 
-        let shell = ahand_platform::shell::env_shell()
-            .unwrap_or_else(|| ahand_platform::shell::default_shell().path);
-        let mut cmd = Command::new(shell);
-        cmd.arg(ahand_platform::shell::shell_c_flag())
-            .arg(&shell_cmd);
+        let mut cmd: Command = if use_direct {
+            // Direct spawn: argv boundaries are preserved — no shell, no injection risk.
+            let exe = &params.command[0];
+            debug!(exe = %exe, args = ?&params.command[1..], "executing command directly (no shell)");
+            let mut c = Command::new(exe);
+            c.args(&params.command[1..]);
+            c
+        } else {
+            // Shell spawn: raw_command or single-element command string.
+            let shell_cmd = params
+                .raw_command
+                .clone()
+                .unwrap_or_else(|| params.command.first().cloned().unwrap_or_default());
+            debug!(shell_cmd = %shell_cmd, "executing command via shell");
+            let shell = ahand_platform::shell::env_shell()
+                .unwrap_or_else(|| ahand_platform::shell::default_shell().path);
+            let mut c = Command::new(shell);
+            c.arg(ahand_platform::shell::shell_c_flag()).arg(&shell_cmd);
+            c
+        };
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
 
-        let command_env = env_overrides
-            .map(sanitize_env)
-            .unwrap_or_else(|| env::vars().collect());
         for (key, value) in &command_env {
             if !crate::plugin_runtime::path_env::is_path_env_key(key) {
                 cmd.env(key, value);
             }
         }
-        let path = crate::plugin_runtime::path_env::child_process_path(&command_env).await;
-        cmd.env("PATH", path);
+        cmd.env("PATH", path_val);
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -461,11 +477,10 @@ impl OpenClawHandler {
                 continue;
             }
 
-            for dir in &path_dirs {
-                let candidate = dir.join(bin);
-                if candidate.exists() && candidate.is_file() {
-                    found.insert(bin.to_string(), candidate.to_string_lossy().to_string());
-                    break;
+            'dirs: for dir in &path_dirs {
+                if let Some(p) = which_in_dir(dir, bin) {
+                    found.insert(bin.to_string(), p.to_string_lossy().to_string());
+                    break 'dirs;
                 }
             }
         }
@@ -1241,6 +1256,43 @@ fn translate_act_kind(kind: &str, body: &serde_json::Value) -> Result<(String, S
     }
 }
 
+/// Probe one directory for `bin`, considering PATHEXT on Windows.
+///
+/// On Unix: checks `dir/bin` existence only.
+///
+/// On Windows: first probes `dir/bin` as-is (handles the case where the
+/// binary already has an extension); if that fails and `bin` has no
+/// extension, probes `dir/bin{ext}` for each extension in the `PATHEXT`
+/// environment variable (falling back to `.COM;.EXE;.BAT;.CMD`).
+fn which_in_dir(dir: &std::path::Path, bin: &str) -> Option<std::path::PathBuf> {
+    let candidate = dir.join(bin);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+
+    #[cfg(windows)]
+    {
+        // Only probe PATHEXT suffixes when the binary name has no extension.
+        use std::path::Path;
+        if Path::new(bin).extension().is_none() {
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            for ext in pathext.split(';') {
+                let ext = ext.trim();
+                if ext.is_empty() {
+                    continue;
+                }
+                let with_ext = dir.join(format!("{bin}{ext}"));
+                if with_ext.is_file() {
+                    return Some(with_ext);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Decode params from JSON string
 fn decode_params<T: serde::de::DeserializeOwned>(
     params_json: &Option<String>,
@@ -1264,49 +1316,6 @@ fn format_command(argv: &[String]) -> String {
                 format!("\"{}\"", trimmed.replace('"', "\\\""))
             } else {
                 trimmed.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-/// Join command array into shell-safe string
-fn shell_escape_join(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| {
-            // If arg contains shell special chars, quote it
-            if arg.chars().any(|c| {
-                matches!(
-                    c,
-                    ' ' | '"'
-                        | '\''
-                        | '\\'
-                        | '$'
-                        | '`'
-                        | '!'
-                        | '*'
-                        | '?'
-                        | '['
-                        | ']'
-                        | '('
-                        | ')'
-                        | '{'
-                        | '}'
-                        | '|'
-                        | '&'
-                        | ';'
-                        | '<'
-                        | '>'
-                        | '\n'
-                        | '\t'
-                )
-            }) {
-                // Use single quotes and escape any single quotes inside
-                format!("'{}'", arg.replace('\'', "'\\''"))
-            } else if arg.is_empty() {
-                "''".to_string()
-            } else {
-                arg.clone()
             }
         })
         .collect::<Vec<_>>()
@@ -1642,5 +1651,112 @@ mod tests {
         assert_eq!(payload["success"], false);
         assert_eq!(payload["exitCode"], 7);
         assert_eq!(event.unwrap().kind, ExecEventKind::Finished);
+    }
+
+    /// Build an invoke request that uses a true argv array (no rawCommand).
+    /// Used to test the direct-spawn path.
+    fn array_command_invoke(
+        session_key: &str,
+        argv: Vec<&str>,
+        approved: Option<bool>,
+    ) -> super::NodeInvokeRequest {
+        let mut params = serde_json::Map::new();
+        let cmd_json: serde_json::Value = argv.iter().map(|s| json!(s)).collect();
+        params.insert("command".into(), cmd_json);
+        params.insert("sessionKey".into(), json!(session_key));
+        params.insert("runId".into(), json!("run-arr-1"));
+        if let Some(approved) = approved {
+            params.insert("approved".into(), json!(approved));
+        }
+        super::NodeInvokeRequest {
+            id: "invoke-arr-1".to_string(),
+            node_id: "node-1".to_string(),
+            command: "system.run".to_string(),
+            params_json: Some(serde_json::Value::Object(params).to_string()),
+            timeout_ms: Some(5_000),
+            idempotency_key: None,
+        }
+    }
+
+    // ── which_in_dir tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn which_in_dir_finds_exact_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_path = tmp.path().join("mybinary");
+        std::fs::write(&bin_path, b"").unwrap();
+        let result = super::which_in_dir(tmp.path(), "mybinary");
+        assert_eq!(result, Some(bin_path));
+    }
+
+    #[test]
+    fn which_in_dir_returns_none_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = super::which_in_dir(tmp.path(), "doesnotexist");
+        assert!(result.is_none());
+    }
+
+    /// On Windows, a binary without an extension should be found when probing
+    /// PATHEXT extensions. Gate to cfg(windows) since we need actual .exe files
+    /// to exist and PATHEXT semantics are Windows-specific.
+    #[cfg(windows)]
+    #[test]
+    fn which_in_dir_finds_pathext_extension_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create "mybinary.exe" — PATHEXT typically contains .EXE
+        let bin_path = tmp.path().join("mybinary.exe");
+        std::fs::write(&bin_path, b"").unwrap();
+        // Query without extension
+        let result = super::which_in_dir(tmp.path(), "mybinary");
+        assert_eq!(
+            result,
+            Some(bin_path),
+            "should find mybinary.exe via PATHEXT"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn which_in_dir_already_has_extension_does_not_double_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_path = tmp.path().join("mybinary.exe");
+        std::fs::write(&bin_path, b"").unwrap();
+        // Query WITH extension — should find via exact match, not PATHEXT loop.
+        let result = super::which_in_dir(tmp.path(), "mybinary.exe");
+        assert_eq!(result, Some(bin_path));
+    }
+
+    /// Array-form commands spawn directly (no shell), so an argument containing
+    /// `&` is passed verbatim to the child process rather than interpreted by a
+    /// shell.  We verify by running `echo` with an arg that contains `&foo` and
+    /// asserting the output contains the literal ampersand — if it were passed
+    /// to a shell the `&` would fork a background job instead.
+    ///
+    /// This test covers Unix only because `echo` semantics on Windows differ;
+    /// the security property (no shell involved) applies on all platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn array_command_with_ampersand_does_not_spawn_second_command() {
+        let (handler, session_mgr, _approval_mgr, _broadcast_tx) = test_handler(1);
+        session_mgr
+            .set_mode("session-1", SessionMode::AutoAccept, 0)
+            .await;
+
+        // The arg "hello&world" must arrive verbatim; a shell would interpret
+        // `&` as a command separator and the output would just be "hello".
+        let invoke = array_command_invoke("session-1", vec!["echo", "hello&world"], None);
+
+        let (result, _event) = handler.handle_invoke(invoke).await;
+        let payload = payload_json(&result);
+        assert_eq!(
+            payload["success"], true,
+            "direct-spawn echo should succeed: {:?}",
+            payload
+        );
+        let stdout = payload["stdout"].as_str().unwrap_or("").trim().to_string();
+        assert_eq!(
+            stdout, "hello&world",
+            "ampersand must be passed verbatim, not shell-interpreted; got: {stdout:?}"
+        );
     }
 }

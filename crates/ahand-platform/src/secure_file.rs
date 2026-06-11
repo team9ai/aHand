@@ -1,29 +1,36 @@
 //! Owner-only secret-file writes.
 //!
-//! Unix: stale/staged tmp is removed, then a new file is created exclusively
-//! (`O_CREAT|O_EXCL`) with mode `0o600` before writing (no chmod-after-write
-//! window; pre-existing tmp can never donate its permissions). fsync, atomic
-//! rename. Windows: write a temp file, strip ACL inheritance and grant only
-//! the current user via `icacls`, then rename into place; the temp file
-//! briefly exists with default ACLs inside the target directory, which is
-//! itself under the user profile — accepted and documented in the design spec
-//! ("Behavioral decisions"). Parent directories are created with mode `0o700`
-//! on Unix (newly created dirs only; existing dirs are untouched).
+//! Unix: concurrent writers each get a private tmp file (`.{name}.{pid}.{N}.tmp`);
+//! the last-rename-wins but every rename carries a fully-written file. A best-effort
+//! sweep removes sibling stale tmps before writing. Files are created exclusively
+//! (`O_CREAT|O_EXCL`) with mode `0o600` so the mode always applies to a fresh file.
+//! fsync, atomic rename. Windows: write a temp file, strip ACL inheritance and grant
+//! only the current user via `icacls`, then rename into place; the temp file briefly
+//! exists with default ACLs inside the target directory, which is itself under the
+//! user profile — accepted and documented in the design spec ("Behavioral decisions").
+//! Parent directories are created with mode `0o700` on Unix (newly created dirs only;
+//! existing dirs are untouched).
 
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-process monotonic counter used to build unique tmp names.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Write `contents` to `path` with owner-only permissions, atomically.
 ///
 /// - Creates parent directories if they do not exist (Unix: mode `0o700`;
 ///   existing dirs are untouched).
-/// - Unix: any stale or attacker-staged tmp is removed first, then the tmp
-///   file is created exclusively (`O_CREAT|O_EXCL`) with mode `0o600` before
-///   any bytes are written — the mode always applies to a fresh file and a
-///   pre-existing tmp can never donate its permissions. A concurrent second
-///   writer loses the `create_new` race and errors out cleanly (fail-fast;
-///   documented M1 accepted window in the design spec "Behavioral decisions").
+/// - Unix: a unique tmp file `.{name}.{pid}.{N}.tmp` is created exclusively
+///   (`O_CREAT|O_EXCL`) with mode `0o600` before any bytes are written — the
+///   mode always applies to a fresh file and a pre-existing tmp can never
+///   donate its permissions. Before creating the tmp, sibling files matching
+///   `.{name}.*.tmp` are removed best-effort (stale tmps from crashed runs or
+///   other concurrent writers are swept; errors are ignored). Concurrent
+///   writers each hold a private tmp; the last `rename` wins but always
+///   publishes a COMPLETE file.
 /// - Windows: a temp file is created in the same directory, then
 ///   `icacls /inheritance:r /grant:r <USERNAME>:F` is applied to strip
 ///   inheritance and grant only the current user full control. If `icacls`
@@ -52,22 +59,23 @@ pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create directory {}", parent.display()))?;
 
-    let tmp = parent.join(format!(
-        ".{}.tmp",
-        path.file_name()
-            .map(|n| n.to_string_lossy())
-            .unwrap_or_default()
-    ));
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    // Build a unique tmp name: .{name}.{pid}.{counter}.tmp
+    let pid = std::process::id();
+    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(".{file_name}.{pid}.{counter}.tmp"));
+
+    // Best-effort sweep of sibling stale tmps (same prefix/suffix) — ignore errors.
+    sweep_stale_tmps(parent, &file_name, &tmp);
 
     {
-        // Remove any stale tmp (crashed run or staged file), then create
-        // exclusively: with O_EXCL/create_new the file is guaranteed fresh, so
-        // the 0o600 mode (Unix) always applies and we never inherit foreign
-        // permissions or contents. A concurrent writer of the same secret loses
-        // the create_new race and errors out cleanly instead of truncating our
-        // tmp mid-write (these files have no cross-process lock; fail-fast is
-        // the accepted M1 behavior).
-        let _ = std::fs::remove_file(&tmp);
+        // Create exclusively: with O_EXCL/create_new the file is guaranteed
+        // fresh, so the 0o600 mode (Unix) always applies and we never inherit
+        // foreign permissions or contents.
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
         #[cfg(unix)]
@@ -94,7 +102,8 @@ pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
     // fail; remove-then-rename is acceptable for these secret files — a
     // concurrent reader may observe a missing file during the window
     // (documented M1 accepted window in the design spec "Behavioral
-    // decisions"; a concurrent writer fails fast on create_new above).
+    // decisions"; concurrent writers use unique tmp names so last complete
+    // write wins).
     #[cfg(windows)]
     if path.exists() {
         std::fs::remove_file(path)
@@ -107,6 +116,47 @@ pub fn write_secure_file(path: &Path, contents: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()));
     }
     Ok(())
+}
+
+/// Remove sibling tmp files matching `.{name}.*.tmp` in `parent`, skipping
+/// `own_tmp` and any file modified within the last 10 seconds (to avoid
+/// racing with other currently-active writers). All errors are ignored
+/// (best-effort cleanup only).
+fn sweep_stale_tmps(parent: &Path, file_name: &str, own_tmp: &Path) {
+    let prefix = format!(".{file_name}.");
+    let suffix = ".tmp";
+    let now = std::time::SystemTime::now();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path == own_tmp {
+            continue;
+        }
+        let fname = entry.file_name();
+        let s = fname.to_string_lossy();
+        if !s.starts_with(&prefix) || !s.ends_with(suffix) {
+            continue;
+        }
+        // Skip recently-modified files: they may belong to an active writer.
+        // If we cannot determine the age (unsupported mtime, clock skew, etc.)
+        // we conservatively skip the file rather than risk deleting an active tmp.
+        let is_old = match entry.metadata() {
+            Ok(meta) => match meta.modified() {
+                Ok(modified) => match now.duration_since(modified) {
+                    Ok(age) => age.as_secs() >= 10,
+                    Err(_) => false, // modified is in the future — very recent, skip
+                },
+                Err(_) => false, // mtime unavailable — skip conservatively
+            },
+            Err(_) => false, // can't stat — skip conservatively
+        };
+        if !is_old {
+            continue;
+        }
+        let _ = std::fs::remove_file(&entry_path);
+    }
 }
 
 /// Restrict `path` to the current user only (Windows). Hard error on failure:
@@ -190,14 +240,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("secret");
         // Stage a world-readable tmp file the way an attacker (or crashed
-        // run) would.
-        let staged = tmp.path().join(".secret.tmp");
+        // run) would. Security property: even if the staged file is NOT swept
+        // (the sweep uses a time threshold to avoid racing active writers),
+        // the secret must still be created with 0o600 because `write_secure_file`
+        // uses `create_new(true)` with `mode(0o600)` — the staged file's mode
+        // can never propagate to the freshly-created tmp or to the secret.
+        let staged = tmp.path().join(".secret.stale.tmp");
         std::fs::write(&staged, b"stale").unwrap();
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o666)).unwrap();
         write_secure_file(&path, b"fresh").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "staged tmp permissions leaked");
         assert_eq!(std::fs::read(&path).unwrap(), b"fresh");
+        // Note: the stale tmp may or may not be swept depending on its age
+        // (sweep skips recently-modified files to avoid racing active writers).
+        // The security invariant is that the SECRET's mode is 0o600, which
+        // is verified above regardless of whether the staged file was swept.
     }
 
     #[cfg(unix)]
@@ -230,6 +288,58 @@ mod tests {
         assert!(
             msg.contains("no parent") || msg.contains("parent"),
             "error should mention 'no parent': {msg}"
+        );
+    }
+
+    /// Spawn 8 threads, each writing 50 iterations of a distinct 64 KB pattern
+    /// (byte = thread id) to the SAME path concurrently. After all threads
+    /// finish, the final file must equal one of the patterns exactly — no
+    /// partial writes, no corruption.
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_writers_never_publish_partial_content() {
+        use std::sync::Arc;
+
+        const THREAD_COUNT: u8 = 8;
+        const ITERATIONS: usize = 50;
+        const CHUNK_SIZE: usize = 64 * 1024; // 64 KB
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = Arc::new(tmp.path().join("concurrent_secret"));
+
+        let handles: Vec<_> = (0..THREAD_COUNT)
+            .map(|tid| {
+                let p = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    let pattern = vec![tid; CHUNK_SIZE];
+                    for _ in 0..ITERATIONS {
+                        write_secure_file(&p, &pattern).expect("write_secure_file failed");
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // The file must exist and contain exactly one valid pattern.
+        let final_data = std::fs::read(&*path).expect("final file missing");
+        assert_eq!(
+            final_data.len(),
+            CHUNK_SIZE,
+            "final file length is not CHUNK_SIZE ({} != {})",
+            final_data.len(),
+            CHUNK_SIZE
+        );
+        let first_byte = final_data[0];
+        assert!(
+            first_byte < THREAD_COUNT,
+            "unexpected byte value {first_byte} (expected 0..{THREAD_COUNT})"
+        );
+        assert!(
+            final_data.iter().all(|&b| b == first_byte),
+            "file contains mixed bytes — partial write detected"
         );
     }
 }
