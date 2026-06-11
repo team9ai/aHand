@@ -66,36 +66,61 @@ jobs:
           # store root for later steps
           "FIXTURE_ROOT=$fixtureRoot" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-          # ── Start Python HTTP server as a detached process ─────────────────────
-          # Use Start-Process so the server survives beyond this step.
-          $port    = 18080
-          $logFile = Join-Path $env:RUNNER_TEMP "mock-server.log"
+          # ── Write server script then launch as a detached pwsh process ─────────
+          # Using a separate pwsh process (not Start-Job) ensures the server
+          # survives beyond this step. .NET HttpListener needs no Python.
+          $port      = 18080
+          $serverLog = Join-Path $env:RUNNER_TEMP "mock-server.log"
           "SERVER_PORT=$port"    | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "SERVER_LOG=$logFile"  | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "SERVER_LOG=$serverLog" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-          $proc = Start-Process python `
-            -ArgumentList "-m","http.server",$port,"--bind","127.0.0.1" `
-            -WorkingDirectory $fixtureRoot `
-            -RedirectStandardOutput $logFile `
-            -RedirectStandardError  "$logFile.err" `
-            -PassThru
+          # Write the server script to a temp file
+          $serverScript = Join-Path $env:RUNNER_TEMP "mock-http-server.ps1"
+          @"
+param([string]\$Root, [int]\$Port)
+`$listener = [System.Net.HttpListener]::new()
+`$listener.Prefixes.Add("http://127.0.0.1:`$Port/")
+`$listener.Start()
+[System.IO.File]::WriteAllText("$serverLog", "READY`n")
+while (`$listener.IsListening) {
+    try {
+        `$ctx  = `$listener.GetContext()
+        `$req  = `$ctx.Request
+        `$resp = `$ctx.Response
+        # Strip leading slash to get relative path
+        `$rel  = `$req.Url.AbsolutePath.TrimStart('/')
+        `$file = Join-Path `$Root `$rel
+        if (Test-Path `$file -PathType Leaf) {
+            `$bytes = [System.IO.File]::ReadAllBytes(`$file)
+            `$resp.ContentLength64 = `$bytes.Length
+            `$resp.OutputStream.Write(`$bytes, 0, `$bytes.Length)
+            `$resp.StatusCode = 200
+        } else {
+            `$resp.StatusCode = 404
+        }
+        `$resp.Close()
+    } catch { break }
+}
+"@ | Set-Content $serverScript -Encoding UTF8
+
+          $proc = Start-Process pwsh `
+            -ArgumentList "-NoProfile","-NonInteractive","-File",$serverScript,"-Root",$fixtureRoot,"-Port",$port `
+            -PassThru -WindowStyle Hidden
           "SERVER_PID=$($proc.Id)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "Started Python HTTP server PID $($proc.Id) on port $port"
+          Write-Host "Started mock HTTP server PID $($proc.Id) on port $port"
 
-          # wait for server to be ready (up to 15 s)
+          # wait for READY signal or up to 15 s
           $ready = $false
           for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Milliseconds 500
-            try {
-              $null = Invoke-WebRequest -Uri "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
-              $ready = $true; break
-            } catch {}
+            if (Test-Path $serverLog) {
+              $content = Get-Content $serverLog -Raw
+              if ($content -match 'READY') { $ready = $true; break }
+            }
           }
           if (-not $ready) {
-            Write-Host "=== Server stdout ==="
-            Get-Content $logFile -ErrorAction SilentlyContinue
-            Write-Host "=== Server stderr ==="
-            Get-Content "$logFile.err" -ErrorAction SilentlyContinue
+            Write-Host "=== Server log ==="
+            Get-Content $serverLog -ErrorAction SilentlyContinue
             throw "Mock HTTP server did not become ready in time (PID $($proc.Id))"
           }
           Write-Host "Mock server is ready."
@@ -201,10 +226,10 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $pid = "${{ steps.mock-server.outputs.SERVER_PID }}"
-          if ($pid) {
-            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
-            Write-Host "Stopped mock server PID $pid"
+          $serverPid = "${{ steps.mock-server.outputs.SERVER_PID }}"
+          if ($serverPid) {
+            Stop-Process -Id ([int]$serverPid) -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped mock server PID $serverPid"
           }
           $logFile = "${{ steps.mock-server.outputs.SERVER_LOG }}"
           if ($logFile -and (Test-Path $logFile)) {
