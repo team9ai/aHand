@@ -367,20 +367,11 @@ pub fn install_binary_into(
                 target_path.display()
             )));
         }
-
-        // Success — skip the shared rename below on Windows.
-        info!(path = %target_path.display(), "installed new binary");
-
-        // Write version marker.
-        let version_path = ahand_home.join("version");
-        std::fs::write(&version_path, target_version)?;
-        info!(version = %target_version, "wrote version marker");
-
-        return Ok(());
     }
 
     #[cfg(not(windows))]
     std::fs::rename(&tmp_path, &target_path)?;
+
     info!(path = %target_path.display(), "installed new binary");
 
     // Write version marker.

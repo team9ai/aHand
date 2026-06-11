@@ -685,6 +685,9 @@ mod tool_resolution_tests {
         );
     }
 
+    // Uses a #!/bin/sh shebang script + Unix permission bits; Windows has no
+    // direct equivalent of an extensionless executable script.
+    #[cfg(unix)]
     #[tokio::test]
     async fn run_job_with_target_uses_explicit_executable_path() {
         use std::os::unix::fs::PermissionsExt;
