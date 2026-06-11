@@ -97,9 +97,16 @@ Note: `upgrade.sh` (in `scripts/dist/`) is deprecated and kept only for legacy i
 ahandctl browser-init       # install browser automation dependencies
 ```
 
-This sets up [playwright-cli](https://github.com/microsoft/playwright-cli), a local Node.js runtime (if needed), and detects/installs Chrome/Chromium.
+This sets up [playwright-cli](https://github.com/microsoft/playwright-cli) and a local Node.js runtime on all three platforms — no shell or bash required.
 
-Windows: browser automation lands in a later milestone (M3).
+**Platform behaviour:**
+
+- **macOS / Linux** — downloads the `.tar.xz` Node.js distribution and extracts it to the managed runtime directory (`~/.cache/ahand-runtimes/ahand-primary-runtime/`).
+- **Windows** — downloads the official `.zip` Node.js distribution from nodejs.org, extracts it with traversal/symlink guards, and normalises the flat zip layout (`node.exe` at archive root) into the consistent `bin/node.exe` shape used on all platforms. npm and playwright-cli are invoked via `node.exe <js-entrypoint>` (the `npm-cli.js` path and the `@playwright/cli` package.json `"bin"` entry resolved at runtime) — no `.cmd` shim is spawned.
+
+**Browser requirement:** Chrome or Edge must be installed on the machine. Both are auto-detected from the standard install paths; no additional browser download is needed.
+
+`setup-browser.sh` is deprecated (kept for legacy installs only; no longer downloaded or installed during upgrade). Use `ahandctl browser-init` instead on all platforms.
 
 ## Session Modes
 
