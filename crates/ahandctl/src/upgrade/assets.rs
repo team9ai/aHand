@@ -110,8 +110,8 @@ pub async fn perform_upgrade(
     } else {
         None
     };
-    #[cfg(not(unix))]
-    let browser_bytes: Option<Vec<u8>> = None;
+    // (No setup-browser.sh on non-unix; the unix-only install step below is
+    // the sole consumer, so no binding is needed elsewhere.)
 
     // ── 5. Verify Rust binary checksums BEFORE any install ──────────────────
     if let Some(ref cs_text) = checksum_text {
