@@ -132,7 +132,9 @@ async fn spawn_stub(mode: StubMode) -> StubObject {
 }
 
 fn test_manager(tmp: &TempDir) -> (FileManager, PathBuf) {
-    let root = tmp.path().canonicalize().unwrap();
+    // canonicalize_simplified strips the Windows verbatim prefix (\\?\) so
+    // the allowlist patterns match what FilePolicyChecker returns internally.
+    let root = ahand_platform::paths::canonicalize_simplified(tmp.path()).unwrap();
     let pattern = format!("{}/**", root.to_string_lossy());
     let self_pattern = root.to_string_lossy().into_owned();
     let mgr = FileManager::new(&FilePolicyConfig {

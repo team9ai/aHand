@@ -54,4 +54,6 @@ jobs:
         run: cargo clippy -p ahand-platform -p ahandd -p ahandctl --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test -p ahand-platform -p ahandd -p ahandctl --all-targets
+        # --no-fail-fast: run every test binary even if one fails, so a single
+        # CI round surfaces all platform-specific failures at once.
+        run: cargo test -p ahand-platform -p ahandd -p ahandctl --all-targets --no-fail-fast
