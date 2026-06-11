@@ -76,12 +76,20 @@ impl Dirs {
         self.runtime.node_bin()
     }
 
-    pub fn npm_bin(&self) -> PathBuf {
-        self.runtime.npm_bin()
+    /// Return the (program, leading_args) pair for invoking npm.
+    /// Delegates to `RuntimeDirs::npm_invocation()`.
+    pub fn npm_invocation(&self) -> (PathBuf, Vec<std::ffi::OsString>) {
+        self.runtime.npm_invocation()
     }
 
     pub fn playwright_cli_bin(&self) -> PathBuf {
         self.runtime.playwright_cli_bin()
+    }
+
+    /// Return the (program, leading_args) pair for invoking playwright-cli.
+    /// Delegates to `RuntimeDirs::playwright_cli_invocation()`.
+    pub fn playwright_cli_invocation(&self) -> anyhow::Result<(PathBuf, Vec<std::ffi::OsString>)> {
+        self.runtime.playwright_cli_invocation()
     }
 }
 
@@ -922,5 +930,109 @@ mod tests {
                 p.display()
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Carry-over T1 review tests
+    // -------------------------------------------------------------------------
+
+    /// Zip fixture without root node.exe — extraction succeeds (the archive is
+    /// valid) but `bin/node.exe` is absent because there is nothing to move.
+    /// The `ensure()` backstop (post-extraction binary-not-found bail) catches
+    /// this in production; here we just confirm the extractor doesn't panic.
+    ///
+    /// NOTE: the move step in `extract_node_zip` is conditional (`if
+    /// node_exe_src.exists()`), so a zip that never contained node.exe at the
+    /// root simply skips the rename and leaves `bin/` absent — which is the
+    /// correct "no binary" outcome for `ensure()` to report.
+    #[test]
+    fn zip_extraction_without_root_node_exe_succeeds_but_bin_absent() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zw = zip::ZipWriter::new(buf);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        // Top-level versioned directory — but NO node.exe inside.
+        zw.add_directory("node-v24.13.0-win-x64/", opts).unwrap();
+        zw.start_file("node-v24.13.0-win-x64/npm.cmd", opts)
+            .unwrap();
+        zw.write_all(b"@echo off").unwrap();
+
+        let cursor = zw.finish().unwrap();
+        let zip_bytes = cursor.into_inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("node");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Extraction must succeed — the extractor does not require node.exe.
+        extract_node_zip(&zip_bytes, &dest)
+            .expect("extraction should succeed even without node.exe");
+
+        // bin/node.exe must be absent (move-skip pinned).
+        // ensure() bails with "binary not found" as the backstop.
+        assert!(
+            !dest.join("bin").join("node.exe").exists(),
+            "bin/node.exe must be absent when the zip had no root node.exe"
+        );
+    }
+
+    /// Malformed zip with duplicate/type-conflicting entries: a file named `a`
+    /// followed by a directory named `a/`. The extractor must either succeed
+    /// cleanly or fail with an error — it must NOT write files outside `dest`.
+    #[test]
+    fn zip_extraction_duplicate_name_does_not_escape_root() {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+
+        let buf = std::io::Cursor::new(Vec::new());
+        let mut zw = zip::ZipWriter::new(buf);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+
+        // Top-level dir.
+        zw.add_directory("node-v24.13.0-win-x64/", opts).unwrap();
+
+        // File named `a`.
+        zw.start_file("node-v24.13.0-win-x64/a", opts).unwrap();
+        zw.write_all(b"file content").unwrap();
+
+        // Directory also named `a/` — type conflict.
+        zw.add_directory("node-v24.13.0-win-x64/a/", opts).unwrap();
+
+        // File inside the conflicting dir (should either extract or be skipped).
+        zw.start_file("node-v24.13.0-win-x64/a/inner.txt", opts)
+            .unwrap();
+        zw.write_all(b"inner").unwrap();
+
+        let cursor = zw.finish().unwrap();
+        let zip_bytes = cursor.into_inner();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("node");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Extraction either succeeds or errors cleanly — either is acceptable.
+        // What is NOT acceptable: writing anything outside `dest`.
+        let result = extract_node_zip(&zip_bytes, &dest);
+        if let Err(ref e) = result {
+            // Error path: the message must not be a panic, just an anyhow error.
+            let _ = format!("{e:#}"); // ensure it formats without panic
+        }
+
+        // Regardless of outcome, nothing must have escaped the dest root.
+        let parent = dest.parent().unwrap();
+        let escaped = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name();
+                name != dest.file_name().unwrap()
+            });
+        assert!(
+            !escaped,
+            "no files must be written outside the dest directory"
+        );
     }
 }

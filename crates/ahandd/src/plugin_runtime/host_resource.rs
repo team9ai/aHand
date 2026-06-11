@@ -151,7 +151,18 @@ fn node_resource(
     let mut resources = BTreeMap::new();
     let status = match &report.status {
         CheckStatus::Ok { version, path, .. } => {
-            let npm = runtime.npm_bin();
+            // Use npm_invocation() to find the canonical "npm is available" file:
+            // - Unix: node/bin/npm (the script itself)
+            // - Windows: node_modules/npm/bin/npm-cli.js (the JS entry — node.exe
+            //   is always present if node_bin() exists, so we check the JS file)
+            let (npm_program, npm_leading) = runtime.npm_invocation();
+            let npm_path = if npm_leading.is_empty() {
+                // Unix: program IS the npm script.
+                npm_program.clone()
+            } else {
+                // Windows: first leading arg is npm-cli.js.
+                std::path::PathBuf::from(&npm_leading[0])
+            };
             resources.insert(
                 "node".to_string(),
                 HostResourceValue::Executable {
@@ -160,12 +171,12 @@ fn node_resource(
                     version: Some(version.clone()),
                 },
             );
-            if npm.is_file() {
+            if npm_path.is_file() {
                 resources.insert(
                     "npm".to_string(),
                     HostResourceValue::Executable {
                         name: "npm".to_string(),
-                        path: path_to_string(npm),
+                        path: path_to_string(&npm_path),
                         version: None,
                     },
                 );
