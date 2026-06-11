@@ -24,8 +24,8 @@
 #![allow(dead_code)]
 
 use ahand_protocol::{
-    AppToolRequest, AppToolResponse, AppToolsUpdate, Envelope, FileRequest, FileResponse,
-    Heartbeat, HelloAccepted, HelloChallenge, envelope,
+    AppToolRequest, AppToolResponse, AppToolsUpdate, ApprovalRequest, ApprovalResponse, Envelope,
+    FileRequest, FileResponse, Heartbeat, HelloAccepted, HelloChallenge, envelope,
 };
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -46,6 +46,8 @@ pub struct Mock {
     file_responses: Arc<Mutex<Vec<FileResponse>>>,
     app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>>,
     app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>>,
+    /// Captured ApprovalRequest envelopes received from the daemon.
+    approval_requests: Arc<Mutex<Vec<ApprovalRequest>>>,
     // mpsc sender used to inject envelopes into the active connection, paired
     // with a generation counter so stale connection cleanup can't clobber a
     // newer connection's sender.
@@ -87,6 +89,59 @@ impl Mock {
     /// daemons since the mock started.
     pub fn captured_app_tool_responses(&self) -> Vec<AppToolResponse> {
         self.app_tool_responses.lock().unwrap().clone()
+    }
+
+    /// Snapshot of every `ApprovalRequest` envelope received from connected
+    /// daemons since the mock started.
+    pub fn captured_approval_requests(&self) -> Vec<ApprovalRequest> {
+        self.approval_requests.lock().unwrap().clone()
+    }
+
+    /// Wait until at least `n` `ApprovalRequest` envelopes have been received,
+    /// then return all of them. Returns `None` on timeout.
+    pub async fn wait_for_approval_requests(
+        &self,
+        n: usize,
+        timeout: std::time::Duration,
+    ) -> Option<Vec<ApprovalRequest>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let reqs = self.captured_approval_requests();
+            if reqs.len() >= n {
+                return Some(reqs);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Send an `ApprovalResponse` envelope to the connected daemon. Returns
+    /// `Err` if no daemon is currently connected (no inject channel active).
+    pub fn send_approval_response(
+        &self,
+        job_id: impl Into<String>,
+        approved: bool,
+        reason: impl Into<String>,
+    ) -> Result<(), String> {
+        let env = Envelope {
+            device_id: "mock-hub".into(),
+            msg_id: "approval-resp".into(),
+            ts_ms: 0,
+            payload: Some(envelope::Payload::ApprovalResponse(ApprovalResponse {
+                job_id: job_id.into(),
+                approved,
+                reason: reason.into(),
+                remember: false,
+            })),
+            ..Default::default()
+        };
+        let guard = self.inject_tx.lock().unwrap();
+        match guard.as_ref() {
+            Some((_gen, tx)) => tx.send(env).map_err(|e| e.to_string()),
+            None => Err("no active connection inject channel".to_string()),
+        }
     }
 
     /// Wait until at least `n` `AppToolsUpdate` envelopes have been
@@ -232,6 +287,7 @@ async fn start(behavior: Behavior) -> Mock {
     let file_responses: Arc<Mutex<Vec<FileResponse>>> = Arc::new(Mutex::new(Vec::new()));
     let app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>> = Arc::new(Mutex::new(Vec::new()));
     let app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>> = Arc::new(Mutex::new(Vec::new()));
+    let approval_requests: Arc<Mutex<Vec<ApprovalRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let inject_tx: Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Envelope>)>>> =
         Arc::new(Mutex::new(None));
     // Monotonically increasing connection generation counter.
@@ -242,6 +298,7 @@ async fn start(behavior: Behavior) -> Mock {
     let file_responses_for_task = file_responses.clone();
     let app_tools_updates_for_task = app_tools_updates.clone();
     let app_tool_responses_for_task = app_tool_responses.clone();
+    let approval_requests_for_task = approval_requests.clone();
     let inject_tx_for_task = inject_tx.clone();
     let conn_gen_for_task = conn_gen.clone();
     let task = tokio::spawn(async move {
@@ -263,6 +320,7 @@ async fn start(behavior: Behavior) -> Mock {
                         file_responses_for_task.clone(),
                         app_tools_updates_for_task.clone(),
                         app_tool_responses_for_task.clone(),
+                        approval_requests_for_task.clone(),
                         inject_tx_for_task.clone(),
                         conn_gen_id,
                     ));
@@ -277,6 +335,7 @@ async fn start(behavior: Behavior) -> Mock {
         file_responses,
         app_tools_updates,
         app_tool_responses,
+        approval_requests,
         inject_tx,
         _shutdown: shutdown_tx,
         _task: task,
@@ -290,6 +349,7 @@ async fn handle_conn(
     file_responses: Arc<Mutex<Vec<FileResponse>>>,
     app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>>,
     app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>>,
+    approval_requests: Arc<Mutex<Vec<ApprovalRequest>>>,
     inject_tx: Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Envelope>)>>>,
     conn_generation: u64,
 ) {
@@ -397,6 +457,9 @@ async fn handle_conn(
                             }
                             Some(envelope::Payload::AppToolResponse(resp)) => {
                                 app_tool_responses.lock().unwrap().push(resp);
+                            }
+                            Some(envelope::Payload::ApprovalRequest(req)) => {
+                                approval_requests.lock().unwrap().push(req);
                             }
                             _ => {}
                         }

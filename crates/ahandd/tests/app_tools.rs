@@ -854,3 +854,568 @@ async fn duplicate_call_id_while_running_is_ignored() {
 
     handle.shutdown().await.expect("shutdown clean");
 }
+
+// ── Task 6: session-mode gate + tighten-only approval tests ──────────────────
+
+use ahandd::SessionMode;
+
+/// Build a DaemonConfig with a specific session mode, short approval_timeout,
+/// and no heartbeat noise. `approval_timeout_secs` controls how quickly
+/// APPROVAL_TIMEOUT fires in tests.
+fn gated_dispatch_config(
+    ws_url: String,
+    jwt: String,
+    tmp: &TempDir,
+    mode: SessionMode,
+    approval_timeout_secs: u64,
+) -> DaemonConfig {
+    DaemonConfig::builder(ws_url, jwt, tmp.path())
+        .heartbeat_interval(Duration::from_secs(60))
+        .session_mode(mode)
+        .approval_timeout(Duration::from_secs(approval_timeout_secs))
+        .build()
+}
+
+/// Helper: spawn with a specific session mode; drain the initial snapshot.
+async fn setup_gated_daemon(
+    mode: SessionMode,
+    approval_timeout_secs: u64,
+) -> (mock_hub::Mock, ahandd::DaemonHandle, TempDir) {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let handle = spawn(gated_dispatch_config(
+        mock.ws_url(),
+        mock.valid_jwt(),
+        &tmp,
+        mode,
+        approval_timeout_secs,
+    ))
+    .await
+    .expect("spawn ok");
+    wait_online(&handle).await;
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial AppToolsUpdate not received within 5s");
+    (mock, handle, tmp)
+}
+
+/// Helper: register a tool that counts invocations, returning `{"ran": true}`.
+async fn register_counted_echo(
+    handle: &ahandd::DaemonHandle,
+    name: &str,
+    requires_approval: bool,
+    counter: Arc<AtomicUsize>,
+) {
+    let def = AppToolDef {
+        name: name.to_string(),
+        description: "Counted echo".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval,
+    };
+    let counter_clone = Arc::clone(&counter);
+    let handler: AppToolHandler = Arc::new(move |_args| {
+        let c = Arc::clone(&counter_clone);
+        Box::pin(async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"ran": true}))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register_app_tool ok");
+}
+
+// ── Case 1: INACTIVE mode → SESSION_INACTIVE ──────────────────────────────────
+
+/// Case 1: INACTIVE mode → SESSION_INACTIVE error, no ApprovalRequest, handler
+/// never runs.
+#[tokio::test]
+async fn inactive_mode_returns_session_inactive() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Inactive, 2).await;
+
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "demo_echo", false, Arc::clone(&run_count)).await;
+
+    // Wait for the tool's snapshot.
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request("call-inactive", "demo_echo", r#"{}"#, 5000)
+        .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-inactive");
+    match &resp.result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(
+                err.code, "SESSION_INACTIVE",
+                "expected SESSION_INACTIVE, got: {}",
+                err.code
+            );
+            assert!(
+                err.message.contains("session mode rejects"),
+                "message should mention session mode: {}",
+                err.message
+            );
+        }
+        other => panic!("expected SESSION_INACTIVE error, got {other:?}"),
+    }
+
+    // No ApprovalRequest should have been sent.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        mock.captured_approval_requests().len(),
+        0,
+        "no ApprovalRequest expected in INACTIVE mode"
+    );
+
+    // Handler must not have run.
+    assert_eq!(
+        run_count.load(Ordering::SeqCst),
+        0,
+        "handler must not run in INACTIVE mode"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Case 2: STRICT + approve → execution ─────────────────────────────────────
+
+/// Case 2: STRICT mode + approval granted → ApprovalRequest with correct
+/// job_id and tool; on approval, result arrives; handler ran once.
+#[tokio::test]
+async fn strict_mode_approve_executes() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 10).await;
+
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "demo_echo", false, Arc::clone(&run_count)).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request("call-strict-approve", "demo_echo", r#"{}"#, 5000)
+        .expect("send ok");
+
+    // Wait for the ApprovalRequest.
+    let approval_reqs = mock
+        .wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s");
+
+    let ar = &approval_reqs[0];
+    assert_eq!(
+        ar.job_id, "call-strict-approve",
+        "job_id must equal tool_call_id"
+    );
+    assert_eq!(ar.tool, "app:demo_echo", "tool must be 'app:<name>'");
+
+    // Approve.
+    mock.send_approval_response("call-strict-approve", true, "")
+        .expect("send approval ok");
+
+    // Result should arrive after approval.
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s after approval");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-strict-approve");
+    assert!(
+        matches!(&resp.result, Some(app_tool_response::Result::ResultJson(_))),
+        "expected ResultJson after approval, got {:?}",
+        resp.result
+    );
+
+    assert_eq!(run_count.load(Ordering::SeqCst), 1, "handler ran once");
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Case 3: STRICT + deny → APPROVAL_DENIED ───────────────────────────────────
+
+/// Case 3: STRICT mode, deny with reason "nope" → APPROVAL_DENIED with reason
+/// in message; handler never runs.
+#[tokio::test]
+async fn strict_mode_deny_returns_approval_denied() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 10).await;
+
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "demo_echo", false, Arc::clone(&run_count)).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request("call-strict-deny", "demo_echo", r#"{}"#, 5000)
+        .expect("send ok");
+
+    // Wait for the ApprovalRequest.
+    mock.wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s");
+
+    // Deny with reason.
+    mock.send_approval_response("call-strict-deny", false, "nope")
+        .expect("send denial ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s after denial");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-strict-deny");
+    match &resp.result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(
+                err.code, "APPROVAL_DENIED",
+                "expected APPROVAL_DENIED, got: {}",
+                err.code
+            );
+            assert!(
+                err.message.contains("nope"),
+                "reason 'nope' should be in message: {}",
+                err.message
+            );
+        }
+        other => panic!("expected APPROVAL_DENIED error, got {other:?}"),
+    }
+
+    assert_eq!(
+        run_count.load(Ordering::SeqCst),
+        0,
+        "handler must not run when denied"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Case 4: STRICT + silence → APPROVAL_TIMEOUT ───────────────────────────────
+
+/// Case 4: STRICT mode, no response → APPROVAL_TIMEOUT after approval_timeout
+/// fires (~1s). Handler never runs.
+#[tokio::test]
+async fn strict_mode_timeout_returns_approval_timeout() {
+    // 1-second approval timeout for test speed.
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 1).await;
+
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "demo_echo", false, Arc::clone(&run_count)).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request("call-strict-timeout", "demo_echo", r#"{}"#, 5000)
+        .expect("send ok");
+
+    // Wait for the ApprovalRequest to arrive.
+    mock.wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s");
+
+    // Do NOT send a response — let the timeout fire (1s + buffer).
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(10))
+        .await
+        .expect("APPROVAL_TIMEOUT response not received within 10s");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-strict-timeout");
+    match &resp.result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(
+                err.code, "APPROVAL_TIMEOUT",
+                "expected APPROVAL_TIMEOUT, got: {}",
+                err.code
+            );
+        }
+        other => panic!("expected APPROVAL_TIMEOUT error, got {other:?}"),
+    }
+
+    assert_eq!(
+        run_count.load(Ordering::SeqCst),
+        0,
+        "handler must not run on timeout"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Case 5: TRUST + requires_approval=false → direct execution ───────────────
+
+/// Case 5: TRUST mode, requires_approval=false → no ApprovalRequest, direct
+/// execution.
+#[tokio::test]
+async fn trust_mode_no_requires_approval_executes_directly() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Trust, 10).await;
+
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "demo_echo", false, Arc::clone(&run_count)).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request("call-trust-direct", "demo_echo", r#"{}"#, 5000)
+        .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-trust-direct");
+    assert!(
+        matches!(&resp.result, Some(app_tool_response::Result::ResultJson(_))),
+        "expected ResultJson in TRUST mode, got {:?}",
+        resp.result
+    );
+
+    // No ApprovalRequest should have been sent.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        mock.captured_approval_requests().len(),
+        0,
+        "no ApprovalRequest expected for requires_approval=false in TRUST mode"
+    );
+
+    assert_eq!(run_count.load(Ordering::SeqCst), 1, "handler ran once");
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Case 6: AUTO_ACCEPT + requires_approval=false → direct execution ─────────
+
+/// Case 6: AUTO_ACCEPT mode, requires_approval=false → no ApprovalRequest,
+/// direct execution.
+#[tokio::test]
+async fn auto_accept_mode_no_requires_approval_executes_directly() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::AutoAccept, 10).await;
+
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "demo_echo", false, Arc::clone(&run_count)).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request("call-auto-direct", "demo_echo", r#"{}"#, 5000)
+        .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-auto-direct");
+    assert!(
+        matches!(&resp.result, Some(app_tool_response::Result::ResultJson(_))),
+        "expected ResultJson in AUTO_ACCEPT mode, got {:?}",
+        resp.result
+    );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        mock.captured_approval_requests().len(),
+        0,
+        "no ApprovalRequest expected for requires_approval=false in AUTO_ACCEPT mode"
+    );
+
+    assert_eq!(run_count.load(Ordering::SeqCst), 1, "handler ran once");
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Case 7: TRUST + requires_approval=true → ApprovalRequest; approve ─────────
+
+/// Case 7: TRUST mode, requires_approval=true → ApprovalRequest is still
+/// required (tighten-only). On approval → executes.
+#[tokio::test]
+async fn trust_mode_requires_approval_true_sends_approval_request() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Trust, 10).await;
+
+    let run_count = Arc::new(AtomicUsize::new(0));
+    // requires_approval=true even in TRUST mode.
+    register_counted_echo(&handle, "demo_echo", true, Arc::clone(&run_count)).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request("call-trust-approval", "demo_echo", r#"{}"#, 5000)
+        .expect("send ok");
+
+    // ApprovalRequest must be sent even in TRUST mode.
+    let approval_reqs = mock
+        .wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s (TRUST + requires_approval=true)");
+
+    assert_eq!(approval_reqs[0].job_id, "call-trust-approval");
+    assert_eq!(approval_reqs[0].tool, "app:demo_echo");
+
+    // Approve.
+    mock.send_approval_response("call-trust-approval", true, "")
+        .expect("send approval ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s after approval");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-trust-approval");
+    assert!(
+        matches!(&resp.result, Some(app_tool_response::Result::ResultJson(_))),
+        "expected ResultJson after TRUST+requires_approval approval, got {:?}",
+        resp.result
+    );
+
+    assert_eq!(run_count.load(Ordering::SeqCst), 1, "handler ran once");
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Case 8: AUTO_ACCEPT + requires_approval=true → ApprovalRequest; deny ──────
+
+/// Case 8: AUTO_ACCEPT mode, requires_approval=true → ApprovalRequest required
+/// (tighten-only). Deny → APPROVAL_DENIED.
+#[tokio::test]
+async fn auto_accept_mode_requires_approval_true_deny() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::AutoAccept, 10).await;
+
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "demo_echo", true, Arc::clone(&run_count)).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request("call-auto-deny", "demo_echo", r#"{}"#, 5000)
+        .expect("send ok");
+
+    // ApprovalRequest must be sent even in AUTO_ACCEPT mode.
+    let approval_reqs = mock
+        .wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s (AUTO_ACCEPT + requires_approval=true)");
+
+    assert_eq!(approval_reqs[0].job_id, "call-auto-deny");
+
+    // Deny.
+    mock.send_approval_response("call-auto-deny", false, "not allowed")
+        .expect("send denial ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s after denial");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-auto-deny");
+    match &resp.result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(
+                err.code, "APPROVAL_DENIED",
+                "expected APPROVAL_DENIED, got: {}",
+                err.code
+            );
+            assert!(
+                err.message.contains("not allowed"),
+                "denial reason should appear in message: {}",
+                err.message
+            );
+        }
+        other => panic!("expected APPROVAL_DENIED, got {other:?}"),
+    }
+
+    assert_eq!(
+        run_count.load(Ordering::SeqCst),
+        0,
+        "handler must not run when denied"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Case 9: duplicate request while approval pending ─────────────────────────
+
+/// Case 9: duplicate tool_call_id while approval is pending → no second
+/// ApprovalRequest, only one response arrives.
+#[tokio::test]
+async fn duplicate_while_approval_pending_no_second_request() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 10).await;
+
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "demo_echo", false, Arc::clone(&run_count)).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    // First request.
+    mock.send_app_tool_request("call-dup-pending", "demo_echo", r#"{}"#, 5000)
+        .expect("first send ok");
+
+    // Wait for the first ApprovalRequest to arrive before sending the duplicate.
+    mock.wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("first ApprovalRequest not received");
+
+    // Duplicate request while approval is pending.
+    mock.send_app_tool_request("call-dup-pending", "demo_echo", r#"{}"#, 5000)
+        .expect("duplicate send ok");
+
+    // Brief pause: if a second ApprovalRequest were sent, it would arrive quickly.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        mock.captured_approval_requests().len(),
+        1,
+        "only one ApprovalRequest expected even with duplicate"
+    );
+
+    // Approve the original request.
+    mock.send_approval_response("call-dup-pending", true, "")
+        .expect("send approval ok");
+
+    // Only one response should arrive.
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("single AppToolResponse not received within 5s");
+
+    // Brief pause to confirm no second response arrives.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let all = mock.captured_app_tool_responses();
+    assert_eq!(
+        all.len(),
+        1,
+        "expected exactly 1 AppToolResponse, got {}",
+        all.len()
+    );
+
+    assert!(
+        matches!(
+            &responses[0].result,
+            Some(app_tool_response::Result::ResultJson(_))
+        ),
+        "expected ResultJson after approval, got {:?}",
+        responses[0].result
+    );
+
+    assert_eq!(run_count.load(Ordering::SeqCst), 1, "handler ran once");
+
+    handle.shutdown().await.expect("shutdown clean");
+}

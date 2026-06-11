@@ -1848,12 +1848,29 @@ fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: St
 
 /// Handle an incoming AppToolRequest.
 ///
-/// Steps 1-5 run inline (they are fast O(1) memory ops or cheap semaphore
-/// try-acquires). Step 6 (execute_app_tool) is spawned onto a dedicated
-/// tokio task so the read loop is never blocked waiting up to 300s for a
-/// long-running handler. mark_running is called BEFORE returning to the loop
-/// so that any duplicate request arriving before the spawned task starts
-/// still sees Running and is silently ignored (idempotency holds).
+/// Revised step order (Task 6):
+///   1. Idempotency check — early-exit if already Running (silent) or Completed
+///      (replay cached response).
+///   2. Lookup — TOOL_NOT_FOUND if not registered. Lookup must happen before the
+///      gate so TOOL_NOT_FOUND is always returned for unknown tools regardless of
+///      session mode (no information leak about mode from the error code).
+///   3. Session-mode gate — uses a synthetic JobRequest keyed on tool_call_id so
+///      the existing approval machinery (ApprovalManager, spawned-wait pattern)
+///      is reused without modification.
+///      * Inactive / expired trust → SESSION_INACTIVE error, return.
+///      * Allow (Trust/AutoAccept) + requires_approval=false → fall through.
+///      * Allow + requires_approval=true OR Strict → NeedsApproval path:
+///        mark_running first (idempotency), send ApprovalRequest, spawn waiter.
+///   4. Parse args — INVALID_ARGS on bad JSON or non-object.
+///   5. Concurrency permit — CONCURRENCY_LIMIT if all slots taken.
+///   6. Execute (spawned).
+///
+/// mark_running is called BEFORE sending the ApprovalRequest (NeedsApproval path)
+/// or before spawning execution (Allow path). This closes the idempotency window:
+/// a duplicate request arriving while approval is pending or while execution is
+/// running sees Running and is silently ignored. Every terminal outcome
+/// (denied / timed out / handler result) calls mark_completed so that a
+/// post-completion replay of the same tool_call_id returns the cached result.
 ///
 /// Contrast with handle_file_request (which also spawns its approval-wait leg):
 /// file requests front-load a quick policy check inline and only spawn the
@@ -1914,12 +1931,12 @@ async fn handle_app_tool_request<T>(
         crate::app_tool_registry::CallState::Unknown => {}
     }
 
-    // ── Step 2: session-mode gate (Task 6) inserts here, before lookup ────
-    // TODO(task-6): check session mode and approval for app tools.
-    let _ = (session_mgr, approval_mgr, approval_broadcast_tx, caller_uid);
-
-    // ── Step 3: lookup ────────────────────────────────────────────────────
-    let (_descriptor, handler) = match app_tools.lookup(&req.name).await {
+    // ── Step 2: lookup ────────────────────────────────────────────────────
+    // Lookup happens BEFORE the session gate so that TOOL_NOT_FOUND is always
+    // returned for unknown tools regardless of session mode (no information
+    // leak about mode). The gate needs descriptor.requires_approval, so we
+    // look up once and reuse both descriptor and handler.
+    let (descriptor, handler) = match app_tools.lookup(&req.name).await {
         Some(pair) => pair,
         None => {
             warn!(
@@ -1940,19 +1957,262 @@ async fn handle_app_tool_request<T>(
         }
     };
 
-    // ── Step 4: parse args ────────────────────────────────────────────────
-    let args: serde_json::Value = match serde_json::from_str(&req.args_json) {
-        Ok(v) => v,
-        Err(err) => {
+    // ── Step 3: session-mode gate ─────────────────────────────────────────
+    // Build a synthetic JobRequest so the existing SessionManager and
+    // ApprovalManager work unchanged. job_id = tool_call_id so that an
+    // ApprovalResponse keyed by job_id resolves our pending entry.
+    let args_preview: String = req.args_json.chars().take(512).collect();
+    let synthetic = ahand_protocol::JobRequest {
+        job_id: req.tool_call_id.clone(),
+        tool: format!("app:{}", req.name),
+        args: vec![args_preview],
+        ..Default::default()
+    };
+
+    let decision = match session_mgr.check(&synthetic, caller_uid).await {
+        SessionDecision::Deny(reason) => {
             warn!(
                 tool_call_id = %req.tool_call_id,
                 name = %req.name,
-                error = %err,
-                "invalid app tool args"
+                reason = %reason,
+                "app tool rejected by session mode"
             );
             let _ = tx.send(app_tool_error_envelope(
                 device_id,
                 &req.tool_call_id,
+                "SESSION_INACTIVE",
+                format!("session mode rejects app tool calls: {reason}"),
+            ));
+            return;
+        }
+        // Allow but requires_approval=true: upgrade to NeedsApproval.
+        SessionDecision::Allow if descriptor.requires_approval => {
+            let previous_refusals = session_mgr.get_refusals(&synthetic.tool).await;
+            SessionDecision::NeedsApproval {
+                reason: format!(
+                    "app tool {:?} is registered with requires_approval",
+                    req.name
+                ),
+                previous_refusals,
+            }
+        }
+        other => other,
+    };
+
+    if let SessionDecision::NeedsApproval {
+        reason,
+        previous_refusals,
+    } = decision
+    {
+        info!(
+            tool_call_id = %req.tool_call_id,
+            name = %req.name,
+            reason = %reason,
+            "app tool requires approval"
+        );
+
+        // Mark running BEFORE sending the ApprovalRequest so that a
+        // duplicate request arriving while approval is pending sees Running
+        // and is silently ignored (idempotency window is closed now).
+        // Every terminal outcome (deny/timeout/execute) calls mark_completed.
+        app_tools.mark_running(&req.tool_call_id).await;
+
+        let (approval_req, approval_rx) = approval_mgr
+            .submit(synthetic.clone(), caller_uid, reason, previous_refusals)
+            .await;
+
+        // Send ApprovalRequest to cloud via WS.
+        let approval_env = Envelope {
+            device_id: device_id.to_string(),
+            msg_id: new_msg_id(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::ApprovalRequest(approval_req.clone())),
+            ..Default::default()
+        };
+        let _ = tx.send(approval_env.clone());
+
+        // Broadcast to all IPC clients.
+        let _ = approval_broadcast_tx.send(approval_env);
+
+        // Spawn a task to wait for approval without blocking the WS read loop.
+        let tx_clone = (*tx).clone();
+        let did = device_id.to_string();
+        let amgr = Arc::clone(approval_mgr);
+        let smgr = Arc::clone(session_mgr);
+        let app_tools_clone = Arc::clone(app_tools);
+        let tool_call_id = req.tool_call_id.clone();
+        let tool_name = req.name.clone();
+        let args_json = req.args_json.clone();
+        let timeout_ms_req = req.timeout_ms;
+        let cuid = caller_uid.to_string();
+        let timeout = amgr.default_timeout();
+        let synthetic_tool = synthetic.tool.clone();
+
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(timeout, approval_rx).await;
+            match result {
+                Ok(Ok(resp)) if resp.approved => {
+                    info!(
+                        tool_call_id = %tool_call_id,
+                        name = %tool_name,
+                        duration_ms = started.elapsed().as_millis() as u64,
+                        "app tool approval granted"
+                    );
+                    // Proceed to args parse → permit → execute inside this task.
+                    validate_and_execute_app_tool(
+                        &did,
+                        tool_call_id,
+                        tool_name,
+                        args_json,
+                        timeout_ms_req,
+                        handler,
+                        &tx_clone,
+                        &app_tools_clone,
+                    )
+                    .await;
+                }
+                Ok(Ok(resp)) => {
+                    // Denied — record refusal.
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    info!(
+                        tool_call_id = %tool_call_id,
+                        name = %tool_name,
+                        duration_ms,
+                        reason = %resp.reason,
+                        "app tool approval denied"
+                    );
+                    if !resp.reason.is_empty() {
+                        smgr.record_refusal(&cuid, &synthetic_tool, &resp.reason)
+                            .await;
+                    }
+                    amgr.expire(&tool_call_id).await;
+                    // Record completion so replay returns the error.
+                    let denied_reason = if resp.reason.is_empty() {
+                        "the user declined this call".to_string()
+                    } else {
+                        format!("the user declined this call: {}", resp.reason)
+                    };
+                    app_tools_clone
+                        .mark_completed(
+                            tool_call_id.clone(),
+                            crate::app_tool_registry::CompletedAppToolCall {
+                                result_json: None,
+                                error: Some(crate::app_tool_registry::AppToolError {
+                                    code: "APPROVAL_DENIED".to_string(),
+                                    message: denied_reason.clone(),
+                                }),
+                            },
+                        )
+                        .await;
+                    let _ = tx_clone.send(app_tool_error_envelope(
+                        &did,
+                        &tool_call_id,
+                        "APPROVAL_DENIED",
+                        denied_reason,
+                    ));
+                }
+                _ => {
+                    // Timeout (or channel closed).
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    warn!(
+                        tool_call_id = %tool_call_id,
+                        name = %tool_name,
+                        duration_ms,
+                        "app tool approval timed out"
+                    );
+                    amgr.expire(&tool_call_id).await;
+                    let msg = "approval request expired without a user response".to_string();
+                    app_tools_clone
+                        .mark_completed(
+                            tool_call_id.clone(),
+                            crate::app_tool_registry::CompletedAppToolCall {
+                                result_json: None,
+                                error: Some(crate::app_tool_registry::AppToolError {
+                                    code: "APPROVAL_TIMEOUT".to_string(),
+                                    message: msg.clone(),
+                                }),
+                            },
+                        )
+                        .await;
+                    let _ = tx_clone.send(app_tool_error_envelope(
+                        &did,
+                        &tool_call_id,
+                        "APPROVAL_TIMEOUT",
+                        msg,
+                    ));
+                }
+            }
+        });
+
+        return; // spawned task owns the rest; read loop continues
+    }
+
+    // ── Allow path: fall through to args parse → permit → execute ────────
+    validate_and_execute_app_tool(
+        device_id,
+        req.tool_call_id,
+        req.name,
+        req.args_json,
+        req.timeout_ms,
+        handler,
+        tx,
+        app_tools,
+    )
+    .await;
+}
+
+/// Post-gate tail: parse args, acquire permit, mark_running, spawn execute.
+///
+/// Called from two sites:
+///   1. Inline Allow path in handle_app_tool_request.
+///   2. Inside the approval-wait task after approval is granted.
+///
+/// The caller must NOT have called mark_running yet on the Allow path (it is
+/// called here). On the approval path, mark_running was called before the
+/// ApprovalRequest was sent (to close the idempotency window during the wait),
+/// so this function's mark_running call is a no-op duplicate — the registry
+/// treats a second mark_running as idempotent (still Running).
+#[allow(clippy::too_many_arguments)]
+async fn validate_and_execute_app_tool<T>(
+    device_id: &str,
+    tool_call_id: String,
+    tool_name: String,
+    args_json: String,
+    timeout_ms_req: u32,
+    handler: crate::app_tool_registry::AppToolHandler,
+    tx: &T,
+    app_tools: &Arc<AppToolRegistry>,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    // ── Parse args ────────────────────────────────────────────────────────
+    let args: serde_json::Value = match serde_json::from_str(&args_json) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(
+                tool_call_id = %tool_call_id,
+                name = %tool_name,
+                error = %err,
+                "invalid app tool args"
+            );
+            // On the approval path mark_running was already called; record
+            // completion so the idempotency cache is consistent.
+            app_tools
+                .mark_completed(
+                    tool_call_id.clone(),
+                    crate::app_tool_registry::CompletedAppToolCall {
+                        result_json: None,
+                        error: Some(crate::app_tool_registry::AppToolError {
+                            code: "INVALID_ARGS".to_string(),
+                            message: format!("args_json is not valid JSON: {err}"),
+                        }),
+                    },
+                )
+                .await;
+            let _ = tx.send(app_tool_error_envelope(
+                device_id,
+                &tool_call_id,
                 "INVALID_ARGS",
                 format!("args_json is not valid JSON: {err}"),
             ));
@@ -1961,31 +2221,55 @@ async fn handle_app_tool_request<T>(
     };
     if !args.is_object() {
         warn!(
-            tool_call_id = %req.tool_call_id,
-            name = %req.name,
+            tool_call_id = %tool_call_id,
+            name = %tool_name,
             "invalid app tool args"
         );
+        app_tools
+            .mark_completed(
+                tool_call_id.clone(),
+                crate::app_tool_registry::CompletedAppToolCall {
+                    result_json: None,
+                    error: Some(crate::app_tool_registry::AppToolError {
+                        code: "INVALID_ARGS".to_string(),
+                        message: "args_json must be a JSON object".to_string(),
+                    }),
+                },
+            )
+            .await;
         let _ = tx.send(app_tool_error_envelope(
             device_id,
-            &req.tool_call_id,
+            &tool_call_id,
             "INVALID_ARGS",
             "args_json must be a JSON object".to_string(),
         ));
         return;
     }
 
-    // ── Step 5: concurrency permit (fail-fast) ────────────────────────────
+    // ── Concurrency permit (fail-fast) ────────────────────────────────────
     let permit = match app_tools.try_acquire_permit() {
         Some(p) => p,
         None => {
             warn!(
-                tool_call_id = %req.tool_call_id,
-                name = %req.name,
+                tool_call_id = %tool_call_id,
+                name = %tool_name,
                 "app tool concurrency limit hit"
             );
+            app_tools
+                .mark_completed(
+                    tool_call_id.clone(),
+                    crate::app_tool_registry::CompletedAppToolCall {
+                        result_json: None,
+                        error: Some(crate::app_tool_registry::AppToolError {
+                            code: "CONCURRENCY_LIMIT".to_string(),
+                            message: "too many app tool calls in flight on this device; retry after in-flight calls finish".to_string(),
+                        }),
+                    },
+                )
+                .await;
             let _ = tx.send(app_tool_error_envelope(
                 device_id,
-                &req.tool_call_id,
+                &tool_call_id,
                 "CONCURRENCY_LIMIT",
                 "too many app tool calls in flight on this device; retry after in-flight calls finish".to_string(),
             ));
@@ -1993,21 +2277,23 @@ async fn handle_app_tool_request<T>(
         }
     };
 
-    // ── Step 6: execute (spawned so the read loop stays unblocked) ────────
+    // ── Execute (spawned so the read loop / approval task stays unblocked) ─
     // mark_running BEFORE spawning so any duplicate that arrives before the
     // task starts still sees Running (idempotency window is closed here).
-    app_tools.mark_running(&req.tool_call_id).await;
+    // On the approval path this is already Running — mark_running is
+    // idempotent; calling it again is safe.
+    app_tools.mark_running(&tool_call_id).await;
 
     let tx_clone = (*tx).clone();
     let did = device_id.to_string();
     let app_tools_clone = Arc::clone(app_tools);
-    let timeout_ms = AppToolRegistry::clamp_timeout(req.timeout_ms);
+    let timeout_ms = AppToolRegistry::clamp_timeout(timeout_ms_req);
 
     tokio::spawn(async move {
         execute_app_tool(
             &did,
-            req.tool_call_id,
-            req.name,
+            tool_call_id,
+            tool_name,
             args,
             handler,
             permit,
