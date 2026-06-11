@@ -120,6 +120,29 @@ describe("CloudClient.spawn", () => {
     expect(calls[1].init?.headers).toMatchObject({ Authorization: "Bearer test-token" });
   });
 
+  it("notifies callers of the hub job id before streaming output", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ jobId: "job-001" }, 201),
+      () =>
+        sseResponse([
+          sseEvent("stdout", { chunk: "hello" }),
+          sseEvent("finished", { exitCode: 0, durationMs: 123 }),
+        ]),
+    ]);
+
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const events: string[] = [];
+
+    await client.spawn({
+      deviceId: "dev-1",
+      tool: "bash",
+      onJobStarted: ({ jobId }) => events.push(`started:${jobId}`),
+      onStdout: (chunk) => events.push(`stdout:${chunk}`),
+    });
+
+    expect(events).toEqual(["started:job-001", "stdout:hello"]);
+  });
+
   it("sends optional fields (env, cwd, timeoutMs, correlationId, interactive)", async () => {
     const { fn, calls } = mockFetch([
       () => jsonResponse({ jobId: "job-x" }, 201),

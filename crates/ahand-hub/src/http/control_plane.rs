@@ -39,7 +39,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderValue, StatusCode, header::AUTHORIZATION};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header::AUTHORIZATION};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -62,6 +62,7 @@ pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/api/control/jobs", post(create_job))
         .route("/api/control/jobs/{id}/stream", get(stream_job))
+        .route("/api/control/jobs/{id}/output", get(stream_job_output))
         .route("/api/control/jobs/{id}/cancel", post(cancel_job))
         .route("/api/control/browser", post(browser_command_control))
         .route(
@@ -206,6 +207,7 @@ async fn create_job(
         claims.external_user_id.clone(),
         req.correlation_id.clone().filter(|cid| !cid.is_empty()),
     );
+    state.output_stream.prime(&job_id);
 
     let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_JOB_TIMEOUT_MS);
     let envelope = ahand_protocol::Envelope {
@@ -269,11 +271,19 @@ fn spawn_control_job_timeout(state: AppState, job_id: String, device_id: String,
         };
         let _ = state.connections.send_envelope(&device_id, cancel).await;
 
+        let message = format!("job timed out after {timeout_ms}ms");
+        if let Err(err) = state
+            .output_stream
+            .push_finished(&job_id, 1, &message)
+            .await
+        {
+            tracing::warn!(job_id, error = %err, "failed recording control job timeout output");
+        }
         state.control_jobs.finalize(
             &job_id,
             ControlJobEvent::Error {
                 code: "timeout".into(),
-                message: format!("job timed out after {timeout_ms}ms"),
+                message,
             },
         );
     });
@@ -366,6 +376,62 @@ async fn stream_job(
             .interval(Duration::from_secs(15))
             .text("keepalive"),
     ))
+}
+
+async fn stream_job_output(
+    State(state): State<AppState>,
+    Extension(claims): Extension<ControlPlaneJwtClaims>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ControlError> {
+    if claims.scope != "jobs:execute" {
+        return Err(ControlError::Forbidden);
+    }
+    if state
+        .control_rate_limiter
+        .check_key(&claims.external_user_id)
+        .is_err()
+    {
+        return Err(ControlError::RateLimited);
+    }
+
+    let access = state
+        .control_jobs
+        .access(&job_id)
+        .ok_or(ControlError::JobNotFound)?;
+    if access.external_user_id != claims.external_user_id {
+        return Err(ControlError::JobNotFound);
+    }
+    if let Some(allowed) = &claims.device_ids
+        && !allowed.contains(&access.device_id)
+    {
+        return Err(ControlError::Forbidden);
+    }
+
+    let stream = state
+        .output_stream
+        .subscribe_from(job_id, parse_last_event_id(&headers)?)
+        .await
+        .map_err(|err| ControlError::Internal(err.to_string()))?;
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<u64>, ControlError> {
+    let Some(value) = headers.get("last-event-id") else {
+        return Ok(None);
+    };
+    let raw = value
+        .to_str()
+        .map_err(|_| ControlError::BadRequest("Invalid Last-Event-ID header".into()))?;
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|_| ControlError::BadRequest("Invalid Last-Event-ID header".into()))?;
+    Ok(Some(parsed))
 }
 
 fn render_sse_event(event: &ControlJobEvent) -> Event {
