@@ -1258,6 +1258,17 @@ git add crates/ahand-hub/
 git commit -m "feat(hub): POST /api/control/app-tool with offline fast-fail and audit"
 ```
 
+### Review amendments (Task 9 post-review hardening)
+
+- **`ok_unparseable` outcome added**: when the daemon's `result_json` is not valid JSON, the hub returns HTTP 200 with `result` omitted, writes an audit entry with `outcome = "ok_unparseable"`, and logs `warn!(tool_call_id, "unparseable result_json from daemon")`. Previously the parse error was silently swallowed and the outcome was recorded as `"ok"`.
+- **`ChannelClosed` audited**: the `ChannelClosed` error variant now destructures `tool_call_id`, writes an audit entry with `outcome = "internal_error"` and the real UUID, and includes the UUID in the `Internal` error message so the log line correlates with daemon-side traces.
+- **`args` must be a JSON object (400 otherwise)**: a `!args.is_object()` check is performed after JSON body parsing; passing an array, string, number, or boolean as `args` returns 400 `BAD_REQUEST`. The unreachable `unwrap_or_else(|_| "{}".into())` on `serde_json::to_string` was removed — args are validated as objects before serialization, so `to_string()` is infallible; instead `v.to_string()` is called directly.
+- **`<dispatch-failed>` placeholder renamed** to `<not-dispatched>` on the service-level `DeviceOffline` race path (no UUID was minted before the race, so the placeholder distinguishes it from the pre-dispatch fast-fail `<offline-fast-fail>`).
+- **`audit_invocation` helper extracted**: all six audit sites (offline fast-fail, service DeviceOffline race, SendFailed, Timeout, ChannelClosed, Ok) now call `async fn audit_invocation(state, device_id, actor, name, tool_call_id, outcome, duration_ms)`, eliminating copy-paste drift.
+- **Duration measured from handler entry**: `let started = std::time::Instant::now()` moved to the top of `invoke_app_tool` so `durationMs` in audit entries is accurate for the offline fast-fail path.
+- **Tracing added**: `info!(device_id, tool_name, timeout_ms, "dispatching app tool invocation")` before `invoke()`; `warn!(tool_call_id, timeout_ms, "app tool invocation timed out")` on the `Timeout` arm. Matches gateway style.
+- **Follow-up filed**: extract a shared `PendingMap<T>` abstraction — the browser, app-tool, and file-request pending correlation maps are now three copies of the same pattern; a fourth copy must NOT be added before this is factored out.
+
 ---
 
 ### Task 10: SDK — `listAppTools` / `invokeAppTool`

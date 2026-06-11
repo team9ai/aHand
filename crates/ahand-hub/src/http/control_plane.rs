@@ -1300,8 +1300,10 @@ pub struct InvokeAppToolRequest {
 #[serde(rename_all = "camelCase")]
 pub struct InvokeAppToolResponse {
     pub tool_call_id: String,
-    /// Parsed JSON result on success; `null` if the daemon returned an
-    /// empty result_json.
+    /// Parsed JSON result on success. **Omitted** (not serialized) when the
+    /// daemon returned an empty `result_json`, when the daemon's response
+    /// carried no `result` oneof, or when `result_json` could not be parsed
+    /// as valid JSON (audit outcome `ok_unparseable` in that last case).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     /// Daemon-level error; present iff the daemon replied with an error
@@ -1317,11 +1319,43 @@ pub struct InvokeAppToolError {
     pub message: String,
 }
 
+/// Write a single `app_tool.invoked` audit entry. Called at every outcome
+/// site so fields are consistent across success, daemon-error, timeout, and
+/// offline paths.
+async fn audit_invocation(
+    state: &AppState,
+    device_id: &str,
+    actor: &str,
+    name: &str,
+    tool_call_id: &str,
+    outcome: &str,
+    duration_ms: u64,
+) {
+    state
+        .append_audit_entry(
+            "app_tool.invoked",
+            "device",
+            device_id,
+            actor,
+            serde_json::json!({
+                "name": name,
+                "toolCallId": tool_call_id,
+                "outcome": outcome,
+                "durationMs": duration_ms,
+            }),
+        )
+        .await;
+}
+
 async fn invoke_app_tool(
     State(state): State<AppState>,
     Extension(claims): Extension<ControlPlaneJwtClaims>,
     body: Result<Json<InvokeAppToolRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<InvokeAppToolResponse>), ControlError> {
+    // Measure from handler entry so durationMs is honest on every path,
+    // including the offline fast-fail.
+    let started = std::time::Instant::now();
+
     // Validate scope before any DB / WS work.
     if claims.scope != "jobs:execute" {
         return Err(ControlError::Forbidden);
@@ -1336,6 +1370,16 @@ async fn invoke_app_tool(
     }
     if req.name.trim().is_empty() {
         return Err(ControlError::BadRequest("name must not be empty".into()));
+    }
+
+    // args must be a JSON object (or absent). A non-object value (array,
+    // string, number, bool) is a caller error → 400.
+    if let Some(args) = &req.args
+        && !args.is_object()
+    {
+        return Err(ControlError::BadRequest(
+            "args must be a JSON object".into(),
+        ));
     }
 
     // Rate-limit BEFORE the ownership lookup so storms can't DOS the
@@ -1374,34 +1418,37 @@ async fn invoke_app_tool(
     // Uses DeviceOfflineConflict — see the comment on that variant for why
     // a separate variant exists rather than reusing DeviceOffline (404).
     if !state.connections.is_online(&device.id) {
-        let started = std::time::Instant::now();
-        state
-            .append_audit_entry(
-                "app_tool.invoked",
-                "device",
-                &device.id,
-                &claims.external_user_id,
-                serde_json::json!({
-                    "name": req.name,
-                    "toolCallId": "<offline-fast-fail>",
-                    "outcome": "offline",
-                    "durationMs": started.elapsed().as_millis() as u64,
-                }),
-            )
-            .await;
+        audit_invocation(
+            &state,
+            &device.id,
+            &claims.external_user_id,
+            &req.name,
+            "<offline-fast-fail>",
+            "offline",
+            started.elapsed().as_millis() as u64,
+        )
+        .await;
         return Err(ControlError::DeviceOfflineConflict);
     }
 
-    // Serialize args; default to `{}` when absent.
+    // Serialize args to a JSON string; default to `{}` when absent.
+    // `is_object()` was already validated above so this is infallible.
     let args_json = req
         .args
         .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+        .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".into());
 
     let timeout_ms = req.timeout_ms.unwrap_or(0); // 0 → service default
 
-    let started = std::time::Instant::now();
+    tracing::info!(
+        tool_call_id = tracing::field::Empty,
+        device_id = %device.id,
+        tool_name = %req.name,
+        timeout_ms = timeout_ms,
+        "dispatching app tool invocation"
+    );
+
     let result = app_tool_service::invoke(
         &state,
         AppToolInput {
@@ -1421,15 +1468,30 @@ async fn invoke_app_tool(
 
             let (outcome, response) = match &resp.result {
                 Some(ahand_protocol::app_tool_response::Result::ResultJson(json_str)) => {
-                    let parsed: Option<serde_json::Value> = serde_json::from_str(json_str).ok();
-                    (
-                        "ok".to_string(),
-                        InvokeAppToolResponse {
-                            tool_call_id: tool_call_id.clone(),
-                            result: parsed,
-                            error: None,
-                        },
-                    )
+                    match serde_json::from_str::<serde_json::Value>(json_str) {
+                        Ok(parsed) => (
+                            "ok".to_string(),
+                            InvokeAppToolResponse {
+                                tool_call_id: tool_call_id.clone(),
+                                result: Some(parsed),
+                                error: None,
+                            },
+                        ),
+                        Err(_) => {
+                            tracing::warn!(
+                                tool_call_id = %tool_call_id,
+                                "unparseable result_json from daemon"
+                            );
+                            (
+                                "ok_unparseable".to_string(),
+                                InvokeAppToolResponse {
+                                    tool_call_id: tool_call_id.clone(),
+                                    result: None,
+                                    error: None,
+                                },
+                            )
+                        }
+                    }
                 }
                 Some(ahand_protocol::app_tool_response::Result::Error(err)) => {
                     let outcome = format!("daemon_error:{}", err.code);
@@ -1455,87 +1517,89 @@ async fn invoke_app_tool(
                 ),
             };
 
-            state
-                .append_audit_entry(
-                    "app_tool.invoked",
-                    "device",
-                    &device.id,
-                    &claims.external_user_id,
-                    serde_json::json!({
-                        "name": req.name,
-                        "toolCallId": tool_call_id,
-                        "outcome": outcome,
-                        "durationMs": duration_ms,
-                    }),
-                )
-                .await;
+            audit_invocation(
+                &state,
+                &device.id,
+                &claims.external_user_id,
+                &req.name,
+                &tool_call_id,
+                &outcome,
+                duration_ms,
+            )
+            .await;
 
             Ok((StatusCode::OK, Json(response)))
         }
         Err(AppToolServiceError::DeviceOffline { .. }) => {
-            state
-                .append_audit_entry(
-                    "app_tool.invoked",
-                    "device",
-                    &device.id,
-                    &claims.external_user_id,
-                    serde_json::json!({
-                        "name": req.name,
-                        "toolCallId": "<dispatch-failed>",
-                        "outcome": "offline",
-                        "durationMs": duration_ms,
-                    }),
-                )
-                .await;
+            // Race: device went offline between the is_online check and the
+            // send attempt. No UUID was minted yet.
+            audit_invocation(
+                &state,
+                &device.id,
+                &claims.external_user_id,
+                &req.name,
+                "<not-dispatched>",
+                "offline",
+                duration_ms,
+            )
+            .await;
             Err(ControlError::DeviceOfflineConflict)
         }
         Err(AppToolServiceError::SendFailed { tool_call_id, .. }) => {
             // UUID was minted before the send attempt — use it so operators
             // can correlate hub-side failure with any daemon-side trace that
             // may have been written before the connection dropped.
-            state
-                .append_audit_entry(
-                    "app_tool.invoked",
-                    "device",
-                    &device.id,
-                    &claims.external_user_id,
-                    serde_json::json!({
-                        "name": req.name,
-                        "toolCallId": tool_call_id,
-                        "outcome": "offline",
-                        "durationMs": duration_ms,
-                    }),
-                )
-                .await;
+            audit_invocation(
+                &state,
+                &device.id,
+                &claims.external_user_id,
+                &req.name,
+                &tool_call_id,
+                "offline",
+                duration_ms,
+            )
+            .await;
             Err(ControlError::DeviceOfflineConflict)
         }
-        Err(AppToolServiceError::Timeout { tool_call_id, .. }) => {
+        Err(AppToolServiceError::Timeout { tool_call_id, ms }) => {
             // Use the real UUID that was dispatched to the daemon so that
             // hub-side timeout audit entries can be correlated with daemon
             // logs for the same invocation.
-            state
-                .append_audit_entry(
-                    "app_tool.invoked",
-                    "device",
-                    &device.id,
-                    &claims.external_user_id,
-                    serde_json::json!({
-                        "name": req.name,
-                        "toolCallId": tool_call_id,
-                        "outcome": "timeout",
-                        "durationMs": duration_ms,
-                    }),
-                )
-                .await;
+            tracing::warn!(
+                tool_call_id = %tool_call_id,
+                timeout_ms = ms,
+                "app tool invocation timed out waiting for daemon response"
+            );
+            audit_invocation(
+                &state,
+                &device.id,
+                &claims.external_user_id,
+                &req.name,
+                &tool_call_id,
+                "timeout",
+                duration_ms,
+            )
+            .await;
             Err(ControlError::HubTimeout)
         }
-        Err(AppToolServiceError::DeviceNotFound { .. }) => {
-            // This should not normally occur — we already checked existence
-            // above — but handle it gracefully.
-            Err(ControlError::DeviceNotFound)
-        }
-        Err(AppToolServiceError::ChannelClosed { .. }) => {
-            Err(ControlError::Internal("response channel closed".into()))
+        Err(AppToolServiceError::ChannelClosed { tool_call_id }) => {
+            tracing::error!(
+                tool_call_id = %tool_call_id,
+                "response channel closed unexpectedly (internal inconsistency)"
+            );
+            audit_invocation(
+                &state,
+                &device.id,
+                &claims.external_user_id,
+                &req.name,
+                &tool_call_id,
+                "internal_error",
+                duration_ms,
+            )
+            .await;
+            Err(ControlError::Internal(format!(
+                "response channel closed unexpectedly (tool_call_id={tool_call_id})"
+            )))
         }
     }
 }

@@ -91,10 +91,12 @@ pub struct AppToolInput {
 
 /// Errors that [`invoke`] can return. Mapped to HTTP status codes by the
 /// control-plane handler.
+///
+/// Note: `DeviceNotFound` is intentionally absent — existence + ownership are
+/// checked by the handler before calling [`invoke`], so the service only sees
+/// devices that are known. Offline detection is at the presence layer.
 #[derive(Debug, Error)]
 pub enum AppToolServiceError {
-    #[error("device {device_id} not found")]
-    DeviceNotFound { device_id: String },
     /// Device is known but has no active WS connection. Mapped to **409**
     /// (`DEVICE_OFFLINE`) by the handler — see the 404/409 variant split
     /// note in `control_plane.rs`.

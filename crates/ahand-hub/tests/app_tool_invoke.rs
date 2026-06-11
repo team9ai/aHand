@@ -10,7 +10,7 @@
 //!   - device_ids allowlist excluded: 403 FORBIDDEN
 //!   - wrong scope: 403 FORBIDDEN
 //!   - hub timeout: 504 TIMEOUT with timeoutMs=1000 and silent device
-//!   - pending map cleaned after timeout (second request still works)
+//!   - pending map cleaned after timeout (asserts app_tool_pending.len() == 0)
 //!   - audit entries written for happy, daemon-error, timeout, offline cases
 
 mod support;
@@ -680,8 +680,8 @@ async fn timeout_clamping_is_applied_before_dispatch() {
     let mut socket = attach_owned_device(&server, "clamp-dev", "user-clamp").await;
     let token = mint_cp_jwt("user-clamp");
 
-    // Helper closure: POST the request then immediately have the device
-    // capture and echo back so the handler resolves successfully.
+    // Helper: POST the request and concurrently have the device capture
+    // timeout_ms and echo back so the handler resolves successfully.
     async fn invoke_and_capture(
         server: &support::TestServer,
         token: &str,
@@ -691,34 +691,15 @@ async fn timeout_clamping_is_applied_before_dispatch() {
         body: serde_json::Value,
     ) -> u32 {
         let device_id = body["deviceId"].as_str().unwrap().to_string();
-        let device_id_clone = device_id.clone();
 
-        // Spawn device side: capture timeout_ms, reply with ResultJson.
-        let device_task = tokio::spawn({
-            // We can't move the socket into spawn, so we drive it manually below.
-            // Instead, use a channel to coordinate.
-            // (We poll the socket inline after posting.)
-            async move { () }
-        });
-        // Drop placeholder task immediately.
-        drop(device_task);
-
-        // Post from HTTP side in a separate task so we can drive the socket
-        // concurrently.
         let post_fut = post_invoke(server, token, body);
-
-        // Drive both concurrently: first await the HTTP request (which blocks
-        // until device responds), but we need the device side to run too.
-        // Use tokio::join! with the device-side driven inline.
-        let captured_timeout_ms = tokio::sync::OnceCell::<u32>::new();
-        let captured_timeout_ms_clone = &captured_timeout_ms;
 
         let (resp, received_timeout_ms) = tokio::join!(post_fut, async {
             let req = recv_app_tool_request(socket).await;
             let tm = req.timeout_ms;
             let tcid = req.tool_call_id.clone();
             send_app_tool_response(
-                &device_id_clone,
+                &device_id,
                 socket,
                 AppToolResponse {
                     tool_call_id: tcid,
@@ -729,7 +710,6 @@ async fn timeout_clamping_is_applied_before_dispatch() {
             tm
         });
 
-        let _ = captured_timeout_ms_clone.set(received_timeout_ms);
         assert_eq!(
             resp.status(),
             StatusCode::OK,
@@ -794,3 +774,243 @@ async fn timeout_clamping_is_applied_before_dispatch() {
 // NOTE: Oversized result payloads are not capped in this stage — the hub
 // passes through whatever the daemon sends as result_json without a size
 // check. This is a known limitation documented for a follow-up task.
+
+// ────────────────────────────────────────────────────────────
+// Bad-case validation: empty deviceId, empty name, malformed JSON
+// ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn empty_device_id_returns_400() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+    let token = mint_cp_jwt("user-validate");
+
+    let resp = post_invoke(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "",
+            "name": "some_tool",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "expected 400 for empty deviceId"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn empty_name_returns_400() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+    let token = mint_cp_jwt("user-validate2");
+
+    let resp = post_invoke(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "some-device",
+            "name": "",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "expected 400 for empty name"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn malformed_json_body_returns_400() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+    let token = mint_cp_jwt("user-validate3");
+
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/control/app-tool", server.http_base_url()))
+        .bearer_auth(&token)
+        .header("content-type", "application/json")
+        .body("not valid json{")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "expected 400 for malformed JSON"
+    );
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn non_object_args_returns_400() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+    let token = mint_cp_jwt("user-validate4");
+
+    let resp = post_invoke(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "some-device",
+            "name": "some_tool",
+            "args": ["not", "an", "object"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "expected 400 for non-object args"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+    server.shutdown().await;
+}
+
+// ────────────────────────────────────────────────────────────
+// ok_unparseable: device replies with unparseable result_json
+// ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn unparseable_result_json_returns_200_no_result_field() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state.clone()).await;
+
+    let mut socket = attach_owned_device(&server, "bad-json-dev", "user-bad-json").await;
+    let token = mint_cp_jwt("user-bad-json");
+
+    let device_task = tokio::spawn(async move {
+        let req = recv_app_tool_request(&mut socket).await;
+        let tcid = req.tool_call_id.clone();
+        send_app_tool_response(
+            "bad-json-dev",
+            &mut socket,
+            AppToolResponse {
+                tool_call_id: tcid.clone(),
+                result: Some(app_tool_response::Result::ResultJson("not json{".into())),
+            },
+        )
+        .await;
+        tcid
+    });
+
+    let resp = post_invoke(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "bad-json-dev",
+            "name": "some_tool",
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "expected 200 even for unparseable result"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // result field must be absent (skip_serializing_if)
+    assert!(
+        body.get("result").is_none() || body["result"].is_null(),
+        "result field must be absent when result_json is unparseable"
+    );
+    assert!(
+        body.get("error").is_none() || body["error"].is_null(),
+        "error field must be absent for unparseable result"
+    );
+
+    let _tcid = device_task.await.unwrap();
+
+    // Audit outcome must be ok_unparseable.
+    let entries = poll_audit(
+        server.state(),
+        "app_tool.invoked",
+        "bad-json-dev",
+        Duration::from_secs(3),
+    )
+    .await;
+    let entry = &entries[0];
+    assert_eq!(entry.detail["outcome"], "ok_unparseable");
+
+    server.shutdown().await;
+}
+
+// ────────────────────────────────────────────────────────────
+// result: None oneof — device sends a response with no result variant
+// ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn result_none_oneof_returns_200_no_result_or_error() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state.clone()).await;
+
+    let mut socket = attach_owned_device(&server, "none-oneof-dev", "user-none-oneof").await;
+    let token = mint_cp_jwt("user-none-oneof");
+
+    tokio::spawn(async move {
+        let req = recv_app_tool_request(&mut socket).await;
+        let tcid = req.tool_call_id.clone();
+        // Send AppToolResponse with result = None (no oneof variant set).
+        send_app_tool_response(
+            "none-oneof-dev",
+            &mut socket,
+            AppToolResponse {
+                tool_call_id: tcid,
+                result: None,
+            },
+        )
+        .await;
+    });
+
+    let resp = post_invoke(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "none-oneof-dev",
+            "name": "empty_tool",
+        }),
+    )
+    .await;
+    // Code treats result=None as a successful (empty) response → 200.
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "expected 200 for result=None"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("result").is_none() || body["result"].is_null(),
+        "result field must be absent for None oneof"
+    );
+    assert!(
+        body.get("error").is_none() || body["error"].is_null(),
+        "error field must be absent for None oneof"
+    );
+
+    // Audit outcome is "ok" for the None oneof path.
+    let entries = poll_audit(
+        server.state(),
+        "app_tool.invoked",
+        "none-oneof-dev",
+        Duration::from_secs(3),
+    )
+    .await;
+    let entry = &entries[0];
+    assert_eq!(entry.detail["outcome"], "ok");
+
+    server.shutdown().await;
+}
