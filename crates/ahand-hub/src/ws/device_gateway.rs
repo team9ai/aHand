@@ -644,6 +644,15 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         let last_inbound_at = Arc::new(AsyncMutex::new(tokio::time::Instant::now()));
         active_connection = Some((device_id.clone(), connection_id));
         state.devices.mark_online(&device_id, "ws").await?;
+        // New connection = continuity broken; the daemon re-advertises its snapshot right after
+        // Hello, and a stale catalog accepts any revision — this self-heals revision resets and
+        // survives hub crashes. The disconnect-time mark_stale is also retained (see below) but
+        // it is connection-id-guarded: unregister() only fires for the exact connection_id that
+        // was registered, so a superseded socket's unregister() cannot stale a catalog that was
+        // already accepted by the new connection. The hello-time mark_stale covers the case where
+        // the hub crashed (cleanup never ran) and the daemon's revision counter reset after
+        // restart, which would otherwise be silently ignored as a lower-revision fresh catalog.
+        let _ = state.app_tools.mark_stale(&device_id).await;
         state.jobs.handle_device_connected(&device_id).await?;
         if let Err(err) = state.events.emit_device_online(&device_id, &hostname).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.online audit");
@@ -858,38 +867,83 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     } else if let Some(ahand_protocol::envelope::Payload::AppToolsUpdate(ref update)) = envelope.payload {
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
                         queue_ack_only(&control_tx, &device_id, envelope.seq)?;
-                        let existing = state.app_tools.get_catalog(&device_id).await.ok().flatten();
-                        if should_accept_update(existing.as_ref(), update.revision) {
-                            let catalog = StoredAppToolCatalog {
-                                revision: update.revision,
-                                stale: false,
-                                tools: update.tools.iter().map(|t| StoredAppTool {
-                                    name: t.name.clone(),
-                                    description: t.description.clone(),
-                                    input_schema_json: t.input_schema_json.clone(),
-                                    requires_approval: t.requires_approval,
-                                }).collect(),
-                                updated_at_ms: now_ms(),
+                        // 256 KiB hard cap — untrusted daemon payload; storing huge catalogs
+                        // wastes Redis memory and can exhaust downstream readers. Logged at
+                        // warn so operators notice misbehaving daemons without crashing them.
+                        let catalog_bytes: usize = update.tools.iter()
+                            .map(|t| t.name.len() + t.description.len() + t.input_schema_json.len())
+                            .sum();
+                        const CATALOG_MAX_BYTES: usize = 256 * 1024;
+                        if catalog_bytes > CATALOG_MAX_BYTES {
+                            tracing::warn!(
+                                device_id = %device_id,
+                                catalog_bytes,
+                                limit_bytes = CATALOG_MAX_BYTES,
+                                "app tool catalog exceeds size limit; ignoring update",
+                            );
+                        } else {
+                            let existing = match state.app_tools.get_catalog(&device_id).await {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        device_id = %device_id,
+                                        error = %err,
+                                        "failed to read app tool catalog; accepting update fail-open",
+                                    );
+                                    None
+                                }
                             };
-                            let tool_count = catalog.tools.len();
-                            if let Err(err) = state.app_tools.put_catalog(&device_id, catalog).await {
-                                tracing::warn!(
-                                    device_id = %device_id,
-                                    error = %err,
-                                    "failed to store app tool catalog",
-                                );
+                            if should_accept_update(existing.as_ref(), update.revision) {
+                                let catalog = StoredAppToolCatalog {
+                                    revision: update.revision,
+                                    stale: false,
+                                    tools: update.tools.iter().map(|t| StoredAppTool {
+                                        name: t.name.clone(),
+                                        description: t.description.clone(),
+                                        input_schema_json: t.input_schema_json.clone(),
+                                        requires_approval: t.requires_approval,
+                                    }).collect(),
+                                    updated_at_ms: now_ms(),
+                                };
+                                let tool_count = catalog.tools.len();
+                                let revision = update.revision;
+                                if let Err(err) = state.app_tools.put_catalog(&device_id, catalog).await {
+                                    tracing::warn!(
+                                        device_id = %device_id,
+                                        error = %err,
+                                        "failed to store app tool catalog",
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        device_id = %device_id,
+                                        revision,
+                                        tool_count,
+                                        catalog_bytes,
+                                        "app tool catalog updated",
+                                    );
+                                    state.append_audit_entry(
+                                        "device.app_tools.updated",
+                                        "device",
+                                        &device_id,
+                                        &device_id,
+                                        serde_json::json!({
+                                            "revision": update.revision,
+                                            "toolCount": tool_count,
+                                        }),
+                                    ).await;
+                                    // Webhook enqueue lands in Task 8.
+                                }
                             } else {
-                                state.append_audit_entry(
-                                    "device.app_tools.updated",
-                                    "device",
-                                    &device_id,
-                                    &device_id,
-                                    serde_json::json!({
-                                        "revision": update.revision,
-                                        "toolCount": tool_count,
-                                    }),
-                                ).await;
-                                // Webhook enqueue lands in Task 8.
+                                let incoming_revision = update.revision;
+                                let existing_revision = existing.as_ref().map(|c| c.revision).unwrap_or(0);
+                                let existing_stale = existing.as_ref().map(|c| c.stale).unwrap_or(false);
+                                tracing::debug!(
+                                    device_id = %device_id,
+                                    incoming_revision,
+                                    existing_revision,
+                                    existing_stale,
+                                    "ignoring app tool update (not newer than fresh catalog)",
+                                );
                             }
                         }
                     } else if dispatch_control_plane_event(&state, &envelope).await {
@@ -972,6 +1026,12 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         };
         state.devices.mark_offline(&device_id).await?;
         state.jobs.handle_device_disconnected(&device_id).await?;
+        // Disconnect-time mark_stale: only runs when unregister() succeeded for
+        // *this* connection_id — a superseded (replaced) connection always returns
+        // false from unregister(), so a late-running cleanup from an old socket
+        // cannot stale a catalog that was already accepted by the new connection.
+        // The hello-time mark_stale (above, at accept time) covers hub-crash and
+        // fast-reconnect scenarios where this cleanup might never run.
         if let Err(err) = state.app_tools.mark_stale(&device_id).await {
             tracing::warn!(
                 device_id = %device_id,

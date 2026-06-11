@@ -864,4 +864,13 @@ impl AppToolStore {
             }
         }
     }
+
+    /// Delete the catalog entry entirely. Returns `Ok(true)` if a key was
+    /// removed, `Ok(false)` if no catalog existed (no-op).
+    pub async fn delete_catalog(&self, device_id: &str) -> Result<bool> {
+        match self {
+            AppToolStore::Redis(s) => s.delete_catalog(device_id).await,
+            AppToolStore::Memory(m) => Ok(m.remove(device_id).is_some()),
+        }
+    }
 }

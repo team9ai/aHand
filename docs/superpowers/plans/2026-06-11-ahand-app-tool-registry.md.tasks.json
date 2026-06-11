@@ -4,79 +4,101 @@
     {
       "id": 1,
       "subject": "Task 1: Proto messages + Rust generation",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Define app tool messages, Envelope tags 35/36/37, Rust roundtrip tests.\n\n```json:metadata\n{\"files\": [\"proto/ahand/v1/app_tool.proto\", \"proto/ahand/v1/envelope.proto\", \"crates/ahand-protocol/build.rs\", \"crates/ahand-protocol/tests/app_tool_roundtrip.rs\"], \"verifyCommand\": \"cargo test -p ahand-protocol && cargo check --workspace\", \"acceptanceCriteria\": [\"roundtrip tests pass\", \"workspace compiles\", \"tag 32 untouched\"]}\n```"
     },
     {
       "id": 2,
       "subject": "Task 2: TypeScript proto generation + exports + changelog",
-      "status": "pending",
-      "blockedBy": [1],
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
       "description": "**Goal:** Regenerate @ahandai/proto with app tool types, version 0.3.0.\n\n```json:metadata\n{\"files\": [\"packages/proto-ts/src/index.ts\", \"packages/proto-ts/package.json\", \"packages/proto-ts/CHANGELOG.md\"], \"verifyCommand\": \"pnpm --filter @ahandai/proto build && pnpm --filter @ahandai/proto lint\", \"acceptanceCriteria\": [\"AppTool* types importable from package root\", \"build+lint pass\"]}\n```"
     },
     {
       "id": 3,
       "subject": "Task 3: ahandd app_tool_registry core module",
-      "status": "pending",
-      "blockedBy": [1],
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
       "description": "**Goal:** Registry with validation, snapshot/revision watch, fail-fast permits, completed-call cache; unit-tested.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/app_tool_registry/mod.rs\", \"crates/ahandd/src/lib.rs\"], \"verifyCommand\": \"cargo test -p ahandd app_tool_registry\", \"acceptanceCriteria\": [\"name regex + schema-object validation\", \"revision bump + watch notify on mutation\", \"clamp_timeout [1000,300000] default 60000\", \"4-permit fail-fast semaphore\", \"bounded completed cache\"]}\n```"
     },
     {
       "id": 4,
       "subject": "Task 4: ahandd DaemonHandle API + snapshot advertising",
       "status": "pending",
-      "blockedBy": [3],
+      "blockedBy": [
+        3
+      ],
       "description": "**Goal:** register_app_tool/unregister_app_tool on DaemonHandle; AppToolsUpdate pushed on change and re-sent after every Hello.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/public_api.rs\", \"crates/ahandd/src/ahand_client.rs\", \"crates/ahandd/src/main.rs\", \"crates/ahandd/tests/app_tools.rs\", \"crates/ahandd/tests/mock_hub/mod.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test app_tools && cargo check --workspace\", \"acceptanceCriteria\": [\"snapshot after Hello\", \"snapshot on register/unregister\", \"snapshot re-sent after reconnect\", \"CLI daemon still builds\"]}\n```"
     },
     {
       "id": 5,
       "subject": "Task 5: ahandd AppToolRequest dispatch + isolated execution",
       "status": "pending",
-      "blockedBy": [4],
+      "blockedBy": [
+        4
+      ],
       "description": "**Goal:** Idempotency, lookup, INVALID_ARGS, clamped timeout, panic isolation, fail-fast concurrency, AppToolResponse.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\", \"crates/ahandd/tests/app_tools.rs\", \"crates/ahandd/tests/mock_hub/mod.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test app_tools\", \"acceptanceCriteria\": [\"happy path\", \"TOOL_NOT_FOUND\", \"INVALID_ARGS\", \"EXECUTION_TIMEOUT\", \"HANDLER_PANIC daemon survives\", \"CONCURRENCY_LIMIT on 5th call\", \"idempotent replay returns cached response\"]}\n```"
     },
     {
       "id": 6,
       "subject": "Task 6: ahandd session-mode gating + tighten-only requires_approval",
       "status": "pending",
-      "blockedBy": [5],
+      "blockedBy": [
+        5
+      ],
       "description": "**Goal:** Synthetic JobRequest rides SessionManager::check + ApprovalManager::submit; tighten-only escalation in TRUST/AUTO_ACCEPT.\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ahand_client.rs\", \"crates/ahandd/tests/app_tools.rs\"], \"verifyCommand\": \"cargo test -p ahandd --test app_tools && cargo check --workspace\", \"acceptanceCriteria\": [\"INACTIVE -> SESSION_INACTIVE\", \"STRICT -> approve/deny/timeout paths\", \"TRUST+AUTO_ACCEPT pass without flag\", \"requires_approval forces approval in all modes\", \"ApprovalRequest carries job_id=tool_call_id tool=app:{name}\"]}\n```"
     },
     {
       "id": 7,
       "subject": "Task 7: hub catalog store + inbound AppToolsUpdate",
       "status": "pending",
-      "blockedBy": [1],
+      "blockedBy": [
+        1
+      ],
       "description": "**Goal:** Redis-backed per-device catalog with explicit stale flag; gateway arm with revision ordering; audit on accepted update.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub-store/src/app_tool_store.rs\", \"crates/ahand-hub-store/src/lib.rs\", \"crates/ahand-hub/src/state.rs\", \"crates/ahand-hub/src/ws/device_gateway.rs\", \"crates/ahand-hub/tests/app_tool_catalog.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub-store && cargo test -p ahand-hub && cargo check --workspace\", \"acceptanceCriteria\": [\"wholesale replace + stale clear\", \"revision ordering with stale exception\", \"stale on disconnect\", \"audit device.app_tools.updated\"]}\n```"
     },
     {
       "id": 8,
       "subject": "Task 8: hub catalog read endpoint + webhook event",
       "status": "pending",
-      "blockedBy": [7],
+      "blockedBy": [
+        7
+      ],
       "description": "**Goal:** GET /api/devices/{id}/app-tools (JWT, camelCase, stale ORed with presence) + device.app_tools.updated webhook.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/http/control_plane.rs\", \"crates/ahand-hub/src/webhook/mod.rs\", \"crates/ahand-hub/src/ws/device_gateway.rs\", \"crates/ahand-hub/tests/app_tool_catalog.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub && cargo check --workspace\", \"acceptanceCriteria\": [\"endpoint returns revision/stale/tools\", \"404 unknown device\", \"webhook enqueued on accept, not on duplicate\"]}\n```"
     },
     {
       "id": 9,
       "subject": "Task 9: hub POST /api/control/app-tool invocation",
       "status": "pending",
-      "blockedBy": [8],
+      "blockedBy": [
+        8
+      ],
       "description": "**Goal:** Oneshot pending-map invoke service (browser pattern), offline fast-fail, timeout, full-outcome audit.\n\n```json:metadata\n{\"files\": [\"crates/ahand-hub/src/app_tool_service.rs\", \"crates/ahand-hub/src/lib.rs\", \"crates/ahand-hub/src/state.rs\", \"crates/ahand-hub/src/http/control_plane.rs\", \"crates/ahand-hub/src/ws/device_gateway.rs\", \"crates/ahand-hub/tests/app_tool_invoke.rs\"], \"verifyCommand\": \"cargo test -p ahand-hub --test app_tool_invoke && cargo check --workspace\", \"acceptanceCriteria\": [\"happy path 200 result\", \"daemon errors in 200 body\", \"409 DEVICE_OFFLINE fast-fail\", \"404 unknown\", \"504 timeout + pending cleanup\", \"audit app_tool.invoked all outcomes\"]}\n```"
     },
     {
       "id": 10,
       "subject": "Task 10: SDK listAppTools + invokeAppTool",
       "status": "pending",
-      "blockedBy": [2, 9],
+      "blockedBy": [
+        2,
+        9
+      ],
       "description": "**Goal:** CloudClient methods with established auth/error/abort conventions; sdk+proto 0.3.0 lockstep.\n\n```json:metadata\n{\"files\": [\"packages/sdk/src/cloud-client.ts\", \"packages/sdk/src/index.ts\", \"packages/sdk/package.json\", \"packages/sdk/CHANGELOG.md\", \"packages/sdk/src/cloud-client.test.ts\"], \"verifyCommand\": \"pnpm --filter @ahandai/sdk test && pnpm --filter @ahandai/sdk lint\", \"acceptanceCriteria\": [\"listAppTools returns catalog\", \"invokeAppTool throws app_tool_error with daemon code\", \"409->device_offline 504->timeout\", \"AbortSignal honored\"]}\n```"
     },
     {
       "id": 11,
       "subject": "Task 11: docs, roadmap, full validation sweep",
       "status": "pending",
-      "blockedBy": [6, 10],
+      "blockedBy": [
+        6,
+        10
+      ],
       "description": "**Goal:** Roadmap/README updated; full CI-equivalent validation green; new modules at 100% line coverage.\n\n```json:metadata\n{\"files\": [\"docs/remote-control-roadmap.md\", \"README.md\"], \"verifyCommand\": \"cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-targets\", \"acceptanceCriteria\": [\"roadmap records app tools\", \"coverage thresholds met\", \"all TS builds/tests/lints pass\"]}\n```"
     }
   ],
-  "lastUpdated": "2026-06-11T16:00:00+08:00"
+  "lastUpdated": "2026-06-11T18:30:00+08:00"
 }

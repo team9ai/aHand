@@ -48,8 +48,9 @@ impl RedisAppToolStore {
 
     pub async fn put_catalog(&self, device_id: &str, catalog: StoredAppToolCatalog) -> Result<()> {
         let key = app_tool_key(device_id);
-        let value =
-            serde_json::to_string(&catalog).map_err(|e| HubError::Internal(e.to_string()))?;
+        let value = serde_json::to_string(&catalog).map_err(|e| {
+            HubError::Internal(format!("encode app tool catalog for {device_id}: {e}"))
+        })?;
         let mut conn = self.connection.lock().await;
         let _: () = conn
             .set(key, value)
@@ -68,8 +69,9 @@ impl RedisAppToolStore {
         match raw {
             None => Ok(None),
             Some(s) => {
-                let catalog: StoredAppToolCatalog =
-                    serde_json::from_str(&s).map_err(|e| HubError::Internal(e.to_string()))?;
+                let catalog: StoredAppToolCatalog = serde_json::from_str(&s).map_err(|e| {
+                    HubError::Internal(format!("decode app tool catalog for {device_id}: {e}"))
+                })?;
                 Ok(Some(catalog))
             }
         }
@@ -87,19 +89,33 @@ impl RedisAppToolStore {
         let Some(s) = raw else {
             return Ok(false);
         };
-        let mut catalog: StoredAppToolCatalog =
-            serde_json::from_str(&s).map_err(|e| HubError::Internal(e.to_string()))?;
+        let mut catalog: StoredAppToolCatalog = serde_json::from_str(&s).map_err(|e| {
+            HubError::Internal(format!("decode app tool catalog for {device_id}: {e}"))
+        })?;
         if catalog.stale {
             return Ok(true); // already stale, nothing to write
         }
         catalog.stale = true;
-        let new_value =
-            serde_json::to_string(&catalog).map_err(|e| HubError::Internal(e.to_string()))?;
+        let new_value = serde_json::to_string(&catalog).map_err(|e| {
+            HubError::Internal(format!("encode app tool catalog for {device_id}: {e}"))
+        })?;
         let _: () = conn
             .set(&key, new_value)
             .await
             .map_err(|e| HubError::Internal(e.to_string()))?;
         Ok(true)
+    }
+
+    /// Delete the catalog entry entirely. Returns `Ok(true)` if a key was
+    /// removed, `Ok(false)` if no catalog existed (no-op).
+    pub async fn delete_catalog(&self, device_id: &str) -> Result<bool> {
+        let key = app_tool_key(device_id);
+        let mut conn = self.connection.lock().await;
+        let deleted: u64 = conn
+            .del(key)
+            .await
+            .map_err(|e| HubError::Internal(e.to_string()))?;
+        Ok(deleted > 0)
     }
 }
 

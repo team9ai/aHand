@@ -1124,6 +1124,12 @@ git add crates/ahand-hub-store/ crates/ahand-hub/
 git commit -m "feat(hub): per-device app tool catalog with stale semantics"
 ```
 
+### Review amendments (applied in post-review hardening pass)
+
+- **Hello-time staleness**: catalog is now marked stale at Hello-accept time on every new connection, in addition to the existing disconnect-time mark. This self-heals hub-crash (cleanup never ran → catalog stays fresh forever) and daemon revision-counter resets after restart. The disconnect-time mark is retained and is connection-id-guarded via `unregister()`, so it cannot late-stale a catalog already accepted by a new connection.
+- **`delete_catalog` addition**: `RedisAppToolStore` and `AppToolStore` now expose `delete_catalog`, called best-effort from the admin `delete_device` handler so catalog keys do not outlive their device row.
+- **256 KiB size guard**: the gateway arm rejects (warns + ignores) any `AppToolsUpdate` whose combined tool payload exceeds 256 KiB, with `catalog_bytes` included in the accept log line.
+
 ---
 
 ### Task 8: hub — catalog read endpoint + webhook event

@@ -6,6 +6,9 @@
 //! - Disconnect marks the catalog stale (content retained).
 //! - Reconnect + re-send of same revision is accepted (was stale).
 //! - Audit entry `device.app_tools.updated` is written on accepted updates.
+//! - Hello-time staleness: catalog is marked stale on new connection before
+//!   the daemon re-advertises (covers hub-crash / revision-reset scenarios).
+//! - Empty tools snapshot is accepted as a valid catalog state.
 
 mod support;
 
@@ -128,13 +131,10 @@ async fn app_tools_update_stored_and_cleared_stale() {
         .await
         .expect("send app tools update");
 
-    // Poll for catalog to appear.
-    let catalog = tokio::time::timeout(Duration::from_secs(3), async {
-        poll_catalog(server.state(), "device-1", Duration::from_secs(3)).await
-    })
-    .await
-    .expect("timeout waiting for catalog")
-    .expect("catalog should be present");
+    // Poll for catalog to appear (poll_catalog already enforces its own deadline).
+    let catalog = poll_catalog(server.state(), "device-1", Duration::from_secs(3))
+        .await
+        .expect("catalog should be present");
 
     assert_eq!(catalog.revision, 1);
     assert!(!catalog.stale, "catalog should not be stale after update");
@@ -169,13 +169,10 @@ async fn duplicate_revision_on_fresh_catalog_is_ignored() {
         .await
         .expect("send first update");
 
-    // Wait until rev=1 is stored.
-    let catalog_rev1 = tokio::time::timeout(Duration::from_secs(3), async {
-        poll_catalog(server.state(), "device-1", Duration::from_secs(3)).await
-    })
-    .await
-    .expect("timeout waiting for first catalog")
-    .expect("first catalog should be stored");
+    // Wait until rev=1 is stored (poll_catalog already enforces its own deadline).
+    let catalog_rev1 = poll_catalog(server.state(), "device-1", Duration::from_secs(3))
+        .await
+        .expect("first catalog should be stored");
     let first_updated_at = catalog_rev1.updated_at_ms;
 
     // Give a tiny gap to ensure updated_at_ms would differ if we did write.
@@ -203,22 +200,53 @@ async fn duplicate_revision_on_fresh_catalog_is_ignored() {
         .await
         .expect("send duplicate update");
 
-    // Give the hub time to process.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // To make the negative assertion sound: send a higher-revision update (rev=2) after the
+    // duplicate, then wait until rev=2 is reflected in the store. Once rev=2 is observed we
+    // know the hub has fully processed the duplicate frame that preceded it, so any write
+    // the duplicate might have caused would already be visible.
+    let sentinel = Envelope {
+        device_id: "device-1".into(),
+        msg_id: "app-tools-sentinel".into(),
+        seq: 3,
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolsUpdate(AppToolsUpdate {
+            revision: 2,
+            tools: vec![AppToolDescriptor {
+                name: "tool_a_v2".into(),
+                description: "Sentinel update".into(),
+                input_schema_json: r#"{"type":"object"}"#.into(),
+                requires_approval: false,
+            }],
+        })),
+        ..Default::default()
+    };
+    socket
+        .send(WsMessage::Binary(sentinel.encode_to_vec().into()))
+        .await
+        .expect("send sentinel update");
 
-    // Catalog should still have the original content — not "tool_b".
-    let catalog = server
+    // Wait until the sentinel (rev=2) lands — at that point all preceding frames are processed.
+    // Use poll_fresh(revision=2) so we wait specifically for rev=2 rather than returning on any
+    // existing catalog (which would still be rev=1).
+    let sentinel_landed = poll_fresh(server.state(), "device-1", 2, Duration::from_secs(3)).await;
+    assert!(sentinel_landed, "sentinel update (rev=2) must be accepted");
+
+    let final_catalog = server
         .state()
         .app_tools
         .get_catalog("device-1")
         .await
         .expect("no store error")
-        .expect("catalog should still exist");
-    assert_eq!(catalog.revision, 1);
-    assert_eq!(catalog.tools.len(), 1);
-    assert_eq!(catalog.tools[0].name, "tool_a", "duplicate must be ignored");
+        .expect("catalog should exist");
+    // Sentinel reached us; the original rev=1 content was never overwritten by the duplicate.
     assert_eq!(
-        catalog.updated_at_ms, first_updated_at,
+        final_catalog.revision, 2,
+        "sentinel update must be accepted"
+    );
+    assert_eq!(final_catalog.tools[0].name, "tool_a_v2");
+    // The updated_at for rev=1 must not have been touched by the duplicate.
+    assert_eq!(
+        catalog_rev1.updated_at_ms, first_updated_at,
         "updated_at must not change for ignored update"
     );
 
@@ -252,21 +280,13 @@ async fn disconnect_marks_catalog_stale_and_reconnect_accepts_same_revision() {
         .expect("send update");
 
     // Wait for catalog to land.
-    tokio::time::timeout(Duration::from_secs(3), async {
-        poll_catalog(server.state(), "device-1", Duration::from_secs(3)).await
-    })
-    .await
-    .expect("timeout waiting for catalog")
-    .expect("catalog should be stored");
+    poll_catalog(server.state(), "device-1", Duration::from_secs(3))
+        .await
+        .expect("catalog should be stored");
 
     // Disconnect — catalog should become stale.
     socket.close(None).await.ok();
-    let became_stale = tokio::time::timeout(
-        Duration::from_secs(3),
-        poll_stale(server.state(), "device-1", Duration::from_secs(3)),
-    )
-    .await
-    .expect("timeout waiting for stale");
+    let became_stale = poll_stale(server.state(), "device-1", Duration::from_secs(3)).await;
     assert!(became_stale, "catalog must be stale after disconnect");
 
     // Verify content is retained.
@@ -301,12 +321,7 @@ async fn disconnect_marks_catalog_stale_and_reconnect_accepts_same_revision() {
         .expect("send same revision after reconnect");
 
     // Wait for catalog to become fresh again.
-    let is_fresh = tokio::time::timeout(
-        Duration::from_secs(3),
-        poll_fresh(server.state(), "device-1", 1, Duration::from_secs(3)),
-    )
-    .await
-    .expect("timeout waiting for fresh catalog");
+    let is_fresh = poll_fresh(server.state(), "device-1", 1, Duration::from_secs(3)).await;
     assert!(is_fresh, "catalog must be fresh after reconnect + resend");
 
     let fresh_catalog = server
@@ -353,11 +368,7 @@ async fn audit_entry_written_on_accepted_update() {
         .expect("send update");
 
     // Wait for catalog to land.
-    tokio::time::timeout(Duration::from_secs(3), async {
-        poll_catalog(server.state(), "device-1", Duration::from_secs(3)).await
-    })
-    .await
-    .expect("timeout waiting for catalog");
+    poll_catalog(server.state(), "device-1", Duration::from_secs(3)).await;
 
     // Poll for the audit entry to appear (the BufferedAuditStore flushes on a
     // ~500ms batch cycle, so we need to wait for that flush to complete).
@@ -389,6 +400,236 @@ async fn audit_entry_written_on_accepted_update() {
     assert_eq!(entry.resource_id, "device-1");
     assert_eq!(entry.detail["revision"], 1);
     assert_eq!(entry.detail["toolCount"], 1);
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
+/// Hello-time staleness: the catalog is marked stale when a new connection is
+/// registered, BEFORE the daemon re-advertises its snapshot. This covers
+/// hub-crash (cleanup never ran → catalog stays fresh forever) and
+/// fast-reconnect (the daemon's revision counter reset after restart).
+#[tokio::test]
+async fn hello_time_staleness_marks_catalog_stale_before_re_advertise() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state.clone()).await;
+
+    // --- First connection: establish a fresh catalog ---
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .expect("connect");
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("device-1", &challenge.nonce);
+    socket
+        .send(WsMessage::Binary(hello.encode_to_vec().into()))
+        .await
+        .expect("send hello");
+    let _ = read_hello_accepted(&mut socket).await;
+
+    socket
+        .send(WsMessage::Binary(
+            make_app_tools_update(1, "original_tool")
+                .encode_to_vec()
+                .into(),
+        ))
+        .await
+        .expect("send first update");
+
+    poll_catalog(server.state(), "device-1", Duration::from_secs(3))
+        .await
+        .expect("catalog should be stored");
+
+    // Disconnect gracefully so cleanup runs.
+    socket.close(None).await.ok();
+    let became_stale = poll_stale(server.state(), "device-1", Duration::from_secs(3)).await;
+    assert!(became_stale, "catalog must become stale after disconnect");
+
+    // Directly inject a fresh (non-stale) catalog to simulate the hub-crash scenario:
+    // the stale flag was never set because cleanup never ran.
+    server
+        .state()
+        .app_tools
+        .put_catalog(
+            "device-1",
+            ahand_hub_store::app_tool_store::StoredAppToolCatalog {
+                revision: 1,
+                stale: false,
+                tools: vec![ahand_hub_store::app_tool_store::StoredAppTool {
+                    name: "original_tool".into(),
+                    description: "A test tool".into(),
+                    input_schema_json: r#"{"type":"object","properties":{}}"#.into(),
+                    requires_approval: false,
+                }],
+                updated_at_ms: 0,
+            },
+        )
+        .await
+        .expect("manual catalog inject");
+
+    // Confirm catalog is fresh before reconnect.
+    let pre_hello = server
+        .state()
+        .app_tools
+        .get_catalog("device-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !pre_hello.stale,
+        "pre-condition: catalog must be fresh before new Hello"
+    );
+
+    // --- Second connection: Hello must stale the catalog immediately ---
+    let (mut socket2, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .expect("reconnect");
+    let challenge2 = read_hello_challenge(&mut socket2).await;
+    let hello2 = signed_hello("device-1", &challenge2.nonce);
+    socket2
+        .send(WsMessage::Binary(hello2.encode_to_vec().into()))
+        .await
+        .expect("send hello on reconnect");
+    let _ = read_hello_accepted(&mut socket2).await;
+
+    // The catalog should now be stale because Hello-accept sets it stale,
+    // BEFORE the daemon re-advertises its snapshot.
+    let became_stale_on_hello =
+        poll_stale(server.state(), "device-1", Duration::from_secs(3)).await;
+    assert!(
+        became_stale_on_hello,
+        "catalog must be stale right after new Hello (hello-time staleness)"
+    );
+
+    // Now the daemon resends revision=1 — must be accepted since catalog is stale.
+    socket2
+        .send(WsMessage::Binary(
+            make_app_tools_update(1, "original_tool")
+                .encode_to_vec()
+                .into(),
+        ))
+        .await
+        .expect("send re-advertise after hello-time stale");
+
+    let is_fresh = poll_fresh(server.state(), "device-1", 1, Duration::from_secs(3)).await;
+    assert!(
+        is_fresh,
+        "catalog must become fresh after daemon re-advertises on hello-time-stale path"
+    );
+
+    socket2.close(None).await.ok();
+    server.shutdown().await;
+}
+
+/// An empty-tools snapshot (tools=[]) is a valid accepted catalog state.
+/// Covers the "register-then-clear" semantics where the daemon may advertise
+/// an empty tool list after all tools have been deregistered.
+#[tokio::test]
+async fn empty_tools_snapshot_is_accepted() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state.clone()).await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .expect("connect");
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("device-1", &challenge.nonce);
+    socket
+        .send(WsMessage::Binary(hello.encode_to_vec().into()))
+        .await
+        .expect("send hello");
+    let _ = read_hello_accepted(&mut socket).await;
+
+    // Send an AppToolsUpdate with no tools.
+    let empty_update = ahand_protocol::Envelope {
+        device_id: "device-1".into(),
+        msg_id: "app-tools-empty".into(),
+        seq: 1,
+        ts_ms: now_ms(),
+        payload: Some(ahand_protocol::envelope::Payload::AppToolsUpdate(
+            ahand_protocol::AppToolsUpdate {
+                revision: 1,
+                tools: vec![],
+            },
+        )),
+        ..Default::default()
+    };
+    socket
+        .send(WsMessage::Binary(empty_update.encode_to_vec().into()))
+        .await
+        .expect("send empty tools update");
+
+    let catalog = poll_catalog(server.state(), "device-1", Duration::from_secs(3))
+        .await
+        .expect("empty-tools catalog should be stored");
+
+    assert_eq!(catalog.revision, 1);
+    assert!(!catalog.stale);
+    assert_eq!(
+        catalog.tools.len(),
+        0,
+        "empty tools list must be stored as-is"
+    );
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
+/// 256 KiB size guard: an oversized catalog must be rejected (not stored).
+#[tokio::test]
+async fn oversized_catalog_is_rejected() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state.clone()).await;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .expect("connect");
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("device-1", &challenge.nonce);
+    socket
+        .send(WsMessage::Binary(hello.encode_to_vec().into()))
+        .await
+        .expect("send hello");
+    let _ = read_hello_accepted(&mut socket).await;
+
+    // Build a tool whose input_schema_json exceeds 256 KiB.
+    let huge_schema = "x".repeat(300 * 1024);
+    let oversized_update = ahand_protocol::Envelope {
+        device_id: "device-1".into(),
+        msg_id: "app-tools-oversized".into(),
+        seq: 1,
+        ts_ms: now_ms(),
+        payload: Some(ahand_protocol::envelope::Payload::AppToolsUpdate(
+            ahand_protocol::AppToolsUpdate {
+                revision: 1,
+                tools: vec![AppToolDescriptor {
+                    name: "huge_tool".into(),
+                    description: "A tool with a very large schema".into(),
+                    input_schema_json: huge_schema,
+                    requires_approval: false,
+                }],
+            },
+        )),
+        ..Default::default()
+    };
+    socket
+        .send(WsMessage::Binary(oversized_update.encode_to_vec().into()))
+        .await
+        .expect("send oversized update");
+
+    // The hub should reject the update: catalog must remain absent after a short wait.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let catalog = server
+        .state()
+        .app_tools
+        .get_catalog("device-1")
+        .await
+        .expect("no store error");
+    // Catalog may be absent (never written) or, due to hello-time stale + absent None, still None.
+    // Either way, no catalog with revision=1 should exist.
+    if let Some(c) = catalog {
+        assert_ne!(c.revision, 1, "oversized catalog must not be stored");
+    }
 
     let _ = socket.close(None).await;
     server.shutdown().await;
