@@ -982,6 +982,9 @@ fn envelope_payload_variant_name(p: &Option<ahand_protocol::envelope::Payload>) 
         Some(Heartbeat(_)) => "Heartbeat",
         Some(FileRequest(_)) => "FileRequest",
         Some(FileResponse(_)) => "FileResponse",
+        Some(AppToolsUpdate(_)) => "AppToolsUpdate",
+        Some(AppToolRequest(_)) => "AppToolRequest",
+        Some(AppToolResponse(_)) => "AppToolResponse",
     }
 }
 
