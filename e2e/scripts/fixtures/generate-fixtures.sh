@@ -26,6 +26,8 @@ fi
 
 # ── node-fake.tar.xz ─────────────────────────────────────────────
 # Needs a top-level directory to work with --strip-components=1.
+# Includes node, npm, and npx stubs. The npm stub creates a playwright-cli
+# stub in its own bin directory when called with `install -g @playwright/cli`.
 if [ ! -f node-fake.tar.xz ]; then
   TMP=$(mktemp -d)
   mkdir -p "$TMP/node-fake/bin"
@@ -34,6 +36,20 @@ if [ ! -f node-fake.tar.xz ]; then
 if [ "$1" = "-v" ]; then echo "v24.13.0"; else echo "node-installed-fake $*"; fi
 NODEEOF
   chmod +x "$TMP/node-fake/bin/node"
+  cat > "$TMP/node-fake/bin/npm" <<'NPMEOF'
+#!/bin/bash
+# Fake npm: create playwright-cli stub on `install -g @playwright/cli*`.
+if [ "$1" = "install" ] && [ "$2" = "-g" ]; then
+  BIN_DIR="$(dirname "$0")"
+  cat > "$BIN_DIR/playwright-cli" <<'PCEOF'
+#!/bin/bash
+if [ "$1" = "--version" ]; then echo "0.1.1"; else echo "playwright-cli-fake $*"; fi
+PCEOF
+  chmod +x "$BIN_DIR/playwright-cli"
+fi
+echo "npm-installed-fake $*"
+NPMEOF
+  chmod +x "$TMP/node-fake/bin/npm"
   cat > "$TMP/node-fake/bin/npx" <<'NPXEOF'
 #!/bin/bash
 echo "npx-installed-fake $*"
