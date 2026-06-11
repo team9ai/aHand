@@ -28,7 +28,7 @@
     {
       "id": 4,
       "subject": "Task 4: ahandd DaemonHandle API + snapshot advertising",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         3
       ],
@@ -37,7 +37,7 @@
     {
       "id": 5,
       "subject": "Task 5: ahandd AppToolRequest dispatch + isolated execution",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         4
       ],
@@ -46,7 +46,7 @@
     {
       "id": 6,
       "subject": "Task 6: ahandd session-mode gating + tighten-only requires_approval",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         5
       ],
@@ -55,7 +55,7 @@
     {
       "id": 7,
       "subject": "Task 7: hub catalog store + inbound AppToolsUpdate",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         1
       ],
@@ -64,7 +64,7 @@
     {
       "id": 8,
       "subject": "Task 8: hub catalog read endpoint + webhook event",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         7
       ],
@@ -100,5 +100,5 @@
       "description": "**Goal:** Roadmap/README updated; full CI-equivalent validation green; new modules at 100% line coverage.\n\n```json:metadata\n{\"files\": [\"docs/remote-control-roadmap.md\", \"README.md\"], \"verifyCommand\": \"cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-targets\", \"acceptanceCriteria\": [\"roadmap records app tools\", \"coverage thresholds met\", \"all TS builds/tests/lints pass\"]}\n```"
     }
   ],
-  "lastUpdated": "2026-06-11T18:30:00+08:00"
+  "lastUpdated": "2026-06-11T22:30:00+08:00"
 }
