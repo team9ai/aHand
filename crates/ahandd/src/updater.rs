@@ -481,6 +481,113 @@ mod install_tests {
 }
 
 #[cfg(test)]
+mod checksum_tests {
+    use super::*;
+
+    #[test]
+    fn verify_checksum_correct_hash_passes() {
+        use sha2::{Digest, Sha256};
+        let data = b"data";
+        let expected = hex::encode(Sha256::digest(data));
+        verify_checksum(data, &expected).expect("correct sha256 should pass");
+    }
+
+    #[test]
+    fn verify_checksum_wrong_hash_errors() {
+        let data = b"data";
+        let wrong = "0000000000000000000000000000000000000000000000000000000000000000";
+        let err = verify_checksum(data, wrong).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("expected") || msg.contains("got"),
+            "error should describe mismatch: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    #[test]
+    fn verify_signature_garbage_bytes_errors() {
+        let data = b"some payload";
+        let garbage = vec![0xde, 0xad, 0xbe, 0xef];
+        let err = verify_signature(data, &garbage).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid signature") || msg.contains("signature"),
+            "error should describe bad signature: {msg}"
+        );
+    }
+
+    #[test]
+    fn verify_signature_64_zero_bytes_errors() {
+        let data = b"some payload";
+        // 64 zero bytes: syntactically a valid-length Ed25519 signature but
+        // will fail cryptographic verification against the real embedded key.
+        let zeros = vec![0u8; 64];
+        let err = verify_signature(data, &zeros).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verification failed")
+                || msg.contains("signature")
+                || msg.contains("ed25519"),
+            "error should describe verification failure: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod spawn_update_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn make_params(target_version: &str) -> UpdateParams {
+        UpdateParams {
+            update_id: "test-upd".into(),
+            target_version: target_version.into(),
+            download_url: "https://example.invalid/bin".into(),
+            checksum_sha256: "".into(),
+            signature: vec![],
+            max_retries: 1,
+        }
+    }
+
+    // The current CARGO_PKG_VERSION for ahandd drives the downgrade check. We
+    // construct a version that is guaranteed to be lower.
+    fn lower_version() -> String {
+        "0.0.1-test-downgrade".into()
+    }
+
+    #[test]
+    fn spawn_update_rejects_downgrade() {
+        // Target version 0.0.1 is guaranteed to be ≤ any real release.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let params = make_params(&lower_version());
+        let launched = spawn_update(params, "dev-test".into(), tx);
+        assert!(!launched, "downgrade should be rejected (returns false)");
+    }
+
+    #[tokio::test]
+    async fn spawn_update_concurrent_guard_returns_false_while_busy() {
+        // Set the flag; assert spawn_update returns false; reset.
+        UPDATE_IN_PROGRESS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        // Use a version that is higher than the current package version so the
+        // downgrade check doesn't interfere. We pick a large semver.
+        let params = make_params("999.0.0");
+        let launched = spawn_update(params, "dev-test".into(), tx);
+        // Reset before asserting (avoid poisoning other tests).
+        UPDATE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !launched,
+            "concurrent-guard should return false while UPDATE_IN_PROGRESS is set"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -213,4 +213,23 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o700, "newly created parent dir is not 0700");
     }
+
+    // ── no-parent path (#6) ───────────────────────────────────────────────────
+    //
+    // `Path::new("/").parent()` returns `None` on both Unix and Windows, which
+    // is the no-parent branch in `write_secure_file`. We use that as the
+    // canonical "no parent" input. (A bare filename like `Path::new("file")`
+    // also has no parent *component* but its `.parent()` returns `Some("")`,
+    // so it does NOT exercise the `ok_or_else` branch.)
+    #[test]
+    fn write_secure_file_no_parent_errors() {
+        // "/" has no parent — `.parent()` returns None — triggering the
+        // "secure file path has no parent" error branch.
+        let err = write_secure_file(std::path::Path::new("/"), b"x").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no parent") || msg.contains("parent"),
+            "error should mention 'no parent': {msg}"
+        );
+    }
 }

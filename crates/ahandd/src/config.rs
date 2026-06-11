@@ -548,6 +548,23 @@ mod tilde_tests {
             "/tmp/~backup"
         );
     }
+
+    /// #17 — `~\rest` (backslash variant) is expanded the same way as `~/rest`.
+    ///
+    /// `expand_tilde_with` strips the `~\` prefix via `strip_prefix("~\\")` and
+    /// calls `home.join(rest)`.  On Unix `Path::join("rest")` produces
+    /// `<home>/rest` (forward slash); on Windows it produces `<home>\rest`.
+    /// We assert against `home.join("rest")` so the test is platform-neutral.
+    #[test]
+    fn expand_tilde_with_backslash_separator_expands_to_home_join_rest() {
+        let home = std::path::Path::new("/fake/home");
+        let result = expand_tilde_with(r"~\rest", Some(home)).unwrap();
+        let expected = home.join("rest").to_string_lossy().into_owned();
+        assert_eq!(
+            result, expected,
+            "backslash tilde should expand like forward-slash tilde"
+        );
+    }
 }
 
 /// End-to-end tests that exercise `Config::load` through a real TOML
@@ -704,6 +721,82 @@ path_allowlist = ["/etc/passwd", "/var/log/**"]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ipc_socket_path (#18) ─────────────────────────────────────────────────
+
+    #[test]
+    fn ipc_socket_path_custom_path_is_used() {
+        let cfg = Config {
+            ipc_socket_path: Some("/tmp/custom-ahandd.sock".to_string()),
+            ..minimal_config()
+        };
+        let ep = cfg.ipc_socket_path();
+        let s = ep.as_path().to_string_lossy().into_owned();
+        assert_eq!(s, "/tmp/custom-ahandd.sock");
+    }
+
+    #[test]
+    fn ipc_socket_path_none_uses_platform_default() {
+        let cfg = Config {
+            ipc_socket_path: None,
+            ..minimal_config()
+        };
+        let ep = cfg.ipc_socket_path();
+        let s = ep.as_path().to_string_lossy().into_owned();
+        // Platform default should not be the literal "None".
+        assert!(!s.is_empty(), "default IPC path should not be empty");
+        // Rough shape check — either a socket path or a pipe.
+        #[cfg(unix)]
+        assert!(
+            s.contains("ahandd"),
+            "unix default IPC path should contain 'ahandd': {s}"
+        );
+        #[cfg(windows)]
+        assert!(
+            s.starts_with(r"\\.\pipe\"),
+            "windows default IPC path should be a named pipe: {s}"
+        );
+    }
+
+    // ── ipc_socket_mode (#19) ─────────────────────────────────────────────────
+
+    #[test]
+    fn ipc_socket_mode_default_is_0o660() {
+        let cfg = Config {
+            ipc_socket_mode: None,
+            ..minimal_config()
+        };
+        assert_eq!(cfg.ipc_socket_mode(), 0o660);
+    }
+
+    #[test]
+    fn ipc_socket_mode_override_is_used() {
+        let cfg = Config {
+            ipc_socket_mode: Some(0o600),
+            ..minimal_config()
+        };
+        assert_eq!(cfg.ipc_socket_mode(), 0o600);
+    }
+
+    fn minimal_config() -> Config {
+        Config {
+            mode: None,
+            server_url: "ws://localhost:3000/ws".to_string(),
+            device_id: None,
+            max_concurrent_jobs: None,
+            data_dir: None,
+            debug_ipc: None,
+            ipc_socket_path: None,
+            ipc_socket_mode: None,
+            trust_timeout_mins: None,
+            default_session_mode: None,
+            policy: PolicyConfig::default(),
+            openclaw: None,
+            browser: None,
+            hub: None,
+            file_policy: None,
+        }
+    }
 
     #[test]
     fn set_browser_enabled_true_then_false_round_trips() {

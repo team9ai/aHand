@@ -56,4 +56,33 @@ mod tests {
         // succeeds — OS-level dispositions remain installed process-wide (tokio
         // semantics).
     }
+
+    // ── SIGTERM integration (#5, unix-only) ───────────────────────────────────
+    //
+    // Raises SIGTERM via libc::raise and confirms the shutdown_signal future
+    // resolves to "SIGTERM".
+    //
+    // DESIGN NOTES:
+    // - `#[ignore]` because raising a real signal in a multi-threaded test
+    //   binary is disruptive: SIGTERM is delivered to an arbitrary thread.
+    //   Tokio's signal machinery intercepts it via a self-pipe, but there is
+    //   a narrow race between `raise()` and the signal handler being polled,
+    //   and the signal also interrupts any other test running concurrently.
+    //   Run it explicitly with `cargo test -- --ignored sigterm` for
+    //   deterministic single-test isolation.
+    // - The test is gated `#[cfg(unix)]` so it compiles only where SIGTERM and
+    //   libc::raise are available.
+    #[cfg(unix)]
+    #[ignore = "raises a real SIGTERM in the test process — run in isolation with --ignored"]
+    #[tokio::test]
+    async fn unix_sigterm_resolves_shutdown_signal() {
+        let fut = shutdown_signal().expect("shutdown_signal must install successfully");
+        // Raise SIGTERM to ourselves. Tokio's signal driver catches it via the
+        // self-pipe before it can terminate the process.
+        // SAFETY: raise() is async-signal-safe; Tokio has already installed
+        // the SA_RESTART signal handler for SIGTERM before we call raise().
+        unsafe { libc::raise(libc::SIGTERM) };
+        let name = fut.await;
+        assert_eq!(name, "SIGTERM");
+    }
 }

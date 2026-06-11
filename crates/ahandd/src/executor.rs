@@ -732,4 +732,96 @@ mod tool_resolution_tests {
         }
         assert!(saw_stdout, "managed runtime stdout should be streamed");
     }
+
+    // ── timeout path (#20) ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_job_with_target_timeout_kills_process_and_returns_minus1_timeout() {
+        use tokio::sync::mpsc;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel_rx) = mpsc::channel(1);
+
+        #[cfg(unix)]
+        let (cmd, args): (&str, Vec<String>) = ("sleep", vec!["5".into()]);
+        #[cfg(windows)]
+        let (cmd, args): (&str, Vec<String>) =
+            ("cmd.exe", vec!["/C".into(), "ping -n 6 127.0.0.1".into()]);
+
+        let req = JobRequest {
+            job_id: "timeout-job".to_string(),
+            tool: cmd.to_string(),
+            args: args.clone(),
+            timeout_ms: 100,
+            ..Default::default()
+        };
+
+        let (exit_code, error) = run_job_with_target(
+            "device-timeout".to_string(),
+            req,
+            ExecutionTarget {
+                path: cmd.to_string(),
+                leading_args: vec![],
+            },
+            tx,
+            cancel_rx,
+            None,
+        )
+        .await;
+
+        assert_eq!(exit_code, -1, "timed-out job must return exit code -1");
+        assert_eq!(
+            error, "timeout",
+            "timed-out job must return error=\"timeout\""
+        );
+    }
+
+    // ── cancel path (#21) ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_job_with_target_cancel_returns_cancelled() {
+        use tokio::sync::mpsc;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel_rx) = mpsc::channel(1);
+
+        #[cfg(unix)]
+        let (cmd, args): (&str, Vec<String>) = ("sleep", vec!["30".into()]);
+        #[cfg(windows)]
+        let (cmd, args): (&str, Vec<String>) =
+            ("cmd.exe", vec!["/C".into(), "ping -n 60 127.0.0.1".into()]);
+
+        let req = JobRequest {
+            job_id: "cancel-job".to_string(),
+            tool: cmd.to_string(),
+            args: args.clone(),
+            timeout_ms: 0, // no timeout — rely on cancel
+            ..Default::default()
+        };
+
+        // Send cancel after a brief delay.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = cancel_tx.send(()).await;
+        });
+
+        let (exit_code, error) = run_job_with_target(
+            "device-cancel".to_string(),
+            req,
+            ExecutionTarget {
+                path: cmd.to_string(),
+                leading_args: vec![],
+            },
+            tx,
+            cancel_rx,
+            None,
+        )
+        .await;
+
+        assert_eq!(exit_code, -1, "cancelled job must return exit code -1");
+        assert_eq!(
+            error, "cancelled",
+            "cancelled job must return error=\"cancelled\""
+        );
+    }
 }

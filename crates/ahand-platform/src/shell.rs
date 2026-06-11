@@ -75,4 +75,84 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(shell_c_flag(), "/C");
     }
+
+    // ── env_shell Some/None branches (#4) ─────────────────────────────────────
+    //
+    // Rust 2024: std::env::set_var / remove_var are unsafe. We guard all
+    // mutations under a static Mutex so concurrent tests cannot race on the
+    // process-global environment.
+
+    #[cfg(unix)]
+    mod env_shell_tests_unix {
+        use super::*;
+        use std::sync::Mutex;
+
+        static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn env_shell_returns_some_when_shell_is_set() {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            let original = std::env::var("SHELL").ok();
+            // SAFETY: guarded by ENV_MUTEX; no other thread touches SHELL concurrently.
+            unsafe { std::env::set_var("SHELL", "/bin/test-shell") };
+            let result = env_shell();
+            // Restore.
+            if let Some(v) = &original {
+                unsafe { std::env::set_var("SHELL", v) }
+            } else {
+                unsafe { std::env::remove_var("SHELL") }
+            }
+            assert_eq!(result, Some("/bin/test-shell".to_string()));
+        }
+
+        #[test]
+        fn env_shell_returns_none_when_shell_is_unset() {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            let original = std::env::var("SHELL").ok();
+            // SAFETY: guarded by ENV_MUTEX.
+            unsafe { std::env::remove_var("SHELL") };
+            let result = env_shell();
+            // Restore.
+            if let Some(v) = &original {
+                unsafe { std::env::set_var("SHELL", v) }
+            }
+            assert!(result.is_none(), "SHELL unset should return None");
+        }
+    }
+
+    #[cfg(windows)]
+    mod env_shell_tests_windows {
+        use super::*;
+        use std::sync::Mutex;
+
+        static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn env_shell_returns_some_when_comspec_is_set() {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            let original = std::env::var("COMSPEC").ok();
+            // SAFETY: guarded by ENV_MUTEX; no other thread touches COMSPEC concurrently.
+            unsafe { std::env::set_var("COMSPEC", r"C:\Windows\System32\cmd.exe") };
+            let result = env_shell();
+            match &original {
+                Some(v) => unsafe { std::env::set_var("COMSPEC", v) },
+                None => unsafe { std::env::remove_var("COMSPEC") },
+            }
+            assert_eq!(result, Some(r"C:\Windows\System32\cmd.exe".to_string()));
+        }
+
+        #[test]
+        fn env_shell_returns_none_when_comspec_is_unset() {
+            let _guard = ENV_MUTEX.lock().unwrap();
+            let original = std::env::var("COMSPEC").ok();
+            // SAFETY: guarded by ENV_MUTEX.
+            unsafe { std::env::remove_var("COMSPEC") };
+            let result = env_shell();
+            match &original {
+                Some(v) => unsafe { std::env::set_var("COMSPEC", v) },
+                None => {}
+            }
+            assert!(result.is_none(), "COMSPEC unset should return None");
+        }
+    }
 }

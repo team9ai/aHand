@@ -139,4 +139,36 @@ mod tests {
             cmd.arg("60");
         }
     }
+
+    // ── Graceful terminate (#2) ───────────────────────────────────────────────
+
+    #[test]
+    fn terminate_graceful_stops_a_spawned_sleeper() {
+        let mut cmd = std::process::Command::new(sleep_cmd());
+        sleep_args(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn sleeper");
+        let pid = child.id();
+        assert!(
+            is_process_running(pid),
+            "process should be running before terminate"
+        );
+
+        terminate(pid, TerminateMode::Graceful).expect("graceful terminate");
+
+        // On Unix, SIGTERM requests termination; on Windows taskkill /PID (no /F)
+        // sends a WM_CLOSE / console event — not all console-less processes
+        // honor it immediately. Wait up to 5 s and reap the child.
+        for _ in 0..50 {
+            let _ = child.try_wait();
+            if !is_process_running(pid) {
+                return; // success
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // If the process is still alive after graceful, force-kill to clean up
+        // and then fail the test.
+        let _ = terminate(pid, TerminateMode::Force);
+        let _ = child.wait();
+        panic!("process {pid} still running after graceful terminate");
+    }
 }

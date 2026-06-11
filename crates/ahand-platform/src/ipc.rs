@@ -346,4 +346,26 @@ mod tests {
         #[cfg(windows)]
         assert!(s.starts_with(r"\\.\pipe\ahandd-"), "{s}");
     }
+
+    // ── ipc_connect to nonexistent endpoint (#8) ──────────────────────────────
+
+    #[tokio::test]
+    async fn ipc_connect_nonexistent_endpoint_errors() {
+        #[cfg(unix)]
+        let ep = {
+            let dir = tempfile::tempdir().unwrap();
+            // Deliberately do NOT create the socket file.
+            IpcEndpoint::from_path(dir.path().join("does-not-exist.sock"))
+        };
+        #[cfg(windows)]
+        let ep = IpcEndpoint::from_path(std::path::PathBuf::from(
+            r"\\.\pipe\ahand-test-nonexistent-definitely-not-running",
+        ));
+
+        let err = ipc_connect(&ep).await;
+        assert!(
+            err.is_err(),
+            "connecting to a nonexistent endpoint should error"
+        );
+    }
 }

@@ -702,4 +702,35 @@ mod tests {
             other => panic!("expected JobRejected envelope, got {other:?}"),
         }
     }
+
+    // ── read_frame / write_frame (#15) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_length_prefix() {
+        use tokio::io::AsyncWriteExt;
+        // 16 MB + 1 byte exceeds the cap.
+        let too_large: u32 = 16 * 1024 * 1024 + 1;
+        let (mut client, mut server) = tokio::io::duplex(64);
+        // Write the length-prefix only (no body needed — rejection is on length).
+        client.write_u32(too_large).await.unwrap();
+        drop(client);
+        let err = read_frame(&mut server).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "oversized frame should be InvalidData, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_frame_write_frame_small_valid_roundtrip() {
+        use tokio::io::BufReader;
+        let payload = b"hello ipc frame";
+        let (mut writer_half, reader_half) = tokio::io::duplex(1024);
+        write_frame(&mut writer_half, payload).await.unwrap();
+        drop(writer_half);
+        let mut buf_reader = BufReader::new(reader_half);
+        let got = read_frame(&mut buf_reader).await.unwrap();
+        assert_eq!(got, payload);
+    }
 }
