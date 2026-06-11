@@ -7,7 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ahandctl::upgrade::{build_check_output, resolve_latest, resolve_target, run_with_bases};
+use ahandctl::upgrade::{
+    build_check_output, check_output, resolve_latest, resolve_target, run_with_bases,
+};
 use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -110,7 +112,7 @@ fn fixture_malformed() -> String {
 // ── resolve_latest tests ───────────────────────────────────────────────────
 
 /// Happy path: three tags resolved correctly from a fixture with older ones
-/// below them.
+/// below them.  Versions are stored BARE (prefix stripped).
 #[tokio::test]
 async fn resolve_latest_three_tags_correct() {
     let stub = spawn_stub(StubMode::Ok(fixture_all_tags())).await;
@@ -118,9 +120,9 @@ async fn resolve_latest_three_tags_correct() {
         .await
         .expect("should resolve");
 
-    assert_eq!(info.rust.as_deref(), Some("rust-v0.2.0"));
-    assert_eq!(info.admin.as_deref(), Some("admin-v0.1.5"));
-    assert_eq!(info.browser.as_deref(), Some("browser-v0.1.1"));
+    assert_eq!(info.rust.as_deref(), Some("0.2.0"));
+    assert_eq!(info.admin.as_deref(), Some("0.1.5"));
+    assert_eq!(info.browser.as_deref(), Some("0.1.1"));
 
     stub.stop().await;
 }
@@ -133,7 +135,7 @@ async fn resolve_latest_missing_admin_browser_are_none() {
         .await
         .expect("should resolve");
 
-    assert_eq!(info.rust.as_deref(), Some("rust-v0.2.0"));
+    assert_eq!(info.rust.as_deref(), Some("0.2.0"));
     assert!(info.admin.is_none());
     assert!(info.browser.is_none());
 
@@ -210,29 +212,55 @@ async fn resolve_target_override_pins_all_three() {
     assert_eq!(info.browser.as_deref(), Some("0.5.0"));
 }
 
-// ── run_with_bases check-mode tests ────────────────────────────────────────
+// ── run_with_bases check-mode end-to-end tests ────────────────────────────
 
-/// Marker matches latest rust tag → output contains "Already up to date".
+/// End-to-end: marker "0.2.0" matches latest rust tag "rust-v0.2.0" (stored
+/// bare after prefix strip) → output contains "Already up to date!" and
+/// displays the bare version number.
 #[tokio::test]
 async fn run_with_bases_marker_equals_latest_up_to_date() {
     let stub = spawn_stub(StubMode::Ok(fixture_all_tags())).await;
     let tmp = TempDir::new().unwrap();
 
-    // Write a marker that matches the latest rust tag.
-    ahand_platform::paths::write_version_marker(tmp.path(), "rust-v0.2.0").unwrap();
+    // Write a bare version marker — the same format install.sh writes.
+    ahand_platform::paths::write_version_marker(tmp.path(), "0.2.0").unwrap();
 
-    // Use build_check_output to test the string-builder directly (no stdout
-    // capture needed).
-    let output = build_check_output(
-        "rust-v0.2.0",
-        "rust-v0.2.0",
-        "admin-v0.1.5",
-        "browser-v0.1.1",
-        "darwin-arm64",
+    let out = check_output(None, &stub.api_base(), tmp.path())
+        .await
+        .expect("check_output should succeed");
+
+    assert!(
+        out.contains("Already up to date!"),
+        "expected 'Already up to date!' in output, got: {out}"
     );
     assert!(
-        output.contains("Already up to date"),
-        "expected 'Already up to date' in output, got: {output}"
+        out.contains("rust=0.2.0"),
+        "expected bare version 'rust=0.2.0' in output, got: {out}"
+    );
+
+    stub.stop().await;
+}
+
+/// End-to-end: marker "0.1.0" is older than latest "0.2.0" → output reports
+/// the update with bare version numbers.
+#[tokio::test]
+async fn run_with_bases_marker_older_reports_update_available() {
+    let stub = spawn_stub(StubMode::Ok(fixture_all_tags())).await;
+    let tmp = TempDir::new().unwrap();
+
+    ahand_platform::paths::write_version_marker(tmp.path(), "0.1.0").unwrap();
+
+    let out = check_output(None, &stub.api_base(), tmp.path())
+        .await
+        .expect("check_output should succeed");
+
+    assert!(
+        out.contains("Update available: 0.1.0 -> 0.2.0"),
+        "expected update line with bare versions, got: {out}"
+    );
+    assert!(
+        !out.contains("Already up to date"),
+        "should NOT say up-to-date, got: {out}"
     );
 
     stub.stop().await;
@@ -270,34 +298,19 @@ async fn run_with_bases_non_check_errors_with_stub_message() {
 /// When current == latest rust → "Already up to date!".
 #[test]
 fn build_check_output_up_to_date() {
-    let out = build_check_output(
-        "rust-v0.2.0",
-        "rust-v0.2.0",
-        "admin-v0.1.5",
-        "browser-v0.1.1",
-        "linux-x64",
-    );
+    let out = build_check_output("0.2.0", "0.2.0", "0.1.5", "0.1.1", "linux-x64");
     assert!(out.contains("Already up to date!"), "got: {out}");
-    assert!(out.contains("Current version: rust-v0.2.0"), "got: {out}");
-    assert!(
-        out.contains("Latest version:  rust=rust-v0.2.0"),
-        "got: {out}"
-    );
+    assert!(out.contains("Current version: 0.2.0"), "got: {out}");
+    assert!(out.contains("Latest version:  rust=0.2.0"), "got: {out}");
     assert!(out.contains("Platform:        linux-x64"), "got: {out}");
 }
 
 /// When current != latest rust → "Update available" with correct versions.
 #[test]
 fn build_check_output_update_available() {
-    let out = build_check_output(
-        "rust-v0.1.9",
-        "rust-v0.2.0",
-        "admin-v0.1.5",
-        "none",
-        "darwin-arm64",
-    );
+    let out = build_check_output("0.1.9", "0.2.0", "0.1.5", "none", "darwin-arm64");
     assert!(
-        out.contains("Update available: rust-v0.1.9 -> rust-v0.2.0"),
+        out.contains("Update available: 0.1.9 -> 0.2.0"),
         "got: {out}"
     );
     assert!(out.contains("Run: ahandctl upgrade"), "got: {out}");
@@ -310,7 +323,7 @@ fn build_check_output_update_available() {
 /// None artefacts show as "none" in the output.
 #[test]
 fn build_check_output_none_artefacts_display_as_none() {
-    let out = build_check_output("rust-v0.2.0", "rust-v0.2.0", "none", "none", "windows-x64");
+    let out = build_check_output("0.2.0", "0.2.0", "none", "none", "windows-x64");
     assert!(out.contains("admin=none"), "got: {out}");
     assert!(out.contains("browser=none"), "got: {out}");
 }

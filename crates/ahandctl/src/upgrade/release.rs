@@ -107,14 +107,20 @@ fn parse_releases(body: &str) -> anyhow::Result<ReleaseInfo> {
             Some(t) => t,
             None => continue,
         };
-        if rust.is_none() && tag.starts_with("rust-v") {
-            rust = Some(tag.to_string());
+        if rust.is_none()
+            && let Some(v) = tag.strip_prefix("rust-v")
+        {
+            rust = Some(v.to_string());
         }
-        if admin.is_none() && tag.starts_with("admin-v") {
-            admin = Some(tag.to_string());
+        if admin.is_none()
+            && let Some(v) = tag.strip_prefix("admin-v")
+        {
+            admin = Some(v.to_string());
         }
-        if browser.is_none() && tag.starts_with("browser-v") {
-            browser = Some(tag.to_string());
+        if browser.is_none()
+            && let Some(v) = tag.strip_prefix("browser-v")
+        {
+            browser = Some(v.to_string());
         }
         // Short-circuit once all three are found.
         if rust.is_some() && admin.is_some() && browser.is_some() {
