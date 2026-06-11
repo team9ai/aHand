@@ -1854,8 +1854,9 @@ fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: St
 ///   2. Lookup — TOOL_NOT_FOUND if not registered. Lookup must happen before the
 ///      gate so TOOL_NOT_FOUND is always returned for unknown tools regardless of
 ///      session mode (no information leak about mode from the error code).
-///   3. Session-mode gate — uses a synthetic JobRequest keyed on tool_call_id so
-///      the existing approval machinery (ApprovalManager, spawned-wait pattern)
+///   3. Session-mode gate — uses a synthetic JobRequest keyed on a namespaced
+///      `"app-tool:{tool_call_id}"` job_id (see approval_job_id below) so the
+///      existing approval machinery (ApprovalManager, spawned-wait pattern)
 ///      is reused without modification.
 ///      * Inactive / expired trust → SESSION_INACTIVE error, return.
 ///      * Allow (Trust/AutoAccept) + requires_approval=false → fall through.
@@ -1871,6 +1872,11 @@ fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: St
 /// running sees Running and is silently ignored. Every terminal outcome
 /// (denied / timed out / handler result) calls mark_completed so that a
 /// post-completion replay of the same tool_call_id returns the cached result.
+///
+/// Note: the handler captured at step 2 is the one registered at request time.
+/// If the app re-registers the same tool mid-wait (between step 3 NeedsApproval
+/// and waiter resolution), the captured handler still executes — we approve
+/// what was requested, not what happens to be registered at approval time.
 ///
 /// Contrast with handle_file_request (which also spawns its approval-wait leg):
 /// file requests front-load a quick policy check inline and only spawn the
@@ -1959,11 +1965,16 @@ async fn handle_app_tool_request<T>(
 
     // ── Step 3: session-mode gate ─────────────────────────────────────────
     // Build a synthetic JobRequest so the existing SessionManager and
-    // ApprovalManager work unchanged. job_id = tool_call_id so that an
-    // ApprovalResponse keyed by job_id resolves our pending entry.
+    // ApprovalManager work unchanged. The job_id is namespaced "app-tool:"
+    // so a cloud-chosen tool_call_id can never accidentally evict a real
+    // job's pending approval in ApprovalManager's shared HashMap — mirroring
+    // the "file-req:" namespace used by handle_file_request (~line 1615).
+    // ApprovalResponse echoes ApprovalRequest.job_id, so resolve() still
+    // works: we send "app-tool:{tool_call_id}" and receive it back unchanged.
+    let approval_job_id = format!("app-tool:{}", req.tool_call_id);
     let args_preview: String = req.args_json.chars().take(512).collect();
     let synthetic = ahand_protocol::JobRequest {
-        job_id: req.tool_call_id.clone(),
+        job_id: approval_job_id.clone(),
         tool: format!("app:{}", req.name),
         args: vec![args_preview],
         ..Default::default()
@@ -2038,15 +2049,13 @@ async fn handle_app_tool_request<T>(
         let tx_clone = (*tx).clone();
         let did = device_id.to_string();
         let amgr = Arc::clone(approval_mgr);
-        let smgr = Arc::clone(session_mgr);
         let app_tools_clone = Arc::clone(app_tools);
         let tool_call_id = req.tool_call_id.clone();
         let tool_name = req.name.clone();
         let args_json = req.args_json.clone();
         let timeout_ms_req = req.timeout_ms;
-        let cuid = caller_uid.to_string();
         let timeout = amgr.default_timeout();
-        let synthetic_tool = synthetic.tool.clone();
+        let approval_job_id_clone = approval_job_id.clone();
 
         tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -2055,8 +2064,8 @@ async fn handle_app_tool_request<T>(
                 Ok(Ok(resp)) if resp.approved => {
                     info!(
                         tool_call_id = %tool_call_id,
-                        name = %tool_name,
-                        duration_ms = started.elapsed().as_millis() as u64,
+                        tool_name = %tool_name,
+                        approval_wait_ms = started.elapsed().as_millis() as u64,
                         "app tool approval granted"
                     );
                     // Proceed to args parse → permit → execute inside this task.
@@ -2073,74 +2082,55 @@ async fn handle_app_tool_request<T>(
                     .await;
                 }
                 Ok(Ok(resp)) => {
-                    // Denied — record refusal.
-                    let duration_ms = started.elapsed().as_millis() as u64;
+                    // Denied.
+                    // refusal is recorded at the ApprovalResponse resolve site
+                    // (see ~line 650); recording here would duplicate it.
+                    let approval_wait_ms = started.elapsed().as_millis() as u64;
                     info!(
                         tool_call_id = %tool_call_id,
-                        name = %tool_name,
-                        duration_ms,
+                        tool_name = %tool_name,
+                        approval_wait_ms,
                         reason = %resp.reason,
                         "app tool approval denied"
                     );
-                    if !resp.reason.is_empty() {
-                        smgr.record_refusal(&cuid, &synthetic_tool, &resp.reason)
-                            .await;
-                    }
-                    amgr.expire(&tool_call_id).await;
-                    // Record completion so replay returns the error.
+                    // resolve() already removed the entry from ApprovalManager;
+                    // calling expire here would be a no-op — skip it.
                     let denied_reason = if resp.reason.is_empty() {
                         "the user declined this call".to_string()
                     } else {
                         format!("the user declined this call: {}", resp.reason)
                     };
-                    app_tools_clone
-                        .mark_completed(
-                            tool_call_id.clone(),
-                            crate::app_tool_registry::CompletedAppToolCall {
-                                result_json: None,
-                                error: Some(crate::app_tool_registry::AppToolError {
-                                    code: "APPROVAL_DENIED".to_string(),
-                                    message: denied_reason.clone(),
-                                }),
-                            },
-                        )
-                        .await;
-                    let _ = tx_clone.send(app_tool_error_envelope(
+                    fail_app_tool_call(
+                        &app_tools_clone,
+                        &tx_clone,
                         &did,
                         &tool_call_id,
                         "APPROVAL_DENIED",
                         denied_reason,
-                    ));
+                    )
+                    .await;
                 }
                 _ => {
                     // Timeout (or channel closed).
-                    let duration_ms = started.elapsed().as_millis() as u64;
+                    let approval_wait_ms = started.elapsed().as_millis() as u64;
                     warn!(
                         tool_call_id = %tool_call_id,
-                        name = %tool_name,
-                        duration_ms,
+                        tool_name = %tool_name,
+                        approval_wait_ms,
                         "app tool approval timed out"
                     );
-                    amgr.expire(&tool_call_id).await;
-                    let msg = "approval request expired without a user response".to_string();
-                    app_tools_clone
-                        .mark_completed(
-                            tool_call_id.clone(),
-                            crate::app_tool_registry::CompletedAppToolCall {
-                                result_json: None,
-                                error: Some(crate::app_tool_registry::AppToolError {
-                                    code: "APPROVAL_TIMEOUT".to_string(),
-                                    message: msg.clone(),
-                                }),
-                            },
-                        )
-                        .await;
-                    let _ = tx_clone.send(app_tool_error_envelope(
+                    // expire() is needed here: resolve() was never called (no
+                    // response arrived), so the entry is still in the HashMap.
+                    amgr.expire(&approval_job_id_clone).await;
+                    fail_app_tool_call(
+                        &app_tools_clone,
+                        &tx_clone,
                         &did,
                         &tool_call_id,
                         "APPROVAL_TIMEOUT",
-                        msg,
-                    ));
+                        "approval request expired without a user response".to_string(),
+                    )
+                    .await;
                 }
             }
         });
@@ -2160,6 +2150,39 @@ async fn handle_app_tool_request<T>(
         app_tools,
     )
     .await;
+}
+
+/// Record a failed app-tool call in the idempotency cache and send the error
+/// envelope to the WS. Used at all five fail paths (deny, timeout, bad-JSON,
+/// non-object args, concurrency limit) to keep them DRY and avoid the
+/// double-construction drift risk where code and message diverge between
+/// mark_completed and the envelope.
+async fn fail_app_tool_call<T: crate::executor::EnvelopeSink>(
+    app_tools: &Arc<AppToolRegistry>,
+    tx: &T,
+    device_id: &str,
+    tool_call_id: &str,
+    code: &str,
+    message: String,
+) {
+    app_tools
+        .mark_completed(
+            tool_call_id.to_string(),
+            crate::app_tool_registry::CompletedAppToolCall {
+                result_json: None,
+                error: Some(crate::app_tool_registry::AppToolError {
+                    code: code.to_string(),
+                    message: message.clone(),
+                }),
+            },
+        )
+        .await;
+    let _ = tx.send(app_tool_error_envelope(
+        device_id,
+        tool_call_id,
+        code,
+        message,
+    ));
 }
 
 /// Post-gate tail: parse args, acquire permit, mark_running, spawn execute.
@@ -2192,57 +2215,39 @@ async fn validate_and_execute_app_tool<T>(
         Err(err) => {
             warn!(
                 tool_call_id = %tool_call_id,
-                name = %tool_name,
+                tool_name = %tool_name,
                 error = %err,
                 "invalid app tool args"
             );
             // On the approval path mark_running was already called; record
             // completion so the idempotency cache is consistent.
-            app_tools
-                .mark_completed(
-                    tool_call_id.clone(),
-                    crate::app_tool_registry::CompletedAppToolCall {
-                        result_json: None,
-                        error: Some(crate::app_tool_registry::AppToolError {
-                            code: "INVALID_ARGS".to_string(),
-                            message: format!("args_json is not valid JSON: {err}"),
-                        }),
-                    },
-                )
-                .await;
-            let _ = tx.send(app_tool_error_envelope(
+            fail_app_tool_call(
+                app_tools,
+                tx,
                 device_id,
                 &tool_call_id,
                 "INVALID_ARGS",
                 format!("args_json is not valid JSON: {err}"),
-            ));
+            )
+            .await;
             return;
         }
     };
     if !args.is_object() {
         warn!(
             tool_call_id = %tool_call_id,
-            name = %tool_name,
-            "invalid app tool args"
+            tool_name = %tool_name,
+            "invalid app tool args: not a JSON object"
         );
-        app_tools
-            .mark_completed(
-                tool_call_id.clone(),
-                crate::app_tool_registry::CompletedAppToolCall {
-                    result_json: None,
-                    error: Some(crate::app_tool_registry::AppToolError {
-                        code: "INVALID_ARGS".to_string(),
-                        message: "args_json must be a JSON object".to_string(),
-                    }),
-                },
-            )
-            .await;
-        let _ = tx.send(app_tool_error_envelope(
+        fail_app_tool_call(
+            app_tools,
+            tx,
             device_id,
             &tool_call_id,
             "INVALID_ARGS",
             "args_json must be a JSON object".to_string(),
-        ));
+        )
+        .await;
         return;
     }
 
@@ -2252,27 +2257,18 @@ async fn validate_and_execute_app_tool<T>(
         None => {
             warn!(
                 tool_call_id = %tool_call_id,
-                name = %tool_name,
+                tool_name = %tool_name,
                 "app tool concurrency limit hit"
             );
-            app_tools
-                .mark_completed(
-                    tool_call_id.clone(),
-                    crate::app_tool_registry::CompletedAppToolCall {
-                        result_json: None,
-                        error: Some(crate::app_tool_registry::AppToolError {
-                            code: "CONCURRENCY_LIMIT".to_string(),
-                            message: "too many app tool calls in flight on this device; retry after in-flight calls finish".to_string(),
-                        }),
-                    },
-                )
-                .await;
-            let _ = tx.send(app_tool_error_envelope(
+            fail_app_tool_call(
+                app_tools,
+                tx,
                 device_id,
                 &tool_call_id,
                 "CONCURRENCY_LIMIT",
                 "too many app tool calls in flight on this device; retry after in-flight calls finish".to_string(),
-            ));
+            )
+            .await;
             return;
         }
     };

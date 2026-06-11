@@ -921,7 +921,7 @@ git commit -m "feat(ahandd): dispatch and execute AppToolRequest with isolation"
 
 **Acceptance Criteria (the full matrix):**
 - [ ] INACTIVE → `SESSION_INACTIVE` error, no ApprovalRequest, handler never runs
-- [ ] STRICT → ApprovalRequest emitted (job_id = tool_call_id, tool = `app:{name}`); approve → result; deny → `APPROVAL_DENIED`; no response → `APPROVAL_TIMEOUT` after `approval_timeout`
+- [ ] STRICT → ApprovalRequest emitted (`job_id = "app-tool:{tool_call_id}"`, tool = `app:{name}`); approve → result; deny → `APPROVAL_DENIED`; no response → `APPROVAL_TIMEOUT` after `approval_timeout`
 - [ ] TRUST and AUTO_ACCEPT with `requires_approval=false` → direct execution, no ApprovalRequest
 - [ ] TRUST and AUTO_ACCEPT with `requires_approval=true` → ApprovalRequest required (tighten-only)
 
@@ -933,12 +933,15 @@ git commit -m "feat(ahandd): dispatch and execute AppToolRequest with isolation"
 
 ```rust
 // Synthetic JobRequest: lets SessionManager + ApprovalManager handle app
-// tools without modification. job_id == tool_call_id so ApprovalResponse
-// (keyed by job_id) resolves our pending entry; tool is namespaced "app:".
+// tools without modification. job_id is namespaced "app-tool:" so a
+// cloud-chosen tool_call_id cannot evict a real job's pending approval in
+// ApprovalManager's shared HashMap — mirroring the "file-req:" prefix used
+// by handle_file_request. ApprovalResponse echoes job_id, so resolve() works.
+let approval_job_id = format!("app-tool:{}", req.tool_call_id);
 let mut args_preview = req.args_json.clone();
 args_preview.truncate(512);
 let synthetic = JobRequest {
-    job_id: req.tool_call_id.clone(),
+    job_id: approval_job_id.clone(),
     tool: format!("app:{}", req.name),
     args: vec![args_preview],
     ..Default::default()
@@ -995,7 +998,7 @@ if let SessionDecision::NeedsApproval { reason, previous_refusals } = decision {
             return;
         }
         _ => {
-            approval_mgr.expire(&req.tool_call_id).await;
+            approval_mgr.expire(&approval_job_id).await;
             let _ = tx.send(app_tool_error_envelope(
                 device_id, &req.tool_call_id, "APPROVAL_TIMEOUT",
                 "approval request expired without a user response".to_string(),
@@ -1008,7 +1011,7 @@ if let SessionDecision::NeedsApproval { reason, previous_refusals } = decision {
 
 Implementation notes: (a) unlike the job path, await the approval inline rather than spawning a wait-task — the handler already runs per-message and execution follows immediately; if the surrounding read-loop must not block (check how `handle_file_request` handles long waits with `close_rx`), wrap the whole gate+execute in a `tokio::spawn` the way the job approval wait-task does. (b) `approval_mgr.default_timeout()` — if no such getter exists, add a one-line accessor to `ApprovalManager` (the field exists: `approval.rs:20`). (c) Match the exact `SessionDecision` variant shapes from `session.rs:9`.
 
-- [ ] **Step 2: Matrix tests** (extend `tests/app_tools.rs`). The mock hub side: receive the ApprovalRequest envelope, reply with an ApprovalResponse envelope (approved / denied), or stay silent for the timeout case. Configure short `approval_timeout` via `DaemonConfig::builder(...).approval_timeout(Duration::from_millis(300))`. Eight cases per the acceptance matrix. Assert ApprovalRequest fields: `job_id == tool_call_id`, `tool == "app:demo_echo"`.
+- [ ] **Step 2: Matrix tests** (extend `tests/app_tools.rs`). The mock hub side: receive the ApprovalRequest envelope, reply with an ApprovalResponse envelope (approved / denied), or stay silent for the timeout case. Configure short `approval_timeout` via `DaemonConfig::builder(...).approval_timeout(Duration::from_millis(300))`. Eight cases per the acceptance matrix. Assert ApprovalRequest fields: `job_id == "app-tool:{tool_call_id}"` (namespaced form), `tool == "app:demo_echo"`. ApprovalResponse must echo the same namespaced `job_id` so `ApprovalManager::resolve()` finds the pending entry.
 
 - [ ] **Step 3: Run and commit**
 
@@ -1018,6 +1021,16 @@ Run: `cargo test -p ahandd --test app_tools && cargo check --workspace`
 git add crates/ahandd/
 git commit -m "feat(ahandd): session-mode gate + tighten-only approval for app tools"
 ```
+
+### Review amendments (Task 6 post-review hardening)
+
+- **Namespace the approval `job_id`**: synthetic `JobRequest.job_id` changed from raw `tool_call_id` to `"app-tool:{tool_call_id}"` — prevents a cloud-chosen `tool_call_id` from evicting a real job's pending approval in `ApprovalManager`'s shared `HashMap`. Mirrors the existing `"file-req:"` precedent. `ApprovalResponse` echoes `ApprovalRequest.job_id`, so `resolve()` still works unchanged. Tests updated to send `"app-tool:{id}"` in `send_approval_response` and assert `"app-tool:{id}"` in `ApprovalRequest.job_id`.
+- **Exactly-once refusal recording**: removed the duplicate `record_refusal` call from the approval waiter's deny arm. Refusal is recorded at the WS `ApprovalResponse` resolve site (`ahand_client.rs ~line 650`) only. Known pre-existing: job/IPC approval paths double-record refusals (resolve site + waiter); fix tracked as follow-up.
+- **`fail_app_tool_call` helper**: extracted common deny/timeout/bad-JSON/non-object/concurrency fail path into `fail_app_tool_call<T: EnvelopeSink>` — kills drift risk where `mark_completed` code/message could diverge from the error envelope.
+- **Tracing key**: unified to `tool_name` in all waiter and `validate_and_execute_app_tool` log lines (was `name`). Log field `duration_ms` in the approval-wait logs renamed to `approval_wait_ms` (measures approval latency, not handler execution time).
+- **No-op `expire` removed**: the deny arm's `amgr.expire(&tool_call_id)` was a no-op because `resolve()` already removed the entry; removed and replaced with a comment. The timeout arm's `expire` is retained (entry is still in the map when no response arrives).
+- **Stale-handler note**: handler doc extended — the handler captured at lookup time executes even if the app re-registers the tool mid-wait ("approve what was requested").
+- **New tests (Cases 10–12)**: (10) >512-char args: `ApprovalRequest.args[0].chars().count() == 512`; (11) replay-after-denial: same `tool_call_id` replays `APPROVAL_DENIED` without a new `ApprovalRequest`; (12) `previous_refusals == 1` on second invocation after one denial.
 
 ---
 

@@ -20,13 +20,32 @@
 //!   * 5 concurrent slow calls → exactly one CONCURRENCY_LIMIT.
 //!   * Duplicate tool_call_id while running → ignored; after completion →
 //!     cached response re-sent with identical payload.
+//!
+//! Task 6 session-mode gate matrix:
+//! ┌─────────────────────────────┬───────────────────────────────────────────────┐
+//! │ Mode / requires_approval    │ Outcome                                       │
+//! ├─────────────────────────────┼───────────────────────────────────────────────┤
+//! │ INACTIVE                    │ SESSION_INACTIVE; no ApprovalRequest           │
+//! │ STRICT + false / approve    │ ApprovalRequest(job_id="app-tool:…"); execute  │
+//! │ STRICT + false / deny       │ ApprovalRequest; APPROVAL_DENIED               │
+//! │ STRICT + false / silence    │ ApprovalRequest; APPROVAL_TIMEOUT              │
+//! │ TRUST  + false              │ direct execution; no ApprovalRequest           │
+//! │ TRUST  + true / approve     │ ApprovalRequest even in TRUST (tighten-only)   │
+//! │ AUTO_ACCEPT + false         │ direct execution; no ApprovalRequest           │
+//! │ AUTO_ACCEPT + true / deny   │ ApprovalRequest; APPROVAL_DENIED               │
+//! │ dup while approval pending  │ second request ignored (Running state)         │
+//! │ >512-char args preview lock │ ApprovalRequest.args[0].len() == 512           │
+//! │ replay after denial (same   │ cached APPROVAL_DENIED replayed, no new req    │
+//! │   tool_call_id)             │                                                │
+//! │ previous_refusals count     │ second invocation sees exactly 1 refusal entry │
+//! └─────────────────────────────┴───────────────────────────────────────────────┘
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ahand_protocol::app_tool_response;
-use ahandd::{AppToolDef, AppToolHandler, DaemonConfig, DaemonStatus, spawn};
+use ahandd::{AppToolDef, AppToolHandler, DaemonConfig, DaemonStatus, SessionMode, spawn};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -857,8 +876,6 @@ async fn duplicate_call_id_while_running_is_ignored() {
 
 // ── Task 6: session-mode gate + tighten-only approval tests ──────────────────
 
-use ahandd::SessionMode;
-
 /// Build a DaemonConfig with a specific session mode, short approval_timeout,
 /// and no heartbeat noise. `approval_timeout_secs` controls how quickly
 /// APPROVAL_TIMEOUT fires in tests.
@@ -1011,14 +1028,17 @@ async fn strict_mode_approve_executes() {
         .expect("ApprovalRequest not received within 5s");
 
     let ar = &approval_reqs[0];
+    let tool_call_id = "call-strict-approve";
     assert_eq!(
-        ar.job_id, "call-strict-approve",
-        "job_id must equal tool_call_id"
+        ar.job_id,
+        format!("app-tool:{tool_call_id}"),
+        "job_id must be namespaced 'app-tool:<tool_call_id>'"
     );
     assert_eq!(ar.tool, "app:demo_echo", "tool must be 'app:<name>'");
 
-    // Approve.
-    mock.send_approval_response("call-strict-approve", true, "")
+    // Approve — echo the namespaced job_id so ApprovalManager.resolve() finds
+    // the pending entry.
+    mock.send_approval_response(format!("app-tool:{tool_call_id}"), true, "")
         .expect("send approval ok");
 
     // Result should arrive after approval.
@@ -1063,8 +1083,9 @@ async fn strict_mode_deny_returns_approval_denied() {
         .await
         .expect("ApprovalRequest not received within 5s");
 
-    // Deny with reason.
-    mock.send_approval_response("call-strict-deny", false, "nope")
+    // Deny with reason — use the namespaced job_id so the daemon's
+    // ApprovalManager.resolve() finds the pending entry.
+    mock.send_approval_response("app-tool:call-strict-deny", false, "nope")
         .expect("send denial ok");
 
     let responses = mock
@@ -1263,11 +1284,14 @@ async fn trust_mode_requires_approval_true_sends_approval_request() {
         .await
         .expect("ApprovalRequest not received within 5s (TRUST + requires_approval=true)");
 
-    assert_eq!(approval_reqs[0].job_id, "call-trust-approval");
+    assert_eq!(
+        approval_reqs[0].job_id, "app-tool:call-trust-approval",
+        "job_id must be namespaced 'app-tool:<tool_call_id>'"
+    );
     assert_eq!(approval_reqs[0].tool, "app:demo_echo");
 
-    // Approve.
-    mock.send_approval_response("call-trust-approval", true, "")
+    // Approve — echo the namespaced job_id.
+    mock.send_approval_response("app-tool:call-trust-approval", true, "")
         .expect("send approval ok");
 
     let responses = mock
@@ -1312,10 +1336,13 @@ async fn auto_accept_mode_requires_approval_true_deny() {
         .await
         .expect("ApprovalRequest not received within 5s (AUTO_ACCEPT + requires_approval=true)");
 
-    assert_eq!(approval_reqs[0].job_id, "call-auto-deny");
+    assert_eq!(
+        approval_reqs[0].job_id, "app-tool:call-auto-deny",
+        "job_id must be namespaced 'app-tool:<tool_call_id>'"
+    );
 
-    // Deny.
-    mock.send_approval_response("call-auto-deny", false, "not allowed")
+    // Deny — echo the namespaced job_id.
+    mock.send_approval_response("app-tool:call-auto-deny", false, "not allowed")
         .expect("send denial ok");
 
     let responses = mock
@@ -1386,8 +1413,8 @@ async fn duplicate_while_approval_pending_no_second_request() {
         "only one ApprovalRequest expected even with duplicate"
     );
 
-    // Approve the original request.
-    mock.send_approval_response("call-dup-pending", true, "")
+    // Approve the original request — use the namespaced job_id.
+    mock.send_approval_response("app-tool:call-dup-pending", true, "")
         .expect("send approval ok");
 
     // Only one response should arrive.
@@ -1416,6 +1443,174 @@ async fn duplicate_while_approval_pending_no_second_request() {
     );
 
     assert_eq!(run_count.load(Ordering::SeqCst), 1, "handler ran once");
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+// ── Cases 10-12: review-amendment tests ──────────────────────────────────────
+
+/// Case 10: args_json longer than 512 chars → ApprovalRequest.args[0] has
+/// exactly 512 characters (no full-args leak to the approval UI).
+#[tokio::test]
+async fn args_preview_truncated_to_512_chars() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 10).await;
+
+    register_counted_echo(&handle, "demo_echo", false, Arc::new(AtomicUsize::new(0))).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    // Build args_json that is clearly >512 chars (600 'x' chars as a value).
+    let long_value = "x".repeat(600);
+    let args_json = format!(r#"{{"data":"{}"}}"#, long_value);
+    assert!(
+        args_json.len() > 512,
+        "precondition: args_json must exceed 512 chars"
+    );
+
+    mock.send_app_tool_request("call-long-args", "demo_echo", &args_json, 5000)
+        .expect("send ok");
+
+    let approval_reqs = mock
+        .wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s");
+
+    let preview = &approval_reqs[0].args[0];
+    assert_eq!(
+        preview.chars().count(),
+        512,
+        "args preview must be exactly 512 chars; got {}",
+        preview.chars().count()
+    );
+
+    // Clean up — deny so the waiter task exits cleanly.
+    mock.send_approval_response("app-tool:call-long-args", false, "test cleanup")
+        .expect("send denial ok");
+    mock.wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("response after denial not received");
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Case 11: if the same tool_call_id is re-sent after APPROVAL_DENIED, the
+/// cached APPROVAL_DENIED is replayed immediately without issuing a new
+/// ApprovalRequest.
+#[tokio::test]
+async fn replay_after_denial_no_new_approval_request() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 10).await;
+
+    register_counted_echo(&handle, "demo_echo", false, Arc::new(AtomicUsize::new(0))).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    // First invocation → ApprovalRequest → deny.
+    mock.send_app_tool_request("call-replay-deny", "demo_echo", r#"{}"#, 5000)
+        .expect("send ok");
+
+    mock.wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s");
+
+    mock.send_approval_response("app-tool:call-replay-deny", false, "denied for test")
+        .expect("send denial ok");
+
+    let first_responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("APPROVAL_DENIED response not received within 5s");
+
+    assert!(
+        matches!(&first_responses[0].result, Some(app_tool_response::Result::Error(e)) if e.code == "APPROVAL_DENIED"),
+        "expected APPROVAL_DENIED, got {:?}",
+        first_responses[0].result
+    );
+
+    // Re-send the same tool_call_id → cached response should be replayed.
+    mock.send_app_tool_request("call-replay-deny", "demo_echo", r#"{}"#, 5000)
+        .expect("re-send ok");
+
+    let all_responses = mock
+        .wait_for_app_tool_responses(2, Duration::from_secs(5))
+        .await
+        .expect("replayed APPROVAL_DENIED not received within 5s");
+
+    // Brief pause to confirm no extra ApprovalRequest arrived.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        mock.captured_approval_requests().len(),
+        1,
+        "replay must not issue a new ApprovalRequest; still exactly 1"
+    );
+
+    // Both responses carry APPROVAL_DENIED.
+    for resp in &all_responses {
+        assert!(
+            matches!(&resp.result, Some(app_tool_response::Result::Error(e)) if e.code == "APPROVAL_DENIED"),
+            "expected APPROVAL_DENIED in replayed response, got {:?}",
+            resp.result
+        );
+    }
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Case 12: after denying tool_call_id A with a reason, a second invocation
+/// (new tool_call_id B) of the same tool in STRICT mode must carry exactly 1
+/// entry in ApprovalRequest.previous_refusals.
+#[tokio::test]
+async fn second_invocation_sees_one_previous_refusal() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 10).await;
+
+    register_counted_echo(&handle, "demo_echo", false, Arc::new(AtomicUsize::new(0))).await;
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    // First invocation — deny with a reason so the refusal is recorded
+    // at the WS ApprovalResponse resolve site (ahand_client.rs ~line 650).
+    mock.send_app_tool_request("call-refusal-1", "demo_echo", r#"{}"#, 5000)
+        .expect("send first ok");
+
+    mock.wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("first ApprovalRequest not received");
+
+    mock.send_approval_response("app-tool:call-refusal-1", false, "not now")
+        .expect("send denial ok");
+
+    mock.wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("first APPROVAL_DENIED not received");
+
+    // Second invocation (new tool_call_id) of the same tool.
+    mock.send_app_tool_request("call-refusal-2", "demo_echo", r#"{}"#, 5000)
+        .expect("send second ok");
+
+    let approval_reqs = mock
+        .wait_for_approval_requests(2, Duration::from_secs(5))
+        .await
+        .expect("second ApprovalRequest not received within 5s");
+
+    let second_req = &approval_reqs[1];
+    assert_eq!(
+        second_req.previous_refusals.len(),
+        1,
+        "second invocation must see exactly 1 previous_refusal; got {}",
+        second_req.previous_refusals.len()
+    );
+
+    // Clean up — deny the second request.
+    mock.send_approval_response("app-tool:call-refusal-2", false, "cleanup")
+        .expect("send second denial ok");
+    mock.wait_for_app_tool_responses(2, Duration::from_secs(5))
+        .await
+        .expect("second APPROVAL_DENIED not received");
 
     handle.shutdown().await.expect("shutdown clean");
 }
