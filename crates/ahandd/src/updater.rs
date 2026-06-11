@@ -258,7 +258,11 @@ async fn try_update<T: EnvelopeSink>(
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-async fn download_binary(url: &str) -> anyhow::Result<Vec<u8>> {
+/// Download a binary from `url` and return its raw bytes.
+///
+/// Returns an error if the HTTP response status is not 2xx.  Used by both the
+/// hub-driven update path and the CLI `ahandctl upgrade` command.
+pub async fn download_binary(url: &str) -> anyhow::Result<Vec<u8>> {
     let resp = reqwest::get(url).await?;
     let status = resp.status();
     if !status.is_success() {
@@ -269,7 +273,13 @@ async fn download_binary(url: &str) -> anyhow::Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-fn verify_checksum(data: &[u8], expected_hex: &str) -> anyhow::Result<()> {
+/// Verify a SHA-256 checksum of `data` against `expected_hex`.
+///
+/// `expected_hex` is a lowercase hex-encoded SHA-256 digest (64 chars).
+/// Returns `Ok(())` on a match; errors with a description of the mismatch
+/// otherwise.  Used by both the hub-driven update path and the CLI
+/// `ahandctl upgrade` command.
+pub fn verify_checksum(data: &[u8], expected_hex: &str) -> anyhow::Result<()> {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(data);
     let actual_hex = hex::encode(digest);

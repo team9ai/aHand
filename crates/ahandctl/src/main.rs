@@ -13,7 +13,7 @@ use tracing::info;
 mod admin;
 mod browser_init;
 mod daemon;
-mod upgrade;
+use ahandctl::upgrade;
 
 #[derive(Parser)]
 #[command(name = "ahandctl", about = "AHand CLI debug tool")]
