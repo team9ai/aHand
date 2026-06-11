@@ -31,9 +31,10 @@ use tempfile::TempDir;
 /// `/var/folders/...` becomes `/private/var/folders/...` after canonicalization
 /// and our policy checker doesn't resolve symlinks.
 fn test_manager(tmp: &TempDir) -> (FileManager, PathBuf) {
-    let root = tmp
-        .path()
-        .canonicalize()
+    // Use canonicalize_simplified to strip the Windows verbatim prefix (\\?\)
+    // so the allowlist patterns match what FilePolicyChecker returns after its
+    // own simplify() call. On Unix this is identical to plain canonicalize().
+    let root = ahand_platform::paths::canonicalize_simplified(tmp.path())
         .expect("tempdir canonicalization should succeed");
     let root_str = root.to_string_lossy().into_owned();
     let pattern = format!("{}/**", root_str.trim_end_matches('/'));
