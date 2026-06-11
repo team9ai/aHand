@@ -652,7 +652,13 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         // already accepted by the new connection. The hello-time mark_stale covers the case where
         // the hub crashed (cleanup never ran) and the daemon's revision counter reset after
         // restart, which would otherwise be silently ignored as a lower-revision fresh catalog.
-        let _ = state.app_tools.mark_stale(&device_id).await;
+        if let Err(err) = state.app_tools.mark_stale(&device_id).await {
+            tracing::warn!(
+                device_id = %device_id,
+                error = %err,
+                "failed to mark app tool catalog stale at hello time",
+            );
+        }
         state.jobs.handle_device_connected(&device_id).await?;
         if let Err(err) = state.events.emit_device_online(&device_id, &hostname).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.online audit");
@@ -880,6 +886,24 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                     } else if let Some(ahand_protocol::envelope::Payload::AppToolsUpdate(ref update)) = envelope.payload {
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
                         queue_ack_only(&control_tx, &device_id, envelope.seq)?;
+                        // Connection-currency guard: a zombie socket (one that was superseded
+                        // by a new connection before this arm ran) must not overwrite the
+                        // catalog that the new connection's snapshot already installed.
+                        // The loop-level is_current check at loop entry is not sufficient
+                        // because observe_inbound is async — a reconnect could race between
+                        // the loop-level check and this write.
+                        // TODO(behavioral): this residual window is narrow (sub-ms) because
+                        // the old connection is closed before a new one is accepted, but it
+                        // is not zero; a stricter fix would stamp the catalog with the
+                        // accepting connection_id and reject lower-stamp writes.
+                        if !state.connections.is_current(&device_id, connection_id) {
+                            tracing::debug!(
+                                device_id = %device_id,
+                                %connection_id,
+                                "ignoring AppToolsUpdate from superseded (zombie) connection",
+                            );
+                            continue;
+                        }
                         // 256 KiB hard cap — untrusted daemon payload; storing huge catalogs
                         // wastes Redis memory and can exhaust downstream readers. Logged at
                         // warn so operators notice misbehaving daemons without crashing them.
@@ -934,6 +958,24 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                                         catalog_bytes,
                                         "app tool catalog updated",
                                     );
+                                    // Suppress audit + webhook when the incoming catalog is
+                                    // empty and the previous catalog was also empty-or-absent.
+                                    // A tool-less daemon reconnect would otherwise generate
+                                    // webhook noise on every hello without any meaningful
+                                    // state change. The catalog is still stored and `stale`
+                                    // is still cleared — only the noisy signals are suppressed.
+                                    // A real empty-after-nonempty transition (tool_count == 0
+                                    // but existing had tools) STILL fires so operators see
+                                    // intentional unregistrations.
+                                    let prev_tool_count = existing.as_ref().map(|c| c.tools.len()).unwrap_or(0);
+                                    let suppress_signals = tool_count == 0 && prev_tool_count == 0;
+                                    if suppress_signals {
+                                        tracing::debug!(
+                                            device_id = %device_id,
+                                            revision,
+                                            "empty-catalog reconnect: catalog stored, audit/webhook suppressed",
+                                        );
+                                    } else {
                                     state.append_audit_entry(
                                         "device.app_tools.updated",
                                         "device",
@@ -964,6 +1006,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                                             "failed to enqueue device.app_tools.updated webhook",
                                         );
                                     }
+                                    } // end !suppress_signals
                                 }
                             } else {
                                 let incoming_revision = update.revision;

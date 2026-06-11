@@ -1134,6 +1134,172 @@ fn make_app_tools_update_for(device_id: &str, revision: u64, tool_name: &str) ->
     }
 }
 
+/// A helper that builds an empty AppToolsUpdate (no tools).
+fn make_empty_app_tools_update(device_id: &str, revision: u64) -> Envelope {
+    Envelope {
+        device_id: device_id.into(),
+        msg_id: format!("app-tools-empty-{device_id}-{revision}"),
+        seq: revision,
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolsUpdate(AppToolsUpdate {
+            revision,
+            tools: vec![],
+        })),
+        ..Default::default()
+    }
+}
+
+/// A tool-less daemon reconnect (empty-to-empty) must NOT spam the webhook.
+/// The catalog is still stored and stale is cleared, but no audit/webhook fires.
+#[tokio::test]
+async fn empty_catalog_reconnect_does_not_spam_webhook() {
+    let state = test_state_with_webhook_persistent().await;
+    let server = spawn_server_with_state(state).await;
+
+    let verifying = SigningKey::from_bytes(&[7u8; 32])
+        .verifying_key()
+        .to_bytes();
+    server
+        .state()
+        .devices
+        .pre_register("ec-device-1", &verifying, "user-ec-1")
+        .await
+        .unwrap();
+
+    let wh_store = server
+        .state()
+        .webhook
+        .store()
+        .expect("webhook store must be present");
+
+    // Connect and send empty catalog (rev=1).
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("ec-device-1", &challenge.nonce);
+    socket
+        .send(WsMessage::Binary(hello.encode_to_vec().into()))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+
+    let empty_update = make_empty_app_tools_update("ec-device-1", 1);
+    socket
+        .send(WsMessage::Binary(empty_update.encode_to_vec().into()))
+        .await
+        .unwrap();
+
+    // Wait for the catalog to land (stale cleared by the accepted update).
+    let did_land = poll_fresh(server.state(), "ec-device-1", 1, Duration::from_secs(3)).await;
+    assert!(did_land, "empty catalog must be stored and become fresh");
+
+    // Give time for any spurious webhook to appear.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // No device.app_tools.updated webhook should have been fired.
+    let found_webhook = {
+        let rows = wh_store
+            .lease_due(chrono::Utc::now() + chrono::Duration::seconds(3600), 50)
+            .await
+            .unwrap_or_default();
+        rows.iter().any(|r| {
+            r.payload["eventType"] == "device.app_tools.updated"
+                && r.payload["deviceId"] == "ec-device-1"
+        })
+    };
+    assert!(
+        !found_webhook,
+        "empty-to-empty catalog update must not enqueue a device.app_tools.updated webhook"
+    );
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
+/// An empty-AFTER-nonempty catalog update must still fire the webhook so
+/// operators see intentional tool unregistrations.
+#[tokio::test]
+async fn empty_after_nonempty_catalog_fires_webhook() {
+    let state = test_state_with_webhook_persistent().await;
+    let server = spawn_server_with_state(state).await;
+
+    let verifying = SigningKey::from_bytes(&[7u8; 32])
+        .verifying_key()
+        .to_bytes();
+    server
+        .state()
+        .devices
+        .pre_register("ec-device-2", &verifying, "user-ec-2")
+        .await
+        .unwrap();
+
+    let wh_store = server
+        .state()
+        .webhook
+        .store()
+        .expect("webhook store must be present");
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("ec-device-2", &challenge.nonce);
+    socket
+        .send(WsMessage::Binary(hello.encode_to_vec().into()))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+
+    // First: send a non-empty catalog (rev=1, 1 tool).
+    let nonempty = make_app_tools_update_for("ec-device-2", 1, "some_tool");
+    socket
+        .send(WsMessage::Binary(nonempty.encode_to_vec().into()))
+        .await
+        .unwrap();
+    // Wait for the first webhook to confirm it landed.
+    let first_found = poll_webhook_delivery(
+        &wh_store,
+        |p| {
+            p["eventType"] == "device.app_tools.updated"
+                && p["deviceId"] == "ec-device-2"
+                && p["data"]["toolCount"] == 1
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        first_found,
+        "non-empty catalog must fire webhook (rev=1, toolCount=1)"
+    );
+
+    // Now send an empty catalog (rev=2, 0 tools) — must still fire.
+    let empty = make_empty_app_tools_update("ec-device-2", 2);
+    socket
+        .send(WsMessage::Binary(empty.encode_to_vec().into()))
+        .await
+        .unwrap();
+
+    let second_found = poll_webhook_delivery(
+        &wh_store,
+        |p| {
+            p["eventType"] == "device.app_tools.updated"
+                && p["deviceId"] == "ec-device-2"
+                && p["data"]["toolCount"] == 0
+                && p["data"]["revision"] == 2
+        },
+        Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        second_found,
+        "empty-after-nonempty catalog (rev=2, toolCount=0) must still fire the webhook"
+    );
+
+    let _ = socket.close(None).await;
+    server.shutdown().await;
+}
+
 /// 256 KiB size guard: an oversized catalog must be rejected (not stored).
 #[tokio::test]
 async fn oversized_catalog_is_rejected() {
