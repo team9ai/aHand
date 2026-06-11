@@ -271,3 +271,30 @@ these):
   hardware (already on the M2 list).
 - Optional: unify `ahandctl admin`'s direct `ctrl_c()` onto
   `platform::signals`.
+
+## M2 Completion Record (2026-06-11)
+
+M2 landed on `feat/cross-platform-m2` (plan:
+`docs/superpowers/plans/2026-06-11-cross-platform-m2-lifecycle-install.md`).
+
+**What landed:**
+
+- **Native `ahandctl upgrade`** — fully rewritten in Rust (`crates/ahandctl/src/upgrade/`); no shell subprocess. Flow: resolve latest release via GitHub API → download binaries + optional checksum file → SHA-256 verify before any install → stop daemon → rename-aside self-swap via `ahandd::updater::swap_binary_into` (works on Windows: rename running binary to `.old`, place new binary, clean `.old` on next start) → admin-SPA traversal-guarded tar extraction → write version marker. `--check` mode queries versions and prints current vs. available without installing.
+- **`swap_binary_into` generalization** — `ahandd::updater::swap_binary_into` is now the shared primitive used by both `ahandd` self-update and the new `ahandctl upgrade` path. Works on all three platforms.
+- **`AHAND_DIR` / `AHAND_VERSION` env-var support** in `ahandctl upgrade` — `upgrade::resolve_ahand_home()` checks `AHAND_DIR` first; `run()` checks `AHAND_VERSION`. Mirrors `install.sh` / `install.ps1` behaviour.
+- **`scripts/dist/install.ps1`** — PowerShell one-liner installer for Windows. Parameters: `ApiBase`, `DownloadBase`, `InstallDir`, `Version`, `NoPathUpdate`. Idempotent user-PATH update (skips if already present). ARM64 gives a clear error (no artifacts yet). Minimum Windows 10 1803+ for in-box `tar`.
+- **`test-dist-scripts.yml` `windows-install` job** — mocked e2e job on `windows-latest` (mock HTTP server via .NET `HttpListener`): first-run install, binary + version-file assertions, PATH idempotency (second run), checksum-mismatch negative test. Green.
+- **`upgrade.sh` deprecated** — header updated; kept for legacy installs that pre-date native upgrade support.
+
+**Deviations from the M2 spec:**
+
+- Browser automation (`setup-browser.sh` chain) is intentionally untouched. The plugin-runtime replan note in the M1 record calls this out; the install.ps1 comment (`# intentionally omitted on Windows in M2`) matches. Browser support tracks to M3.
+- `windows-arm64` install is blocked on missing release artifacts; `install.ps1` gives an explicit error rather than silently failing.
+
+**Still pending — USER ACTION required:**
+
+The M2 manual-verification checklist from the M1 Completion Record (items 1–7, "M2 must verify manually on a real Windows host") has not been run yet. These items require a real Windows host and remain the M2 exit gate before the branch is merged to main.
+
+**Known issue (pre-existing, not introduced by M2):**
+
+The `test` job in `test-dist-scripts.yml` (BATS, `ubuntu-latest` + `macos-latest`) has been stale-red on `main` since 2026-03-11, before M2 work began. This is under separate investigation; the `windows-install` job is independent and green.

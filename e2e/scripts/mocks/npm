@@ -1,0 +1,22 @@
+#!/bin/bash
+# Mock npm — handles install -g for playwright-cli.
+# Logs calls for assertions.
+
+echo "npm $*" >> "${MOCK_NPM_LOG:-/dev/null}"
+
+# Simulate `npm install -g @playwright/cli` by creating a playwright-cli stub.
+if [ "$1" = "install" ] && [ "$2" = "-g" ]; then
+  # Determine install prefix: use AHAND_DATA_DIR/node/bin so the script's
+  # $NODE_DIR/bin/playwright-cli check succeeds.
+  if [ -n "${AHAND_DATA_DIR:-}" ]; then
+    MOCK_NODE_BIN="$AHAND_DATA_DIR/node/bin"
+    mkdir -p "$MOCK_NODE_BIN"
+    cat > "$MOCK_NODE_BIN/playwright-cli" <<'EOF'
+#!/bin/bash
+if [ "$1" = "--version" ]; then echo "0.1.1"; else echo "playwright-cli-fake $*"; fi
+EOF
+    chmod +x "$MOCK_NODE_BIN/playwright-cli"
+  fi
+fi
+
+exit 0

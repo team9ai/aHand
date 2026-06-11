@@ -12,8 +12,8 @@ use tracing::info;
 
 mod admin;
 mod browser_init;
-mod daemon;
-mod upgrade;
+use ahandctl::daemon;
+use ahandctl::upgrade;
 
 #[derive(Parser)]
 #[command(name = "ahandctl", about = "AHand CLI debug tool")]
@@ -168,6 +168,14 @@ enum SessionAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+
+    // Best-effort: remove any stale ahandctl.old left by a previous
+    // Windows self-swap.  Mirrors the ahandd startup hook.
+    // Honors AHAND_DIR exactly like `upgrade::resolve_ahand_home` does.
+    if let Ok(ahand_home) = upgrade::resolve_ahand_home() {
+        ahandd::updater::cleanup_old_binary_for(&ahand_home.join("bin"), "ahandctl");
+    }
+
     let args = Args::parse();
 
     // Commands that don't use IPC/WS, handle early

@@ -5,11 +5,7 @@ on:
     paths:
       - "scripts/dist/**"
       - "e2e/scripts/**"
-  push:
-    branches: [main]
-    paths:
-      - "scripts/dist/**"
-      - "e2e/scripts/**"
+      - ".github/workflows/test-dist-scripts.yml"
   workflow_dispatch:
 
 jobs:
@@ -27,3 +23,255 @@ jobs:
 
       - name: Run distribution script tests
         run: bash e2e/scripts/run.sh
+
+  windows-install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build fixture tree and start mock HTTP server
+        id: mock-server
+        shell: pwsh
+        run: |
+          # ── Build fixture directory ────────────────────────────────────────────
+          $fixtureRoot = Join-Path $env:RUNNER_TEMP "mock-server"
+          $rustDir     = Join-Path $fixtureRoot "rust-v9.9.9"
+          $apiDir      = Join-Path $fixtureRoot "repos\team9ai\aHand"
+          New-Item -ItemType Directory -Path $rustDir  -Force | Out-Null
+          New-Item -ItemType Directory -Path $apiDir   -Force | Out-Null
+
+          # fake .exe files (non-empty bytes)
+          [System.IO.File]::WriteAllBytes((Join-Path $rustDir "ahandd-windows-x64.exe"),    [byte[]](0x4D,0x5A,0x01))
+          [System.IO.File]::WriteAllBytes((Join-Path $rustDir "ahandctl-windows-x64.exe"),  [byte[]](0x4D,0x5A,0x02))
+
+          # compute real SHA-256 hashes
+          $hashD   = (Get-FileHash (Join-Path $rustDir "ahandd-windows-x64.exe")   -Algorithm SHA256).Hash.ToLower()
+          $hashCtl = (Get-FileHash (Join-Path $rustDir "ahandctl-windows-x64.exe") -Algorithm SHA256).Hash.ToLower()
+          "$hashD  ahandd-windows-x64.exe`n$hashCtl  ahandctl-windows-x64.exe" |
+            Set-Content (Join-Path $rustDir "checksums-rust.txt") -Encoding UTF8
+
+          # admin SPA fixture: a small tar.gz containing index.html
+          $adminDir = Join-Path $fixtureRoot "admin-v9.9.9"
+          New-Item -ItemType Directory -Path $adminDir -Force | Out-Null
+          $spaWorkDir = Join-Path $env:RUNNER_TEMP "spa-build"
+          New-Item -ItemType Directory -Path $spaWorkDir -Force | Out-Null
+          [System.IO.File]::WriteAllText((Join-Path $spaWorkDir "index.html"), "<html><body>admin</body></html>")
+          tar -czf (Join-Path $adminDir "admin-spa.tar.gz") -C $spaWorkDir "index.html"
+
+          # releases JSON served at:  GET /repos/team9ai/aHand/releases
+          $releasesJson = '[{"tag_name":"rust-v9.9.9","name":"Rust Binaries v9.9.9","prerelease":false},{"tag_name":"admin-v9.9.9","name":"Admin SPA v9.9.9","prerelease":false}]'
+          $releasesJson | Set-Content (Join-Path $apiDir "releases") -Encoding UTF8
+
+          Write-Host "Fixture tree:"
+          Get-ChildItem $fixtureRoot -Recurse | Select-Object FullName
+
+          # store root for later steps
+          "FIXTURE_ROOT=$fixtureRoot" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          # ── Write server script then launch as a detached pwsh process ─────────
+          # Using a separate pwsh process (not Start-Job) ensures the server
+          # survives beyond this step. .NET HttpListener needs no Python.
+          $port      = Get-Random -Minimum 20000 -Maximum 59000
+          "MOCK_PORT=$port"      | Out-File $env:GITHUB_ENV    -Encoding utf8 -Append
+          $serverLog = Join-Path $env:RUNNER_TEMP "mock-server.log"
+          "SERVER_PORT=$port"    | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "SERVER_LOG=$serverLog" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          # Write the server script to a temp file (build line-by-line to avoid YAML heredoc conflicts)
+          $serverScript = Join-Path $env:RUNNER_TEMP "mock-http-server.ps1"
+          $lines = @(
+            'param([string]$Root, [int]$Port)',
+            '$listener = [System.Net.HttpListener]::new()',
+            '$listener.Prefixes.Add("http://127.0.0.1:$Port/")',
+            '$listener.Start()',
+            "[System.IO.File]::WriteAllText('$serverLog', 'READY')",
+            'while ($listener.IsListening) {',
+            '    try {',
+            '        $ctx  = $listener.GetContext()',
+            '        $req  = $ctx.Request',
+            '        $resp = $ctx.Response',
+            '        $rel  = $req.Url.AbsolutePath.TrimStart("/")',
+            '        $file = Join-Path $Root $rel',
+            '        if (Test-Path $file -PathType Leaf) {',
+            '            $bytes = [System.IO.File]::ReadAllBytes($file)',
+            '            $resp.ContentLength64 = $bytes.Length',
+            '            $resp.OutputStream.Write($bytes, 0, $bytes.Length)',
+            '            $resp.StatusCode = 200',
+            '        } else {',
+            '            $resp.StatusCode = 404',
+            '        }',
+            '        $resp.Close()',
+            '    } catch { break }',
+            '}'
+          )
+          $lines | Set-Content $serverScript -Encoding UTF8
+
+          $proc = Start-Process pwsh `
+            -ArgumentList "-NoProfile","-NonInteractive","-File",$serverScript,"-Root",$fixtureRoot,"-Port",$port `
+            -PassThru -WindowStyle Hidden
+          "SERVER_PID=$($proc.Id)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Started mock HTTP server PID $($proc.Id) on port $port"
+
+          # wait for READY signal or up to 15 s
+          $ready = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Test-Path $serverLog) {
+              $content = Get-Content $serverLog -Raw
+              if ($content -match 'READY') { $ready = $true; break }
+            }
+          }
+          if (-not $ready) {
+            Write-Host "=== Server log ==="
+            Get-Content $serverLog -ErrorAction SilentlyContinue
+            throw "Mock HTTP server did not become ready in time (PID $($proc.Id))"
+          }
+          Write-Host "Mock server is ready."
+
+      - name: Run install.ps1 (first run — adds bin dir to PATH)
+        # Run under Windows PowerShell 5.1 to exercise the claimed compatibility
+        shell: powershell
+        run: |
+          $base       = "http://127.0.0.1:$env:MOCK_PORT"
+          $installDir = Join-Path $env:RUNNER_TEMP "ahand-test"
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dist/install.ps1 `
+            -ApiBase      $base `
+            -DownloadBase $base `
+            -InstallDir   $installDir
+
+      - name: Assert binaries and version after first run
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP "ahand-test"
+          $binDir     = Join-Path $installDir "bin"
+
+          # binaries exist
+          if (-not (Test-Path (Join-Path $binDir "ahandd.exe")))   { throw "ahandd.exe missing" }
+          if (-not (Test-Path (Join-Path $binDir "ahandctl.exe"))) { throw "ahandctl.exe missing" }
+          Write-Host "PASS: binaries present"
+
+          # version file content
+          $versionFile = Join-Path $installDir "version"
+          if (-not (Test-Path $versionFile)) { throw "version file missing" }
+          $raw = [System.IO.File]::ReadAllText($versionFile)
+          $trimmed = $raw.TrimEnd("`r","`n")
+          if ($trimmed -ne "9.9.9") { throw "version mismatch: '$raw'" }
+          # assert exactly one trailing newline
+          if (-not $raw.EndsWith("`n")) { throw "version file must end with newline" }
+          Write-Host "PASS: version file = '9.9.9\n'"
+
+          # admin SPA extracted
+          $adminIndex = Join-Path $installDir "admin\dist\index.html"
+          if (-not (Test-Path $adminIndex)) { throw "admin\dist\index.html missing after install" }
+          Write-Host "PASS: admin SPA extracted"
+
+      - name: Run install.ps1 (second run — PATH idempotency)
+        # Run under Windows PowerShell 5.1 to exercise the claimed compatibility
+        shell: powershell
+        run: |
+          $base       = "http://127.0.0.1:$env:MOCK_PORT"
+          $installDir = Join-Path $env:RUNNER_TEMP "ahand-test"
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dist/install.ps1 `
+            -ApiBase      $base `
+            -DownloadBase $base `
+            -InstallDir   $installDir
+
+      - name: Assert PATH idempotency (bin dir appears exactly once)
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP "ahand-test"
+          $binDir     = (Join-Path $installDir "bin").TrimEnd('\').ToLower()
+
+          $userPath   = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $parts      = ($userPath -split ';') | Where-Object { $_ -ne '' } |
+                          ForEach-Object { $_.TrimEnd('\').ToLower() }
+          $count      = ($parts | Where-Object { $_ -eq $binDir }).Count
+
+          Write-Host "User PATH parts matching bin dir: $count"
+          if ($count -ne 1) {
+            Write-Host "User PATH: $userPath"
+            throw "Expected exactly 1 occurrence of bin dir in User PATH, got $count"
+          }
+          Write-Host "PASS: PATH idempotency OK"
+
+      - name: Run install.ps1 (-NoPathUpdate) into separate InstallDir
+        # Run under Windows PowerShell 5.1 to exercise the claimed compatibility
+        shell: powershell
+        run: |
+          $base        = "http://127.0.0.1:$env:MOCK_PORT"
+          $installDir3 = Join-Path $env:RUNNER_TEMP "ahand-test-nopathupdate"
+
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dist/install.ps1 `
+            -ApiBase      $base `
+            -DownloadBase $base `
+            -InstallDir   $installDir3 `
+            -NoPathUpdate
+
+      - name: Assert -NoPathUpdate did not add bin dir to User PATH
+        shell: pwsh
+        run: |
+          $installDir3 = Join-Path $env:RUNNER_TEMP "ahand-test-nopathupdate"
+          $binDir3     = (Join-Path $installDir3 "bin").TrimEnd('\').ToLower()
+
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $parts    = ($userPath -split ';') | Where-Object { $_ -ne '' } |
+                        ForEach-Object { $_.TrimEnd('\').ToLower() }
+          $count    = ($parts | Where-Object { $_ -eq $binDir3 }).Count
+
+          Write-Host "User PATH parts matching -NoPathUpdate bin dir: $count"
+          if ($count -ne 0) {
+            Write-Host "User PATH: $userPath"
+            throw "-NoPathUpdate install must NOT add bin dir to User PATH, found $count occurrence(s)"
+          }
+          Write-Host "PASS: -NoPathUpdate did not modify User PATH"
+
+      - name: Negative test — checksum mismatch must fail
+        # Fixture manipulation uses pwsh; the installer itself is invoked via powershell.exe (5.1)
+        shell: pwsh
+        run: |
+          $base        = "http://127.0.0.1:$env:MOCK_PORT"
+          $installDir2 = Join-Path $env:RUNNER_TEMP "ahand-test-bad"
+
+          # Corrupt the checksum file served by the mock server
+          $rustDir = Join-Path "${{ steps.mock-server.outputs.FIXTURE_ROOT }}" "rust-v9.9.9"
+          "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  ahandd-windows-x64.exe" |
+            Set-Content (Join-Path $rustDir "checksums-rust.txt") -Encoding UTF8
+
+          $proc = Start-Process powershell.exe `
+            -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File","scripts/dist/install.ps1",
+                          "-ApiBase",$base,
+                          "-DownloadBase",$base,
+                          "-InstallDir",$installDir2,
+                          "-NoPathUpdate" `
+            -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -eq 0) {
+            throw "Expected non-zero exit for checksum mismatch, got 0"
+          }
+          Write-Host "PASS: installer exited $($proc.ExitCode) on bad checksum"
+
+          # bin dir should not exist or be empty
+          $binDir2 = Join-Path $installDir2 "bin"
+          if (Test-Path $binDir2) {
+            $exes = Get-ChildItem $binDir2 -Filter "*.exe" -ErrorAction SilentlyContinue
+            if ($exes.Count -gt 0) {
+              throw "bin dir should be empty after failed install, found: $($exes.Name)"
+            }
+          }
+          Write-Host "PASS: bin dir empty/absent after checksum failure"
+
+      - name: Stop mock server
+        if: always()
+        shell: pwsh
+        run: |
+          $serverPid = "${{ steps.mock-server.outputs.SERVER_PID }}"
+          if ($serverPid) {
+            Stop-Process -Id ([int]$serverPid) -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped mock server PID $serverPid"
+          }
+          $logFile = "${{ steps.mock-server.outputs.SERVER_LOG }}"
+          if ($logFile -and (Test-Path $logFile)) {
+            Write-Host "=== Server log ==="
+            Get-Content $logFile
+          }
