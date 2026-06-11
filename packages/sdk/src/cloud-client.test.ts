@@ -2038,6 +2038,33 @@ describe("CloudClient.listAppTools", () => {
     const err = await client.listAppTools("d").catch((e) => e);
     expect(err).toBe(tokenErr);
   });
+
+  it("bad: 200 with non-JSON body → CloudClientError(server_error)", async () => {
+    const fakeFetch = async () =>
+      new Response("<html>gateway error</html>", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(client.listAppTools("d")).rejects.toMatchObject({
+      code: "server_error",
+    });
+  });
+
+  it("bad: response has revision but missing tools array → CloudClientError(server_error)", async () => {
+    // revision present and numeric but `tools` is missing — the shape check
+    // now also requires an array `tools` field.
+    const { fn } = mockFetch([
+      () => jsonResponse({ revision: 1, stale: false, updatedAtMs: 0 }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await expect(client.listAppTools("d")).rejects.toMatchObject({
+      code: "server_error",
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2164,5 +2191,62 @@ describe("CloudClient.invokeAppTool", () => {
     });
     const err = await client.invokeAppTool("d", "t").catch((e) => e);
     expect(err).toBe(tokenErr);
+  });
+
+  it("bad: 200 with non-JSON body → CloudClientError(server_error)", async () => {
+    const fakeFetch = async () =>
+      new Response("<html>gateway error</html>", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(client.invokeAppTool("d", "t")).rejects.toMatchObject({
+      code: "server_error",
+    });
+  });
+
+  it.each([
+    ["null literal", "null"],
+    ["number primitive", "42"],
+    ["JSON array", "[]"],
+  ])(
+    "bad: 200 body is malformed root (%s) → CloudClientError(server_error)",
+    async (_label, bodyText) => {
+      const fakeFetch = async () =>
+        new Response(bodyText, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      const client = new CloudClient({
+        ...BASE_OPTS,
+        fetch: fakeFetch as typeof fetch,
+      });
+      await expect(client.invokeAppTool("d", "t")).rejects.toMatchObject({
+        code: "server_error",
+      });
+    },
+  );
+
+  it("bad: daemon error with missing message → 'app tool failed' fallback + jobErrorMessage undefined", async () => {
+    // Daemon returns an error object with only a `code`, no `message`.
+    // The error message should fall back to "app tool failed" and
+    // jobErrorMessage should be undefined (not set from undefined).
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse({
+          toolCallId: "tc-err",
+          error: { code: "HANDLER_PANIC" },
+        }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.invokeAppTool("d", "t").catch((e) => e);
+    expect(err).toBeInstanceOf(CloudClientError);
+    expect((err as CloudClientError).code).toBe("app_tool_error");
+    expect((err as CloudClientError).message).toBe("app tool failed");
+    expect((err as CloudClientError).jobErrorCode).toBe("HANDLER_PANIC");
+    expect((err as CloudClientError).jobErrorMessage).toBeUndefined();
   });
 });
