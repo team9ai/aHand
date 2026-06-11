@@ -82,7 +82,7 @@
     {
       "id": 10,
       "subject": "Task 10: CI — 3-OS client test lane + Windows release artifacts",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         2,
         3,
