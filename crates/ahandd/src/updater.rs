@@ -312,15 +312,25 @@ fn install_binary(data: &[u8], target_version: &str) -> anyhow::Result<()> {
     install_binary_into(&home.join(".ahand"), data, target_version)
 }
 
-pub fn install_binary_into(
-    ahand_home: &std::path::Path,
+/// Write `data` as `{bin_dir}/{base_name}[.exe]`, using rename-aside on
+/// Windows so a running copy of the binary can be replaced safely.
+///
+/// Steps:
+/// 1. Write `{base_name}.update.tmp` to `bin_dir`.
+/// 2. Unix: `chmod 0o755`; Windows: remove stale `.old`, rename target → `.old`,
+///    rename tmp → target (rollback on failure).
+/// 3. Non-Windows: atomic `rename(tmp → target)`.
+///
+/// This is the general-purpose swap used by both the daemon self-update path
+/// (`install_binary_into` / "ahandd") and the CLI upgrade path ("ahandctl").
+pub fn swap_binary_into(
+    bin_dir: &std::path::Path,
+    base_name: &str,
     data: &[u8],
-    target_version: &str,
 ) -> anyhow::Result<()> {
-    let bin_dir = ahand_home.join("bin");
-    std::fs::create_dir_all(&bin_dir)?;
+    std::fs::create_dir_all(bin_dir)?;
 
-    let bin_name = ahand_platform::paths::exe_name("ahandd");
+    let bin_name = ahand_platform::paths::exe_name(base_name);
     let target_path = bin_dir.join(&bin_name);
     let tmp_path = bin_dir.join(format!("{bin_name}.update.tmp"));
 
@@ -382,7 +392,19 @@ pub fn install_binary_into(
     #[cfg(not(windows))]
     std::fs::rename(&tmp_path, &target_path)?;
 
-    info!(path = %target_path.display(), "installed new binary");
+    info!(path = %target_path.display(), "installed binary '{}'", base_name);
+    Ok(())
+}
+
+pub fn install_binary_into(
+    ahand_home: &std::path::Path,
+    data: &[u8],
+    target_version: &str,
+) -> anyhow::Result<()> {
+    let bin_dir = ahand_home.join("bin");
+
+    // Delegate to the generalised swap (preserves all existing behaviour).
+    swap_binary_into(&bin_dir, "ahandd", data)?;
 
     // Write version marker.
     let version_path = ahand_home.join("version");
@@ -390,6 +412,21 @@ pub fn install_binary_into(
     info!(version = %target_version, "wrote version marker");
 
     Ok(())
+}
+
+/// Remove the stale `{base_name}[.exe].old` file left by a previous Windows
+/// self-update for any binary.  Best-effort: logs warnings on failure but does
+/// not return an error.
+pub fn cleanup_old_binary_for(bin_dir: &std::path::Path, base_name: &str) {
+    let bin_name = ahand_platform::paths::exe_name(base_name);
+    let old_path = bin_dir.join(format!("{bin_name}.old"));
+    if old_path.exists() {
+        if let Err(e) = std::fs::remove_file(&old_path) {
+            warn!(path = %old_path.display(), error = %e, "failed to remove stale .old binary");
+        } else {
+            info!(path = %old_path.display(), "removed stale .old binary");
+        }
+    }
 }
 
 /// Remove the stale `.old` binary left by a previous Windows self-update.
@@ -401,15 +438,7 @@ pub fn cleanup_old_binary() {
 }
 
 fn cleanup_old_binary_in(ahand_home: &std::path::Path) {
-    let bin_name = ahand_platform::paths::exe_name("ahandd");
-    let old_path = ahand_home.join("bin").join(format!("{bin_name}.old"));
-    if old_path.exists() {
-        if let Err(e) = std::fs::remove_file(&old_path) {
-            warn!(path = %old_path.display(), error = %e, "failed to remove stale .old binary");
-        } else {
-            info!(path = %old_path.display(), "removed stale .old binary");
-        }
-    }
+    cleanup_old_binary_for(&ahand_home.join("bin"), "ahandd");
 }
 
 fn restart_daemon() -> anyhow::Result<()> {
@@ -512,7 +541,8 @@ mod install_tests {
             .join("bin")
             .join(ahand_platform::paths::exe_name("ahandd"));
         assert_eq!(std::fs::read(&bin).unwrap(), b"v2");
-        cleanup_old_binary_in(tmp.path());
+        // cleanup_old_binary_in is private; call the public generalised version.
+        cleanup_old_binary_for(&tmp.path().join("bin"), "ahandd");
         let old = tmp
             .path()
             .join("bin")
@@ -585,6 +615,74 @@ mod install_tests {
         std::fs::rename(&old_path, &target_path).unwrap();
         assert!(target_path.exists(), "original binary should be restored");
         assert_eq!(std::fs::read(&target_path).unwrap(), b"v1");
+    }
+}
+
+#[cfg(test)]
+mod swap_tests {
+    use super::*;
+
+    /// swap_binary_into with a custom base_name writes the correct file name.
+    #[test]
+    fn swap_binary_into_arbitrary_base_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        swap_binary_into(&bin_dir, "ahandctl", b"ctl-bytes").unwrap();
+        let bin_name = ahand_platform::paths::exe_name("ahandctl");
+        let bin_path = bin_dir.join(&bin_name);
+        assert_eq!(std::fs::read(&bin_path).unwrap(), b"ctl-bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&bin_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o111, 0o111, "binary must be executable after swap");
+        }
+    }
+
+    /// swap_binary_into replaces an existing binary.
+    #[test]
+    fn swap_binary_into_replaces_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        swap_binary_into(&bin_dir, "mybin", b"v1").unwrap();
+        swap_binary_into(&bin_dir, "mybin", b"v2").unwrap();
+        let bin_name = ahand_platform::paths::exe_name("mybin");
+        assert_eq!(std::fs::read(bin_dir.join(&bin_name)).unwrap(), b"v2");
+    }
+
+    /// install_binary_into still uses swap_binary_into correctly (delegation
+    /// keeps existing behaviour: exe named "ahandd", version marker written).
+    #[test]
+    fn install_binary_into_delegates_to_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_binary_into(tmp.path(), b"daemon-v3", "3.0.0").unwrap();
+        let bin_name = ahand_platform::paths::exe_name("ahandd");
+        let bin = tmp.path().join("bin").join(&bin_name);
+        assert_eq!(std::fs::read(&bin).unwrap(), b"daemon-v3");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("version")).unwrap(),
+            "3.0.0"
+        );
+    }
+
+    /// cleanup_old_binary_for removes .old for an arbitrary base_name.
+    #[test]
+    fn cleanup_old_binary_for_removes_old_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let bin_name = ahand_platform::paths::exe_name("mything");
+        let old_path = bin_dir.join(format!("{bin_name}.old"));
+        std::fs::write(&old_path, b"stale").unwrap();
+        cleanup_old_binary_for(&bin_dir, "mything");
+        assert!(!old_path.exists(), ".old should be removed");
+    }
+
+    /// cleanup_old_binary_for is a no-op when .old does not exist.
+    #[test]
+    fn cleanup_old_binary_for_no_op_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Should not panic or error.
+        cleanup_old_binary_for(tmp.path(), "noexist");
     }
 }
 

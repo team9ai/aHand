@@ -12,7 +12,7 @@ use tracing::info;
 
 mod admin;
 mod browser_init;
-mod daemon;
+use ahandctl::daemon;
 use ahandctl::upgrade;
 
 #[derive(Parser)]
@@ -168,6 +168,16 @@ enum SessionAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
+
+    // Best-effort: remove any stale ahandctl.old left by a previous
+    // Windows self-swap.  Mirrors the ahandd startup hook.
+    {
+        let bin_dir = dirs::home_dir().map(|h| h.join(".ahand").join("bin"));
+        if let Some(ref dir) = bin_dir {
+            ahandd::updater::cleanup_old_binary_for(dir, "ahandctl");
+        }
+    }
+
     let args = Args::parse();
 
     // Commands that don't use IPC/WS, handle early

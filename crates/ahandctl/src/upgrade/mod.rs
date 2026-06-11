@@ -1,7 +1,9 @@
-//! Native upgrade-check and (future) upgrade execution for `ahandctl upgrade`.
+//! Native upgrade-check and upgrade execution for `ahandctl upgrade`.
 
+mod assets;
 mod release;
 
+pub use assets::extract_admin_spa;
 pub use release::{ReleaseInfo, current_version, resolve_latest, resolve_target};
 
 use std::path::{Path, PathBuf};
@@ -10,6 +12,9 @@ use anyhow::Context as _;
 
 /// GitHub API base URL — injected by tests via [`run_with_bases`].
 const DEFAULT_API_BASE: &str = "https://api.github.com";
+
+/// Default download base URL for release assets.
+const DEFAULT_DOWNLOAD_BASE: &str = "https://github.com/team9ai/aHand/releases/download";
 
 /// Default GitHub repository slug.
 const DEFAULT_REPO: &str = "team9ai/aHand";
@@ -31,12 +36,14 @@ pub async fn run(check_only: bool, target_version: Option<String>) -> anyhow::Re
         check_only,
         version_override.as_deref(),
         DEFAULT_API_BASE,
+        DEFAULT_DOWNLOAD_BASE,
         &ahand_home,
     )
     .await
 }
 
-/// Testable seam: run the upgrade command with injected API base and aHand home.
+/// Testable seam: run the upgrade command with injected API base, download base,
+/// and aHand home.
 ///
 /// This keeps [`run`] a thin wrapper so integration tests can inject a local
 /// stub server (no network) and a temporary directory (no marker file
@@ -45,6 +52,7 @@ pub async fn run_with_bases(
     check_only: bool,
     version_override: Option<&str>,
     api_base: &str,
+    download_base: &str,
     ahand_home: &Path,
 ) -> anyhow::Result<()> {
     if check_only {
@@ -55,7 +63,7 @@ pub async fn run_with_bases(
 
     let cur = current_version(ahand_home);
     let info = resolve_target(version_override, api_base, DEFAULT_REPO).await?;
-    perform_upgrade(&cur, &info, api_base, ahand_home).await
+    assets::perform_upgrade(&info, &cur, download_base, ahand_home).await
 }
 
 /// Build and return the check-mode output string.
@@ -110,20 +118,6 @@ pub fn build_check_output(
     format!(
         "Current version: {current}\nLatest version:  rust={latest_rust} admin={admin_display} browser={browser_display}\nPlatform:        {suffix}\n{status_line}"
     )
-}
-
-/// Perform the actual upgrade.
-///
-/// NOTE: Full native upgrade implementation lands in the next change (Task 3).
-/// For now this stub returns an error with the pinned message below so callers
-/// can distinguish "not yet implemented" from a real failure.
-async fn perform_upgrade(
-    _current: &str,
-    _info: &ReleaseInfo,
-    _api_base: &str,
-    _ahand_home: &Path,
-) -> anyhow::Result<()> {
-    anyhow::bail!("full native upgrade lands in the next change; use --check to query versions")
 }
 
 // ── Private helpers ────────────────────────────────────────────────────────

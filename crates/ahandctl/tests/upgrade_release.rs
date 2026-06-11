@@ -1,21 +1,31 @@
-//! Integration tests for the native upgrade-check path.
+//! Integration tests for the native upgrade-check and upgrade paths.
 //!
-//! A small axum stub server stands in for `api.github.com`, letting tests
-//! exercise the full `resolve_latest` / `run_with_bases` stack without any
-//! network calls.  Pattern mirrors `ahandd/tests/file_ops_s3_write.rs`.
+//! A small axum stub server stands in for `api.github.com` *and* the GitHub
+//! release download CDN, letting tests exercise the full
+//! `resolve_latest` / `run_with_bases` stack without any network calls.
+//! Pattern mirrors `ahandd/tests/file_ops_s3_write.rs`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ahandctl::upgrade::{
     build_check_output, check_output, resolve_latest, resolve_target, run_with_bases,
 };
-use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+use axum::body::Body;
+use axum::{
+    Router,
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-// ── Stub server ────────────────────────────────────────────────────────────
+// ── Stub server (API releases endpoint) ───────────────────────────────────
 
 #[derive(Clone)]
 enum StubMode {
@@ -79,6 +89,85 @@ async fn spawn_stub(mode: StubMode) -> StubServer {
     }
 }
 
+// ── Full-upgrade stub server ───────────────────────────────────────────────
+
+/// Assets served by the download stub.
+/// Key: URL path (e.g. "/rust-v0.2.0/ahandd-linux-x64"), Value: bytes.
+#[derive(Clone)]
+struct DownloadState {
+    /// API releases JSON body.
+    releases_json: String,
+    /// Assets keyed by URL path suffix after the base.
+    assets: Arc<HashMap<String, Vec<u8>>>,
+}
+
+async fn download_stub_handler(
+    AxumPath(tail): AxumPath<String>,
+    State(state): State<Arc<DownloadState>>,
+) -> impl IntoResponse {
+    if let Some(body) = state.assets.get(&format!("/{tail}")) {
+        (StatusCode::OK, Body::from(body.clone())).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Body::from("not found")).into_response()
+    }
+}
+
+async fn download_releases_handler(State(state): State<Arc<DownloadState>>) -> impl IntoResponse {
+    (StatusCode::OK, state.releases_json.clone()).into_response()
+}
+
+struct FullStub {
+    addr: std::net::SocketAddr,
+    shutdown: oneshot::Sender<()>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl FullStub {
+    fn api_base(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    fn download_base(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    async fn stop(self) {
+        let _ = self.shutdown.send(());
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.handle).await;
+    }
+}
+
+async fn spawn_full_stub(releases_json: String, assets: HashMap<String, Vec<u8>>) -> FullStub {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(DownloadState {
+        releases_json,
+        assets: Arc::new(assets),
+    });
+    let app = Router::new()
+        .route(
+            "/repos/team9ai/aHand/releases",
+            get(download_releases_handler),
+        )
+        .route("/{*tail}", get(download_stub_handler))
+        .with_state(state);
+    let (tx, rx) = oneshot::channel();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    FullStub {
+        addr,
+        shutdown: tx,
+        handle,
+    }
+}
+
 // ── Fixture helpers ────────────────────────────────────────────────────────
 
 /// A releases array with three up-to-date tags followed by older ones.
@@ -107,6 +196,102 @@ fn fixture_empty() -> String {
 /// Malformed JSON.
 fn fixture_malformed() -> String {
     "not-json{{{".to_string()
+}
+
+/// Returns the platform suffix that the upgrade code will use.
+fn platform_suffix() -> String {
+    ahand_platform::paths::release_suffix()
+}
+
+/// Build fake binary bytes (not real ELF/PE, just enough to verify we wrote them).
+fn fake_binary_bytes(name: &str) -> Vec<u8> {
+    format!("fake-binary-content-for-{name}").into_bytes()
+}
+
+/// Build a minimal valid gzip-compressed tar archive with one file inside.
+fn make_tar_gz(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+        let mut ar = tar::Builder::new(enc);
+        for (path, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            ar.append_data(&mut header, path, std::io::Cursor::new(data))
+                .unwrap();
+        }
+        ar.finish().unwrap();
+    }
+    buf
+}
+
+/// Build a tar.gz archive with a single entry at `path` (arbitrary, may
+/// include `..` or leading `/` for traversal tests).
+///
+/// The `tar` crate's safe API rejects paths with `..` or `/`, so we write
+/// a raw POSIX ustar header to bypass those checks.
+fn make_raw_tar_gz_with_path(path: &str, data: &[u8]) -> Vec<u8> {
+    // POSIX ustar header: 512 bytes.
+    let mut header = [0u8; 512];
+
+    // Name field: bytes 0..100.
+    let name_bytes = path.as_bytes();
+    let name_len = name_bytes.len().min(100);
+    header[..name_len].copy_from_slice(&name_bytes[..name_len]);
+
+    // File mode: bytes 100..108 — "0000644\0"
+    header[100..107].copy_from_slice(b"0000644");
+    header[107] = 0;
+
+    // UID/GID: bytes 108..124
+    header[108..115].copy_from_slice(b"0000000");
+    header[115] = 0;
+    header[116..123].copy_from_slice(b"0000000");
+    header[123] = 0;
+
+    // Size: bytes 124..136 (octal, null-terminated).
+    let size_str = format!("{:011o}\0", data.len());
+    header[124..136].copy_from_slice(size_str.as_bytes());
+
+    // Modification time: bytes 136..148
+    header[136..147].copy_from_slice(b"00000000000");
+    header[147] = 0;
+
+    // Type flag: bytes 156 — '0' = regular file.
+    header[156] = b'0';
+
+    // Magic: bytes 257..265 — "ustar  \0"
+    header[257..265].copy_from_slice(b"ustar  \0");
+
+    // Compute checksum (bytes 148..156 are treated as spaces during calc).
+    header[148..156].copy_from_slice(b"        ");
+    let cksum: u32 = header.iter().map(|&b| b as u32).sum();
+    let cksum_str = format!("{:06o}\0 ", cksum);
+    header[148..156].copy_from_slice(cksum_str.as_bytes());
+
+    // Pad data to a 512-byte boundary.
+    let padded_len = (data.len() + 511) & !511;
+    let mut raw_tar: Vec<u8> = Vec::with_capacity(512 + padded_len + 1024);
+    raw_tar.extend_from_slice(&header);
+    raw_tar.extend_from_slice(data);
+    raw_tar.extend(std::iter::repeat_n(0u8, padded_len - data.len()));
+    // Two 512-byte zero blocks = end-of-archive.
+    raw_tar.extend(std::iter::repeat_n(0u8, 1024));
+
+    // Gzip-compress.
+    let mut gz_buf = Vec::new();
+    let mut enc = flate2::write::GzEncoder::new(&mut gz_buf, flate2::Compression::default());
+    std::io::Write::write_all(&mut enc, &raw_tar).unwrap();
+    enc.finish().unwrap();
+    gz_buf
+}
+
+/// Build a checksums-rust.txt line in shasum-a-256 format.
+fn make_checksum_line(filename: &str, data: &[u8]) -> String {
+    let hex = hex::encode(Sha256::digest(data));
+    format!("{hex}  {filename}\n")
 }
 
 // ── resolve_latest tests ───────────────────────────────────────────────────
@@ -182,7 +367,7 @@ async fn resolve_latest_api_500_returns_err() {
 async fn run_with_bases_empty_releases_errors_with_could_not_determine() {
     let stub = spawn_stub(StubMode::Ok(fixture_empty())).await;
     let tmp = TempDir::new().unwrap();
-    let err = run_with_bases(true, None, &stub.api_base(), tmp.path())
+    let err = run_with_bases(true, None, &stub.api_base(), "http://unused", tmp.path())
         .await
         .unwrap_err();
 
@@ -275,24 +460,6 @@ async fn current_version_absent_marker_falls_back_to_cargo_pkg_version() {
     assert_eq!(ver, env!("CARGO_PKG_VERSION"));
 }
 
-/// Non-check mode (check_only=false) errors with the pinned stub message.
-#[tokio::test]
-async fn run_with_bases_non_check_errors_with_stub_message() {
-    let stub = spawn_stub(StubMode::Ok(fixture_all_tags())).await;
-    let tmp = TempDir::new().unwrap();
-
-    let err = run_with_bases(false, None, &stub.api_base(), tmp.path())
-        .await
-        .unwrap_err();
-
-    assert_eq!(
-        err.to_string(),
-        "full native upgrade lands in the next change; use --check to query versions"
-    );
-
-    stub.stop().await;
-}
-
 // ── build_check_output unit tests ─────────────────────────────────────────
 
 /// When current == latest rust → "Already up to date!".
@@ -326,4 +493,416 @@ fn build_check_output_none_artefacts_display_as_none() {
     let out = build_check_output("0.2.0", "0.2.0", "none", "none", "windows-x64");
     assert!(out.contains("admin=none"), "got: {out}");
     assert!(out.contains("browser=none"), "got: {out}");
+}
+
+// ── Full upgrade happy path (unix CI) ─────────────────────────────────────
+
+/// Full-flow happy path: stub serves fake binaries + matching checksums +
+/// small valid admin-spa.tar.gz; asserts binaries installed, dist file present,
+/// version marker written, output contains "Upgrade complete".
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_full_flow_happy_path() {
+    let suffix = platform_suffix();
+    let ver = "0.2.0";
+
+    let ahandd_filename = format!("ahandd-{suffix}");
+    let ahandctl_filename = format!("ahandctl-{suffix}");
+
+    let ahandd_bytes = fake_binary_bytes("ahandd");
+    let ahandctl_bytes = fake_binary_bytes("ahandctl");
+    let spa_content = b"index.html-content";
+    let spa_tar = make_tar_gz(&[("index.html", spa_content)]);
+
+    let mut cs = String::new();
+    cs.push_str(&make_checksum_line(&ahandd_filename, &ahandd_bytes));
+    cs.push_str(&make_checksum_line(&ahandctl_filename, &ahandctl_bytes));
+
+    let mut assets: HashMap<String, Vec<u8>> = HashMap::new();
+    assets.insert(format!("/rust-v{ver}/checksums-rust.txt"), cs.into_bytes());
+    assets.insert(
+        format!("/rust-v{ver}/{ahandd_filename}"),
+        ahandd_bytes.clone(),
+    );
+    assets.insert(
+        format!("/rust-v{ver}/{ahandctl_filename}"),
+        ahandctl_bytes.clone(),
+    );
+    assets.insert(format!("/admin-v{ver}/admin-spa.tar.gz"), spa_tar);
+
+    let releases_json = format!(
+        r#"[{{"tag_name":"rust-v{ver}"}},{{"tag_name":"admin-v{ver}"}},{{"tag_name":"browser-v{ver}"}}]"#
+    );
+
+    let stub = spawn_full_stub(releases_json, assets).await;
+    let tmp = TempDir::new().unwrap();
+
+    let result = run_with_bases(
+        false,
+        Some(ver),
+        &stub.api_base(),
+        &stub.download_base(),
+        tmp.path(),
+    )
+    .await;
+
+    stub.stop().await;
+
+    result.expect("upgrade should succeed");
+
+    // Binaries installed at bin/
+    let bin_dir = tmp.path().join("bin");
+    let ahandd_path = bin_dir.join(ahand_platform::paths::exe_name("ahandd"));
+    let ahandctl_path = bin_dir.join(ahand_platform::paths::exe_name("ahandctl"));
+    assert!(ahandd_path.exists(), "ahandd binary should be installed");
+    assert!(
+        ahandctl_path.exists(),
+        "ahandctl binary should be installed"
+    );
+    assert_eq!(std::fs::read(&ahandd_path).unwrap(), ahandd_bytes);
+    assert_eq!(std::fs::read(&ahandctl_path).unwrap(), ahandctl_bytes);
+
+    // Exec bit set.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&ahandd_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "ahandd not executable");
+        let mode = std::fs::metadata(&ahandctl_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "ahandctl not executable");
+    }
+
+    // Admin SPA extracted.
+    let dist_file = tmp.path().join("admin").join("dist").join("index.html");
+    assert!(dist_file.exists(), "admin dist file should be extracted");
+    assert_eq!(std::fs::read(&dist_file).unwrap(), b"index.html-content");
+
+    // Version marker written.
+    assert_eq!(
+        ahand_platform::paths::read_version_marker(tmp.path()),
+        Some(ver.to_string())
+    );
+}
+
+// ── Checksum mismatch → Err BEFORE install ────────────────────────────────
+
+/// Checksum mismatch for ahandd → hard error BEFORE any binary is installed.
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_checksum_mismatch_errors_before_install() {
+    let suffix = platform_suffix();
+    let ver = "0.3.0";
+
+    let ahandd_filename = format!("ahandd-{suffix}");
+    let ahandctl_filename = format!("ahandctl-{suffix}");
+
+    let ahandd_bytes = fake_binary_bytes("ahandd");
+    let ahandctl_bytes = fake_binary_bytes("ahandctl");
+
+    // Checksum for ahandd is deliberately WRONG.
+    let wrong_hex = "0000000000000000000000000000000000000000000000000000000000000000";
+    let mut cs = String::new();
+    cs.push_str(&format!("{wrong_hex}  {ahandd_filename}\n"));
+    cs.push_str(&make_checksum_line(&ahandctl_filename, &ahandctl_bytes));
+
+    let mut assets: HashMap<String, Vec<u8>> = HashMap::new();
+    assets.insert(format!("/rust-v{ver}/checksums-rust.txt"), cs.into_bytes());
+    assets.insert(format!("/rust-v{ver}/{ahandd_filename}"), ahandd_bytes);
+    assets.insert(format!("/rust-v{ver}/{ahandctl_filename}"), ahandctl_bytes);
+
+    let releases_json = format!(r#"[{{"tag_name":"rust-v{ver}"}}]"#);
+    let stub = spawn_full_stub(releases_json, assets).await;
+    let tmp = TempDir::new().unwrap();
+
+    let err = run_with_bases(
+        false,
+        Some(ver),
+        &stub.api_base(),
+        &stub.download_base(),
+        tmp.path(),
+    )
+    .await
+    .unwrap_err();
+
+    stub.stop().await;
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("checksum") || msg.contains("mismatch"),
+        "error should mention checksum, got: {msg}"
+    );
+
+    // BEFORE any install: bin/ must be empty (no binaries written).
+    let bin_dir = tmp.path().join("bin");
+    assert!(
+        !bin_dir.exists() || std::fs::read_dir(&bin_dir).unwrap().next().is_none(),
+        "bin/ must be empty when checksum fails before install"
+    );
+}
+
+// ── Tar path-traversal → Err ───────────────────────────────────────────────
+
+/// Tar with `../escape` entry → Err, nothing extracted outside dist.
+#[test]
+fn extract_admin_spa_rejects_path_traversal() {
+    // The `tar` crate refuses to build archives with `..` paths using safe APIs.
+    // Build the archive using raw ustar bytes to bypass that check.
+    let buf = make_raw_tar_gz_with_path("../escape.txt", b"evil");
+
+    let tmp = TempDir::new().unwrap();
+    let dist_dir = tmp.path().join("dist");
+
+    let err = ahandctl::upgrade::extract_admin_spa(&buf, &dist_dir).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("traversal") || msg.contains("..") || msg.contains("path"),
+        "should report path traversal, got: {msg}"
+    );
+
+    // Nothing should have been extracted outside dist.
+    let escaped = tmp.path().join("escape.txt");
+    assert!(
+        !escaped.exists(),
+        "traversal file must not be created outside dist"
+    );
+}
+
+// ── Required binary 404 → clear Err ──────────────────────────────────────
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_required_binary_404_returns_err() {
+    let suffix = platform_suffix();
+    let ver = "0.4.0";
+    // No assets at all → ahandd download will 404.
+    let releases_json = format!(r#"[{{"tag_name":"rust-v{ver}"}}]"#);
+    let stub = spawn_full_stub(releases_json, HashMap::new()).await;
+    let tmp = TempDir::new().unwrap();
+
+    let err = run_with_bases(
+        false,
+        Some(ver),
+        &stub.api_base(),
+        &stub.download_base(),
+        tmp.path(),
+    )
+    .await
+    .unwrap_err();
+
+    stub.stop().await;
+
+    let msg = err.to_string();
+    // Should mention either the 404 HTTP status or that the download failed.
+    assert!(
+        msg.contains("404") || msg.contains("failed to download") || msg.contains("HTTP"),
+        "expected download error, got: {msg}"
+    );
+    let _ = suffix; // suppress unused warning on non-unix
+}
+
+// ── Checksums 404 → proceeds without verify ───────────────────────────────
+
+/// When the checksums file is absent (404), the upgrade should succeed
+/// (no verification performed, which matches upgrade.sh behaviour).
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_checksums_404_proceeds_and_succeeds() {
+    let suffix = platform_suffix();
+    let ver = "0.5.0";
+
+    let ahandd_filename = format!("ahandd-{suffix}");
+    let ahandctl_filename = format!("ahandctl-{suffix}");
+
+    let ahandd_bytes = fake_binary_bytes("ahandd");
+    let ahandctl_bytes = fake_binary_bytes("ahandctl");
+
+    // No checksums file in assets.
+    let mut assets: HashMap<String, Vec<u8>> = HashMap::new();
+    assets.insert(format!("/rust-v{ver}/{ahandd_filename}"), ahandd_bytes);
+    assets.insert(format!("/rust-v{ver}/{ahandctl_filename}"), ahandctl_bytes);
+
+    let releases_json = format!(r#"[{{"tag_name":"rust-v{ver}"}}]"#);
+    let stub = spawn_full_stub(releases_json, assets).await;
+    let tmp = TempDir::new().unwrap();
+
+    let result = run_with_bases(
+        false,
+        Some(ver),
+        &stub.api_base(),
+        &stub.download_base(),
+        tmp.path(),
+    )
+    .await;
+
+    stub.stop().await;
+
+    result.expect("upgrade should succeed even when checksums 404");
+
+    // Binaries installed.
+    let bin_dir = tmp.path().join("bin");
+    assert!(
+        bin_dir
+            .join(ahand_platform::paths::exe_name("ahandd"))
+            .exists()
+    );
+    assert!(
+        bin_dir
+            .join(ahand_platform::paths::exe_name("ahandctl"))
+            .exists()
+    );
+}
+
+// ── No admin version → skips admin step ───────────────────────────────────
+
+/// When `info.admin` is None, the admin step is skipped; binaries still
+/// installed and version marker written.
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_no_admin_version_skips_admin_step() {
+    let suffix = platform_suffix();
+    let ver = "0.6.0";
+
+    let ahandd_filename = format!("ahandd-{suffix}");
+    let ahandctl_filename = format!("ahandctl-{suffix}");
+
+    let ahandd_bytes = fake_binary_bytes("ahandd");
+    let ahandctl_bytes = fake_binary_bytes("ahandctl");
+
+    let mut assets: HashMap<String, Vec<u8>> = HashMap::new();
+    assets.insert(format!("/rust-v{ver}/{ahandd_filename}"), ahandd_bytes);
+    assets.insert(format!("/rust-v{ver}/{ahandctl_filename}"), ahandctl_bytes);
+
+    // Only rust-v tag — no admin-v or browser-v.
+    let releases_json = format!(r#"[{{"tag_name":"rust-v{ver}"}}]"#);
+    let stub = spawn_full_stub(releases_json, assets).await;
+    let tmp = TempDir::new().unwrap();
+
+    let result = run_with_bases(
+        false,
+        Some(ver),
+        &stub.api_base(),
+        &stub.download_base(),
+        tmp.path(),
+    )
+    .await;
+
+    stub.stop().await;
+    result.expect("upgrade without admin version should succeed");
+
+    // Version marker written.
+    assert_eq!(
+        ahand_platform::paths::read_version_marker(tmp.path()),
+        Some(ver.to_string())
+    );
+
+    // admin/dist should NOT be created.
+    let dist_dir = tmp.path().join("admin").join("dist");
+    assert!(
+        !dist_dir.exists(),
+        "dist dir should not exist when no admin"
+    );
+}
+
+// ── Daemon not running → stop tolerated ───────────────────────────────────
+
+/// No daemon running → daemon::stop() is tolerant; upgrade still completes.
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_daemon_not_running_stop_tolerated() {
+    // Same as happy path but we don't start any daemon — default tempdir state.
+    let suffix = platform_suffix();
+    let ver = "0.7.0";
+
+    let ahandd_filename = format!("ahandd-{suffix}");
+    let ahandctl_filename = format!("ahandctl-{suffix}");
+
+    let ahandd_bytes = fake_binary_bytes("ahandd");
+    let ahandctl_bytes = fake_binary_bytes("ahandctl");
+
+    let mut assets: HashMap<String, Vec<u8>> = HashMap::new();
+    assets.insert(format!("/rust-v{ver}/{ahandd_filename}"), ahandd_bytes);
+    assets.insert(format!("/rust-v{ver}/{ahandctl_filename}"), ahandctl_bytes);
+
+    let releases_json = format!(r#"[{{"tag_name":"rust-v{ver}"}}]"#);
+    let stub = spawn_full_stub(releases_json, assets).await;
+    let tmp = TempDir::new().unwrap();
+
+    // No daemon.pid in tmp — daemon::stop() should return Ok / print "not running".
+    let result = run_with_bases(
+        false,
+        Some(ver),
+        &stub.api_base(),
+        &stub.download_base(),
+        tmp.path(),
+    )
+    .await;
+
+    stub.stop().await;
+    result.expect("upgrade should succeed even when daemon is not running");
+
+    assert_eq!(
+        ahand_platform::paths::read_version_marker(tmp.path()),
+        Some(ver.to_string())
+    );
+}
+
+// ── extract_admin_spa unit tests ───────────────────────────────────────────
+
+/// Valid tar.gz → files extracted to dist_dir.
+#[test]
+fn extract_admin_spa_valid_archive() {
+    let data = b"hello-spa";
+    let tar = make_tar_gz(&[("index.html", data), ("assets/app.js", b"js-content")]);
+    let tmp = TempDir::new().unwrap();
+    let dist_dir = tmp.path().join("dist");
+
+    ahandctl::upgrade::extract_admin_spa(&tar, &dist_dir).expect("should extract");
+
+    assert_eq!(std::fs::read(dist_dir.join("index.html")).unwrap(), data);
+    assert_eq!(
+        std::fs::read(dist_dir.join("assets").join("app.js")).unwrap(),
+        b"js-content"
+    );
+}
+
+/// Pre-existing files are cleared before extraction.
+#[test]
+fn extract_admin_spa_clears_existing_contents() {
+    let tmp = TempDir::new().unwrap();
+    let dist_dir = tmp.path().join("dist");
+    std::fs::create_dir_all(&dist_dir).unwrap();
+    std::fs::write(dist_dir.join("old.txt"), b"stale").unwrap();
+
+    let tar = make_tar_gz(&[("new.html", b"new")]);
+    ahandctl::upgrade::extract_admin_spa(&tar, &dist_dir).expect("should extract");
+
+    assert!(
+        !dist_dir.join("old.txt").exists(),
+        "stale file must be removed"
+    );
+    assert!(
+        dist_dir.join("new.html").exists(),
+        "new file must be present"
+    );
+}
+
+/// Absolute path in archive → rejected.
+#[test]
+fn extract_admin_spa_rejects_absolute_path() {
+    // Build archive with an absolute path using raw bytes to bypass tar crate safety.
+    let buf = make_raw_tar_gz_with_path("/etc/evil.txt", b"evil");
+
+    let tmp = TempDir::new().unwrap();
+    let dist_dir = tmp.path().join("dist");
+    let err = ahandctl::upgrade::extract_admin_spa(&buf, &dist_dir).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("absolute") || msg.contains("traversal") || msg.contains("path"),
+        "should reject absolute path, got: {msg}"
+    );
 }

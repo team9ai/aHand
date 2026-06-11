@@ -1,4 +1,6 @@
 #!/bin/bash
+# DEPRECATED: superseded by `ahandctl upgrade` (native); kept for legacy installs.
+#
 # Upgrades ahandd, ahandctl, and admin SPA from GitHub releases.
 # Usage: upgrade.sh [--check] [--version 0.2.0]
 
