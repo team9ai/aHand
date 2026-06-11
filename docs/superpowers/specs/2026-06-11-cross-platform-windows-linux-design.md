@@ -220,6 +220,20 @@ platform module; the implementation keeps rename-aside + restart logic inline
 in `updater.rs` with `#[cfg]` arms (plan Task 9 decision). If M2 grows more
 process-swap logic, extract `process::restart_in_place()` then.
 
+**M3 prerequisite — replan against the plugin runtime.** The plugin-runtime
+mechanism merged from main mid-M1 moved browser-binary management to
+`plugin_runtime::RuntimeDirs` (`~/.cache/ahand-runtimes/...`); the
+"Install / upgrade / browser-setup chain" section above still describes the
+old `browser_setup` script paths. Consequences for M3: (1) the Windows Node
+layout problem (zip archive, `node.exe` at root vs the `node/bin/<exe>`
+layout `RuntimeDirs` assumes) must be fixed in the plugin-runtime
+installers — normalize the layout at install time as already planned, but
+the install code lives in plugin_runtime adapters now; (2) `path_env`
+already uses `env::join_paths` + cfg-aware separators, which resolves the
+browser PATH-`':'` audit finding; (3) `runtime_dir.rs` carries a local
+`exe_name()` duplicating `ahand_platform::paths::exe_name` — unify during
+M3. Rewrite the M3 task breakdown against plugin_runtime before starting.
+
 **M2 must verify manually on a real Windows host** (green CI does not prove
 these):
 
