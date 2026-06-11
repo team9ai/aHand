@@ -66,30 +66,37 @@ jobs:
           # store root for later steps
           "FIXTURE_ROOT=$fixtureRoot" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-          # ── Start Python HTTP server ───────────────────────────────────────────
-          $port = 18080
-          "SERVER_PORT=$port" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          # ── Start Python HTTP server as a detached process ─────────────────────
+          # Use Start-Process so the server survives beyond this step.
+          $port    = 18080
+          $logFile = Join-Path $env:RUNNER_TEMP "mock-server.log"
+          "SERVER_PORT=$port"    | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "SERVER_LOG=$logFile"  | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-          $job = Start-Job -ScriptBlock {
-            param($root, $p)
-            Set-Location $root
-            python -m http.server $p --bind 127.0.0.1
-          } -ArgumentList $fixtureRoot, $port
-          "JOB_ID=$($job.Id)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "Started HTTP server job $($job.Id) on port $port"
+          $proc = Start-Process python `
+            -ArgumentList "-m","http.server",$port,"--bind","127.0.0.1" `
+            -WorkingDirectory $fixtureRoot `
+            -RedirectStandardOutput $logFile `
+            -RedirectStandardError  "$logFile.err" `
+            -PassThru
+          "SERVER_PID=$($proc.Id)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Started Python HTTP server PID $($proc.Id) on port $port"
 
           # wait for server to be ready (up to 15 s)
           $ready = $false
           for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Milliseconds 500
             try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 2
+              $null = Invoke-WebRequest -Uri "http://127.0.0.1:$port/" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
               $ready = $true; break
             } catch {}
           }
           if (-not $ready) {
-            Receive-Job -Id $job.Id
-            throw "Mock HTTP server did not become ready in time"
+            Write-Host "=== Server stdout ==="
+            Get-Content $logFile -ErrorAction SilentlyContinue
+            Write-Host "=== Server stderr ==="
+            Get-Content "$logFile.err" -ErrorAction SilentlyContinue
+            throw "Mock HTTP server did not become ready in time (PID $($proc.Id))"
           }
           Write-Host "Mock server is ready."
 
@@ -194,9 +201,13 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $jobId = "${{ steps.mock-server.outputs.JOB_ID }}"
-          if ($jobId) {
-            Stop-Job -Id $jobId -ErrorAction SilentlyContinue
-            Remove-Job -Id $jobId -Force -ErrorAction SilentlyContinue
-            Write-Host "Stopped mock server job $jobId"
+          $pid = "${{ steps.mock-server.outputs.SERVER_PID }}"
+          if ($pid) {
+            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+            Write-Host "Stopped mock server PID $pid"
+          }
+          $logFile = "${{ steps.mock-server.outputs.SERVER_LOG }}"
+          if ($logFile -and (Test-Path $logFile)) {
+            Write-Host "=== Server log ==="
+            Get-Content $logFile
           }
