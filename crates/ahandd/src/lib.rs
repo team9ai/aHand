@@ -1,4 +1,5 @@
 pub mod ahand_client;
+pub mod app_tool_registry;
 pub mod approval;
 pub mod browser;
 pub mod browser_setup;

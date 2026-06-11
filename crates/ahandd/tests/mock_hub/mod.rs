@@ -268,9 +268,7 @@ async fn handle_conn(
                 payload: Some(envelope::Payload::FileRequest((*req).clone())),
                 ..Default::default()
             };
-            let _ = sink
-                .send(WsMessage::Binary(file_req.encode_to_vec()))
-                .await;
+            let _ = sink.send(WsMessage::Binary(file_req.encode_to_vec())).await;
 
             // Capture every inbound envelope's FileResponse, plus
             // record heartbeats so existing assertions still work.

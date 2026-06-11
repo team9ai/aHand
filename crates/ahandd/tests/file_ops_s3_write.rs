@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ahand_protocol::{
-    file_request, file_response, file_write, full_write, FileErrorCode, FileRequest, FileWrite,
-    FullWrite, WriteAction,
+    FileErrorCode, FileRequest, FileWrite, FullWrite, WriteAction, file_request, file_response,
+    file_write, full_write,
 };
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
@@ -147,7 +147,11 @@ fn test_manager(tmp: &TempDir) -> (FileManager, PathBuf) {
     (mgr, root)
 }
 
-fn full_write_request(target: &Path, object_key: &str, download_url: Option<String>) -> FileRequest {
+fn full_write_request(
+    target: &Path,
+    object_key: &str,
+    download_url: Option<String>,
+) -> FileRequest {
     FileRequest {
         request_id: "test-s3-write".into(),
         operation: Some(file_request::Operation::Write(FileWrite {
@@ -385,11 +389,7 @@ async fn full_write_with_s3_url_rejects_non_http_scheme() {
     let (mgr, root) = test_manager(&tmp);
     let target = root.join("ssrf.bin");
 
-    let req = full_write_request(
-        &target,
-        "k",
-        Some("file:///etc/passwd".to_string()),
-    );
+    let req = full_write_request(&target, "k", Some("file:///etc/passwd".to_string()));
     let resp = mgr.handle(&req).await;
     let err = match resp.result {
         Some(file_response::Result::Error(e)) => e,

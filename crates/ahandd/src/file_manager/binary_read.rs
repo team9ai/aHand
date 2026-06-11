@@ -12,7 +12,10 @@ use ahand_protocol::{
     FileError, FileErrorCode, FileReadBinary, FileReadBinaryResult, FileReadImage,
     FileReadImageResult, ImageFormat,
 };
-use image::{codecs::jpeg::JpegEncoder, codecs::webp::WebPEncoder, DynamicImage, ImageFormat as ImgFmt, ImageReader};
+use image::{
+    DynamicImage, ImageFormat as ImgFmt, ImageReader, codecs::jpeg::JpegEncoder,
+    codecs::webp::WebPEncoder,
+};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use super::file_error;
@@ -44,7 +47,10 @@ pub async fn handle_read_binary(
     let total_file_bytes = metadata.len();
     // Clamp against the policy-level read budget so callers can never
     // bypass `max_read_bytes` by requesting a larger per-call max_bytes.
-    let max = req.max_bytes.unwrap_or(DEFAULT_BINARY_MAX).min(max_read_bytes);
+    let max = req
+        .max_bytes
+        .unwrap_or(DEFAULT_BINARY_MAX)
+        .min(max_read_bytes);
 
     let byte_offset = req.byte_offset;
     if byte_offset >= total_file_bytes {
@@ -143,8 +149,8 @@ pub async fn handle_read_image(
     let original_bytes = raw.len() as u64;
 
     // Decode the image in a blocking task — image crate operations are CPU bound.
-    let requested_format = ImageFormat::try_from(req.output_format.unwrap_or(0))
-        .unwrap_or(ImageFormat::Original);
+    let requested_format =
+        ImageFormat::try_from(req.output_format.unwrap_or(0)).unwrap_or(ImageFormat::Original);
     let requested_quality = req.quality.map(|q| q.clamp(1, 100) as u8);
     let max_width = req.max_width;
     let max_height = req.max_height;
@@ -160,104 +166,104 @@ pub async fn handle_read_image(
         && matches!(requested_format, ImageFormat::Original);
 
     let req_path = req.path.clone();
-    let processed = tokio::task::spawn_blocking(move || -> Result<FileReadImageResult, FileError> {
-        // Peek the format and dimensions without decoding pixels, so we can
-        // reject decompression bombs before allocating the full pixel buffer.
-        let header_reader = ImageReader::new(Cursor::new(&raw))
-            .with_guessed_format()
-            .map_err(|e| {
+    let processed =
+        tokio::task::spawn_blocking(move || -> Result<FileReadImageResult, FileError> {
+            // Peek the format and dimensions without decoding pixels, so we can
+            // reject decompression bombs before allocating the full pixel buffer.
+            let header_reader = ImageReader::new(Cursor::new(&raw))
+                .with_guessed_format()
+                .map_err(|e| {
+                    file_error(
+                        FileErrorCode::Unspecified,
+                        &req_path,
+                        format!("failed to read image: {e}"),
+                    )
+                })?;
+            let source_format = header_reader.format();
+            let (header_width, header_height) = header_reader.into_dimensions().map_err(|e| {
                 file_error(
                     FileErrorCode::Unspecified,
                     &req_path,
-                    format!("failed to read image: {e}"),
+                    format!("failed to read image dimensions: {e}"),
                 )
             })?;
-        let source_format = header_reader.format();
-        let (header_width, header_height) = header_reader.into_dimensions().map_err(|e| {
-            file_error(
-                FileErrorCode::Unspecified,
-                &req_path,
-                format!("failed to read image dimensions: {e}"),
-            )
-        })?;
 
-        // Decompression bomb guard: reject images whose decoded RGBA pixel
-        // buffer would exceed the policy's read budget.
-        let decoded_bytes = (header_width as u64)
-            .saturating_mul(header_height as u64)
-            .saturating_mul(4);
-        if decoded_bytes > max_read_bytes {
-            return Err(file_error(
-                FileErrorCode::TooLarge,
-                &req_path,
-                format!(
-                    "image dimensions {}x{} would exceed max_read_bytes when decoded",
-                    header_width, header_height
-                ),
-            ));
-        }
+            // Decompression bomb guard: reject images whose decoded RGBA pixel
+            // buffer would exceed the policy's read budget.
+            let decoded_bytes = (header_width as u64)
+                .saturating_mul(header_height as u64)
+                .saturating_mul(4);
+            if decoded_bytes > max_read_bytes {
+                return Err(file_error(
+                    FileErrorCode::TooLarge,
+                    &req_path,
+                    format!(
+                        "image dimensions {}x{} would exceed max_read_bytes when decoded",
+                        header_width, header_height
+                    ),
+                ));
+            }
 
-        if is_passthrough {
-            let format_proto = source_format
-                .map(output_format_to_proto)
-                .unwrap_or(ImageFormat::Original);
-            let size = raw.len() as u64;
-            return Ok(FileReadImageResult {
-                content: raw,
-                format: format_proto as i32,
-                width: header_width,
-                height: header_height,
+            if is_passthrough {
+                let format_proto = source_format
+                    .map(output_format_to_proto)
+                    .unwrap_or(ImageFormat::Original);
+                let size = raw.len() as u64;
+                return Ok(FileReadImageResult {
+                    content: raw,
+                    format: format_proto as i32,
+                    width: header_width,
+                    height: header_height,
+                    original_bytes,
+                    output_bytes: size,
+                    download_url: None,
+                    download_url_expires_ms: None,
+                });
+            }
+
+            // Non-passthrough: fully decode and go through the resize/encode pipeline.
+            let reader = ImageReader::new(Cursor::new(&raw))
+                .with_guessed_format()
+                .map_err(|e| {
+                    file_error(
+                        FileErrorCode::Unspecified,
+                        &req_path,
+                        format!("failed to read image: {e}"),
+                    )
+                })?;
+            let img = reader.decode().map_err(|e| {
+                file_error(
+                    FileErrorCode::Unspecified,
+                    &req_path,
+                    format!("failed to decode image: {e}"),
+                )
+            })?;
+
+            let resized = apply_resize(img, max_width, max_height);
+            let (width, height) = (resized.width(), resized.height());
+
+            let output_format = resolve_output_format(requested_format, source_format);
+            let quality = requested_quality.unwrap_or(DEFAULT_IMAGE_QUALITY);
+            let encoded = encode_image(&resized, output_format, quality, max_bytes, &req_path)?;
+            Ok(FileReadImageResult {
+                content: encoded.bytes,
+                format: output_format_to_proto(output_format) as i32,
+                width,
+                height,
                 original_bytes,
-                output_bytes: size,
+                output_bytes: encoded.size,
                 download_url: None,
                 download_url_expires_ms: None,
-            });
-        }
-
-        // Non-passthrough: fully decode and go through the resize/encode pipeline.
-        let reader = ImageReader::new(Cursor::new(&raw))
-            .with_guessed_format()
-            .map_err(|e| {
-                file_error(
-                    FileErrorCode::Unspecified,
-                    &req_path,
-                    format!("failed to read image: {e}"),
-                )
-            })?;
-        let img = reader.decode().map_err(|e| {
+            })
+        })
+        .await
+        .map_err(|e| {
             file_error(
                 FileErrorCode::Unspecified,
-                &req_path,
-                format!("failed to decode image: {e}"),
+                &req.path,
+                format!("image worker join error: {e}"),
             )
-        })?;
-
-        let resized = apply_resize(img, max_width, max_height);
-        let (width, height) = (resized.width(), resized.height());
-
-        let output_format =
-            resolve_output_format(requested_format, source_format);
-        let quality = requested_quality.unwrap_or(DEFAULT_IMAGE_QUALITY);
-        let encoded = encode_image(&resized, output_format, quality, max_bytes, &req_path)?;
-        Ok(FileReadImageResult {
-            content: encoded.bytes,
-            format: output_format_to_proto(output_format) as i32,
-            width,
-            height,
-            original_bytes,
-            output_bytes: encoded.size,
-            download_url: None,
-            download_url_expires_ms: None,
-        })
-    })
-    .await
-    .map_err(|e| {
-        file_error(
-            FileErrorCode::Unspecified,
-            &req.path,
-            format!("image worker join error: {e}"),
-        )
-    })??;
+        })??;
 
     Ok(processed)
 }
@@ -280,10 +286,7 @@ fn apply_resize(img: DynamicImage, max_w: Option<u32>, max_h: Option<u32>) -> Dy
 /// Resolve the target output format given the request and the detected source
 /// format. `ImageFormat::Original` maps to the source format (or PNG if
 /// detection failed).
-fn resolve_output_format(
-    requested: ImageFormat,
-    source_format: Option<ImgFmt>,
-) -> ImgFmt {
+fn resolve_output_format(requested: ImageFormat, source_format: Option<ImgFmt>) -> ImgFmt {
     match requested {
         ImageFormat::Original => source_format.unwrap_or(ImgFmt::Png),
         ImageFormat::Jpeg => ImgFmt::Jpeg,

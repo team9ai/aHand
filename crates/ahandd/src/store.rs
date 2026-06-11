@@ -199,8 +199,14 @@ mod tests {
 
     #[test]
     fn describe_payload_covers_every_variant() {
-        check(Payload::HelloChallenge(HelloChallenge::default()), "HelloChallenge");
-        check(Payload::HelloAccepted(HelloAccepted::default()), "HelloAccepted");
+        check(
+            Payload::HelloChallenge(HelloChallenge::default()),
+            "HelloChallenge",
+        );
+        check(
+            Payload::HelloAccepted(HelloAccepted::default()),
+            "HelloAccepted",
+        );
         check(Payload::Hello(Hello::default()), "Hello");
         check(Payload::JobRequest(JobRequest::default()), "JobRequest");
         check(Payload::JobEvent(JobEvent::default()), "JobEvent");
@@ -217,13 +223,22 @@ mod tests {
         );
         check(Payload::PolicyQuery(PolicyQuery::default()), "PolicyQuery");
         check(Payload::PolicyState(PolicyState::default()), "PolicyState");
-        check(Payload::PolicyUpdate(PolicyUpdate::default()), "PolicyUpdate");
+        check(
+            Payload::PolicyUpdate(PolicyUpdate::default()),
+            "PolicyUpdate",
+        );
         check(
             Payload::SetSessionMode(SetSessionMode::default()),
             "SetSessionMode",
         );
-        check(Payload::SessionState(SessionState::default()), "SessionState");
-        check(Payload::SessionQuery(SessionQuery::default()), "SessionQuery");
+        check(
+            Payload::SessionState(SessionState::default()),
+            "SessionState",
+        );
+        check(
+            Payload::SessionQuery(SessionQuery::default()),
+            "SessionQuery",
+        );
         check(
             Payload::BrowserRequest(BrowserRequest::default()),
             "BrowserRequest",
@@ -236,7 +251,10 @@ mod tests {
             Payload::UpdateCommand(UpdateCommand::default()),
             "UpdateCommand",
         );
-        check(Payload::UpdateStatus(UpdateStatus::default()), "UpdateStatus");
+        check(
+            Payload::UpdateStatus(UpdateStatus::default()),
+            "UpdateStatus",
+        );
         check(Payload::StdinChunk(StdinChunk::default()), "StdinChunk");
         check(
             Payload::TerminalResize(TerminalResize::default()),
