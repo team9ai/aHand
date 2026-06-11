@@ -56,8 +56,16 @@ jobs:
           "$hashD  ahandd-windows-x64.exe`n$hashCtl  ahandctl-windows-x64.exe" |
             Set-Content (Join-Path $rustDir "checksums-rust.txt") -Encoding UTF8
 
+          # admin SPA fixture: a small tar.gz containing index.html
+          $adminDir = Join-Path $fixtureRoot "admin-v9.9.9"
+          New-Item -ItemType Directory -Path $adminDir -Force | Out-Null
+          $spaWorkDir = Join-Path $env:RUNNER_TEMP "spa-build"
+          New-Item -ItemType Directory -Path $spaWorkDir -Force | Out-Null
+          [System.IO.File]::WriteAllText((Join-Path $spaWorkDir "index.html"), "<html><body>admin</body></html>")
+          tar -czf (Join-Path $adminDir "admin-spa.tar.gz") -C $spaWorkDir "index.html"
+
           # releases JSON served at:  GET /repos/team9ai/aHand/releases
-          $releasesJson = '[{"tag_name":"rust-v9.9.9","name":"Rust Binaries v9.9.9","prerelease":false}]'
+          $releasesJson = '[{"tag_name":"rust-v9.9.9","name":"Rust Binaries v9.9.9","prerelease":false},{"tag_name":"admin-v9.9.9","name":"Admin SPA v9.9.9","prerelease":false}]'
           $releasesJson | Set-Content (Join-Path $apiDir "releases") -Encoding UTF8
 
           Write-Host "Fixture tree:"
@@ -158,6 +166,11 @@ jobs:
           if (-not $raw.EndsWith("`n")) { throw "version file must end with newline" }
           Write-Host "PASS: version file = '9.9.9\n'"
 
+          # admin SPA extracted
+          $adminIndex = Join-Path $installDir "admin\dist\index.html"
+          if (-not (Test-Path $adminIndex)) { throw "admin\dist\index.html missing after install" }
+          Write-Host "PASS: admin SPA extracted"
+
       - name: Run install.ps1 (second run — PATH idempotency)
         shell: pwsh
         run: |
@@ -187,6 +200,37 @@ jobs:
             throw "Expected exactly 1 occurrence of bin dir in User PATH, got $count"
           }
           Write-Host "PASS: PATH idempotency OK"
+
+      - name: Run install.ps1 (-NoPathUpdate) into separate InstallDir
+        shell: pwsh
+        run: |
+          $port        = "${{ steps.mock-server.outputs.SERVER_PORT }}"
+          $base        = "http://127.0.0.1:$port"
+          $installDir3 = Join-Path $env:RUNNER_TEMP "ahand-test-nopathupdate"
+
+          pwsh -NoProfile -File scripts/dist/install.ps1 `
+            -ApiBase      $base `
+            -DownloadBase $base `
+            -InstallDir   $installDir3 `
+            -NoPathUpdate
+
+      - name: Assert -NoPathUpdate did not add bin dir to User PATH
+        shell: pwsh
+        run: |
+          $installDir3 = Join-Path $env:RUNNER_TEMP "ahand-test-nopathupdate"
+          $binDir3     = (Join-Path $installDir3 "bin").TrimEnd('\').ToLower()
+
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $parts    = ($userPath -split ';') | Where-Object { $_ -ne '' } |
+                        ForEach-Object { $_.TrimEnd('\').ToLower() }
+          $count    = ($parts | Where-Object { $_ -eq $binDir3 }).Count
+
+          Write-Host "User PATH parts matching -NoPathUpdate bin dir: $count"
+          if ($count -ne 0) {
+            Write-Host "User PATH: $userPath"
+            throw "-NoPathUpdate install must NOT add bin dir to User PATH, found $count occurrence(s)"
+          }
+          Write-Host "PASS: -NoPathUpdate did not modify User PATH"
 
       - name: Negative test — checksum mismatch must fail
         shell: pwsh

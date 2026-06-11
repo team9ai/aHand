@@ -390,7 +390,16 @@ pub fn swap_binary_into(
     }
 
     #[cfg(not(windows))]
-    std::fs::rename(&tmp_path, &target_path)?;
+    if let Err(rename_err) = std::fs::rename(&tmp_path, &target_path) {
+        // Best-effort cleanup: remove the orphaned tmp file before propagating
+        // the error so the filesystem is left clean on failure.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(anyhow::anyhow!(rename_err).context(format!(
+            "failed to rename {} -> {}",
+            tmp_path.display(),
+            target_path.display()
+        )));
+    }
 
     info!(path = %target_path.display(), "installed binary '{}'", base_name);
     Ok(())
@@ -683,6 +692,39 @@ mod swap_tests {
         let tmp = tempfile::tempdir().unwrap();
         // Should not panic or error.
         cleanup_old_binary_for(tmp.path(), "noexist");
+    }
+
+    /// On Unix, when rename(tmp → target) fails because the target name is
+    /// occupied by a non-empty directory (which rename cannot overwrite),
+    /// swap_binary_into must:
+    ///   1. Return an Err (not silently succeed).
+    ///   2. Remove the `.update.tmp` file so it is not orphaned on disk.
+    #[cfg(unix)]
+    #[test]
+    fn swap_binary_into_cleans_up_tmp_on_failed_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        // Create the target name as a NON-EMPTY directory so rename will fail.
+        let bin_name = ahand_platform::paths::exe_name("mytool");
+        let target_path = bin_dir.join(&bin_name);
+        std::fs::create_dir_all(&target_path).unwrap();
+        // Place a file inside so it is non-empty (rename-onto-dir fails either way
+        // on Linux, but non-empty makes behaviour consistent across BSDs too).
+        std::fs::write(target_path.join("sentinel"), b"block").unwrap();
+
+        let result = swap_binary_into(&bin_dir, "mytool", b"new-bytes");
+
+        // Must be an error.
+        assert!(result.is_err(), "swap onto directory must fail");
+
+        // The .update.tmp file must have been cleaned up.
+        let tmp_path = bin_dir.join(format!("{bin_name}.update.tmp"));
+        assert!(
+            !tmp_path.exists(),
+            ".update.tmp must be removed after failed rename, but it still exists"
+        );
     }
 }
 

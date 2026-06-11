@@ -191,6 +191,9 @@ async fn download_optional(url: &str) -> Option<String> {
 ///
 /// If no matching line exists, the check is silently skipped (same behaviour
 /// as upgrade.sh's `if [ -n "$expected" ]` guard).
+///
+/// Leniency is intentional: parity with `upgrade.sh` which skips verification
+/// when the expected hash is absent rather than failing the upgrade.
 fn verify_binary_checksum(checksum_text: &str, filename: &str, data: &[u8]) -> anyhow::Result<()> {
     // Find a line that ends with two-spaces + filename (shasum format).
     // e.g. "abc123...  ahandd-linux-x64"
@@ -277,4 +280,30 @@ fn guard_path_traversal(p: &Path) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod checksum_skip_tests {
+    use super::*;
+
+    /// A checksum file that contains valid lines ONLY for OTHER filenames must
+    /// return `Ok(())` without touching the data bytes — this is the documented
+    /// lenient behaviour that mirrors `upgrade.sh`'s
+    /// `if [ -n "$expected" ]` guard.
+    #[test]
+    fn checksum_text_with_no_matching_filename_returns_ok() {
+        // Lines for entirely different filenames; our target is absent.
+        let checksum_text = "\
+            abc123def456abc123def456abc123def456abc123def456abc123def456abc123  other-binary-linux-x64\n\
+            deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  yet-another-tool.exe\n";
+
+        // The data bytes are intentionally wrong — if the fn is lenient it must
+        // never reach the hash comparison for an absent filename.
+        let result =
+            verify_binary_checksum(checksum_text, "ahandd-linux-x64", b"totally-wrong-bytes");
+        assert!(
+            result.is_ok(),
+            "expected Ok(()) when filename is absent from checksum text, got: {result:?}"
+        );
+    }
 }
