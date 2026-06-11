@@ -29,8 +29,7 @@ use tempfile::TempDir;
 /// `check_path` (which also applies dunce::simplify). On Unix this is identical
 /// to `path.canonicalize().unwrap()`.
 fn canon(path: &std::path::Path) -> PathBuf {
-    ahand_platform::paths::canonicalize_simplified(path)
-        .expect("canonicalization should succeed")
+    ahand_platform::paths::canonicalize_simplified(path).expect("canonicalization should succeed")
 }
 
 /// Set up a permissive file manager scoped to the given temp directory.
