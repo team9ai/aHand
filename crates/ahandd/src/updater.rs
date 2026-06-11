@@ -572,6 +572,15 @@ mod install_tests {
     /// NOTE (non-Windows): fault injection requires OS support for failed renames
     /// after a successful rename-aside. On non-Windows the rollback code is not
     /// compiled, so this test is restricted to `#[cfg(windows)]` below.
+    ///
+    /// SKIPPED (X6): A fully automated test that forces the SECOND rename
+    /// (tmp → target) to fail AFTER the first rename (target → .old) has
+    /// already succeeded cannot be implemented deterministically on Windows in
+    /// ≤30 lines without deep refactoring (e.g. injecting a mock fs layer or
+    /// using a separate process to hold a file lock at exactly the right moment).
+    /// The rollback logic is exercised manually below by replaying the three
+    /// operations inline; the `#[cfg(windows)]` guard ensures the test runs
+    /// only where the production code path is compiled.
     #[cfg(windows)]
     #[test]
     fn windows_rollback_restores_binary_when_tmp_rename_fails() {

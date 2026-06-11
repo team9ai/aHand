@@ -137,7 +137,19 @@ pub async fn start(config: Option<String>) -> Result<()> {
 }
 
 pub async fn stop() -> Result<()> {
-    let pid = match read_running_pid()? {
+    stop_at(&get_data_dir()?).await
+}
+
+/// Stop the daemon whose PID file lives under `data_dir`.
+///
+/// This is the AHAND_DIR-aware variant used by the upgrade path: legacy
+/// `upgrade.sh` stopped the daemon via `$AHAND_DIR/data/daemon.pid`; the
+/// native upgrade path calls this function with
+/// `ahand_home.join("data")` so that a non-default `AHAND_DIR` is
+/// honoured consistently.
+pub async fn stop_at(data_dir: &std::path::Path) -> Result<()> {
+    let pid_path = data_dir.join("daemon.pid");
+    let pid = match read_running_pid_at(&pid_path)? {
         Some(pid) => pid,
         None => {
             println!("Daemon is not running.");
@@ -167,7 +179,6 @@ pub async fn stop() -> Result<()> {
     }
 
     // Clean up stale PID file if the daemon didn't remove it.
-    let pid_path = get_pid_path()?;
     if pid_path.exists() {
         let _ = std::fs::remove_file(&pid_path);
     }
@@ -284,6 +295,35 @@ mod tests {
         assert!(
             msg.contains("Invalid PID") || msg.contains("invalid digit"),
             "garbage pid file should error: {msg}"
+        );
+    }
+
+    // ── stop_at ───────────────────────────────────────────────────────────────
+
+    /// stop_at with a dead PID in the pid file: must clean up the pid file and
+    /// return Ok(()).  This exercises the AHAND_DIR-aware variant without
+    /// actually sending a signal to a live process.
+    #[tokio::test]
+    async fn stop_at_with_dead_pid_cleans_up_and_returns_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let pid_path = data_dir.join("daemon.pid");
+
+        // Write a PID that is almost certainly not running.
+        let dead_pid = u32::MAX - 13;
+        std::fs::write(&pid_path, format!("{dead_pid}\n")).unwrap();
+
+        // stop_at must return Ok(()) — dead pid means "not running".
+        let result = stop_at(&data_dir).await;
+        assert!(
+            result.is_ok(),
+            "stop_at with a dead pid must return Ok, got: {result:?}"
+        );
+
+        // The stale pid file must have been removed during read_running_pid_at.
+        assert!(
+            !pid_path.exists(),
+            "stale pid file should be removed after stop_at with dead pid"
         );
     }
 }
