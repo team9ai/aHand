@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 
 use tokio::sync::watch;
 
+use crate::app_tool_registry::AppToolRegistry;
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::config::Config;
@@ -63,9 +64,15 @@ struct QueuedEnvelope {
 /// replied by tungstenite per RFC 6455) before its watchdog timeout
 /// fires — that's how we detect zombie TCP connections that survived
 /// macOS sleep/wake or NAT timeout without any visible socket error.
+///
+/// `DirectEnvelope` bypasses the outbox entirely — used for idempotent
+/// push messages (e.g. `AppToolsUpdate` snapshots) that must NOT be
+/// buffered for replay because on reconnect a fresh snapshot is always
+/// generated from the live registry.
 enum OutboundFrame {
     Envelope(QueuedEnvelope),
     WsPing(Vec<u8>),
+    DirectEnvelope(Vec<u8>),
 }
 
 impl BufferedEnvelopeSender {
@@ -77,6 +84,17 @@ impl BufferedEnvelopeSender {
     /// already exited (session tearing down).
     fn send_ping(&self, payload: Vec<u8>) -> Result<(), ()> {
         self.tx.send(OutboundFrame::WsPing(payload)).map_err(|_| ())
+    }
+
+    /// Send an already-encoded envelope frame WITHOUT going through the
+    /// outbox.  Used for idempotent push messages (e.g. `AppToolsUpdate`
+    /// snapshots) that must not be replayed on reconnect because a fresh
+    /// snapshot is generated at the start of every new connection.
+    fn send_direct(&self, envelope: Envelope) -> Result<(), ()> {
+        let data = envelope.encode_to_vec();
+        self.tx
+            .send(OutboundFrame::DirectEnvelope(data))
+            .map_err(|_| ())
     }
 }
 
@@ -137,6 +155,7 @@ pub async fn run(
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
     file_mgr: Arc<FileManager>,
+    app_tools: Arc<AppToolRegistry>,
 ) -> anyhow::Result<()> {
     run_with_reporter(
         config,
@@ -148,6 +167,7 @@ pub async fn run(
         approval_broadcast_tx,
         browser_mgr,
         file_mgr,
+        app_tools,
         Arc::new(NoopReporter),
     )
     .await
@@ -168,6 +188,7 @@ pub async fn run_with_reporter(
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
     file_mgr: Arc<FileManager>,
+    app_tools: Arc<AppToolRegistry>,
     reporter: Arc<dyn ClientReporter>,
 ) -> anyhow::Result<()> {
     let hub_config = config.hub_config();
@@ -208,6 +229,7 @@ pub async fn run_with_reporter(
             &approval_broadcast_tx,
             &browser_mgr,
             &file_mgr,
+            &app_tools,
             reporter.as_ref(),
         )
         .await;
@@ -245,6 +267,7 @@ async fn connect_reporting(
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
     file_mgr: &Arc<FileManager>,
+    app_tools: &Arc<AppToolRegistry>,
     reporter: &dyn ClientReporter,
 ) -> anyhow::Result<()> {
     let auth_modes = hello_auth_modes(bearer_token.as_deref());
@@ -265,6 +288,7 @@ async fn connect_reporting(
             approval_broadcast_tx,
             browser_mgr,
             file_mgr,
+            app_tools,
             reporter,
         )
         .await;
@@ -301,6 +325,7 @@ async fn connect_with_auth(
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
     file_mgr: &Arc<FileManager>,
+    app_tools: &Arc<AppToolRegistry>,
     reporter: &dyn ClientReporter,
 ) -> Result<(), ConnectError> {
     // OS-level TCP keepalive is the lower-tier twin of the WS Ping/Pong
@@ -389,6 +414,59 @@ async fn connect_with_auth(
         crate::updater::spawn_update(params, device_id.to_string(), tx.clone());
     }
 
+    // AppToolsUpdate advertising:
+    //
+    // Subscribe to revision changes BEFORE sending the initial snapshot so
+    // that any registration that races the post-handshake window (i.e. a
+    // revision bump between subscribe and the initial send) is captured by
+    // the watcher task and not silently dropped.
+    //
+    // Ordering:
+    //   1. subscribe_revision()          → get a Receiver
+    //   2. borrow_and_update()           → mark current revision as "seen"
+    //   3. send initial snapshot         → covers any tools registered before connect
+    //   4. spawn watcher task            → fires on every subsequent bump
+    //
+    // Any revision bump after step 2 wakes the watcher (step 4) and
+    // triggers a fresh snapshot — no duplicate and no missed update.
+    {
+        let mut revision_rx = app_tools.subscribe_revision();
+        // Mark current revision as seen so the watcher doesn't re-send the
+        // initial snapshot.
+        revision_rx.borrow_and_update();
+
+        // Send the initial snapshot (covers all tools registered before or
+        // during the handshake window). Use send_direct so this envelope is
+        // NOT added to the outbox — snapshots are idempotent and must not be
+        // replayed on reconnect (a fresh snapshot is generated each time).
+        let initial_snap = app_tools.snapshot().await;
+        let _ = tx.send_direct(app_tools_snapshot_envelope(device_id, initial_snap));
+
+        // Spawn a connection-scoped watcher that re-sends the snapshot on
+        // every registry mutation.  Exits when `close_tx` fires (connection
+        // teardown) or when `tx` is dropped (mpsc closes).
+        let watcher_tx = tx.clone();
+        let watcher_app_tools = Arc::clone(app_tools);
+        let watcher_device_id = device_id.to_string();
+        let mut watcher_close_rx = close_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = watcher_close_rx.changed() => break,
+                    changed = revision_rx.changed() => {
+                        if changed.is_err() { break; }
+                        let snap = watcher_app_tools.snapshot().await;
+                        // send_direct: snapshots are idempotent, must not be
+                        // added to the outbox for replay on reconnect.
+                        if watcher_tx.send_direct(app_tools_snapshot_envelope(&watcher_device_id, snap)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Task: receive OutboundFrame from executors + ws-ping task, stamp + encode
     // + send over WS. Multiplexed so the sink stays single-owner.
     let send_handle = tokio::spawn(async move {
@@ -402,6 +480,9 @@ async fn connect_with_auth(
                     tungstenite::Message::Binary(queued.frame)
                 }
                 OutboundFrame::WsPing(payload) => tungstenite::Message::Ping(payload),
+                // Direct frames (e.g. AppToolsUpdate snapshots) are sent as-is,
+                // without outbox stamping or store logging — they are idempotent.
+                OutboundFrame::DirectEnvelope(data) => tungstenite::Message::Binary(data),
             };
             if sink.send(msg).await.is_err() {
                 break;
@@ -772,6 +853,19 @@ fn set_tcp_keepcnt_macos(stream: &tokio::net::TcpStream, count: u32) -> std::io:
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn app_tools_snapshot_envelope(
+    device_id: &str,
+    snapshot: ahand_protocol::AppToolsUpdate,
+) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolsUpdate(snapshot)),
+        ..Default::default()
+    }
 }
 
 pub fn build_hello_envelope(

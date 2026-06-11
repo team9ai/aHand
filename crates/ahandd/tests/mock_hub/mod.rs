@@ -13,6 +13,9 @@
 //!     a [`FileRequest`] envelope and captures the daemon's [`FileResponse`].
 //!     Used to exercise the daemon's `handle_file_request` glue end-to-end
 //!     through the WS layer.
+//!   * [`start_accepting_drop_after_n_snapshots`] — like `start_accepting`
+//!     but drops the first connection after receiving `n` `AppToolsUpdate`
+//!     snapshots, letting the daemon reconnect.
 //!
 //! Keep this module small and self-contained — it exists so the daemon's
 //! status state machine has something to race against, not to model the
@@ -21,7 +24,8 @@
 #![allow(dead_code)]
 
 use ahand_protocol::{
-    Envelope, FileRequest, FileResponse, Heartbeat, HelloAccepted, HelloChallenge, envelope,
+    AppToolsUpdate, Envelope, FileRequest, FileResponse, Heartbeat, HelloAccepted, HelloChallenge,
+    envelope,
 };
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -40,6 +44,7 @@ pub struct Mock {
     pub port: u16,
     heartbeats: Arc<Mutex<Vec<Heartbeat>>>,
     file_responses: Arc<Mutex<Vec<FileResponse>>>,
+    app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>>,
     _shutdown: oneshot::Sender<()>,
     _task: JoinHandle<()>,
 }
@@ -66,11 +71,41 @@ impl Mock {
     pub fn captured_file_responses(&self) -> Vec<FileResponse> {
         self.file_responses.lock().unwrap().clone()
     }
+
+    /// Snapshot of every `AppToolsUpdate` envelope received from connected
+    /// daemons since the mock started (across all connections/reconnects).
+    pub fn captured_app_tools_updates(&self) -> Vec<AppToolsUpdate> {
+        self.app_tools_updates.lock().unwrap().clone()
+    }
+
+    /// Wait until at least `n` `AppToolsUpdate` envelopes have been
+    /// received, then return all of them. Polls with a small sleep to avoid
+    /// spinning. Returns `None` on timeout.
+    pub async fn wait_for_app_tools_updates(
+        &self,
+        n: usize,
+        timeout: std::time::Duration,
+    ) -> Option<Vec<AppToolsUpdate>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let updates = self.captured_app_tools_updates();
+            if updates.len() >= n {
+                return Some(updates);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
 }
 
 /// Start a mock hub that accepts every Hello.
 pub async fn start_accepting() -> Mock {
-    start(Behavior::Accept).await
+    start(Behavior::Accept {
+        drop_after_n_app_tools_updates: None,
+    })
+    .await
 }
 
 /// Start a mock hub that rejects every Hello with an `auth-rejected` close frame.
@@ -104,9 +139,26 @@ pub async fn start_with_file_request(req: FileRequest) -> Mock {
     start(Behavior::SendFileRequest(Arc::new(req))).await
 }
 
+/// Start a mock hub that accepts connections and drops the first connection
+/// after receiving `n` `AppToolsUpdate` envelopes. Useful for reconnect
+/// tests: the daemon will reconnect and re-send the snapshot after a new
+/// Hello handshake.
+pub async fn start_accepting_drop_after_n_snapshots(n: usize) -> Mock {
+    start(Behavior::Accept {
+        drop_after_n_app_tools_updates: Some(n),
+    })
+    .await
+}
+
 #[derive(Clone)]
 enum Behavior {
-    Accept,
+    /// Accept every Hello and keep the connection open. If
+    /// `drop_after_n_app_tools_updates` is `Some(n)`, close the connection
+    /// after receiving that many `AppToolsUpdate` envelopes (used to trigger
+    /// daemon reconnect in tests).
+    Accept {
+        drop_after_n_app_tools_updates: Option<usize>,
+    },
     RejectAuth,
     SilentAfterHandshake,
     SendFileRequest(Arc<FileRequest>),
@@ -118,9 +170,11 @@ async fn start(behavior: Behavior) -> Mock {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let heartbeats: Arc<Mutex<Vec<Heartbeat>>> = Arc::new(Mutex::new(Vec::new()));
     let file_responses: Arc<Mutex<Vec<FileResponse>>> = Arc::new(Mutex::new(Vec::new()));
+    let app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>> = Arc::new(Mutex::new(Vec::new()));
 
     let heartbeats_for_task = heartbeats.clone();
     let file_responses_for_task = file_responses.clone();
+    let app_tools_updates_for_task = app_tools_updates.clone();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -135,6 +189,7 @@ async fn start(behavior: Behavior) -> Mock {
                         behavior.clone(),
                         heartbeats_for_task.clone(),
                         file_responses_for_task.clone(),
+                        app_tools_updates_for_task.clone(),
                     ));
                 }
             }
@@ -145,6 +200,7 @@ async fn start(behavior: Behavior) -> Mock {
         port,
         heartbeats,
         file_responses,
+        app_tools_updates,
         _shutdown: shutdown_tx,
         _task: task,
     }
@@ -155,6 +211,7 @@ async fn handle_conn(
     behavior: Behavior,
     heartbeats: Arc<Mutex<Vec<Heartbeat>>>,
     file_responses: Arc<Mutex<Vec<FileResponse>>>,
+    app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>>,
 ) {
     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
         return;
@@ -190,7 +247,9 @@ async fn handle_conn(
 
     // 3. Respond according to the configured behavior.
     match behavior {
-        Behavior::Accept => {
+        Behavior::Accept {
+            drop_after_n_app_tools_updates,
+        } => {
             let accepted = Envelope {
                 device_id: "mock-hub".into(),
                 msg_id: "accepted-0".into(),
@@ -203,7 +262,11 @@ async fn handle_conn(
             };
             let _ = sink.send(WsMessage::Binary(accepted.encode_to_vec())).await;
             // Keep the connection open until the client closes it, and
-            // record every `Heartbeat` envelope observed on the way.
+            // record every `Heartbeat` and `AppToolsUpdate` envelope
+            // observed on the way. If `drop_after_n_app_tools_updates` is
+            // set, close the connection after that many AppToolsUpdate
+            // messages (triggers a reconnect in the daemon).
+            let mut app_tools_count = 0usize;
             while let Some(m) = src.next().await {
                 let frame = match m {
                     Ok(WsMessage::Binary(bytes)) => bytes,
@@ -213,8 +276,28 @@ async fn handle_conn(
                 let Ok(envelope) = Envelope::decode(frame.as_ref()) else {
                     continue;
                 };
-                if let Some(envelope::Payload::Heartbeat(hb)) = envelope.payload {
-                    heartbeats.lock().unwrap().push(hb);
+                match envelope.payload {
+                    Some(envelope::Payload::Heartbeat(hb)) => {
+                        heartbeats.lock().unwrap().push(hb);
+                    }
+                    Some(envelope::Payload::AppToolsUpdate(update)) => {
+                        app_tools_updates.lock().unwrap().push(update);
+                        app_tools_count += 1;
+                        if let Some(limit) = drop_after_n_app_tools_updates {
+                            if app_tools_count >= limit {
+                                // Send a WS Close frame so the daemon's read
+                                // loop sees a clean close and reconnects.
+                                let _ = sink
+                                    .send(WsMessage::Close(Some(CloseFrame {
+                                        code: CloseCode::Normal,
+                                        reason: Cow::Borrowed("test-reconnect"),
+                                    })))
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -271,7 +354,7 @@ async fn handle_conn(
             let _ = sink.send(WsMessage::Binary(file_req.encode_to_vec())).await;
 
             // Capture every inbound envelope's FileResponse, plus
-            // record heartbeats so existing assertions still work.
+            // record heartbeats and AppToolsUpdate so existing assertions still work.
             while let Some(m) = src.next().await {
                 let frame = match m {
                     Ok(WsMessage::Binary(bytes)) => bytes,
@@ -287,6 +370,9 @@ async fn handle_conn(
                     }
                     Some(envelope::Payload::Heartbeat(hb)) => {
                         heartbeats.lock().unwrap().push(hb);
+                    }
+                    Some(envelope::Payload::AppToolsUpdate(update)) => {
+                        app_tools_updates.lock().unwrap().push(update);
                     }
                     _ => {}
                 }
