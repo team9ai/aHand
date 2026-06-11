@@ -24,6 +24,15 @@ use tempfile::TempDir;
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 
+/// Canonicalize `path` and strip the Windows verbatim prefix (`\\?\`) so the
+/// result can be used in allowlist patterns and compared with paths returned by
+/// `check_path` (which also applies dunce::simplify). On Unix this is identical
+/// to `path.canonicalize().unwrap()`.
+fn canon(path: &std::path::Path) -> PathBuf {
+    ahand_platform::paths::canonicalize_simplified(path)
+        .expect("canonicalization should succeed")
+}
+
 /// Set up a permissive file manager scoped to the given temp directory.
 ///
 /// Returns `(manager, canonical_root)`. Tests should use the returned canonical
@@ -1366,7 +1375,7 @@ async fn read_image_input_size_exceeds_max_read_bytes_is_rejected() {
     // size so the file-size check trips before the dimension guard.
     use image::{ImageBuffer, Rgb};
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
         enabled: true,
@@ -1791,7 +1800,7 @@ async fn write_exceeds_max_bytes_returns_too_large() {
     let dir = TempDir::new().unwrap();
     let _ = dir.path();
     // Use a custom manager with a tight max_write_bytes.
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
         enabled: true,
@@ -1834,7 +1843,7 @@ async fn write_string_replace_refuses_oversized_existing_file_before_read() {
     // through the Write StringReplace path (which goes through
     // `apply_string_replace`).
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let mgr = manager_with_max_write(&tmp_root, 50);
 
     let file = tmp_root.join("big.txt");
@@ -1872,7 +1881,7 @@ async fn edit_string_replace_refuses_oversized_existing_file_before_read() {
     // inline `read_to_string` (not delegated to apply_string_replace),
     // so the pre-check has to fire there independently.
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let mgr = manager_with_max_write(&tmp_root, 50);
 
     let file = tmp_root.join("big.txt");
@@ -1907,7 +1916,7 @@ async fn line_range_replace_refuses_oversized_existing_file_before_read() {
     // (apply_line_range_replace also calls read_to_string on the full
     // file before any size check; the same OOM hazard applies).
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let mgr = manager_with_max_write(&tmp_root, 50);
 
     let file = tmp_root.join("big.txt");
@@ -1944,7 +1953,7 @@ async fn byte_range_replace_refuses_oversized_existing_file_before_read() {
     // `read_to_string`, so the size guard has to live on this branch
     // separately even though the OOM hazard is identical).
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let mgr = manager_with_max_write(&tmp_root, 50);
 
     let file = tmp_root.join("big.bin");
@@ -3226,7 +3235,7 @@ async fn read_image_bomb_guard_rejects_oversized_dimensions() {
     // by setting max_read_bytes tight enough that the guard trips.
     use image::{ImageBuffer, Rgb};
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     // Tight budget: 1 MB read cap, but 1024x1024 RGBA = 4 MB decoded.
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
@@ -3257,10 +3266,7 @@ async fn read_image_bomb_guard_rejects_oversized_dimensions() {
 /// marks specific subpaths as `dangerous_paths`. Mirrors `test_manager`
 /// but with the dangerous-paths slot populated.
 fn manager_with_dangerous(tmp: &TempDir, dangerous: &[&str]) -> (FileManager, std::path::PathBuf) {
-    let root = tmp
-        .path()
-        .canonicalize()
-        .expect("tempdir canonicalization should succeed");
+    let root = canon(tmp.path());
     let root_str = root.to_string_lossy().into_owned();
     let pattern = format!("{}/**", root_str.trim_end_matches('/'));
     let dangerous_abs: Vec<String> = dangerous
@@ -3617,7 +3623,7 @@ async fn read_text_exceeding_max_read_bytes_returns_too_large() {
     // slurping. A file that exceeds the policy budget should return
     // TooLarge, never load into memory.
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
         enabled: true,
@@ -3860,7 +3866,7 @@ async fn append_exceeding_total_size_limit_returns_too_large() {
     // and new content. An existing file at the limit + any non-empty
     // append must fail with TooLarge before any write happens.
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
         enabled: true,
@@ -3967,13 +3973,13 @@ async fn verify_post_create_remove_file_or_dir_unlinks_a_rejected_file() {
     // rejects, the artifact at the rejected path is unlinked so the
     // caller's failure surface is "operation didn't happen".
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let policy = restrictive_policy(&allowed_root);
 
     // The artifact lives outside the allowlist — the post-check will
     // reject it and the cleanup must unlink.
     let outside = TempDir::new().unwrap();
-    let outside_root = outside.path().canonicalize().unwrap();
+    let outside_root = canon(outside.path());
     let leaked = outside_root.join("leaked.txt");
     fs::write(&leaked, "ghost").unwrap();
     assert!(leaked.exists());
@@ -4000,10 +4006,10 @@ async fn verify_post_create_remove_tree_all_purges_a_rejected_directory_tree() {
     // used the file-or-dir variant would leak the partial tree on
     // disk after returning PolicyDenied.
     let allowed = TempDir::new().unwrap();
-    let policy = restrictive_policy(&allowed.path().canonicalize().unwrap());
+    let policy = restrictive_policy(&canon(allowed.path()));
 
     let outside = TempDir::new().unwrap();
-    let outside_root = outside.path().canonicalize().unwrap();
+    let outside_root = canon(outside.path());
     let tree_root = outside_root.join("tree");
     fs::create_dir(&tree_root).unwrap();
     fs::create_dir(tree_root.join("nested")).unwrap();
@@ -4035,10 +4041,10 @@ async fn verify_post_create_leave_preserves_data_at_rejected_path() {
     // destination (deleted by us). `Leave` preserves the data so the
     // operator can recover by inspecting the rejected destination.
     let allowed = TempDir::new().unwrap();
-    let policy = restrictive_policy(&allowed.path().canonicalize().unwrap());
+    let policy = restrictive_policy(&canon(allowed.path()));
 
     let outside = TempDir::new().unwrap();
-    let outside_root = outside.path().canonicalize().unwrap();
+    let outside_root = canon(outside.path());
     let preserved = outside_root.join("user_data.txt");
     fs::write(&preserved, b"do not delete").unwrap();
 
@@ -4068,7 +4074,7 @@ async fn verify_post_create_returns_ok_when_path_is_inside_allowlist() {
     // new one — Remove* modes were already exercised by the existing
     // integration suite via Mkdir / Write / Copy / Symlink.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let policy = restrictive_policy(&allowed_root);
 
     let inside = allowed_root.join("ok.txt");
@@ -4114,9 +4120,9 @@ async fn mkdir_with_symlinked_parent_returns_policy_denied_and_does_not_escape()
     // parent walk fails with ELOOP (Linux) or ENOTDIR (macOS) and the
     // handler returns PolicyDenied without touching the attacker side.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
 
     let sentinel = attacker_root.join("sentinel.txt");
     fs::write(&sentinel, b"do_not_touch").unwrap();
@@ -4163,12 +4169,12 @@ async fn move_with_symlinked_destination_parent_does_not_destroy_source() {
     // refactor must reject **before** the rename runs, so the source
     // survives intact.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let source = allowed_root.join("payload.txt");
     fs::write(&source, b"important_data").unwrap();
 
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
     let dest_parent_link = allowed_root.join("dest_parent_link");
     std::os::unix::fs::symlink(&attacker_root, &dest_parent_link).unwrap();
     let destination = dest_parent_link.join("moved.txt");
@@ -4209,12 +4215,12 @@ async fn copy_single_file_with_symlinked_destination_parent_returns_policy_denie
     // openat-based dest open with NOFOLLOW + safe parent walk rejects
     // before any write occurs.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let source = allowed_root.join("readable.txt");
     fs::write(&source, b"secret").unwrap();
 
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
     let dest_parent_link = allowed_root.join("dest_link");
     std::os::unix::fs::symlink(&attacker_root, &dest_parent_link).unwrap();
     let destination = dest_parent_link.join("copy.txt");
@@ -4247,9 +4253,9 @@ async fn create_symlink_with_symlinked_parent_returns_policy_denied() {
     // implementation would follow it and place the link in the
     // attacker's directory. Our safe-open rejects before symlinkat runs.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
 
     let parent_link = allowed_root.join("parent_link");
     std::os::unix::fs::symlink(&attacker_root, &parent_link).unwrap();
@@ -4283,9 +4289,9 @@ async fn chmod_with_symlinked_parent_does_not_modify_target_permissions() {
     // attacker's target. Pre-create a victim file with a known mode
     // and verify it stays exactly that mode after the handler rejects.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
 
     let victim = attacker_root.join("victim.txt");
     fs::write(&victim, b"x").unwrap();
@@ -4335,7 +4341,7 @@ async fn linux_openat2_path_returns_policy_denied_for_symlinked_ancestor() {
     // because operators must read this error as "policy refused to
     // traverse a symlink", not "your filesystem is missing files".
     let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = canon(dir.path());
     let real = root.join("real_dir");
     fs::create_dir(&real).unwrap();
     let link = root.join("link_dir");
