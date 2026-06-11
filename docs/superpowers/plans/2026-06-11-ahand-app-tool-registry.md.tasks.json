@@ -73,7 +73,7 @@
     {
       "id": 9,
       "subject": "Task 9: hub POST /api/control/app-tool invocation",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         8
       ],
@@ -82,7 +82,7 @@
     {
       "id": 10,
       "subject": "Task 10: SDK listAppTools + invokeAppTool",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         2,
         9
@@ -92,7 +92,7 @@
     {
       "id": 11,
       "subject": "Task 11: docs, roadmap, full validation sweep",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [
         6,
         10
@@ -100,5 +100,5 @@
       "description": "**Goal:** Roadmap/README updated; full CI-equivalent validation green; new modules at 100% line coverage.\n\n```json:metadata\n{\"files\": [\"docs/remote-control-roadmap.md\", \"README.md\"], \"verifyCommand\": \"cargo fmt --all -- --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-targets\", \"acceptanceCriteria\": [\"roadmap records app tools\", \"coverage thresholds met\", \"all TS builds/tests/lints pass\"]}\n```"
     }
   ],
-  "lastUpdated": "2026-06-11T22:30:00+08:00"
+  "lastUpdated": "2026-06-12T00:30:00+08:00"
 }
