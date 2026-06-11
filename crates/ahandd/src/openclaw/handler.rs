@@ -1654,7 +1654,9 @@ mod tests {
     }
 
     /// Build an invoke request that uses a true argv array (no rawCommand).
-    /// Used to test the direct-spawn path.
+    /// Used to test the direct-spawn path. Its only caller is the
+    /// unix-gated ampersand test, so gate it the same way.
+    #[cfg(unix)]
     fn array_command_invoke(
         session_key: &str,
         argv: Vec<&str>,
