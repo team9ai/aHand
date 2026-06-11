@@ -2590,7 +2590,7 @@ mod tests {
     use crate::outbox::Outbox;
 
     use super::{
-        BufferedEnvelopeSender, ConnectError, OutboundFrame, QueuedEnvelope,
+        BufferedEnvelopeSender, ConnectError, OutboundFrame,
         classify_hello_accepted_message, connect_tcp_with_keepalive,
         hello_capabilities_from_wire_names,
     };
