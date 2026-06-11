@@ -811,11 +811,19 @@ async fn stat_outside_allowlist_is_denied() {
     let dir = TempDir::new().unwrap();
     let (mgr, _root) = test_manager(&dir);
 
-    // Try to stat a path outside the allowlist.
+    // Use an OS-appropriate absolute path that is guaranteed to be outside the
+    // allowlist (which is scoped to the temp dir). On Windows `/etc/hosts` is
+    // not a valid absolute path (no drive letter), so we use the Windows
+    // equivalent instead.
+    #[cfg(unix)]
+    let outside_path = "/etc/hosts";
+    #[cfg(windows)]
+    let outside_path = r"C:\Windows\System32\drivers\etc\hosts";
+
     let req = FileRequest {
         request_id: "t".into(),
         operation: Some(file_request::Operation::Stat(FileStat {
-            path: "/etc/hosts".into(),
+            path: outside_path.into(),
             no_follow_symlink: false,
         })),
     };
