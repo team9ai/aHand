@@ -275,13 +275,9 @@ pub async fn ensure(
 
     // Post-install verification: playwright_cli_invocation() returns Ok only
     // when the binary (unix) or entry JS (windows) actually exists on disk.
-    let Ok((prog, leading)) = dirs.playwright_cli_invocation() else {
-        let cli = dirs.playwright_cli_bin();
-        anyhow::bail!(
-            "playwright-cli was installed but binary not found at {}",
-            cli.display()
-        );
-    };
+    let (prog, leading) = dirs
+        .playwright_cli_invocation()
+        .map_err(|e| anyhow::anyhow!("playwright-cli was installed but is not resolvable: {e}"))?;
     let version = {
         let mut cmd = tokio::process::Command::new(&prog);
         cmd.args(leading.iter().map(|a| a.as_os_str()));
