@@ -5,6 +5,7 @@ on:
     paths:
       - "scripts/dist/**"
       - "e2e/scripts/**"
+      - ".github/workflows/test-dist-scripts.yml"
   push:
     # TEMPORARY feat/cross-platform-m2 branch — remove before merge
     branches: [main, feat/cross-platform-m2]
@@ -134,13 +135,14 @@ jobs:
           Write-Host "Mock server is ready."
 
       - name: Run install.ps1 (first run — adds bin dir to PATH)
-        shell: pwsh
+        # Run under Windows PowerShell 5.1 to exercise the claimed compatibility
+        shell: powershell
         run: |
           $port       = "${{ steps.mock-server.outputs.SERVER_PORT }}"
           $base       = "http://127.0.0.1:$port"
           $installDir = Join-Path $env:RUNNER_TEMP "ahand-test"
 
-          pwsh -NoProfile -File scripts/dist/install.ps1 `
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dist/install.ps1 `
             -ApiBase      $base `
             -DownloadBase $base `
             -InstallDir   $installDir
@@ -172,13 +174,14 @@ jobs:
           Write-Host "PASS: admin SPA extracted"
 
       - name: Run install.ps1 (second run — PATH idempotency)
-        shell: pwsh
+        # Run under Windows PowerShell 5.1 to exercise the claimed compatibility
+        shell: powershell
         run: |
           $port       = "${{ steps.mock-server.outputs.SERVER_PORT }}"
           $base       = "http://127.0.0.1:$port"
           $installDir = Join-Path $env:RUNNER_TEMP "ahand-test"
 
-          pwsh -NoProfile -File scripts/dist/install.ps1 `
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dist/install.ps1 `
             -ApiBase      $base `
             -DownloadBase $base `
             -InstallDir   $installDir
@@ -202,13 +205,14 @@ jobs:
           Write-Host "PASS: PATH idempotency OK"
 
       - name: Run install.ps1 (-NoPathUpdate) into separate InstallDir
-        shell: pwsh
+        # Run under Windows PowerShell 5.1 to exercise the claimed compatibility
+        shell: powershell
         run: |
           $port        = "${{ steps.mock-server.outputs.SERVER_PORT }}"
           $base        = "http://127.0.0.1:$port"
           $installDir3 = Join-Path $env:RUNNER_TEMP "ahand-test-nopathupdate"
 
-          pwsh -NoProfile -File scripts/dist/install.ps1 `
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dist/install.ps1 `
             -ApiBase      $base `
             -DownloadBase $base `
             -InstallDir   $installDir3 `
@@ -233,6 +237,7 @@ jobs:
           Write-Host "PASS: -NoPathUpdate did not modify User PATH"
 
       - name: Negative test — checksum mismatch must fail
+        # Fixture manipulation uses pwsh; the installer itself is invoked via powershell.exe (5.1)
         shell: pwsh
         run: |
           $port        = "${{ steps.mock-server.outputs.SERVER_PORT }}"
@@ -244,8 +249,8 @@ jobs:
           "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  ahandd-windows-x64.exe" |
             Set-Content (Join-Path $rustDir "checksums-rust.txt") -Encoding UTF8
 
-          $proc = Start-Process pwsh `
-            -ArgumentList "-NoProfile","-File","scripts/dist/install.ps1",
+          $proc = Start-Process powershell.exe `
+            -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File","scripts/dist/install.ps1",
                           "-ApiBase",$base,
                           "-DownloadBase",$base,
                           "-InstallDir",$installDir2,

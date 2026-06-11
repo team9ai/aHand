@@ -141,11 +141,17 @@ function Confirm-Checksums {
 }
 
 # ── Install admin SPA via tar ─────────────────────────────────────────────────
+# Safe staged extraction:
+#   1. Extract into a fresh temp staging dir.
+#   2. Validate every item: reject reparse points and paths that escape staging root.
+#   3. Only after validation succeeds: clear AdminDistDir and move contents in.
+# A failed or malicious archive therefore leaves the existing AdminDistDir untouched.
 
 function Install-AdminSpa {
     param(
         [string]$TarPath,
-        [string]$AdminDistDir
+        [string]$AdminDistDir,
+        [string]$ChecksumFile   # optional — path to checksums-admin.txt
     )
     $tarCmd = Get-Command tar -ErrorAction SilentlyContinue
     if (-not $tarCmd) {
@@ -153,14 +159,65 @@ function Install-AdminSpa {
         Write-Host "  (tar ships with Windows 10 1803+; install Git for Windows or upgrade to get it.)" -ForegroundColor Yellow
         return
     }
-    if (Test-Path $AdminDistDir) {
-        Remove-Item $AdminDistDir -Recurse -Force
+
+    # --- Optional checksum verification for admin-spa.tar.gz ---
+    if ($ChecksumFile -and (Test-Path $ChecksumFile)) {
+        Write-Host "  Verifying admin-spa.tar.gz checksum..."
+        Confirm-Checksums -ChecksumFile $ChecksumFile -FilesToVerify @($TarPath)
     }
-    New-Item -ItemType Directory -Path $AdminDistDir -Force | Out-Null
-    & tar -xzf $TarPath -C $AdminDistDir
-    if ($LASTEXITCODE -ne 0) {
-        throw "tar extraction failed with exit code $LASTEXITCODE."
+
+    # --- Extract into an isolated staging subdirectory ---
+    $stagingExtract = Join-Path ([System.IO.Path]::GetTempPath()) "ahand-spa-stage-$([System.IO.Path]::GetRandomFileName())"
+    New-Item -ItemType Directory -Path $stagingExtract -Force | Out-Null
+
+    try {
+        & tar -xzf $TarPath -C $stagingExtract
+        if ($LASTEXITCODE -ne 0) {
+            throw "tar extraction failed with exit code $LASTEXITCODE."
+        }
+
+        # --- Validate: no reparse points, no path escapes ---
+        # Resolve staging root once (with trailing separator for prefix check)
+        $stagingResolved = [System.IO.Path]::GetFullPath($stagingExtract)
+        if (-not $stagingResolved.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+            $stagingResolved = $stagingResolved + [System.IO.Path]::DirectorySeparatorChar
+        }
+
+        $allItems = Get-ChildItem -LiteralPath $stagingExtract -Recurse -Force -ErrorAction SilentlyContinue
+        foreach ($item in $allItems) {
+            # Check for reparse points (symlinks, junctions, mount points)
+            $attrs = (Get-Item -LiteralPath $item.FullName -Force).Attributes
+            if ($attrs -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Archive contains a reparse point (symlink/junction) which is not permitted: $($item.FullName)"
+            }
+
+            # Check for path traversal escape
+            $resolved = [System.IO.Path]::GetFullPath($item.FullName)
+            if (-not $resolved.StartsWith($stagingResolved, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Archive item escapes the staging directory (path traversal detected): $($item.FullName)"
+            }
+        }
+
+        # --- Validation passed: swap staging into AdminDistDir ---
+        if (Test-Path $AdminDistDir) {
+            Remove-Item $AdminDistDir -Recurse -Force
+        }
+        $adminDistParent = Split-Path $AdminDistDir -Parent
+        if (-not (Test-Path $adminDistParent)) {
+            New-Item -ItemType Directory -Path $adminDistParent -Force | Out-Null
+        }
+        Move-Item -LiteralPath $stagingExtract -Destination $AdminDistDir -Force
+        # Move-Item on PS 5.1 may require the destination not to already exist;
+        # we removed it above so this should always succeed.
+
+    } catch {
+        # Clean up staging dir on failure; leave AdminDistDir untouched.
+        if (Test-Path $stagingExtract) {
+            Remove-Item $stagingExtract -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        throw
     }
+    # staging dir is now AdminDistDir — no separate cleanup needed on success
 }
 
 # ── PATH management ───────────────────────────────────────────────────────────
@@ -251,7 +308,8 @@ try {
     }
 
     # --- Download admin SPA (optional) ---
-    $adminTar = $null
+    $adminTar          = $null
+    $adminChecksumFile = $null
     if ($adminVer) {
         Write-Step "Downloading admin panel (admin-v$adminVer)..."
         $adminBase = "$DownloadBase/admin-v$adminVer"
@@ -259,6 +317,13 @@ try {
         $gotAdmin  = Invoke-Download -Url "$adminBase/admin-spa.tar.gz" -Dest $adminTar -Tolerant
         if (-not $gotAdmin) {
             $adminTar = $null
+        } else {
+            # Download admin checksum file (checksums-admin.txt) — optional
+            $adminChecksumDest = Join-Path $stagingDir "checksums-admin.txt"
+            $gotAdminChecksum  = Invoke-Download -Url "$adminBase/checksums-admin.txt" -Dest $adminChecksumDest -Tolerant
+            if ($gotAdminChecksum) {
+                $adminChecksumFile = $adminChecksumDest
+            }
         }
     }
 
@@ -280,7 +345,7 @@ try {
     if ($adminTar) {
         Write-Step "Extracting admin panel..."
         $adminDistDir = Join-Path $InstallDir "admin\dist"
-        Install-AdminSpa -TarPath $adminTar -AdminDistDir $adminDistDir
+        Install-AdminSpa -TarPath $adminTar -AdminDistDir $adminDistDir -ChecksumFile $adminChecksumFile
         Write-Host "  Admin panel extracted to $adminDistDir"
     }
 
