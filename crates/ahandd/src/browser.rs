@@ -1022,9 +1022,18 @@ mod tests {
         let node_bin = dir.path().join("bin");
         std::fs::create_dir_all(&node_bin).unwrap();
 
-        // Simulate what build_env_vars does once node_bin_dir.is_dir() is true.
-        let system_path = "/usr/local/bin:/usr/bin";
-        let (key, val) = node_path_env(&node_bin, system_path);
+        // Build a platform-native PATH string using join_paths so that
+        // split_paths (which uses ';' on Windows, ':' on Unix) can round-trip
+        // it back correctly.  Using a hard-coded Unix ":"-separated string
+        // would cause Windows to see the whole thing as one path component.
+        let extra_a = std::path::PathBuf::from("/usr/local/bin");
+        let extra_b = std::path::PathBuf::from("/usr/bin");
+        let system_path = std::env::join_paths([&extra_a, &extra_b])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let (key, val) = node_path_env(&node_bin, &system_path);
 
         assert_eq!(key, "PATH");
         let parts: Vec<PathBuf> = std::env::split_paths(&val).collect();
@@ -1034,14 +1043,10 @@ mod tests {
             parts
         );
         // Original entries must still appear.
-        let path_strs: Vec<String> = parts
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect();
         assert!(
-            path_strs.iter().any(|s| s == "/usr/local/bin"),
+            parts.iter().any(|p| p == &extra_a),
             "original PATH entries must be preserved; got {:?}",
-            path_strs
+            parts
         );
     }
 
@@ -1063,6 +1068,15 @@ mod tests {
         }
         #[cfg(windows)]
         {
+            // Windows: playwright_cli_invocation() checks BOTH:
+            //   1. node_bin() == dependencies/node/bin/node.exe EXISTS
+            //   2. resolve_playwright_cli_entry() finds the JS entry
+            // Create node.exe so the node-presence gate passes.
+            let bin_dir = root.join("dependencies").join("node").join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            std::fs::write(bin_dir.join("node.exe"), b"").unwrap();
+
+            // Create the @playwright/cli package so the JS entry resolves.
             let pkg_dir = root
                 .join("dependencies")
                 .join("node")
