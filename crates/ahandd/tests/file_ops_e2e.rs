@@ -421,10 +421,18 @@ async fn e2e_policy_rejection_returns_policy_denied_error() {
     let dir = TempDir::new().unwrap();
     let (mgr, _root) = test_manager(&dir);
 
+    // OS-appropriate absolute path outside the temp-dir-scoped allowlist; on
+    // Windows `/etc/passwd` has no drive letter and fails as InvalidPath
+    // before the allowlist check is reached.
+    #[cfg(unix)]
+    let outside_path = "/etc/passwd";
+    #[cfg(windows)]
+    let outside_path = r"C:\Windows\System32\drivers\etc\hosts";
+
     let req = FileRequest {
         request_id: "denied".into(),
         operation: Some(file_request::Operation::Stat(FileStat {
-            path: "/etc/passwd".into(),
+            path: outside_path.into(),
             no_follow_symlink: false,
         })),
     };
