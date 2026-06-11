@@ -26,6 +26,7 @@ message AppToolRequest {
   uint32 timeout_ms   = 4; // daemon clamps to [1_000, 300_000]; 0 => 60_000
 }
 
+// AppToolError - structured failure for one invocation; code is machine-readable, message is a human-readable remediation hint.
 message AppToolError {
   string code    = 1; // TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE | APPROVAL_DENIED
                       // | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT | HANDLER_PANIC

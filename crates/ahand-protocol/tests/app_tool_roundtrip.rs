@@ -1,8 +1,8 @@
 //! Wire round-trip tests for app tool messages (Envelope tags 35/36/37).
 
 use ahand_protocol::{
-    envelope, AppToolDescriptor, AppToolError, AppToolRequest, AppToolResponse, AppToolsUpdate,
-    Envelope, app_tool_response,
+    AppToolDescriptor, AppToolError, AppToolRequest, AppToolResponse, AppToolsUpdate, Envelope,
+    app_tool_response, envelope,
 };
 use prost::Message;
 

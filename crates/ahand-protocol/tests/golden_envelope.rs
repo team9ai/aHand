@@ -508,6 +508,17 @@ fn golden_app_tool_response() {
     assert_golden("app_tool_response", &env);
 }
 
+#[test]
+fn golden_app_tool_response_result_json() {
+    let env = base_envelope(envelope::Payload::AppToolResponse(AppToolResponse {
+        tool_call_id: "call-golden".into(),
+        result: Some(app_tool_response::Result::ResultJson(
+            r#"{"documents":["a.txt","b.txt"]}"#.into(),
+        )),
+    }));
+    assert_golden("app_tool_response_result_json", &env);
+}
+
 // ── Exhaustiveness lock ─────────────────────────────────────────────────
 //
 // Every arm of `envelope::Payload` must map to a fixture name AND that
