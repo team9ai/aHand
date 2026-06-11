@@ -205,8 +205,15 @@ async fn download_optional(url: &str) -> Option<String> {
     }
 }
 
-/// Look up the expected SHA-256 for `filename` in `checksum_text` (format:
-/// `{hex}  {filename}` per line, as written by `shasum -a 256`), and verify.
+/// Look up the expected SHA-256 for `filename` in `checksum_text` and verify.
+///
+/// Accepted line formats (covers `shasum`, `sha256sum`, binary-mode `*` prefix):
+/// - `{hex}  {filename}`       — double-space (`shasum -a 256`)
+/// - `{hex} *{filename}`       — single-space + binary-mode marker (`sha256sum -b`)
+/// - `{hex} {filename}`        — single-space
+///
+/// Parsing: split each line by whitespace → first token = hex digest, last
+/// token = filename with any leading `*` stripped.
 ///
 /// If no matching line exists, the check is silently skipped (same behaviour
 /// as upgrade.sh's `if [ -n "$expected" ]` guard).
@@ -214,13 +221,13 @@ async fn download_optional(url: &str) -> Option<String> {
 /// Leniency is intentional: parity with `upgrade.sh` which skips verification
 /// when the expected hash is absent rather than failing the upgrade.
 fn verify_binary_checksum(checksum_text: &str, filename: &str, data: &[u8]) -> anyhow::Result<()> {
-    // Find a line that ends with two-spaces + filename (shasum format).
-    // e.g. "abc123...  ahandd-linux-x64"
     let expected_hex = checksum_text.lines().find_map(|line| {
-        // Split on the "  " separator (shasum uses two spaces).
-        let (hex, fname) = line.split_once("  ")?;
-        if fname.trim() == filename {
-            Some(hex.trim().to_string())
+        let mut tokens = line.split_whitespace();
+        let hex = tokens.next()?;
+        // Last token is the filename; strip a leading '*' (binary-mode marker).
+        let fname = tokens.last()?.trim_start_matches('*');
+        if fname == filename {
+            Some(hex.to_string())
         } else {
             None
         }
@@ -234,13 +241,22 @@ fn verify_binary_checksum(checksum_text: &str, filename: &str, data: &[u8]) -> a
     Ok(())
 }
 
-/// Extract `tar.gz` bytes into `dist_dir` using an atomic temp-dir swap.
+/// Extract `tar.gz` bytes into `dist_dir` using a crash-safe rename-aside swap.
 ///
-/// ATOMIC SWAP: extraction happens into a fresh sibling temp directory
-/// (`{dist_parent}/.dist.tmp-{pid}`).  Only after a FULLY successful
-/// extraction is the old `dist_dir` replaced by the new one via rename.
-/// This ensures a failed or malicious archive never destroys the existing
-/// dist content that warp::fs::dir is currently serving.
+/// CRASH-SAFE SWAP:
+///   1. Extraction happens into a fresh sibling temp directory
+///      (`{dist_parent}/.dist.tmp-{pid}`).
+///   2. Only after a FULLY successful extraction: the existing `dist_dir` (if
+///      any) is renamed aside to `{dist_parent}/.dist.old-{pid}`.
+///   3. The temp dir is then renamed into place as `dist_dir`.
+///   4. If the final rename (step 3) fails, the old dir is renamed back from
+///      `.dist.old-{pid}` to `dist_dir` to restore the previous state.  Both
+///      the rename-in error and any rollback error are reported together.
+///   5. On success, the `.dist.old-{pid}` directory is removed on a best-effort
+///      basis (failure is logged but does not abort the upgrade).
+///
+/// This guarantees that a failed mid-swap never leaves `dist_dir` absent: at
+/// any point in time either the old content or the new content is present.
 ///
 /// PATH-TRAVERSAL GUARD: any entry whose normalised path escapes the temp dir
 /// (contains `..` components or is absolute) is rejected with an error before
@@ -260,8 +276,10 @@ pub fn extract_admin_spa(data: &[u8], dist_dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dist_parent)
         .with_context(|| format!("failed to create parent {}", dist_parent.display()))?;
 
+    let pid = std::process::id();
+
     // Create a fresh temp dir sibling for safe extraction.
-    let tmp_dir = dist_parent.join(format!(".dist.tmp-{}", std::process::id()));
+    let tmp_dir = dist_parent.join(format!(".dist.tmp-{pid}"));
 
     // Remove any stale temp dir from a previous aborted run.
     if tmp_dir.exists() {
@@ -325,18 +343,46 @@ pub fn extract_admin_spa(data: &[u8], dist_dir: &Path) -> anyhow::Result<()> {
         return Err(e);
     }
 
-    // Atomic swap: remove old dist (if present) and rename tmp → dist.
-    if dist_dir.exists() {
-        std::fs::remove_dir_all(dist_dir)
-            .with_context(|| format!("failed to remove old dist dir {}", dist_dir.display()))?;
+    // ── Crash-safe rename-aside swap ────────────────────────────────────────
+    // Rename existing dist aside (if present), then rename tmp into place.
+    // On final-rename failure, roll back by restoring the old dir.
+    let old_dir = dist_parent.join(format!(".dist.old-{pid}"));
+
+    let dist_existed = dist_dir.exists();
+    if dist_existed {
+        std::fs::rename(dist_dir, &old_dir).with_context(|| {
+            format!(
+                "failed to rename existing dist aside: {} -> {}",
+                dist_dir.display(),
+                old_dir.display()
+            )
+        })?;
     }
-    std::fs::rename(&tmp_dir, dist_dir).with_context(|| {
-        format!(
+
+    if let Err(rename_err) = std::fs::rename(&tmp_dir, dist_dir) {
+        let rename_err = anyhow::Error::new(rename_err).context(format!(
             "failed to rename {} -> {}",
             tmp_dir.display(),
             dist_dir.display()
-        )
-    })?;
+        ));
+        // Attempt to roll back the old dist.
+        if dist_existed && let Err(rollback_err) = std::fs::rename(&old_dir, dist_dir) {
+            return Err(rename_err.context(format!(
+                "rollback also failed ({rollback_err}); old dist left at {}",
+                old_dir.display()
+            )));
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(rename_err);
+    }
+
+    // Success — best-effort removal of the old aside dir.
+    if dist_existed && let Err(e) = std::fs::remove_dir_all(&old_dir) {
+        eprintln!(
+            "  Warning: could not remove old dist backup {}: {e}",
+            old_dir.display()
+        );
+    }
 
     Ok(())
 }
@@ -377,6 +423,35 @@ mod checksum_skip_tests {
             result.is_ok(),
             "expected Ok(()) when filename is absent from checksum text, got: {result:?}"
         );
+    }
+
+    /// Lines in `{hex} *{filename}` format (binary-mode marker from `sha256sum -b`)
+    /// must be parsed correctly: the leading `*` is stripped from the filename.
+    #[test]
+    fn checksum_text_binary_mode_marker_is_parsed() {
+        use sha2::{Digest, Sha256};
+        let data = b"binary-mode-test";
+        let hex = hex::encode(Sha256::digest(data));
+        // Single-space + `*` prefix — the `sha256sum -b` format.
+        let checksum_text = format!("{hex} *ahandd-linux-x64\n");
+        let result = verify_binary_checksum(&checksum_text, "ahandd-linux-x64", data);
+        assert!(
+            result.is_ok(),
+            "binary-mode (*) line should match: {result:?}"
+        );
+    }
+
+    /// Lines with only a single space between hex and filename (no `*`) must
+    /// also be accepted.
+    #[test]
+    fn checksum_text_single_space_variant_is_parsed() {
+        use sha2::{Digest, Sha256};
+        let data = b"single-space-test";
+        let hex = hex::encode(Sha256::digest(data));
+        // Single-space, no binary-mode marker.
+        let checksum_text = format!("{hex} ahandd-linux-x64\n");
+        let result = verify_binary_checksum(&checksum_text, "ahandd-linux-x64", data);
+        assert!(result.is_ok(), "single-space line should match: {result:?}");
     }
 }
 
@@ -594,6 +669,52 @@ mod extract_tests {
         enc.write_all(&tar_bytes).unwrap();
         drop(enc);
         gz_bytes
+    }
+
+    /// A successful swap must:
+    ///   - leave `dist_dir` with the NEW archive content, and
+    ///   - leave NO `.dist.old-*` residue in the parent directory.
+    #[test]
+    fn extract_admin_spa_successful_swap_leaves_no_old_residue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dist_dir = tmp.path().join("admin").join("dist");
+
+        // Pre-populate dist with old content.
+        std::fs::create_dir_all(&dist_dir).unwrap();
+        std::fs::write(dist_dir.join("old.html"), b"old").unwrap();
+
+        // New archive has different content.
+        let archive = make_tar_gz(&[("index.html", b"<html>new</html>")]);
+        extract_admin_spa(&archive, &dist_dir).unwrap();
+
+        // dist must contain the new content.
+        assert!(
+            dist_dir.join("index.html").exists(),
+            "new index.html must be present after successful swap"
+        );
+        assert_eq!(
+            std::fs::read(dist_dir.join("index.html")).unwrap(),
+            b"<html>new</html>",
+            "dist content must be new archive content"
+        );
+        // Old file must not be present in dist.
+        assert!(
+            !dist_dir.join("old.html").exists(),
+            "old content must not be present in dist after successful swap"
+        );
+
+        // No .dist.old-* residue in parent.
+        let dist_parent = dist_dir.parent().unwrap();
+        let residue: Vec<_> = std::fs::read_dir(dist_parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".dist.old-"))
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "no .dist.old-* residue should remain after successful swap, found: {:?}",
+            residue.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
     }
 
     /// Verify that the admin-spa checksum check passes with a correct hash

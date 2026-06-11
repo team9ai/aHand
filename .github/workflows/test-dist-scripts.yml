@@ -6,13 +6,6 @@ on:
       - "scripts/dist/**"
       - "e2e/scripts/**"
       - ".github/workflows/test-dist-scripts.yml"
-  push:
-    # TEMPORARY feat/cross-platform-m2 branch — remove before merge
-    branches: [main, feat/cross-platform-m2]
-    paths:
-      - "scripts/dist/**"
-      - "e2e/scripts/**"
-      - ".github/workflows/test-dist-scripts.yml"
   workflow_dispatch:
 
 jobs:
@@ -78,7 +71,8 @@ jobs:
           # ── Write server script then launch as a detached pwsh process ─────────
           # Using a separate pwsh process (not Start-Job) ensures the server
           # survives beyond this step. .NET HttpListener needs no Python.
-          $port      = 18080
+          $port      = Get-Random -Minimum 20000 -Maximum 59000
+          "MOCK_PORT=$port"      | Out-File $env:GITHUB_ENV    -Encoding utf8 -Append
           $serverLog = Join-Path $env:RUNNER_TEMP "mock-server.log"
           "SERVER_PORT=$port"    | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "SERVER_LOG=$serverLog" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -138,8 +132,7 @@ jobs:
         # Run under Windows PowerShell 5.1 to exercise the claimed compatibility
         shell: powershell
         run: |
-          $port       = "${{ steps.mock-server.outputs.SERVER_PORT }}"
-          $base       = "http://127.0.0.1:$port"
+          $base       = "http://127.0.0.1:$env:MOCK_PORT"
           $installDir = Join-Path $env:RUNNER_TEMP "ahand-test"
 
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dist/install.ps1 `
@@ -177,8 +170,7 @@ jobs:
         # Run under Windows PowerShell 5.1 to exercise the claimed compatibility
         shell: powershell
         run: |
-          $port       = "${{ steps.mock-server.outputs.SERVER_PORT }}"
-          $base       = "http://127.0.0.1:$port"
+          $base       = "http://127.0.0.1:$env:MOCK_PORT"
           $installDir = Join-Path $env:RUNNER_TEMP "ahand-test"
 
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dist/install.ps1 `
@@ -208,8 +200,7 @@ jobs:
         # Run under Windows PowerShell 5.1 to exercise the claimed compatibility
         shell: powershell
         run: |
-          $port        = "${{ steps.mock-server.outputs.SERVER_PORT }}"
-          $base        = "http://127.0.0.1:$port"
+          $base        = "http://127.0.0.1:$env:MOCK_PORT"
           $installDir3 = Join-Path $env:RUNNER_TEMP "ahand-test-nopathupdate"
 
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/dist/install.ps1 `
@@ -240,8 +231,7 @@ jobs:
         # Fixture manipulation uses pwsh; the installer itself is invoked via powershell.exe (5.1)
         shell: pwsh
         run: |
-          $port        = "${{ steps.mock-server.outputs.SERVER_PORT }}"
-          $base        = "http://127.0.0.1:$port"
+          $base        = "http://127.0.0.1:$env:MOCK_PORT"
           $installDir2 = Join-Path $env:RUNNER_TEMP "ahand-test-bad"
 
           # Corrupt the checksum file served by the mock server
