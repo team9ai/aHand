@@ -1,5 +1,14 @@
 # @ahandai/proto Changelog
 
+## 0.3.0 — 2026-06-11
+
+### Added
+
+- **`AppToolsUpdate` / `AppToolRequest` / `AppToolResponse`** wire types
+  (Envelope tags 35–37) for application-defined tools registered by host
+  apps embedding `ahandd`. Includes `AppToolDescriptor` (name, description,
+  JSON Schema, `requires_approval`) and `AppToolError`.
+
 ## 0.2.1 — 2026-05-13
 
 ### Added
