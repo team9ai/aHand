@@ -854,7 +854,7 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                         }
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
                         queue_ack_only(&control_tx, &device_id, envelope.seq)?;
-                    } else if dispatch_control_plane_event(&state, &envelope) {
+                    } else if dispatch_control_plane_event(&state, &envelope).await {
                         // The control-plane tracker handled the frame, or
                         // the job id is a stale non-dashboard id that must
                         // not fall into JobRuntime's UUID-backed store.
@@ -1015,7 +1015,10 @@ fn queue_ack_only(
 /// UUID-backed runtime trying to parse a control-plane ULID. Returns `false`
 /// otherwise (not job-related, or a dashboard / JobRuntime job id the caller
 /// still needs to process).
-fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Envelope) -> bool {
+async fn dispatch_control_plane_event(
+    state: &AppState,
+    envelope: &ahand_protocol::Envelope,
+) -> bool {
     let Some(payload) = envelope.payload.as_ref() else {
         return false;
     };
@@ -1047,6 +1050,35 @@ fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Env
                     }
                 }
             };
+            match kind {
+                ahand_protocol::job_event::Event::StdoutChunk(chunk) => {
+                    if let Err(err) = state
+                        .output_stream
+                        .push_stdout(&event.job_id, chunk.clone())
+                        .await
+                    {
+                        tracing::warn!(job_id = %event.job_id, error = %err, "failed recording control job stdout");
+                    }
+                }
+                ahand_protocol::job_event::Event::StderrChunk(chunk) => {
+                    if let Err(err) = state
+                        .output_stream
+                        .push_stderr(&event.job_id, chunk.clone())
+                        .await
+                    {
+                        tracing::warn!(job_id = %event.job_id, error = %err, "failed recording control job stderr");
+                    }
+                }
+                ahand_protocol::job_event::Event::Progress(percent) => {
+                    if let Err(err) = state
+                        .output_stream
+                        .push_progress(&event.job_id, (*percent).min(100))
+                        .await
+                    {
+                        tracing::warn!(job_id = %event.job_id, error = %err, "failed recording control job progress");
+                    }
+                }
+            }
             state.control_jobs.publish(&event.job_id, control_event);
             true
         }
@@ -1082,12 +1114,26 @@ fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Env
                     },
                 }
             };
+            if let Err(err) = state
+                .output_stream
+                .push_finished(&finished.job_id, finished.exit_code, &finished.error)
+                .await
+            {
+                tracing::warn!(job_id = %finished.job_id, error = %err, "failed recording control job finish");
+            }
             state.control_jobs.finalize(&finished.job_id, event);
             true
         }
         ahand_protocol::envelope::Payload::JobRejected(rejected) => {
             if state.control_jobs.get(&rejected.job_id).is_none() {
                 return consume_unknown_non_dashboard_job_id(&rejected.job_id, "JobRejected");
+            }
+            if let Err(err) = state
+                .output_stream
+                .push_finished(&rejected.job_id, 1, &rejected.reason)
+                .await
+            {
+                tracing::warn!(job_id = %rejected.job_id, error = %err, "failed recording control job rejection");
             }
             state.control_jobs.finalize(
                 &rejected.job_id,

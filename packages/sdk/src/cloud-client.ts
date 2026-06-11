@@ -67,6 +67,11 @@ export interface SpawnParams {
   /** Callback for progress events. Thrown errors are swallowed. */
   onProgress?: (p: { percent: number; message?: string }) => void;
   /**
+   * Callback fired after the hub accepts the job and returns its id,
+   * before the SDK opens the SSE stream. Thrown errors are swallowed.
+   */
+  onJobStarted?: (job: { jobId: string }) => void;
+  /**
    * AbortSignal — aborting triggers best-effort
    * `POST /cancel` + closes SSE + rejects with an `abort` error.
    */
@@ -1206,6 +1211,13 @@ export class CloudClient {
         "Hub response missing jobId",
         { httpStatus: postRes.status },
       );
+    }
+    if (p.onJobStarted) {
+      try {
+        p.onJobStarted({ jobId });
+      } catch {
+        // Swallow — user callback's problem.
+      }
     }
 
     // Subscribe to the SSE stream. From here on, an abort triggers a
