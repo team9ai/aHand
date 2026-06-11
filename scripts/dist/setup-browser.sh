@@ -1,4 +1,9 @@
 #!/bin/bash
+# DEPRECATED: superseded by `ahandctl browser-init` (native Rust, cross-platform).
+# This script is kept for legacy installs only (pre-M3 aHand versions that
+# shipped the script directly).  New installs and upgrades use the native
+# browser-init command instead.  This script will be removed in a future release.
+#
 # ── aHand Browser Setup ──────────────────────────────────────────────
 # Installs browser automation dependencies for aHand.
 #

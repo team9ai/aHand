@@ -4,7 +4,6 @@ use serde::Serialize;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use warp::http::StatusCode;
 use warp::{Filter, Rejection, Reply, reject};
 
@@ -370,85 +369,49 @@ fn browser_init_route(
         })
 }
 
+/// Convert a `ProgressEvent` to the SSE line data string in the EXACT wire
+/// format the admin SPA expects:
+///   - Per-line events:  `{"line":"<escaped message>"}`
+///   - Final event:      `{"status":"done|error","exit_code":N}`  (not from this fn)
+///
+/// Escaping rules match the original bash-stream implementation:
+/// backslash → `\\`, double-quote → `\"`.  This function is a pure
+/// transformation and is unit-tested for escaping parity in the tests module.
+pub fn progress_event_to_sse_line(event: &ahandd::browser_setup::ProgressEvent) -> String {
+    use ahandd::browser_setup::Phase;
+    let line = match event.phase {
+        Phase::Done => format!("\u{2713} {}", event.message),
+        Phase::Starting
+        | Phase::Downloading
+        | Phase::Extracting
+        | Phase::Installing
+        | Phase::Verifying => event.message.clone(),
+        Phase::Log => event.message.clone(),
+    };
+    let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(r#"{{"line":"{}"}}"#, escaped)
+}
+
 fn browser_init_stream()
 -> impl futures_util::Stream<Item = std::result::Result<warp::sse::Event, Infallible>> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<warp::sse::Event>();
 
     tokio::spawn(async move {
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => {
-                let _ = tx.send(
-                    warp::sse::Event::default()
-                        .data(r#"{"line":"ERROR: Failed to find home directory","status":"error","exit_code":1}"#),
-                );
-                return;
-            }
+        // Callback: convert each ProgressEvent to a `{"line":"..."}` SSE event.
+        // Wire format is byte-compatible with the old bash-stream implementation
+        // (same escaping: backslash → `\\`, double-quote → `\"`).
+        let tx_progress = tx.clone();
+        let progress = move |event: ahandd::browser_setup::ProgressEvent| {
+            let data = progress_event_to_sse_line(&event);
+            let _ = tx_progress.send(warp::sse::Event::default().data(data));
         };
 
-        let script_path = home.join(".ahand").join("bin").join("setup-browser.sh");
-        if !script_path.exists() {
-            let msg = format!(
-                r#"{{"line":"ERROR: setup-browser.sh not found at {}","status":"error","exit_code":1}}"#,
-                script_path.display()
-            );
-            let _ = tx.send(warp::sse::Event::default().data(msg));
-            return;
-        }
+        let result = ahandd::browser_setup::run_all(false, progress).await;
 
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg(&script_path);
-        cmd.arg("--from-release");
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let msg = format!(
-                    r#"{{"line":"ERROR: Failed to spawn setup-browser.sh: {}","status":"error","exit_code":1}}"#,
-                    e
-                );
-                let _ = tx.send(warp::sse::Event::default().data(msg));
-                return;
-            }
+        let (exit_code, status_str) = match result {
+            Ok(_) => (0i32, "done"),
+            Err(_) => (1i32, "error"),
         };
-
-        let stdout = child.stdout.take().expect("stdout");
-        let stderr = child.stderr.take().expect("stderr");
-
-        let tx_out = tx.clone();
-        let stdout_task = tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
-                let data = format!(r#"{{"line":"{}"}}"#, escaped);
-                if tx_out.send(warp::sse::Event::default().data(data)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let tx_err = tx.clone();
-        let stderr_task = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
-                let data = format!(r#"{{"line":"[stderr] {}"}}"#, escaped);
-                if tx_err.send(warp::sse::Event::default().data(data)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let status = child.wait().await;
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
-
-        let exit_code = status.map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-        let status_str = if exit_code == 0 { "done" } else { "error" };
         let data = format!(r#"{{"status":"{}","exit_code":{}}}"#, status_str, exit_code);
         let _ = tx.send(warp::sse::Event::default().data(data));
     });
@@ -743,4 +706,98 @@ fn calculate_dir_size(
 
         Ok(total)
     })
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod sse_adapter_tests {
+    use super::*;
+    use ahandd::browser_setup::{Phase, ProgressEvent};
+
+    fn make_event(phase: Phase, message: &str) -> ProgressEvent {
+        ProgressEvent {
+            step: "node",
+            phase,
+            message: message.to_string(),
+            percent: None,
+            stream: None,
+        }
+    }
+
+    /// Plain message with no special characters should be wrapped unchanged.
+    #[test]
+    fn plain_message_wrapped_in_line_object() {
+        let event = make_event(Phase::Starting, "Installing Node.js");
+        let result = progress_event_to_sse_line(&event);
+        assert_eq!(result, r#"{"line":"Installing Node.js"}"#);
+    }
+
+    /// Backslashes must be escaped as `\\` — parity with old bash stream.
+    #[test]
+    fn backslash_is_escaped() {
+        let event = make_event(Phase::Installing, r"path\to\node");
+        let result = progress_event_to_sse_line(&event);
+        // raw string: path\\to\\node inside the JSON string
+        assert_eq!(result, r#"{"line":"path\\to\\node"}"#);
+    }
+
+    /// Double-quotes must be escaped as `\"` — parity with old bash stream.
+    #[test]
+    fn double_quote_is_escaped() {
+        let event = make_event(Phase::Log, r#"npm warn "deprecated""#);
+        let result = progress_event_to_sse_line(&event);
+        assert_eq!(result, r#"{"line":"npm warn \"deprecated\""}"#);
+    }
+
+    /// Both backslash and double-quote in the same message.
+    #[test]
+    fn backslash_and_quote_both_escaped() {
+        let event = make_event(Phase::Log, r#"C:\Users\"name""#);
+        let result = progress_event_to_sse_line(&event);
+        assert_eq!(result, r#"{"line":"C:\\Users\\\"name\""}"#);
+    }
+
+    /// Unicode content passes through without modification.
+    #[test]
+    fn unicode_content_passes_through() {
+        let event = make_event(Phase::Verifying, "Verification \u{2713} complete");
+        let result = progress_event_to_sse_line(&event);
+        assert_eq!(
+            result,
+            "{\u{22}line\u{22}:\u{22}Verification \u{2713} complete\u{22}}"
+        );
+    }
+
+    /// Phase::Done prepends a check-mark to the message.
+    #[test]
+    fn done_phase_prepends_check_mark() {
+        let event = make_event(Phase::Done, "Node.js installed");
+        let result = progress_event_to_sse_line(&event);
+        assert_eq!(
+            result,
+            "{\u{22}line\u{22}:\u{22}\u{2713} Node.js installed\u{22}}"
+        );
+    }
+
+    /// Result is valid JSON that the SPA can JSON.parse successfully.
+    #[test]
+    fn result_is_valid_json_parseable_by_serde() {
+        let cases = [
+            make_event(Phase::Starting, "Starting"),
+            make_event(Phase::Log, r#"warn "pkg" deprecated"#),
+            make_event(Phase::Done, r"C:\path\done"),
+        ];
+        for event in &cases {
+            let s = progress_event_to_sse_line(event);
+            let parsed: serde_json::Value =
+                serde_json::from_str(&s).expect("result must be valid JSON");
+            assert!(
+                parsed.get("line").is_some(),
+                "parsed JSON must have 'line' key: {s}"
+            );
+        }
+    }
 }

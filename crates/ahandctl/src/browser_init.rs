@@ -1,72 +1,78 @@
-use anyhow::{Context, Result};
-use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use anyhow::Result;
 
-pub async fn run(force: bool) -> Result<()> {
-    let script_path = resolve_script_path()?;
+use ahandd::browser_setup::{self, Phase, ProgressEvent};
 
-    if !script_path.exists() {
-        anyhow::bail!(
-            "setup-browser.sh not found at {}\nRun: bash scripts/deploy-admin.sh",
-            script_path.display()
-        );
+/// Print a `ProgressEvent` to stdout in the same human-readable style that
+/// `setup-browser.sh` produced: step lines on `stdout`, done lines prefixed
+/// with a check-mark.
+fn print_progress(event: ProgressEvent) {
+    match event.phase {
+        Phase::Done => println!("  \u{2713} {}", event.message),
+        Phase::Starting
+        | Phase::Downloading
+        | Phase::Extracting
+        | Phase::Installing
+        | Phase::Verifying => {
+            println!("  {}", event.message);
+        }
+        // Log lines (npm output, etc.) — print verbatim.
+        Phase::Log => {
+            println!("  {}", event.message);
+        }
     }
+}
 
+/// Entry point for `ahandctl browser-init [--force]`.
+///
+/// Replaces the old bash spawn of `setup-browser.sh`: calls the canonical
+/// `ahandd::browser_setup::run_all` orchestration directly (no shell, no
+/// script file on disk required).  `--force` maps to the existing
+/// `force=true` semantics in the library (reinstalls even if already present).
+pub async fn run(force: bool) -> Result<()> {
     println!("Running browser setup...");
     println!();
 
-    let mut cmd = Command::new("bash");
-    cmd.arg(&script_path);
-    cmd.arg("--from-release");
-
     if force {
-        // Force reinstall by cleaning first
-        println!("Force mode: cleaning existing installation...");
-        let _ = Command::new("bash")
-            .arg(&script_path)
-            .arg("--clean")
-            .status()
-            .await;
+        println!("Force mode: will reinstall even if already present.");
+        println!();
     }
 
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
+    let reports = browser_setup::run_all(force, print_progress).await?;
 
-    let mut child = cmd.spawn().context("Failed to spawn setup-browser.sh")?;
+    println!();
+    println!("Setup complete.");
 
-    // Stream stdout
-    let stdout = child.stdout.take().expect("stdout");
-    let stderr = child.stderr.take().expect("stderr");
-
-    let stdout_task = tokio::spawn(async move {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            println!("{}", line);
+    use browser_setup::CheckStatus;
+    for report in &reports {
+        match &report.status {
+            CheckStatus::Ok { version, path, .. } => {
+                let version_str = if version.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {version}")
+                };
+                println!("  {}:{} ({})", report.label, version_str, path.display());
+            }
+            CheckStatus::Missing => {
+                println!("  {}: still missing", report.label);
+            }
+            CheckStatus::Outdated {
+                current, required, ..
+            } => {
+                println!("  {}: {current} (need {required})", report.label);
+            }
+            CheckStatus::NoneDetected { tried } => {
+                println!(
+                    "  {}: none detected (tried: {})",
+                    report.label,
+                    tried.join(", ")
+                );
+            }
+            CheckStatus::Failed { code, message } => {
+                println!("  {}: failed ({code:?}): {message}", report.label);
+            }
         }
-    });
-
-    let stderr_task = tokio::spawn(async move {
-        let reader = BufReader::new(stderr);
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            eprintln!("{}", line);
-        }
-    });
-
-    let status = child.wait().await?;
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-
-    if !status.success() {
-        anyhow::bail!("Browser setup failed with exit code: {}", status);
     }
 
     Ok(())
-}
-
-fn resolve_script_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Failed to find home directory")?;
-    Ok(home.join(".ahand").join("bin").join("setup-browser.sh"))
 }
