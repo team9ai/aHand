@@ -241,5 +241,13 @@ these):
   test helpers reintroduces the `\\?\` landmine.
 - `sanitize_env` Windows blocklist (spec M4 item, untouched in M1).
 - Windows glob case-insensitivity hardening for policy matching.
+- **Named-pipe explicit security descriptor** (Codex review finding, accepted
+  M1 risk): the pipe is created with the DEFAULT Windows SD, whose DACL grants
+  Everyone READ — on a multi-user Windows host another local user could open
+  the pipe read-only and observe approval-broadcast envelopes (metadata leak;
+  cannot submit jobs, which requires write access). Fix in M4 via
+  `ServerOptions::create_with_security_attributes_raw` with an owner-only
+  DACL; M2 manual verification must test cross-user open behavior on real
+  hardware (already on the M2 list).
 - Optional: unify `ahandctl admin`'s direct `ctrl_c()` onto
   `platform::signals`.
