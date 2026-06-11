@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use ahand_hub_core::HubError;
 use ahand_hub_core::traits::{DeviceStore, OutboxStore};
+use ahand_hub_store::app_tool_store::{StoredAppTool, StoredAppToolCatalog, should_accept_update};
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -854,6 +855,43 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                         }
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
                         queue_ack_only(&control_tx, &device_id, envelope.seq)?;
+                    } else if let Some(ahand_protocol::envelope::Payload::AppToolsUpdate(ref update)) = envelope.payload {
+                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
+                        let existing = state.app_tools.get_catalog(&device_id).await.ok().flatten();
+                        if should_accept_update(existing.as_ref(), update.revision) {
+                            let catalog = StoredAppToolCatalog {
+                                revision: update.revision,
+                                stale: false,
+                                tools: update.tools.iter().map(|t| StoredAppTool {
+                                    name: t.name.clone(),
+                                    description: t.description.clone(),
+                                    input_schema_json: t.input_schema_json.clone(),
+                                    requires_approval: t.requires_approval,
+                                }).collect(),
+                                updated_at_ms: now_ms(),
+                            };
+                            let tool_count = catalog.tools.len();
+                            if let Err(err) = state.app_tools.put_catalog(&device_id, catalog).await {
+                                tracing::warn!(
+                                    device_id = %device_id,
+                                    error = %err,
+                                    "failed to store app tool catalog",
+                                );
+                            } else {
+                                state.append_audit_entry(
+                                    "device.app_tools.updated",
+                                    "device",
+                                    &device_id,
+                                    &device_id,
+                                    serde_json::json!({
+                                        "revision": update.revision,
+                                        "toolCount": tool_count,
+                                    }),
+                                ).await;
+                                // Webhook enqueue lands in Task 8.
+                            }
+                        }
                     } else if dispatch_control_plane_event(&state, &envelope).await {
                         // The control-plane tracker handled the frame, or
                         // the job id is a stale non-dashboard id that must
@@ -934,6 +972,13 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         };
         state.devices.mark_offline(&device_id).await?;
         state.jobs.handle_device_disconnected(&device_id).await?;
+        if let Err(err) = state.app_tools.mark_stale(&device_id).await {
+            tracing::warn!(
+                device_id = %device_id,
+                error = %err,
+                "failed to mark app tool catalog stale on disconnect",
+            );
+        }
         if let Err(err) = state.events.emit_device_offline(&device_id).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.offline audit");
         }
