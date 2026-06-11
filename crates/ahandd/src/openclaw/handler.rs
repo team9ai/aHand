@@ -1708,12 +1708,15 @@ mod tests {
         // Create "mybinary.exe" — PATHEXT typically contains .EXE
         let bin_path = tmp.path().join("mybinary.exe");
         std::fs::write(&bin_path, b"").unwrap();
-        // Query without extension
+        // Query without extension. PATHEXT entries are typically upper-case
+        // (".EXE") and NTFS is case-insensitive, so the returned path may
+        // carry the PATHEXT casing — compare case-insensitively.
         let result = super::which_in_dir(tmp.path(), "mybinary");
+        let found = result.expect("should find mybinary.exe via PATHEXT");
         assert_eq!(
-            result,
-            Some(bin_path),
-            "should find mybinary.exe via PATHEXT"
+            found.to_string_lossy().to_lowercase(),
+            bin_path.to_string_lossy().to_lowercase(),
+            "should find mybinary.exe via PATHEXT (case-insensitive)"
         );
     }
 

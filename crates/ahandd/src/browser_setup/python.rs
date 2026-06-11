@@ -343,9 +343,14 @@ mod tests {
             dirs.python,
             PathBuf::from("/tmp/ahand-primary-runtime/dependencies/python")
         );
+        let python_bin = if cfg!(windows) {
+            "python3.exe"
+        } else {
+            "python3"
+        };
         assert_eq!(
             dirs.local_python_bin(),
-            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/python/bin/python3")
+            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/python/bin").join(python_bin)
         );
     }
 

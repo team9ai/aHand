@@ -82,11 +82,15 @@ mod tests {
             dirs.node_dir(),
             std::path::PathBuf::from("/tmp/cache/ahand-primary-runtime/dependencies/node")
         );
+        let cli_bin = if cfg!(windows) {
+            "playwright-cli.exe"
+        } else {
+            "playwright-cli"
+        };
         assert_eq!(
             dirs.playwright_cli_bin(),
-            std::path::PathBuf::from(
-                "/tmp/cache/ahand-primary-runtime/dependencies/node/bin/playwright-cli"
-            )
+            std::path::PathBuf::from("/tmp/cache/ahand-primary-runtime/dependencies/node/bin")
+                .join(cli_bin)
         );
     }
 

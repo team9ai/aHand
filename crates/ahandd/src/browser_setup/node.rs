@@ -318,9 +318,10 @@ mod tests {
             dirs.node,
             PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node")
         );
+        let node_bin = if cfg!(windows) { "node.exe" } else { "node" };
         assert_eq!(
             dirs.local_node_bin(),
-            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node/bin/node")
+            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/node/bin").join(node_bin)
         );
     }
 
