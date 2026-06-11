@@ -40,11 +40,12 @@ pub struct Config {
     /// Directory for trace logs and run artifacts. Defaults to ~/.ahand/data.
     pub data_dir: Option<String>,
 
-    /// Enable debug IPC server (Unix socket).
+    /// Enable debug IPC server.
     #[serde(default)]
     pub debug_ipc: Option<bool>,
 
-    /// Custom path for the IPC Unix socket. Defaults to ~/.ahand/ahandd.sock.
+    /// Custom IPC endpoint. Unix: socket path (default ~/.ahand/ahandd.sock);
+    /// Windows: named pipe name (default \\.\pipe\ahandd-<USERNAME>).
     pub ipc_socket_path: Option<String>,
 
     /// Unix permission mode for the IPC socket (e.g. 0o660 for group access).

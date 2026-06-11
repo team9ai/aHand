@@ -50,11 +50,11 @@ struct Args {
     #[arg(long, env = "AHAND_DATA_DIR")]
     data_dir: Option<String>,
 
-    /// Enable debug IPC server (Unix socket)
+    /// Enable debug IPC server
     #[arg(long, env = "AHAND_DEBUG_IPC")]
     debug_ipc: bool,
 
-    /// Custom path for the IPC Unix socket
+    /// Custom IPC endpoint (Unix socket path; named pipe name on Windows)
     #[arg(long, env = "AHAND_IPC_SOCKET")]
     ipc_socket: Option<String>,
 

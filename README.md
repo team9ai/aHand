@@ -131,6 +131,7 @@ ahand/
 │  ├─ ahand-hub/               # Production control plane HTTP/WebSocket server
 │  ├─ ahand-hub-core/          # Hub domain logic
 │  ├─ ahand-hub-store/         # Hub persistence adapters
+│  ├─ ahand-platform/         # Cross-platform OS abstraction (paths/IPC/process/shell/signals/secure-file)
 │  ├─ ahandd/                  # Local daemon (bin)
 │  └─ ahandctl/                # CLI tool (bin)
 ├─ deploy/
@@ -138,7 +139,7 @@ ahand/
 ├─ scripts/
 │  └─ dist/                    # Distribution scripts (install, upgrade, setup-browser)
 ├─ e2e/scripts/                # E2E tests for distribution scripts (BATS)
-├─ .github/workflows/          # CI/CD (hub-ci, release-rust, release-admin, release-browser, release-hub)
+├─ .github/workflows/          # CI/CD (client-ci, hub-ci, release-rust, release-admin, release-browser, release-hub)
 ├─ turbo.json                  # Turborepo pipeline
 ├─ Cargo.toml                  # Rust workspace
 └─ pnpm-workspace.yaml         # pnpm monorepo

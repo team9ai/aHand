@@ -66,7 +66,7 @@ re-exported from the platform layer).
 |--------|----------------------------------------|------------------------|
 | `ipc` | `UnixListener`/`UnixStream`, socket at `~/.ahand/ahandd.sock`, `peer_cred` check, `0o660` | `tokio::net::windows::named_pipe`, pipe name `\\.\pipe\ahandd-<username>`, default per-user pipe ACL replaces `peer_cred` |
 | `process` | spawn detached via `process_group(0)`; terminate via SIGTERM→SIGKILL; liveness via `/proc` / `ps` | spawn with `DETACHED_PROCESS \| CREATE_NO_WINDOW`; terminate via `taskkill` / `TerminateProcess`; liveness via Win32 process query |
-| `shell` | `SHELL` env → fallback `/bin/sh`; `sh -c <cmd>` | `COMSPEC` env → fallback `cmd.exe`; `cmd /C <cmd>`; config may override to PowerShell |
+| `shell` | `SHELL` env → fallback `/bin/sh`; `sh -c <cmd>` | `COMSPEC` env → fallback `cmd.exe`; `cmd /C <cmd>` (PowerShell override: future option, not in M1) |
 | `secure_file` | open with mode `0o600` before write | write then restrict ACL to owner; single `write_secure_file()` used by all three secret-file writers |
 | `paths` | tilde expansion via `dirs::home_dir()` (unchanged) | same, plus: strip `\\?\`/`\\?\UNC\` after `canonicalize` (via `dunce`) **before policy glob matching**; `std::env::join_paths` for all PATH construction; `std::env::temp_dir()` replaces `/tmp`; `.exe` suffix helper |
 | `restart` | `exec()` self-replace | spawn new process, exit current; self-update uses rename-aside (rename running `ahandd.exe` → `.old`, move new into place, clean `.old` on next start) |
@@ -97,21 +97,27 @@ three platforms; bootstrap scripts stay thin.
 
 ### Behavioral decisions
 
+- **OpenClaw array commands (2+ elements) spawn directly, never via shell**:
+  argv boundaries pass verbatim to `Command::new(cmd[0]).args(cmd[1..])`, so
+  `& | > ^ %` in arguments cannot escape into shell syntax (closes a cmd.exe
+  allowlist-bypass vector). Single-element and raw-string commands keep using
+  the platform shell.
 - **FileChmod (Unix mode) returns an explicit unsupported error on Windows**
   (no silent ignore). `FileMkdir.mode` is documented as Unix-only. A full
   Windows ACL mapping (proto already has ACL fields) is a separate future project.
-- **TOCTOU protection on Windows is approximated by handle verification**:
-  after opening, `GetFinalPathNameByHandle` re-checks the real path against
-  policy. Weaker than openat2; documented as such.
+- **TOCTOU protection on Windows is NOT implemented in M1** (M4 backlog):
+  the planned `GetFinalPathNameByHandle` on-open re-verification has not been
+  built; Windows file ops run without the openat2/symlinkat protection Unix
+  has. Accepted M1 gap, recorded in the M4 backlog.
 - **The daemon runs as a detached process on Windows** — no Windows service
   registration in v1 (parity with macOS, which has no launchd integration
   either). Auto-start is future work.
-- **`sanitize_env` gains a Windows blocklist** for loader/lookup injection
-  vectors (e.g. `PATHEXT` tampering) and compares PATH overrides via
-  `env::split_paths` instead of `':'` string checks.
-- Symlink file ops on Windows use `std::os::windows::fs::symlink_file/dir`;
-  where privilege is missing (non-developer-mode), return a clear error rather
-  than silently skipping.
+- **`sanitize_env` Windows blocklist is an M4 item** (not implemented in M1):
+  it will block loader/lookup injection vectors (e.g. `PATHEXT` tampering) and
+  compare PATH overrides via `env::split_paths` instead of `':'` string checks.
+- Symlink file ops on Windows return an explicit unsupported error in M1
+  (`TODO(M4)`: implement via `std::os::windows::fs::symlink_file/dir` with
+  developer-mode detection; never silently skip).
 - **Policy patterns must be written as plain paths** (`C:\Users\...`, never a
   `\\?\` verbatim prefix). Paths that dunce cannot simplify — verbatim-UNC
   (`\\?\UNC\...`) network shares and over-MAX_PATH paths — keep their prefix
