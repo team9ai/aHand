@@ -374,20 +374,18 @@ fn browser_init_route(
 ///   - Per-line events:  `{"line":"<escaped message>"}`
 ///   - Final event:      `{"status":"done|error","exit_code":N}`  (not from this fn)
 ///
+/// The human-readable line content is produced by the shared
+/// `format_progress_line` helper (same rules as the CLI surfaces):
+///   - `Phase::Done`   → `✓ <message>`
+///   - `Phase::Failed` → `✗ <message>`
+///   - `Phase::Log` with `LogStream::Stderr` → `[stderr] <message>`
+///   - All other phases → `<message>` unchanged
+///
 /// Escaping rules match the original bash-stream implementation:
 /// backslash → `\\`, double-quote → `\"`.  This function is a pure
 /// transformation and is unit-tested for escaping parity in the tests module.
 pub fn progress_event_to_sse_line(event: &ahandd::browser_setup::ProgressEvent) -> String {
-    use ahandd::browser_setup::Phase;
-    let line = match event.phase {
-        Phase::Done => format!("\u{2713} {}", event.message),
-        Phase::Starting
-        | Phase::Downloading
-        | Phase::Extracting
-        | Phase::Installing
-        | Phase::Verifying => event.message.clone(),
-        Phase::Log => event.message.clone(),
-    };
+    let line = ahandd::browser_setup::format_progress_line(event);
     let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
     format!(r#"{{"line":"{}"}}"#, escaped)
 }
@@ -715,7 +713,7 @@ fn calculate_dir_size(
 #[cfg(test)]
 mod sse_adapter_tests {
     use super::*;
-    use ahandd::browser_setup::{Phase, ProgressEvent};
+    use ahandd::browser_setup::{LogStream, Phase, ProgressEvent};
 
     fn make_event(phase: Phase, message: &str) -> ProgressEvent {
         ProgressEvent {
@@ -724,6 +722,16 @@ mod sse_adapter_tests {
             message: message.to_string(),
             percent: None,
             stream: None,
+        }
+    }
+
+    fn make_log_event(message: &str, stream: Option<LogStream>) -> ProgressEvent {
+        ProgressEvent {
+            step: "playwright",
+            phase: Phase::Log,
+            message: message.to_string(),
+            percent: None,
+            stream,
         }
     }
 
@@ -747,7 +755,7 @@ mod sse_adapter_tests {
     /// Double-quotes must be escaped as `\"` — parity with old bash stream.
     #[test]
     fn double_quote_is_escaped() {
-        let event = make_event(Phase::Log, r#"npm warn "deprecated""#);
+        let event = make_log_event(r#"npm warn "deprecated""#, Some(LogStream::Stdout));
         let result = progress_event_to_sse_line(&event);
         assert_eq!(result, r#"{"line":"npm warn \"deprecated\""}"#);
     }
@@ -755,7 +763,7 @@ mod sse_adapter_tests {
     /// Both backslash and double-quote in the same message.
     #[test]
     fn backslash_and_quote_both_escaped() {
-        let event = make_event(Phase::Log, r#"C:\Users\"name""#);
+        let event = make_log_event(r#"C:\Users\"name""#, Some(LogStream::Stdout));
         let result = progress_event_to_sse_line(&event);
         assert_eq!(result, r#"{"line":"C:\\Users\\\"name\""}"#);
     }
@@ -782,13 +790,62 @@ mod sse_adapter_tests {
         );
     }
 
+    /// Phase::Failed prepends a cross mark — NOT a check mark.
+    #[test]
+    fn failed_phase_prepends_cross_mark() {
+        let event = make_event(Phase::Failed, "EACCES: permission denied");
+        let result = progress_event_to_sse_line(&event);
+        // ✗ is U+2717
+        assert_eq!(
+            result,
+            "{\u{22}line\u{22}:\u{22}\u{2717} EACCES: permission denied\u{22}}"
+        );
+    }
+
+    /// Phase::Log with LogStream::Stderr gets a [stderr] prefix.
+    #[test]
+    fn log_stderr_gets_stderr_prefix() {
+        let event = make_log_event("npm warn deprecated foo@1.0.0", Some(LogStream::Stderr));
+        let result = progress_event_to_sse_line(&event);
+        assert_eq!(
+            result,
+            r#"{"line":"[stderr] npm warn deprecated foo@1.0.0"}"#
+        );
+    }
+
+    /// Phase::Log with LogStream::Stdout has no prefix.
+    #[test]
+    fn log_stdout_has_no_prefix() {
+        let event = make_log_event("npm notice flushed", Some(LogStream::Stdout));
+        let result = progress_event_to_sse_line(&event);
+        assert_eq!(result, r#"{"line":"npm notice flushed"}"#);
+    }
+
+    /// Phase::Log with no stream has no prefix.
+    #[test]
+    fn log_no_stream_has_no_prefix() {
+        let event = make_log_event("some output", None);
+        let result = progress_event_to_sse_line(&event);
+        assert_eq!(result, r#"{"line":"some output"}"#);
+    }
+
+    /// [stderr] prefix + backslash escaping both apply correctly.
+    #[test]
+    fn log_stderr_with_backslash_escapes_correctly() {
+        let event = make_log_event(r"npm ERR! path\to\module", Some(LogStream::Stderr));
+        let result = progress_event_to_sse_line(&event);
+        assert_eq!(result, r#"{"line":"[stderr] npm ERR! path\\to\\module"}"#);
+    }
+
     /// Result is valid JSON that the SPA can JSON.parse successfully.
     #[test]
     fn result_is_valid_json_parseable_by_serde() {
         let cases = [
             make_event(Phase::Starting, "Starting"),
-            make_event(Phase::Log, r#"warn "pkg" deprecated"#),
+            make_log_event(r#"warn "pkg" deprecated"#, Some(LogStream::Stdout)),
             make_event(Phase::Done, r"C:\path\done"),
+            make_event(Phase::Failed, "install error"),
+            make_log_event("npm error msg", Some(LogStream::Stderr)),
         ];
         for event in &cases {
             let s = progress_event_to_sse_line(event);

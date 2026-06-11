@@ -1,25 +1,12 @@
 use anyhow::Result;
 
-use ahandd::browser_setup::{self, Phase, ProgressEvent};
+use ahandd::browser_setup::{self, ProgressEvent, format_progress_line, format_summary};
 
 /// Print a `ProgressEvent` to stdout in the same human-readable style that
 /// `setup-browser.sh` produced: step lines on `stdout`, done lines prefixed
-/// with a check-mark.
+/// with a check-mark, failure lines prefixed with `✗`.
 fn print_progress(event: ProgressEvent) {
-    match event.phase {
-        Phase::Done => println!("  \u{2713} {}", event.message),
-        Phase::Starting
-        | Phase::Downloading
-        | Phase::Extracting
-        | Phase::Installing
-        | Phase::Verifying => {
-            println!("  {}", event.message);
-        }
-        // Log lines (npm output, etc.) — print verbatim.
-        Phase::Log => {
-            println!("  {}", event.message);
-        }
-    }
+    println!("  {}", format_progress_line(&event));
 }
 
 /// Entry point for `ahandctl browser-init [--force]`.
@@ -41,38 +28,7 @@ pub async fn run(force: bool) -> Result<()> {
 
     println!();
     println!("Setup complete.");
-
-    use browser_setup::CheckStatus;
-    for report in &reports {
-        match &report.status {
-            CheckStatus::Ok { version, path, .. } => {
-                let version_str = if version.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {version}")
-                };
-                println!("  {}:{} ({})", report.label, version_str, path.display());
-            }
-            CheckStatus::Missing => {
-                println!("  {}: still missing", report.label);
-            }
-            CheckStatus::Outdated {
-                current, required, ..
-            } => {
-                println!("  {}: {current} (need {required})", report.label);
-            }
-            CheckStatus::NoneDetected { tried } => {
-                println!(
-                    "  {}: none detected (tried: {})",
-                    report.label,
-                    tried.join(", ")
-                );
-            }
-            CheckStatus::Failed { code, message } => {
-                println!("  {}: failed ({code:?}): {message}", report.label);
-            }
-        }
-    }
+    println!("{}", format_summary(&reports));
 
     Ok(())
 }
