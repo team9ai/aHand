@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - feat/cross-platform-m3  # TEMPORARY — remove before merge
   pull_request:
     paths:
       - "crates/**"
@@ -55,3 +56,93 @@ jobs:
         # --no-fail-fast: run every test binary even if one fails, so a single
         # CI round surfaces all platform-specific failures at once.
         run: cargo test -p ahand-platform -p ahandd -p ahandctl --all-targets --no-fail-fast
+
+  browser-e2e:
+    name: browser-e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build ahandd (debug)
+        run: cargo build -p ahandd
+
+      - name: browser-init (with retry on download flake)
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set +e
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            AHANDD="target/debug/ahandd.exe"
+          else
+            AHANDD="target/debug/ahandd"
+          fi
+
+          echo "=== browser-init attempt 1 ==="
+          "$AHANDD" browser-init
+          STATUS=$?
+
+          if [ $STATUS -ne 0 ]; then
+            echo "=== browser-init attempt 1 failed (exit $STATUS) — retrying once ==="
+            "$AHANDD" browser-init --force
+            STATUS=$?
+          fi
+
+          exit $STATUS
+
+      - name: browser-doctor (assert healthy)
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            AHANDD="target/debug/ahandd.exe"
+          else
+            AHANDD="target/debug/ahandd"
+          fi
+
+          OUTPUT=$("$AHANDD" browser-doctor 2>&1)
+          STATUS=$?
+
+          echo "$OUTPUT"
+
+          if [ $STATUS -ne 0 ]; then
+            echo "ERROR: browser-doctor exited with status $STATUS"
+            exit 1
+          fi
+
+          # Assert healthy markers from browser_doctor::print_check output
+          if ! echo "$OUTPUT" | grep -qF "Node.js:"; then
+            echo "ERROR: doctor output missing 'Node.js:' marker"
+            exit 1
+          fi
+          if ! echo "$OUTPUT" | grep -qF "playwright-cli:"; then
+            echo "ERROR: doctor output missing 'playwright-cli:' marker"
+            exit 1
+          fi
+          if ! echo "$OUTPUT" | grep -qF "System Browser:"; then
+            echo "ERROR: doctor output missing 'System Browser:' marker"
+            exit 1
+          fi
+          if ! echo "$OUTPUT" | grep -qF "all checks passed"; then
+            echo "ERROR: doctor output missing 'all checks passed'"
+            exit 1
+          fi
+
+          echo "=== browser-doctor: all assertions passed ==="
