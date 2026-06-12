@@ -474,9 +474,7 @@ mod tests {
     // The SDDL string is the correctness anchor for the Windows pipe DACL: a
     // full cross-user rejection test is not CI-achievable (single principal on
     // the runner), so it stays on the M2 manual-verification list. This pins
-    // the exact string instead. Defined cross-platform so it runs everywhere
-    // (the helper is windows-only, but the string is platform-independent and
-    // we re-declare the expectation here to avoid a windows-only test gap).
+    // the exact string instead. Windows-only: runs on the Windows CI lane.
     #[cfg(windows)]
     #[test]
     fn pipe_sddl_is_owner_system_admins_only() {

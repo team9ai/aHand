@@ -1048,13 +1048,33 @@ pub async fn handle_create_symlink(
         let target = req.target.clone();
         let link_path_str = req.link_path.clone();
 
+        // For the dir/file probe we must resolve a RELATIVE target against the
+        // link's parent directory, not against the daemon's CWD (which could be
+        // anywhere).  An absolute target is used as-is.  The symlink itself is
+        // still created with the verbatim `target` string so the stored path is
+        // exactly what the caller requested.
+        let target_for_stat = {
+            let t = std::path::Path::new(&target);
+            if t.is_absolute() {
+                t.to_path_buf()
+            } else {
+                match link.parent() {
+                    Some(parent) => parent.join(t),
+                    None => t.to_path_buf(),
+                }
+            }
+        };
+
         tokio::task::spawn_blocking(move || -> Result<(), FileError> {
             // Determine whether the target is an existing directory so we can
             // choose symlink_dir vs symlink_file.  We use std::fs::metadata
             // (which follows symlinks) so that a symlink-to-dir target gives
             // us symlink_dir, matching how the OS resolves it.  If stat fails
             // (e.g. dangling target), we fall back to symlink_file.
-            let target_is_dir = std::fs::metadata(&target)
+            // `target_for_stat` is already resolved from the link's parent so
+            // relative targets are stat'd in the correct directory, not in the
+            // daemon's CWD.
+            let target_is_dir = std::fs::metadata(&target_for_stat)
                 .map(|m| m.is_dir())
                 .unwrap_or(false);
 
@@ -1347,14 +1367,26 @@ fn acl_mask_to_sddl_rights(access_mask: u32) -> String {
 /// after a strict alias/SID-string check), we still reject obviously malformed
 /// tokens up front as defense-in-depth and to give a clear, early error:
 /// a principal containing a `:` (e.g. `Everyone:F`) is the classic
-/// perm-smuggling attempt; whitespace is never part of a valid account token;
-/// a leading `/` looks like a flag. These are rejected before any SID lookup or
-/// filesystem touch.
+/// perm-smuggling attempt; a leading `/` looks like a flag.
+///
+/// **Spaces are explicitly allowed.** Legitimate Windows account names such as
+/// `NT AUTHORITY\LOCAL SERVICE` and `BUILTIN\Authenticated Users` contain
+/// spaces. A space-containing principal can ONLY reach `LookupAccountNameW`
+/// (the SDDL-passthrough path in `sddl_principal_passthrough` requires a
+/// two-letter alias or `S-1-…` SID — neither contains spaces), so spaces can
+/// never be injected into raw SDDL.
+///
+/// What IS rejected: ASCII control characters (`\t`, `\n`, `\r`, and other
+/// `\x00`–`\x1f` / `\x7f` bytes) which have no place in any account name and
+/// could corrupt a downstream NUL-terminated UTF-16 API call; the SDDL
+/// structural metacharacters `:`, `;`, `(`, `)` (injection); and a leading `/`
+/// (looks like a flag / Unix path).
 ///
 /// Returns `Ok(())` for a well-formed principal (e.g. `BUILTIN\Users`,
-/// `DOMAIN\user`, `Everyone`, the SDDL aliases `BA`/`SY`/`WD`/`OW`, or a literal
-/// SID string `S-1-5-…`) and a `FileError` (InvalidPath, matching the file's
-/// existing path-style validation errors) otherwise.
+/// `NT AUTHORITY\LOCAL SERVICE`, `BUILTIN\Authenticated Users`,
+/// `DOMAIN\user`, `Everyone`, the SDDL aliases `BA`/`SY`/`WD`/`OW`, or a
+/// literal SID string `S-1-5-…`) and a `FileError` (InvalidPath, matching the
+/// file's existing path-style validation errors) otherwise.
 #[cfg(any(windows, test))]
 fn validate_principal(principal: &str, path_for_error: &str) -> Result<(), FileError> {
     if principal.is_empty() {
@@ -1368,7 +1400,7 @@ fn validate_principal(principal: &str, path_for_error: &str) -> Result<(), FileE
         || principal.contains(';')
         || principal.contains('(')
         || principal.contains(')')
-        || principal.chars().any(char::is_whitespace)
+        || principal.chars().any(|c| c.is_ascii_control())
         || principal.starts_with('/')
     {
         return Err(file_error(
@@ -1376,8 +1408,8 @@ fn validate_principal(principal: &str, path_for_error: &str) -> Result<(), FileE
             path_for_error,
             format!(
                 "ACL entry has a malformed principal '{principal}' — a principal must not \
-                 contain ':', ';', '(', ')' or whitespace or start with '/' (these corrupt \
-                 the SDDL ACE token)"
+                 contain ':', ';', '(', ')', ASCII control characters, or start with '/' \
+                 (these corrupt the SDDL ACE token or downstream API calls)"
             ),
         ));
     }
@@ -2169,6 +2201,79 @@ mod tests {
         );
     }
 
+    // ── Windows symlink dir/file probe: relative target resolution ───────────
+    // This test is Windows-only because it exercises the actual symlink_dir /
+    // symlink_file syscall and must run under Developer Mode.
+
+    /// Verify that a relative-path directory target selects `symlink_dir` (not
+    /// `symlink_file`).  The bug: `target_is_dir` was previously computed by
+    /// `std::fs::metadata(&req.target)`, which stats the raw string relative to
+    /// the *daemon's CWD*, not the link's parent directory.  For a relative target
+    /// `../subdir` that does not exist under CWD the stat fails and we'd
+    /// incorrectly fall back to `symlink_file`, causing `CreateSymlink` to return
+    /// an error on Windows (a file-symlink pointing at a directory is invalid and
+    /// fails with `ERROR_DIRECTORY`).
+    ///
+    /// After the fix the probe resolves the target against `link.parent()`, so the
+    /// stat succeeds and `symlink_dir` is chosen.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_relative_dir_target_chooses_symlink_dir() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // Layout:
+        //   root/
+        //     src_dir/          ← the directory to point at
+        //     links/
+        //       link_to_dir     ← relative target: "../src_dir"
+        let src = root.join("src_dir");
+        std::fs::create_dir(&src).unwrap();
+        let links_dir = root.join("links");
+        std::fs::create_dir(&links_dir).unwrap();
+        let link = links_dir.join("link_to_dir");
+
+        // Use a relative target: "../src_dir" — relative to links/ means src_dir.
+        let relative_target = r"..\src_dir";
+
+        // Build a minimal request and call handle_create_symlink directly.
+        // We exercise the public handle() path so the file_manager dispatch layer
+        // (allowlist checks) is also covered; both link and target are under root.
+        let (mgr, _root_path) = {
+            use crate::file_manager::{FileManager, FileManagerConfig};
+            let allowed = vec![root.to_path_buf()];
+            let cfg = FileManagerConfig::new(allowed);
+            let mgr = FileManager::new(cfg);
+            (mgr, root.to_path_buf())
+        };
+
+        let req = ahand_protocol::FileRequest {
+            request_id: "rel-dir".into(),
+            operation: Some(ahand_protocol::file_request::Operation::CreateSymlink(
+                ahand_protocol::FileCreateSymlink {
+                    target: relative_target.into(),
+                    link_path: link.to_string_lossy().into_owned(),
+                },
+            )),
+        };
+        mgr.handle(&req)
+            .await
+            .expect("symlink creation must succeed");
+
+        let meta = std::fs::symlink_metadata(&link).expect("link must exist");
+        assert!(
+            meta.file_type().is_symlink(),
+            "created path must be a symlink"
+        );
+        // The link must resolve to a *directory*, confirming symlink_dir was chosen.
+        let resolved_meta = std::fs::metadata(&link).expect("link must resolve");
+        assert!(
+            resolved_meta.is_dir(),
+            "symlink must resolve to the target directory (symlink_dir was chosen)"
+        );
+    }
+
     // ── Windows ACL SDDL builder unit tests ──────────────────────────────────
     // These run cross-platform because the builders are compiled under
     // cfg(any(windows, test)). They never touch the filesystem or the Win32 API
@@ -2352,16 +2457,40 @@ mod tests {
     }
 
     #[test]
-    fn validate_principal_rejects_whitespace_and_leading_slash() {
-        assert_eq!(
-            super::validate_principal("Local Service", "/p")
-                .unwrap_err()
-                .code,
-            ahand_protocol::FileErrorCode::InvalidPath as i32
-        );
+    fn validate_principal_rejects_control_chars_and_leading_slash() {
+        // ASCII control characters have no place in account names and must be
+        // rejected (they would corrupt a NUL-terminated UTF-16 API call).
+        for bad in ["\tLocal Service", "bad\nname", "cr\rhere", "\x01inject"] {
+            assert_eq!(
+                super::validate_principal(bad, "/p").unwrap_err().code,
+                ahand_protocol::FileErrorCode::InvalidPath as i32,
+                "principal {bad:?} must be rejected"
+            );
+        }
+        // A leading '/' looks like a flag / Unix path.
         assert_eq!(
             super::validate_principal("/grant", "/p").unwrap_err().code,
             ahand_protocol::FileErrorCode::InvalidPath as i32
+        );
+    }
+
+    #[test]
+    fn validate_principal_accepts_space_containing_windows_accounts() {
+        // Legitimate Windows account names that contain spaces must be accepted.
+        // They can ONLY reach LookupAccountNameW (the SDDL-passthrough path
+        // requires a two-letter alias or S-1-… SID — neither contains spaces),
+        // so spaces are safe.
+        assert!(
+            super::validate_principal("NT AUTHORITY\\LOCAL SERVICE", "/p").is_ok(),
+            "NT AUTHORITY\\LOCAL SERVICE must be accepted"
+        );
+        assert!(
+            super::validate_principal("BUILTIN\\Authenticated Users", "/p").is_ok(),
+            "BUILTIN\\Authenticated Users must be accepted"
+        );
+        assert!(
+            super::validate_principal("Local Service", "/p").is_ok(),
+            "bare 'Local Service' must be accepted"
         );
     }
 

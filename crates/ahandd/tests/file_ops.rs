@@ -4409,12 +4409,18 @@ async fn windows_create_symlink_target_outside_allowlist_is_denied() {
     let (mgr, root) = test_manager(&dir);
     let link = root.join("escape");
 
+    // Build an outside-allowlist path that is robust on non-C: Windows installs.
+    // WINDIR is set by Windows itself (e.g. "C:\Windows" or "D:\Windows");
+    // fall back to the conventional path if somehow unset.
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    let outside_target = format!(r"{windir}\System32\drivers\etc\hosts");
+
     let req = FileRequest {
         request_id: "t".into(),
         operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
-            // C:\Windows\System32\drivers\etc\hosts is a reliable outside-allowlist
-            // path on any Windows installation.
-            target: r"C:\Windows\System32\drivers\etc\hosts".into(),
+            // %WINDIR%\System32\drivers\etc\hosts is outside the temp-dir
+            // allowlist on any Windows installation regardless of drive letter.
+            target: outside_target,
             link_path: link.to_string_lossy().into_owned(),
         })),
     };
