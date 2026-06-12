@@ -1897,8 +1897,9 @@ fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: St
 ///
 /// The approval waiter intentionally does NOT watch `close_rx` (unlike file-request
 /// waiters): the response rides the stamped outbox so a result produced across a
-/// reconnect is replayed to the hub; the cost is an orphaned waiter for up to
-/// `approval_timeout` (default 24 h) if the hub never responds after disconnect.
+/// reconnect is replayed to the hub; the cost is an orphaned waiter for at most
+/// `min(approval_timeout, 300 s)` for app tools — not watching `close_rx` is
+/// therefore cheap, because the waiter self-cancels within the invocation deadline.
 #[allow(clippy::too_many_arguments)]
 async fn handle_app_tool_request<T>(
     device_id: &str,
@@ -2039,6 +2040,23 @@ async fn handle_app_tool_request<T>(
             "app tool requires approval"
         );
 
+        // Compute the bounded approval-wait timeout BEFORE submitting so the
+        // advertised expires_ms in the ApprovalRequest matches the window the
+        // waiter actually uses (dial + dialog UI both show this value).
+        let timeout_ms_req = req.timeout_ms;
+        // The call's clamped timeout is the TOTAL deadline for approval +
+        // execution. Bounding the approval wait by it guarantees the hub's
+        // `clamped + 2s` wait always covers the daemon-side outcome — no ghost
+        // execution after the caller's window closed (the hub mints a fresh
+        // tool_call_id per POST, so a late result would be unreachable anyway).
+        // The operator's approval_timeout remains an upper bound — a caller's
+        // timeout_ms can shrink the window but never extend it beyond what the
+        // approval policy permits.
+        let total_deadline_ms = AppToolRegistry::clamp_timeout(timeout_ms_req);
+        let timeout = approval_mgr
+            .default_timeout()
+            .min(Duration::from_millis(total_deadline_ms as u64));
+
         // Mark running BEFORE sending the ApprovalRequest so that a
         // duplicate request arriving while approval is pending sees Running
         // and is silently ignored (idempotency window is closed now).
@@ -2046,7 +2064,13 @@ async fn handle_app_tool_request<T>(
         app_tools.mark_running(&req.tool_call_id).await;
 
         let (approval_req, approval_rx) = approval_mgr
-            .submit(synthetic.clone(), caller_uid, reason, previous_refusals)
+            .submit_with_timeout(
+                synthetic.clone(),
+                caller_uid,
+                reason,
+                previous_refusals,
+                timeout,
+            )
             .await;
 
         // Send ApprovalRequest to cloud via WS.
@@ -2070,16 +2094,6 @@ async fn handle_app_tool_request<T>(
         let tool_call_id = req.tool_call_id.clone();
         let tool_name = req.name.clone();
         let args_json = req.args_json.clone();
-        let timeout_ms_req = req.timeout_ms;
-        // The call's clamped timeout is the TOTAL deadline for approval +
-        // execution. Bounding the approval wait by it guarantees the hub's
-        // `clamped + 2s` wait always covers the daemon-side outcome — no ghost
-        // execution after the caller's window closed (the hub mints a fresh
-        // tool_call_id per POST, so a late result would be unreachable anyway).
-        let total_deadline_ms = AppToolRegistry::clamp_timeout(timeout_ms_req);
-        let timeout = amgr
-            .default_timeout()
-            .min(Duration::from_millis(total_deadline_ms as u64));
         let approval_job_id_clone = approval_job_id.clone();
 
         tokio::spawn(async move {

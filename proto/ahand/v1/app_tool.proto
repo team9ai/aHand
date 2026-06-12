@@ -23,7 +23,7 @@ message AppToolRequest {
   string tool_call_id = 1;
   string name         = 2;
   string args_json    = 3; // JSON object matching input_schema_json
-  uint32 timeout_ms   = 4; // daemon clamps to [1_000, 300_000]; 0 => 60_000
+  uint32 timeout_ms   = 4; // daemon clamps to [1_000, 300_000]; 0 => 60_000; bounds approval wait + execution for approval-gated tools
 }
 
 // AppToolError - structured failure for one invocation; code is machine-readable, message is a human-readable remediation hint.

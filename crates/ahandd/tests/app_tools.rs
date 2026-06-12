@@ -1615,10 +1615,11 @@ async fn second_invocation_sees_one_previous_refusal() {
     handle.shutdown().await.expect("shutdown clean");
 }
 
-// ── Task 1: approval wait bounded by the invocation deadline ─────────────────
+// ── Approval deadline bound (2026-06-12 plan) ─────────────────────────────────
 
-/// Task 1 / Case A: approval_timeout_secs=3600, timeout_ms=2_000.
+/// Approval deadline / Case A: approval_timeout_secs=3600, timeout_ms=2_000.
 /// Nobody approves → APPROVAL_TIMEOUT fires from the request deadline, elapsed < 6s.
+/// Also verifies that expires_ms ≤ now + clamped_timeout + 2 s slack (NOT 24 h out).
 #[tokio::test]
 async fn approval_wait_is_bounded_by_request_timeout() {
     let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
@@ -1627,12 +1628,30 @@ async fn approval_wait_is_bounded_by_request_timeout() {
     mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
         .await
         .expect("tool snapshot");
+    let send_time_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let started = std::time::Instant::now();
     mock.send_app_tool_request("call-bounded-timeout", "bounded_echo", r#"{}"#, 2_000)
         .expect("send ok");
-    mock.wait_for_approval_requests(1, Duration::from_secs(5))
+    let approval_reqs = mock
+        .wait_for_approval_requests(1, Duration::from_secs(5))
         .await
         .expect("ApprovalRequest not received within 5s");
+    // expires_ms must reflect the clamped invocation deadline (2 s), not the
+    // operator's 3600-second default.  Allow 2 s slack for scheduling jitter.
+    let clamped_timeout_ms: u64 = 2_000;
+    let slack_ms: u64 = 2_000;
+    let max_expected_expires_ms = send_time_ms + clamped_timeout_ms + slack_ms;
+    assert!(
+        approval_reqs[0].expires_ms <= max_expected_expires_ms,
+        "expires_ms={} should be ≤ now+{}ms+{}ms_slack={} (not 24h out)",
+        approval_reqs[0].expires_ms,
+        clamped_timeout_ms,
+        slack_ms,
+        max_expected_expires_ms
+    );
     let responses = mock
         .wait_for_app_tool_responses(1, Duration::from_secs(8))
         .await
@@ -1658,7 +1677,7 @@ async fn approval_wait_is_bounded_by_request_timeout() {
     handle.shutdown().await.expect("shutdown clean");
 }
 
-/// Task 1 / Case B: approval_timeout_secs=3600, timeout_ms=10_000.
+/// Approval deadline / Case B: approval_timeout_secs=3600, timeout_ms=10_000.
 /// Approve after ApprovalRequest arrives → ResultJson, handler ran once.
 #[tokio::test]
 async fn approve_within_deadline_executes_with_remaining_budget() {
@@ -1695,7 +1714,7 @@ async fn approve_within_deadline_executes_with_remaining_budget() {
     handle.shutdown().await.expect("shutdown clean");
 }
 
-/// Task 1 / Case C: approval_timeout_secs=3600, timeout_ms=3_000.
+/// Approval deadline / Case C: approval_timeout_secs=3600, timeout_ms=3_000.
 /// Sleep 1_500ms after ApprovalRequest, then approve → remaining budget ≈1.5s
 /// (floored at MIN_TIMEOUT_MS). Handler sleeps 60s → EXECUTION_TIMEOUT fires.
 /// Total elapsed < 8s.

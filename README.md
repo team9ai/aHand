@@ -166,11 +166,11 @@ const result  = await client.invokeAppTool(deviceId, "run_analysis", { dataset: 
 
 Session-mode gating applies to every invocation. `requires_approval: true` on a descriptor forces explicit approval regardless of the caller's session mode.
 
-> **Approval + timeout composition:** the hub waits at most `clamp(timeoutMs)+2 s ≤ 302 s` for
-> the daemon to respond, while the daemon's approval dialog defaults to a 24 h window. For
-> approval-gated tools, set `timeoutMs` ≥ expected approval latency (max 300 000 ms); an
-> approval granted after the hub window still executes the handler, but the result is discarded
-> and the audit `outcome` remains `timeout`. Correlate via a replay of the same call if needed.
+> **Approval + timeout composition:** the approval wait on the daemon side is bounded by
+> `min(approval policy timeout, clamp(timeoutMs))` — the request's clamped `timeoutMs` caps
+> the user's time to answer the dialog. A late approval finds the request already expired and
+> nothing executes. Set `timeoutMs` ≥ expected approval latency (max 300 000 ms); the request
+> timeout is now the hard deadline for both approval and execution.
 
 See `proto/ahand/v1/app_tool.proto` and `docs/remote-control-roadmap.md` (Section 5) for the full capability description.
 
