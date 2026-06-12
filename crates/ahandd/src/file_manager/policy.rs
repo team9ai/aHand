@@ -742,6 +742,50 @@ mod tests {
         );
     }
 
+    // ── glob_match invalid-pattern fallback (fail-closed) ────────────────────
+
+    /// A malformed denylist pattern (e.g. unmatched `[`) must NOT match a
+    /// *different* path — the fallback is literal equality, not a wildcard.
+    /// This is the "fail-closed" invariant: a typo in a denylist entry must not
+    /// accidentally allow everything (fail-open) or silently block everything.
+    #[cfg(not(windows))]
+    #[test]
+    fn glob_match_invalid_pattern_does_not_match_different_path() {
+        // Malformed pattern with unmatched `[` must not match a different path.
+        assert!(
+            !glob_match("path/[unclosed", "path/anything"),
+            "a malformed denylist pattern must NOT match a different path (fail-closed, not fail-open)"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn glob_match_invalid_pattern_matches_itself_exactly() {
+        // The fallback is literal equality: a malformed pattern matches only the
+        // exact same string (so a denylist entry still blocks the verbatim path).
+        assert!(
+            glob_match("path/[unclosed", "path/[unclosed"),
+            "a malformed pattern must still match the identical literal string"
+        );
+    }
+
+    /// On Windows the invalid-pattern fallback is Unicode-folded case-insensitive
+    /// equality (both sides are lowercased before comparison).
+    #[cfg(windows)]
+    #[test]
+    fn windows_glob_match_invalid_pattern_case_folded_equality() {
+        // Same string with different ASCII casing → matches (fold applied).
+        assert!(
+            glob_match("path/[x", "PATH/[X"),
+            "Windows fallback must use Unicode-folded equality: 'path/[x' must match 'PATH/[X'"
+        );
+        // Completely different string → must not match.
+        assert!(
+            !glob_match("path/[x", "path/anything"),
+            "Windows fallback must NOT match a different string"
+        );
+    }
+
     /// Security: on Windows, non-ASCII case variants (é/É, ö/Ö) in denylist
     /// patterns must block the case-folded path variant.  The glob crate's
     /// `case_sensitive: false` only folds ASCII; our Unicode-aware pre-fold via

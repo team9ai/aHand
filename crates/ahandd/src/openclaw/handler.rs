@@ -2158,6 +2158,132 @@ mod tests {
         }
     }
 
+    // ── sanitize_env BLOCKED_PREFIXES tests ──────────────────────────────────
+
+    /// DYLD_INSERT_LIBRARIES and DYLD_LIBRARY_PATH are macOS loader-injection
+    /// vectors; LD_PRELOAD is the Linux/ELF equivalent.  They are the ONLY
+    /// loader-injection defence and must be blocked unconditionally on every
+    /// platform (the blocklist is enforced by `BLOCKED_PREFIXES`, so the same
+    /// code path runs on Windows too).
+    #[test]
+    fn sanitize_env_blocks_dyld_insert_libraries() {
+        let malicious = "/attacker/evil.dylib";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("DYLD_INSERT_LIBRARIES".to_string(), malicious.to_string());
+        overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("DYLD_INSERT_LIBRARIES").map(String::as_str),
+            Some(malicious),
+            "a blocked DYLD_INSERT_LIBRARIES override must never take effect"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("ok"),
+            "non-blocked variables must pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_blocks_dyld_library_path() {
+        let malicious = "/attacker/libs";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("DYLD_LIBRARY_PATH".to_string(), malicious.to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("DYLD_LIBRARY_PATH").map(String::as_str),
+            Some(malicious),
+            "a blocked DYLD_LIBRARY_PATH override must never take effect"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_blocks_ld_preload() {
+        let malicious = "/attacker/inject.so";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("LD_PRELOAD".to_string(), malicious.to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("LD_PRELOAD").map(String::as_str),
+            Some(malicious),
+            "a blocked LD_PRELOAD override must never take effect"
+        );
+    }
+
+    // ── sanitize_env case-variant key bypass tests ────────────────────────────
+
+    /// sanitize_env uppercases all keys before comparing against BLOCKED_KEYS
+    /// and BLOCKED_PREFIXES.  A lowercase variant of a blocked key must not
+    /// bypass the blocklist.
+    #[test]
+    fn sanitize_env_case_variant_blocked_keys() {
+        // Exact-key blocks: lowercase variants of BLOCKED_KEYS entries must not
+        // win (the uppercase-normalisation must apply before the check).
+        let malicious = "injected_value";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("node_options".to_string(), malicious.to_string());
+        overrides.insert("pythonpath".to_string(), malicious.to_string());
+        overrides.insert("SAFE_CUSTOM".to_string(), "legit".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        // Neither the lowercase key nor the uppercase form must hold the malicious value.
+        assert_ne!(
+            result.get("node_options").map(String::as_str),
+            Some(malicious),
+            "lowercase 'node_options' key must be treated as blocked NODE_OPTIONS"
+        );
+        assert_ne!(
+            result.get("NODE_OPTIONS").map(String::as_str),
+            Some(malicious),
+            "blocked NODE_OPTIONS must not appear with attacker value under any casing"
+        );
+        assert_ne!(
+            result.get("pythonpath").map(String::as_str),
+            Some(malicious),
+            "lowercase 'pythonpath' key must be treated as blocked PYTHONPATH"
+        );
+        assert_ne!(
+            result.get("PYTHONPATH").map(String::as_str),
+            Some(malicious),
+            "blocked PYTHONPATH must not appear with attacker value under any casing"
+        );
+        assert_eq!(
+            result.get("SAFE_CUSTOM").map(String::as_str),
+            Some("legit"),
+            "non-blocked variables must still pass through"
+        );
+    }
+
+    /// A lowercase variant of a BLOCKED_PREFIX key must also be blocked.
+    /// The prefix check runs on the uppercased key, so `dyld_insert_libraries`
+    /// must be treated identically to `DYLD_INSERT_LIBRARIES`.
+    #[test]
+    fn sanitize_env_case_variant_blocked_prefix() {
+        let malicious = "/attacker/evil.dylib";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("dyld_insert_libraries".to_string(), malicious.to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("dyld_insert_libraries").map(String::as_str),
+            Some(malicious),
+            "lowercase 'dyld_insert_libraries' must be blocked by the DYLD_ prefix rule"
+        );
+        assert_ne!(
+            result.get("DYLD_INSERT_LIBRARIES").map(String::as_str),
+            Some(malicious),
+            "the uppercase form must also not hold the malicious value"
+        );
+    }
+
     #[test]
     fn sanitize_env_path_prepend_is_accepted() {
         let base_path = std::env::var("PATH").unwrap_or_default();

@@ -2261,6 +2261,48 @@ mod tests {
         );
     }
 
+    /// On Windows, when the symlink target does NOT exist (dangling), the
+    /// dir/file probe (`std::fs::metadata`) fails and the code falls back to
+    /// `symlink_file`.  This mirrors the behaviour of `mklink` / `ln` on Windows
+    /// for a nonexistent target and ensures `handle_create_symlink` does not
+    /// error out when the target is absent.
+    ///
+    /// This test requires Developer Mode or SeCreateSymbolicLinkPrivilege; it
+    /// mirrors the structure of `windows_relative_dir_target_chooses_symlink_dir`
+    /// to keep privilege-gating consistent.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_dangling_target_chooses_symlink_file() {
+        use tempfile::TempDir;
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+
+        // The target does NOT exist — this is a dangling symlink scenario.
+        let nonexistent_target = root.join("does_not_exist.txt");
+        let link = root.join("dangling_link");
+
+        let req = ahand_protocol::FileCreateSymlink {
+            target: nonexistent_target.to_string_lossy().into_owned(),
+            link_path: link.to_string_lossy().into_owned(),
+        };
+        super::handle_create_symlink(&req, &link).await.expect(
+            "dangling symlink creation must succeed (symlink_file chosen for nonexistent target)",
+        );
+
+        let meta = std::fs::symlink_metadata(&link).expect("link must exist after creation");
+        assert!(
+            meta.file_type().is_symlink(),
+            "created path must be a symlink even when target is nonexistent"
+        );
+        // Resolving the link must fail because the target does not exist —
+        // this confirms it is a dangling symlink (not a directory symlink that
+        // somehow auto-created the target).
+        assert!(
+            std::fs::metadata(&link).is_err(),
+            "dangling symlink must not resolve (target does not exist)"
+        );
+    }
+
     // ── Windows ACL SDDL builder unit tests ──────────────────────────────────
     // These run cross-platform because the builders are compiled under
     // cfg(any(windows, test)). They never touch the filesystem or the Win32 API
