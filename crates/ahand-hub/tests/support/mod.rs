@@ -5,6 +5,7 @@ use std::time::Duration;
 use ahand_hub::config::{Config, S3Config, StoreConfig};
 use ahand_hub::state::AppState;
 use ahand_hub_core::device::NewDevice;
+use ahand_hub_core::traits::DeviceAdminStore;
 use ahand_hub_core::traits::DeviceStore;
 use ahand_hub_store::test_support::TestStack;
 use axum::body::Body;
@@ -23,6 +24,76 @@ use ahand_protocol::{
     FileResponse, Hello, HelloAccepted, HelloChallenge, JobEvent, JobFinished, JobRequest,
     envelope, hello, job_event,
 };
+
+/// JWT secret shared by all test configs (matches `test_config().jwt_secret`).
+pub const CP_JWT_SECRET: &str = "service-test-secret";
+
+/// Mint a control-plane JWT for `external_user_id` with `jobs:execute` scope.
+/// No device_ids restriction.
+pub fn mint_cp_jwt(external_user_id: &str) -> String {
+    use ahand_hub_core::auth::mint_control_plane_jwt;
+    let (token, _) = mint_control_plane_jwt(
+        CP_JWT_SECRET.as_bytes(),
+        external_user_id,
+        "jobs:execute",
+        None,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    token
+}
+
+/// Mint a control-plane JWT with a custom scope and/or device_ids allowlist.
+pub fn mint_cp_jwt_with_options(
+    external_user_id: &str,
+    scope: &str,
+    device_ids: Option<Vec<String>>,
+) -> String {
+    use ahand_hub_core::auth::mint_control_plane_jwt;
+    let (token, _) = mint_control_plane_jwt(
+        CP_JWT_SECRET.as_bytes(),
+        external_user_id,
+        scope,
+        device_ids,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    token
+}
+
+/// Register a device with `external_user_id`, attach it via WS, and return
+/// the socket so the caller can keep the connection alive (keeping the device
+/// online in `state.connections`).
+pub async fn attach_owned_device(
+    server: &TestServer,
+    device_id: &str,
+    external_user_id: &str,
+) -> tokio_tungstenite::WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>> {
+    let verifying = SigningKey::from_bytes(&[7u8; 32])
+        .verifying_key()
+        .to_bytes();
+    server
+        .state()
+        .devices
+        .pre_register(device_id, &verifying, external_user_id)
+        .await
+        .unwrap();
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello(device_id, &challenge.nonce);
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+    // Small grace so the hub finishes registering the WS connection.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    socket
+}
 
 pub fn service_request(uri: &str) -> Request<Body> {
     Request::builder()
@@ -189,6 +260,26 @@ pub async fn test_state_with_webhook() -> AppState {
     // Keep attempts small so the worker doesn't spam the log if the
     // test takes a while to assert.
     config.webhook_max_retries = 1;
+    config.webhook_max_concurrency = 2;
+    let state = AppState::from_config(config)
+        .await
+        .expect("test state should build");
+    state.devices.mark_offline("device-2").await.ok();
+    state
+}
+
+/// Like [`test_state_with_webhook`] but with a high `max_retries` (100) so
+/// the background worker never exhausts retries and deletes rows during the
+/// test window. Used by tests that need to inspect the webhook delivery
+/// store contents after an event fires — the `max_retries = 1` config in
+/// `test_state_with_webhook` causes the worker to DLQ+delete rows after the
+/// first failed attempt (very quickly on ECONNREFUSED), which races with
+/// `lease_due` inspection.
+pub async fn test_state_with_webhook_persistent() -> AppState {
+    let mut config = test_config();
+    config.webhook_url = Some("http://127.0.0.1:1/webhook".into());
+    config.webhook_secret = Some("test-webhook-secret".into());
+    config.webhook_max_retries = 100;
     config.webhook_max_concurrency = 2;
     let state = AppState::from_config(config)
         .await

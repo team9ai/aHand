@@ -286,6 +286,9 @@ async fn delete_device(
     // of these failures are client-visible; we log at warn level
     // and return 204 either way.
     let _ = state.connections.kick_device(&device_id).await;
+    if let Err(err) = state.app_tools.delete_catalog(&device_id).await {
+        tracing::warn!(device_id = %device_id, error = %err, "failed to delete app tool catalog on device deletion");
+    }
     if let Err(err) = state
         .events
         .emit_device_revoked(&device_id, existing_user.as_deref())

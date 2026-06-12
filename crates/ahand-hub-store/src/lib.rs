@@ -1,3 +1,4 @@
+pub mod app_tool_store;
 pub mod audit_store;
 pub mod bootstrap_store;
 pub mod device_store;

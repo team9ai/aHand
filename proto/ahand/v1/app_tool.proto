@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package ahand.v1;
+
+// AppToolDescriptor - one application-defined tool advertised by the host app
+// embedding ahandd. Names are flat per device (device <-> app is 1:1).
+message AppToolDescriptor {
+  string name              = 1; // ^[a-z0-9_-]{1,64}$
+  string description       = 2;
+  string input_schema_json = 3; // JSON Schema, serialized JSON object
+  bool   requires_approval = 4; // tighten-only: forces approval in every session mode
+}
+
+// AppToolsUpdate - daemon -> hub. FULL snapshot of registered tools.
+// Sent on every register/unregister and re-sent after each Hello handshake.
+message AppToolsUpdate {
+  uint64 revision = 1; // monotonic per daemon process
+  repeated AppToolDescriptor tools = 2;
+}
+
+// AppToolRequest - hub -> daemon. Invoke one app tool.
+message AppToolRequest {
+  string tool_call_id = 1;
+  string name         = 2;
+  string args_json    = 3; // JSON object matching input_schema_json
+  uint32 timeout_ms   = 4; // daemon clamps to [1_000, 300_000]; 0 => 60_000
+}
+
+// AppToolError - structured failure for one invocation; code is machine-readable, message is a human-readable remediation hint.
+message AppToolError {
+  string code    = 1; // TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE | APPROVAL_DENIED
+                      // | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT | HANDLER_PANIC
+                      // | HANDLER_ERROR | CONCURRENCY_LIMIT
+  string message = 2; // human-readable, host-neutral remediation hint
+}
+
+// AppToolResponse - daemon -> hub. Single response per invocation (no streaming).
+message AppToolResponse {
+  string tool_call_id = 1;
+  oneof result {
+    string       result_json = 2;
+    AppToolError error       = 3;
+  }
+}

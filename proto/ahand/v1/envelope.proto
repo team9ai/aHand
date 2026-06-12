@@ -4,6 +4,7 @@ package ahand.v1;
 
 import "ahand/v1/browser.proto";
 import "ahand/v1/file_ops.proto";
+import "ahand/v1/app_tool.proto";
 
 // Envelope wraps all messages on the wire (WS and IPC).
 message Envelope {
@@ -45,6 +46,9 @@ message Envelope {
     // a hub built between c9b8a4d and the fix will emit/parse it.
     FileRequest      file_request      = 33;
     FileResponse     file_response     = 34;
+    AppToolsUpdate   app_tools_update  = 35;
+    AppToolRequest   app_tool_request  = 36;
+    AppToolResponse  app_tool_response = 37;
   }
 }
 

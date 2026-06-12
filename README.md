@@ -11,6 +11,8 @@ Cloud (WS server)  ←──  WebSocket (protobuf)  ──→  Local daemon (WS 
   (control plane)                                  (job executor)
                                                    ├─ shell / tools
                                                    ├─ browser automation
+                                                   ├─ file operations
+                                                   ├─ app tool registry
                                                    └─ policy enforcement
 ```
 
@@ -127,6 +129,50 @@ max_write_bytes = 10485760   # 10 MB
 ```
 
 `dangerous_paths` matches escalate to STRICT-mode approval. Allowlist patterns support `~` expansion (fail-loud if `HOME` is unavailable) and glob (`**`, `?`). The hub forwards via `POST /api/devices/{device_id}/files` with admission control. See `proto/ahand/v1/file_ops.proto` for the wire format.
+
+## App Tool Registry
+
+Host applications that embed `ahandd` can register application-defined tools at runtime. Cloud callers discover and invoke them through the hub without custom protocol work.
+
+```rust
+// in the host application that embeds ahandd
+use ahandd::{AppToolDef, AppToolError, AppToolHandler};
+use serde_json::{Value, json};
+use std::sync::Arc;
+
+let def = AppToolDef {
+    name: "run_analysis".to_string(),
+    description: "Run a data analysis job".to_string(),
+    input_schema: json!({
+        "type": "object",
+        "properties": { "dataset": { "type": "string" } }
+    }),
+    requires_approval: false,
+};
+let handler: AppToolHandler = Arc::new(|_args: Value| {
+    Box::pin(async move {
+        // ... handler logic ...
+        Ok(json!({"status": "done"}))
+    })
+});
+daemon_handle.register_app_tool(def, handler).await?;
+```
+
+```typescript
+// cloud caller via SDK
+const catalog = await client.listAppTools(deviceId);
+const result  = await client.invokeAppTool(deviceId, "run_analysis", { dataset: "q1" });
+```
+
+Session-mode gating applies to every invocation. `requires_approval: true` on a descriptor forces explicit approval regardless of the caller's session mode.
+
+> **Approval + timeout composition:** the hub waits at most `clamp(timeoutMs)+2 s ≤ 302 s` for
+> the daemon to respond, while the daemon's approval dialog defaults to a 24 h window. For
+> approval-gated tools, set `timeoutMs` ≥ expected approval latency (max 300 000 ms); an
+> approval granted after the hub window still executes the handler, but the result is discarded
+> and the audit `outcome` remains `timeout`. Correlate via a replay of the same call if needed.
+
+See `proto/ahand/v1/app_tool.proto` and `docs/remote-control-roadmap.md` (Section 5) for the full capability description.
 
 ## Repository Structure
 
