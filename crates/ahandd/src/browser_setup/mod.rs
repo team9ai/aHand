@@ -11,10 +11,12 @@ use anyhow::{Result, bail};
 pub mod browser_detect;
 pub mod node;
 pub mod playwright;
+pub mod progress_format;
 pub mod python;
 pub mod types;
 
 pub use browser_detect::{detect as detect_browser, tried_browsers};
+pub use progress_format::{format_progress_line, format_summary};
 pub use types::*;
 
 /// Classify an `anyhow::Error` produced by an install step into a
@@ -94,9 +96,8 @@ pub async fn inspect(name: &str) -> Option<CheckReport> {
 
 /// Run all install steps. `force` reinstalls even if already present.
 ///
-/// **Progress-callback note:** `Phase::Done` is emitted even on failure
-/// (see `wrap_failure`); use the `Result` return value, not the callback,
-/// to determine success.
+/// **Progress-callback note:** `Phase::Failed` (not `Phase::Done`) is emitted
+/// on failure (see `wrap_failure`); formatters can distinguish by phase.
 pub async fn run_all(
     force: bool,
     progress: impl Fn(ProgressEvent) + Send + Sync + 'static,
@@ -129,9 +130,8 @@ pub async fn run_all(
 /// Returns an error for `playwright`/`browser-playwright-cli` if Node is not
 /// already installed.
 ///
-/// **Progress-callback note:** `Phase::Done` is emitted even on failure
-/// (see `wrap_failure`); use the `Result` return value, not the callback,
-/// to determine success.
+/// **Progress-callback note:** `Phase::Failed` (not `Phase::Done`) is emitted
+/// on failure (see `wrap_failure`); formatters can distinguish by phase.
 pub async fn run_step(
     name: &str,
     force: bool,
@@ -175,15 +175,14 @@ pub async fn run_step(
     }
 }
 
-/// Build a `FailedStepReport`, emit a terminal `ProgressEvent::Done`, and
-/// attach the report to the error via `.context(...)`. Called by
-/// `run_all` / `run_step` on any `ensure()` failure.
+/// Build a `FailedStepReport`, emit a terminal `ProgressEvent` with
+/// `Phase::Failed`, and attach the report to the error via `.context(...)`.
+/// Called by `run_all` / `run_step` on any `ensure()` failure.
 ///
-/// `Phase::Done` is emitted here on the failure path as well as in
-/// `node::ensure` / `playwright::ensure` on success. Progress-callback
-/// consumers CANNOT infer success vs. failure from the `Done` event alone
-/// — they must inspect the `Result` from `run_all` / `run_step`. Use
-/// `err.downcast_ref::<FailedStepReport>()` to get the classified report.
+/// `Phase::Failed` (not `Phase::Done`) is emitted here so that presentation
+/// formatters can render a `✗` prefix without consulting the `Result` return
+/// value. Use `err.downcast_ref::<FailedStepReport>()` to get the classified
+/// report.
 fn wrap_failure(
     err: anyhow::Error,
     name: &'static str,
@@ -194,7 +193,7 @@ fn wrap_failure(
     let message = format!("{err:#}");
     progress(ProgressEvent {
         step: name,
-        phase: Phase::Done,
+        phase: Phase::Failed,
         message: message.clone(),
         percent: None,
         stream: None,

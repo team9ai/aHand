@@ -1008,6 +1008,97 @@ fn extract_admin_spa_rejects_symlink_escape() {
     // Both Ok (contained) and Err (rejected) are acceptable outcomes.
 }
 
+// ── Regression: no setup-browser.sh written even when browser version present ──
+
+/// Regression test (audit TOP-2): a release with a `browser-v*` tag must
+/// complete perform_upgrade successfully AND must NOT write `setup-browser.sh`
+/// (or any `.sh` script) to the bin directory.
+///
+/// setup-browser.sh was removed in M3 (superseded by `ahandctl browser-init`).
+/// This test pins the "no legacy script installed" contract so regressions
+/// are caught immediately.
+#[cfg(unix)]
+#[tokio::test]
+async fn upgrade_with_browser_version_does_not_write_setup_browser_sh() {
+    let suffix = platform_suffix();
+    let ver = "0.5.0";
+
+    let ahandd_filename = format!("ahandd-{suffix}");
+    let ahandctl_filename = format!("ahandctl-{suffix}");
+
+    let ahandd_bytes = fake_binary_bytes("ahandd");
+    let ahandctl_bytes = fake_binary_bytes("ahandctl");
+
+    let mut cs = String::new();
+    cs.push_str(&make_checksum_line(&ahandd_filename, &ahandd_bytes));
+    cs.push_str(&make_checksum_line(&ahandctl_filename, &ahandctl_bytes));
+
+    let mut assets: HashMap<String, Vec<u8>> = HashMap::new();
+    assets.insert(format!("/rust-v{ver}/checksums-rust.txt"), cs.into_bytes());
+    assets.insert(
+        format!("/rust-v{ver}/{ahandd_filename}"),
+        ahandd_bytes.clone(),
+    );
+    assets.insert(
+        format!("/rust-v{ver}/{ahandctl_filename}"),
+        ahandctl_bytes.clone(),
+    );
+
+    // Include a browser-v tag in the release JSON to confirm the browser
+    // version is visible but does NOT trigger any script download or install.
+    let releases_json =
+        format!(r#"[{{"tag_name":"rust-v{ver}"}},{{"tag_name":"browser-v{ver}"}}]"#);
+
+    let stub = spawn_full_stub(releases_json, assets).await;
+    let tmp = TempDir::new().unwrap();
+
+    let result = run_with_bases(
+        false,
+        Some(ver),
+        &stub.api_base(),
+        &stub.download_base(),
+        tmp.path(),
+    )
+    .await;
+
+    stub.stop().await;
+
+    result.expect("upgrade with browser version should succeed");
+
+    // Binaries must be installed.
+    let bin_dir = tmp.path().join("bin");
+    assert!(
+        bin_dir
+            .join(ahand_platform::paths::exe_name("ahandd"))
+            .exists(),
+        "ahandd binary should be installed"
+    );
+    assert!(
+        bin_dir
+            .join(ahand_platform::paths::exe_name("ahandctl"))
+            .exists(),
+        "ahandctl binary should be installed"
+    );
+
+    // NO setup-browser.sh (or any .sh file) must exist in the bin directory.
+    let sh_files: Vec<_> = std::fs::read_dir(&bin_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".sh"))
+        .collect();
+    assert!(
+        sh_files.is_empty(),
+        "no .sh scripts must be written to bin dir; found: {:?}",
+        sh_files.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
+
+    // Also assert setup-browser.sh specifically is absent (belt + suspenders).
+    assert!(
+        !bin_dir.join("setup-browser.sh").exists(),
+        "setup-browser.sh must NOT be written to bin dir (superseded by native browser-init)"
+    );
+}
+
 // ── I-2: version marker only written after BOTH binaries swap ────────────
 
 /// Partial-upgrade error path: stub serves a correct checksums file but the

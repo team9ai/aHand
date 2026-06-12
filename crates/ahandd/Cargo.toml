@@ -63,6 +63,7 @@ chardetng = "0.1"
 # wrapper, and it is already present in the workspace lock as a
 # transitive dep so deduplicates cleanly.
 nix = { version = "0.28", features = ["fs", "dir"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [features]
 # Dev-only escape hatch for the manual TCP-keepalive smoke test in

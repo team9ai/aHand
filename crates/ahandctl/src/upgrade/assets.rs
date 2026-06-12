@@ -14,7 +14,11 @@ use super::release::ReleaseInfo;
 /// Asset URL layout (mirrors `upgrade.sh`):
 /// - Rust binaries: `{download_base}/rust-v{ver}/{asset}`
 /// - Admin SPA:     `{download_base}/admin-v{ver}/admin-spa.tar.gz`
-/// - Browser setup: `{download_base}/browser-v{ver}/setup-browser.sh`
+///
+/// Note: `setup-browser.sh` is NO LONGER downloaded or installed during
+/// upgrade.  Browser automation setup is performed natively via
+/// `ahandctl browser-init` (Rust), which replaces the script entirely.
+/// `info.browser` is still resolved for version-check display purposes only.
 pub async fn perform_upgrade(
     info: &ReleaseInfo,
     current: &str,
@@ -94,24 +98,12 @@ pub async fn perform_upgrade(
         None
     };
 
-    // ── 4. Download setup-browser.sh (optional, unix only) ─────────────────
-    #[cfg(unix)]
-    let browser_bytes = if let Some(browser_ver) = info.browser.as_deref() {
-        println!("==> Downloading scripts (browser-v{browser_ver})...");
-        let browser_url = format!("{download_base}/browser-v{browser_ver}/setup-browser.sh");
-        println!("  Downloading setup-browser.sh...");
-        match ahandd::updater::download_binary(&browser_url).await {
-            Ok(b) => Some(b),
-            Err(e) => {
-                eprintln!("  Warning: could not download setup-browser.sh: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // (No setup-browser.sh on non-unix; the unix-only install step below is
-    // the sole consumer, so no binding is needed elsewhere.)
+    // ── 4. (Removed) setup-browser.sh download ────────────────────────────
+    //
+    // Browser setup is now handled natively by `ahandctl browser-init` (Rust).
+    // setup-browser.sh is no longer downloaded or installed during upgrade.
+    // `info.browser` is still resolved above for the version-check display
+    // output (upgrade --check prints browser=<version>); it is not consumed here.
 
     // ── 5. Verify Rust binary checksums BEFORE any install ──────────────────
     if let Some(ref cs_text) = checksum_text {
@@ -166,18 +158,10 @@ pub async fn perform_upgrade(
         println!("  admin SPA: OK");
     }
 
-    // ── 10. Install setup-browser.sh ────────────────────────────────────────
-    #[cfg(unix)]
-    if let Some(ref bytes) = browser_bytes {
-        let script_path = bin_dir.join("setup-browser.sh");
-        std::fs::write(&script_path, bytes).context("failed to write setup-browser.sh")?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
-                .context("failed to chmod setup-browser.sh")?;
-        }
-        println!("  setup-browser.sh: OK");
-    }
+    // ── 10. (Removed) Install setup-browser.sh ──────────────────────────────
+    //
+    // setup-browser.sh is superseded by `ahandctl browser-init` (native Rust).
+    // The script is no longer installed during upgrade.
 
     // ── 11. Write version marker ─────────────────────────────────────────────
     ahand_platform::paths::write_version_marker(ahand_home, latest)

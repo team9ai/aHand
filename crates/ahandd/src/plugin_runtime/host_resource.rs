@@ -151,7 +151,25 @@ fn node_resource(
     let mut resources = BTreeMap::new();
     let status = match &report.status {
         CheckStatus::Ok { version, path, .. } => {
-            let npm = runtime.npm_bin();
+            // Use npm_invocation() to find the canonical "npm is available" file:
+            // - Unix: node/bin/npm (the script itself)
+            // - Windows: node_modules/npm/bin/npm-cli.js (the JS entry — node.exe
+            //   is always present if node_bin() exists, so we check the JS file)
+            let (npm_program, npm_leading) = runtime.npm_invocation();
+            let npm_path = if npm_leading.is_empty() {
+                // Unix: program IS the npm script.
+                npm_program.clone()
+            } else {
+                // Windows: first leading arg is npm-cli.js (the JS entry
+                // for npm under the managed Node runtime).  The path exposed
+                // in the `npm` resource therefore points at `npm-cli.js`, NOT
+                // a native executable.  Consumers MUST use `npm_invocation()`
+                // to obtain the correct (program, leading_args) pair and must
+                // NOT attempt to exec the `npm` resource path directly —
+                // direct execution requires `node.exe` as the program with
+                // the JS file as the first argument.
+                std::path::PathBuf::from(&npm_leading[0])
+            };
             resources.insert(
                 "node".to_string(),
                 HostResourceValue::Executable {
@@ -160,12 +178,12 @@ fn node_resource(
                     version: Some(version.clone()),
                 },
             );
-            if npm.is_file() {
+            if npm_path.is_file() {
                 resources.insert(
                     "npm".to_string(),
                     HostResourceValue::Executable {
                         name: "npm".to_string(),
-                        path: path_to_string(npm),
+                        path: path_to_string(&npm_path),
                         version: None,
                     },
                 );
@@ -364,8 +382,12 @@ mod tests {
         assert_eq!(normalize_arch("x86_64"), "x64");
     }
 
+    /// When the npm file is absent the node plugin reports `Failed` so the
+    /// caller knows npm is not usable.  (The test name was previously
+    /// `node_resource_does_not_report_missing_npm_executable`; renamed for
+    /// clarity.)
     #[test]
-    fn node_resource_does_not_report_missing_npm_executable() {
+    fn node_resource_reports_failed_when_npm_file_is_absent() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = RuntimeDirs::from_root(dir.path().to_path_buf());
         let report = CheckReport {
@@ -384,6 +406,55 @@ mod tests {
         assert_eq!(plugin.status, PluginStatus::Failed);
         assert!(plugin.resources.contains_key("node"));
         assert!(!plugin.resources.contains_key("npm"));
+    }
+
+    /// Positive case: when the npm file is present the node plugin reports
+    /// `Installed` and the `npm` resource key is populated.
+    ///
+    /// The fixture creates the platform-correct npm file path as determined by
+    /// `RuntimeDirs::npm_invocation()`:
+    /// - **Unix**: `dependencies/node/bin/npm` (the script itself is the program)
+    /// - **Windows**: `dependencies/node/node_modules/npm/bin/npm-cli.js` (the
+    ///   JS entry that is the first leading arg)
+    #[test]
+    fn node_resource_reports_installed_when_npm_file_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = RuntimeDirs::from_root(dir.path().to_path_buf());
+
+        // Determine which file path npm_invocation() will check, then create it.
+        let (npm_program, npm_leading) = runtime.npm_invocation();
+        let npm_file = if npm_leading.is_empty() {
+            // Unix: program IS the npm script.
+            npm_program.clone()
+        } else {
+            // Windows: first leading arg is npm-cli.js.
+            PathBuf::from(&npm_leading[0])
+        };
+        std::fs::create_dir_all(npm_file.parent().unwrap()).unwrap();
+        std::fs::write(&npm_file, b"// npm stub").unwrap();
+
+        let report = CheckReport {
+            name: "node",
+            label: "Node.js",
+            status: CheckStatus::Ok {
+                version: "24.13.0".to_string(),
+                path: PathBuf::from("/tmp/node"),
+                source: CheckSource::Managed,
+            },
+            fix_hint: None,
+        };
+
+        let plugin = node_resource(&manifest("node"), &runtime, &report);
+
+        assert_eq!(plugin.status, PluginStatus::Installed);
+        assert!(
+            plugin.resources.contains_key("node"),
+            "node key must be present"
+        );
+        assert!(
+            plugin.resources.contains_key("npm"),
+            "npm key must be present when npm file exists"
+        );
     }
 
     #[tokio::test]
