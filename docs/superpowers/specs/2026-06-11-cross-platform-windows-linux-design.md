@@ -472,3 +472,57 @@ tests for the three load-bearing-but-untested security branches — the
 `DYLD_`/`LD_` loader-injection prefix blocks, the case-insensitive key
 normalization (lowercase blocked-key bypass), and the `glob_match` malformed-
 pattern fail-closed fallback.
+
+## M5 Completion Record (2026-06-12)
+
+M5 landed on `feat/cross-platform-m5` (PR #53). The understand pass reframed
+the milestone: most of the spec's M5 framing was **already satisfied** — the
+BATS e2e suite already ran on `ubuntu-latest` (since commit `4266200`), the
+README already documented all three platforms, and config/data paths already
+resolved cross-platform via `dirs::home_dir()`. So M5 closed the concrete
+*residuals*, not "add the Linux lane".
+
+**What landed (7/7 tasks):**
+- **install.sh parallel-safety (T1):** replaced the shared `/tmp/ahand-admin-spa.tar.gz`
+  with a per-invocation `mktemp -d` + `trap EXIT`. The race only surfaced under
+  bats `--jobs` (Linux CI runs parallel; macOS sequential), so it could pass by
+  luck. Verified gone: `install.bats --jobs 3` 10/10, full suite 5/5.
+- **install.sh SHA-256 verification (T3, user-approved):** mirrors install.ps1's
+  scope (`checksums-rust.txt` + `checksums-admin.txt`, the files the release
+  pipeline actually publishes — confirmed present in `rust-v0.1.14` /
+  `admin-v0.1.2`), `shasum`/`sha256sum` auto-detect, exact-match (awk, not regex)
+  extraction. **Fail-closed** on mismatch, missing file, AND no-matching-entry
+  (an intentional asymmetry vs the lenient upgrade.sh/install.ps1, documented
+  inline). +4 bats tests (happy / tampered / missing-file / no-entry), all
+  non-vacuous (assert the binary is not installed).
+- **run.sh GNU-parallel gating (T2):** detect GNU parallel by version string
+  (bare `command -v parallel` also matched moreutils, which aborts bats-core);
+  extracted to a sourceable `lib/parallel.sh` helper with a `run-helpers.bats`
+  test covering GNU / moreutils / absent.
+- **browser-doctor host-OS filter (T4):** the fix-hint renderer printed *all*
+  platforms' commands (a Linux user saw `brew install --cask google-chrome`);
+  now filters to the host via `cfg!(target_os)` → display label, with a fallback
+  for unknown OS. The serialized `/api` form keeps all platforms.
+- **admin-panel paths from /api/status (T5):** additive `home_dir`/`bin_dir` on
+  `StatusResponse`; SetupPanel shows the real `config_path` and ConfigPanel's
+  Data Directory / Browser Binary placeholders resolve from `/api/status`
+  instead of hardcoded `~/.ahand/…` literals (wrong on Windows). The panel reads
+  are guarded against the resource's error state (`statusOrNull`) so a failed
+  `/api/status` degrades to the literal instead of crashing the panel.
+- **README per-platform docs (T6):** macOS/Linux/Windows subsections with
+  per-platform post-install notes; the checksum claim is now accurate (install.sh
+  fail-closed for daemon/CLI/admin-panel artifacts; install.ps1 verifies-when-
+  present); glibc-only Linux caveat; Windows log-path note.
+- **Exit gate (T7):** `test-dist-scripts` ubuntu-latest BATS lane + `test`
+  ubuntu-latest Rust lane green on CI (run `27419468053`/`27419467954`), and the
+  `/tmp` race verified gone under forced parallel locally (10×).
+
+**Honest non-goal (unchanged):** musl / Alpine / armv7 stay out of scope.
+Released Linux binaries are glibc `x86_64`/`aarch64`.
+
+**Known residual (pre-existing, not introduced by M5):** install.sh downloads
+`setup-browser.sh` and `chmod +x`'s it WITHOUT checksum verification (no
+`checksums-browser.txt` is published). The fresh-install path fires this only
+when a `browser-v*` release resolves. The README claim was scoped to avoid
+overstating coverage; closing the gap requires publishing a browser-script
+checksum in the release pipeline (follow-up).
