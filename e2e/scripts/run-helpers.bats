@@ -44,10 +44,13 @@ EOF
 }
 
 @test "detect_parallel_jobs_flag: parallel absent -> empty (no --jobs)" {
-  # No stub written, and restrict PATH to stub dir + system bins (no Homebrew)
-  # so any real GNU `parallel` is invisible — `parallel` is genuinely absent.
-  # `grep` still resolves via /usr/bin so the helper itself can run.
-  export PATH="$STUB_DIR:/usr/bin:/bin"
+  # Hermetic PATH: a stub dir containing ONLY a `grep` symlink (which the helper
+  # needs) and NO `parallel`. We must NOT add /usr/bin here — GitHub's
+  # ubuntu-latest ships GNU parallel at /usr/bin/parallel, which would make
+  # `parallel` visible and flip this assertion. Symlinking just grep keeps the
+  # helper runnable while genuinely simulating "parallel not installed".
+  ln -s "$(command -v grep)" "$STUB_DIR/grep"
+  export PATH="$STUB_DIR"
   source "$LIB_DIR/parallel.sh"
   run detect_parallel_jobs_flag
   assert_success
