@@ -364,15 +364,13 @@ where
             }
             Some(envelope::Payload::ApprovalResponse(resp)) => {
                 info!(job_id = %resp.job_id, approved = resp.approved, "IPC: received approval response");
-                if !resp.approved && !resp.reason.is_empty() {
-                    if let Some((req, _)) = approval_mgr.resolve(&resp).await {
-                        session_mgr
-                            .record_refusal(&caller_id, &req.tool, &resp.reason)
-                            .await;
-                    }
-                } else {
-                    approval_mgr.resolve(&resp).await;
-                }
+                crate::approval::apply_approval_response(
+                    &approval_mgr,
+                    &session_mgr,
+                    &resp,
+                    &caller_id,
+                )
+                .await;
             }
             Some(envelope::Payload::SetSessionMode(msg)) => {
                 let mode = SessionMode::try_from(msg.mode).unwrap_or(SessionMode::Inactive);
