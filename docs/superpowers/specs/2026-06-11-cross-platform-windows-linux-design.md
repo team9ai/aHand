@@ -373,3 +373,52 @@ additive change to `types.rs` that does not break any callers.
 contributes any new M4 items beyond the existing list (TOCTOU, symlink ops,
 `sanitize_env` Windows blocklist, ACL chmod, shell e2e un-gating,
 named-pipe explicit security descriptor).
+
+## M4 Completion Record (2026-06-12)
+
+M4 work began on `feat/cross-platform-m4`. The first task was un-gating the
+shell-execution / `sanitize_env` test suite on the real `windows-latest` lane
+and fixing the failures the live Windows runner surfaced.
+
+**What landed:**
+
+- **`sanitize_env` strip tests are now platform-robust.** `sanitize_env` seeds
+  its result from the daemon's own process env (`env::vars()`), then *skips*
+  blocked keys present in the override map. A blocked key already in the base
+  env (on Windows, `PATHEXT` and `COMSPEC` are always present) therefore keeps
+  the daemon's own value — the security property is intact (a cloud override
+  cannot *change* `PATHEXT`/`COMSPEC`), but the old test assertion
+  (`!result.contains_key(KEY)`) was wrong and failed on the real Windows lane.
+  All blocked-key strip tests now assert the true invariant — a malicious
+  override value never *wins* (`result.get(KEY) != Some(malicious)`) — which is
+  correct on every platform. (The Unix-only keys like `NODE_PATH`/`BASH_ENV`
+  were also converted; their old `!contains_key` only *happened* to hold
+  because those keys aren't in a normal base env.)
+
+- **Strict-mode marker command is `cmd.exe`-safe.** The real shell-job e2e tests
+  (`strict_mode_*`) run `cmd /C <write_marker_command>` on Windows. The marker
+  command had a quoted path (`echo X> "<path>"`); the whole raw command is
+  passed to `cmd.exe /C` as a SINGLE arg by `tokio::process::Command`, which
+  serialises it with MSVC-CRT quoting (`"` → `\"`). `cmd.exe` does not parse
+  `\"` (it uses `""`/`^`), so the quoted path was mangled and the redirect wrote
+  to the wrong target → the marker file never appeared at the asserted path. The
+  test command is now unquoted (`echo X><path>`); `unique_output_path` builds the
+  path under `temp_dir()`, which is space-free on the CI runner
+  (`C:\Users\runneradmin\AppData\Local\Temp`), so an unquoted path is safe.
+
+**New M4 backlog item — production `cmd /C` quoted-argument gap (Windows):**
+
+The fix above is scoped to the *test* command, but the root cause is a real
+(edge-case) production concern. In `openclaw/handler.rs::run_command`, the shell
+path spawns `Command::new(cmd.exe).arg("/C").arg(&raw_command)` — the entire
+cloud-sent `rawCommand` string is passed as ONE argument. Rust's `Command`
+applies MSVC-CRT argument escaping (escapes `"` as `\"`), which is incompatible
+with `cmd.exe`'s own quote parsing (cmd uses `""` and `^`, and treats `\"`
+literally). So any cloud-sent `rawCommand` that contains double quotes (e.g. to
+handle a path with spaces) is corrupted on Windows before `cmd.exe` ever sees
+it. Out of scope for the current M4 test-stabilisation task; tracked here as a
+backlog item. Likely fix: bypass the CRT quoter with
+`std::os::windows::process::CommandExt::raw_arg` and build a `cmd.exe`-correct
+command line by hand (escaping `"` as `""`/`^` per cmd rules), or document that
+`rawCommand` on Windows must already be a cmd-valid one-liner. Until then,
+quoted-argument `rawCommand`s are unsupported on Windows.

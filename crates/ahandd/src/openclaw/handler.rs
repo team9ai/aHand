@@ -1499,9 +1499,16 @@ mod tests {
     ///
     /// Unix:    `printf X > '<path>'` via sh  — single-quotes the path so names
     ///          with spaces are handled correctly.
-    /// Windows: `echo X> "<path>"` via COMSPEC (typically cmd.exe) — double-quotes
-    ///          the path so names with spaces work; no space before `>` so cmd.exe
-    ///          doesn't include a trailing space in the redirect token.
+    /// Windows: `echo X><path>` via COMSPEC (typically cmd.exe) — UNQUOTED path.
+    ///          The whole command is passed to `cmd.exe /C` as a SINGLE arg by
+    ///          `tokio::process::Command`, which serialises it with MSVC-CRT
+    ///          quoting (`"` → `\"`).  cmd.exe does not understand `\"`, so a
+    ///          quoted path would be mangled and the redirect would write to the
+    ///          wrong target (see the M4 backlog note in the cross-platform spec).
+    ///          `unique_output_path` builds the path under `temp_dir()`, which is
+    ///          space-free on the CI runner (`C:\Users\runneradmin\AppData\Local\
+    ///          Temp`), so an unquoted path is safe here.  No space before `>` so
+    ///          cmd.exe doesn't include a trailing space in the redirect token.
     ///          Tests assert only `path.exists()`, not exact content, so the
     ///          trailing CRLF cmd adds is irrelevant.
     fn write_marker_command(path: &std::path::Path) -> String {
@@ -1511,9 +1518,9 @@ mod tests {
         }
         #[cfg(windows)]
         {
-            // No space before `>` so cmd.exe doesn't include a trailing space in
-            // the redirect token.  The file is created; content is not asserted.
-            format!("echo X> \"{}\"", path.display())
+            // Unquoted, no space before `>`.  See the doc comment above for why
+            // quotes must NOT be used through `cmd.exe /C` from Rust's Command.
+            format!("echo X>{}", path.display())
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -1992,18 +1999,21 @@ mod tests {
 
     #[test]
     fn sanitize_env_strips_pythonexecutable() {
+        // Assert the platform-robust invariant: a malicious override for a blocked
+        // key never takes effect.  (`!contains_key` only happens to hold here
+        // because PYTHONEXECUTABLE isn't in a normal base env; the override-never-
+        // wins assertion is correct even if some host did set it.)
+        let malicious = "/attacker/python";
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert(
-            "PYTHONEXECUTABLE".to_string(),
-            "/attacker/python".to_string(),
-        );
+        overrides.insert("PYTHONEXECUTABLE".to_string(), malicious.to_string());
         overrides.insert("SAFE_VAR".to_string(), "hello".to_string());
 
         let result = super::sanitize_env(&overrides);
 
-        assert!(
-            !result.contains_key("PYTHONEXECUTABLE"),
-            "PYTHONEXECUTABLE must be stripped by sanitize_env"
+        assert_ne!(
+            result.get("PYTHONEXECUTABLE").map(String::as_str),
+            Some(malicious),
+            "a blocked PYTHONEXECUTABLE override must never take effect"
         );
         assert_eq!(
             result.get("SAFE_VAR").map(String::as_str),
@@ -2014,34 +2024,32 @@ mod tests {
 
     #[test]
     fn sanitize_env_strips_pythonstartup() {
+        let malicious = "/attacker/startup.py";
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert(
-            "PYTHONSTARTUP".to_string(),
-            "/attacker/startup.py".to_string(),
-        );
+        overrides.insert("PYTHONSTARTUP".to_string(), malicious.to_string());
 
         let result = super::sanitize_env(&overrides);
 
-        assert!(
-            !result.contains_key("PYTHONSTARTUP"),
-            "PYTHONSTARTUP must be stripped by sanitize_env"
+        assert_ne!(
+            result.get("PYTHONSTARTUP").map(String::as_str),
+            Some(malicious),
+            "a blocked PYTHONSTARTUP override must never take effect"
         );
     }
 
     #[test]
     fn sanitize_env_strips_node_path() {
+        let malicious = "/attacker/node_modules";
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert(
-            "NODE_PATH".to_string(),
-            "/attacker/node_modules".to_string(),
-        );
+        overrides.insert("NODE_PATH".to_string(), malicious.to_string());
         overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
 
         let result = super::sanitize_env(&overrides);
 
-        assert!(
-            !result.contains_key("NODE_PATH"),
-            "NODE_PATH must be stripped by sanitize_env"
+        assert_ne!(
+            result.get("NODE_PATH").map(String::as_str),
+            Some(malicious),
+            "a blocked NODE_PATH override must never take effect"
         );
         assert_eq!(
             result.get("SAFE_VAR").map(String::as_str),
@@ -2052,14 +2060,16 @@ mod tests {
 
     #[test]
     fn sanitize_env_strips_bash_env() {
+        let malicious = "/attacker/inject.sh";
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert("BASH_ENV".to_string(), "/attacker/inject.sh".to_string());
+        overrides.insert("BASH_ENV".to_string(), malicious.to_string());
 
         let result = super::sanitize_env(&overrides);
 
-        assert!(
-            !result.contains_key("BASH_ENV"),
-            "BASH_ENV must be stripped by sanitize_env"
+        assert_ne!(
+            result.get("BASH_ENV").map(String::as_str),
+            Some(malicious),
+            "a blocked BASH_ENV override must never take effect"
         );
     }
 
@@ -2067,16 +2077,25 @@ mod tests {
     fn sanitize_env_strips_pathext() {
         // On Windows, cmd.exe uses PATHEXT to resolve a bare command's extension;
         // a cloud JobRequest could hide an env override that changes which
-        // script/exe an approved bare command resolves to.
+        // script/exe an approved bare command resolves to.  The real invariant is
+        // that a malicious override never *takes effect*: `sanitize_env` seeds its
+        // result from the daemon's own process env, so a blocked key already in the
+        // base env (PATHEXT/COMSPEC are present on Windows) keeps the daemon's
+        // value — but the override value must never win.  Asserting absence would
+        // be wrong on Windows; asserting the override didn't take is correct on
+        // every platform.
+        let malicious = ".BAT;.CMD;.VBS";
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert("PATHEXT".to_string(), ".BAT;.CMD;.VBS".to_string());
+        overrides.insert("PATHEXT".to_string(), malicious.to_string());
         overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
 
         let result = super::sanitize_env(&overrides);
 
-        assert!(
-            !result.contains_key("PATHEXT"),
-            "PATHEXT must be stripped by sanitize_env"
+        assert_ne!(
+            result.get("PATHEXT").map(String::as_str),
+            Some(malicious),
+            "a blocked PATHEXT override must never take effect (base value is kept, \
+             override is rejected)"
         );
         assert_eq!(
             result.get("SAFE_VAR").map(String::as_str),
@@ -2089,16 +2108,21 @@ mod tests {
     fn sanitize_env_strips_comspec() {
         // A child-env COMSPEC override redirects the command interpreter
         // %COMSPEC% resolves to, allowing an attacker-controlled binary to be
-        // invoked as the shell.
+        // invoked as the shell.  On Windows COMSPEC is present in the base process
+        // env, so the result keeps the daemon's value; the invariant we assert is
+        // that the malicious override value never wins (platform-robust).
+        let malicious = r"C:\attacker\evil.exe";
         let mut overrides = std::collections::HashMap::new();
-        overrides.insert("COMSPEC".to_string(), r"C:\attacker\evil.exe".to_string());
+        overrides.insert("COMSPEC".to_string(), malicious.to_string());
         overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
 
         let result = super::sanitize_env(&overrides);
 
-        assert!(
-            !result.contains_key("COMSPEC"),
-            "COMSPEC must be stripped by sanitize_env"
+        assert_ne!(
+            result.get("COMSPEC").map(String::as_str),
+            Some(malicious),
+            "a blocked COMSPEC override must never take effect (base value is kept, \
+             override is rejected)"
         );
         assert_eq!(
             result.get("SAFE_VAR").map(String::as_str),
@@ -2117,17 +2141,19 @@ mod tests {
             "PERL5OPT",
             "RUBYOPT",
         ];
+        let malicious = "injected";
         let mut overrides = std::collections::HashMap::new();
         for key in blocked {
-            overrides.insert((*key).to_string(), "injected".to_string());
+            overrides.insert((*key).to_string(), malicious.to_string());
         }
 
         let result = super::sanitize_env(&overrides);
 
         for key in blocked {
-            assert!(
-                !result.contains_key(*key),
-                "{key} must be stripped by sanitize_env"
+            assert_ne!(
+                result.get(*key).map(String::as_str),
+                Some(malicious),
+                "a blocked {key} override must never take effect"
             );
         }
     }
