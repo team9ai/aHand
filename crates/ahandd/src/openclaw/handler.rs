@@ -1487,6 +1487,31 @@ mod tests {
         std::env::temp_dir().join(format!("ahand-openclaw-{}", uuid::Uuid::new_v4()))
     }
 
+    /// Returns a shell command string that creates a marker file at `path`.
+    ///
+    /// Unix:    `printf X > <path>` via sh  — writes "X", no trailing newline.
+    /// Windows: `echo X> <path>` via cmd.exe — cmd `echo` would prepend a trailing
+    ///          space before `>`; by writing `echo X>` (no space before `>`) the
+    ///          redirect is still parsed correctly and the file is created.
+    ///          Tests assert only `path.exists()`, not exact content, so the
+    ///          trailing CRLF cmd adds is irrelevant.
+    fn write_marker_command(path: &std::path::Path) -> String {
+        #[cfg(unix)]
+        {
+            format!("printf X > {}", path.display())
+        }
+        #[cfg(windows)]
+        {
+            // No space before `>` so cmd.exe doesn't include a trailing space in
+            // the redirect token.  The file is created; content is not asserted.
+            format!("echo X> {}", path.display())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            format!("printf X > {}", path.display())
+        }
+    }
+
     fn system_run_invoke(
         session_key: &str,
         raw_command: String,
@@ -1544,9 +1569,10 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
-    // Executes a real `sh -c 'printf …'` and asserts the output file was
-    // created; `sh` and `/tmp` are not available on Windows.
-    #[cfg(unix)]
+    // Executes a real shell job (sh -c on Unix; cmd /C on Windows) and asserts
+    // the output file was created.  The command is built by `write_marker_command`
+    // which selects the right syntax per platform.  `unique_output_path` uses
+    // `std::env::temp_dir()` so the path is writable on both platforms.
     #[tokio::test]
     async fn strict_mode_preapproved_request_executes_without_local_wait() {
         let (handler, session_mgr, _approval_mgr, approval_broadcast_tx) = test_handler(1);
@@ -1555,7 +1581,7 @@ mod tests {
             .await;
         let mut approval_rx = approval_broadcast_tx.subscribe();
         let output_path = unique_output_path();
-        let command = format!("printf approved > {}", output_path.display());
+        let command = write_marker_command(&output_path);
 
         let (result, event) = handler
             .handle_invoke(system_run_invoke("session-1", command, Some(true), None))
@@ -1576,9 +1602,9 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
-    // Executes a real `sh -c 'printf …'` and asserts the output file was
-    // created; `sh` and `/tmp` are not available on Windows.
-    #[cfg(unix)]
+    // Executes a real shell job (sh -c on Unix; cmd /C on Windows) and asserts
+    // the output file was created after approval.  The command is built by
+    // `write_marker_command` which selects the right syntax per platform.
     #[tokio::test]
     async fn strict_mode_waits_for_local_approval_before_running() {
         let (handler, session_mgr, approval_mgr, approval_broadcast_tx) = test_handler(1);
@@ -1587,7 +1613,7 @@ mod tests {
             .await;
         let mut approval_rx = approval_broadcast_tx.subscribe();
         let output_path = unique_output_path();
-        let command = format!("printf locally-approved > {}", output_path.display());
+        let command = write_marker_command(&output_path);
 
         let resolver = tokio::spawn(async move {
             let envelope = approval_rx.recv().await.unwrap();
