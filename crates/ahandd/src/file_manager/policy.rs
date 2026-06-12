@@ -263,10 +263,84 @@ fn canonicalize_no_follow(path: &Path) -> io::Result<PathBuf> {
 }
 
 /// Match a path against a glob pattern. Supports `*`, `**`, and `?`.
+///
+/// # Platform separator behaviour (evidence-based, not assumed)
+///
+/// `glob` 0.3.x uses `std::path::is_separator` throughout its matching code.
+/// On Windows that function returns `true` for **both** `/` and `\`.
+/// Concretely:
+///
+/// * `chars_eq(a, b, _)` (glob src line ~1041) short-circuits to `true`
+///   whenever both characters satisfy `is_separator`, so `/` and `\` are
+///   interchangeable in every character comparison.
+/// * `AnyRecursiveSequence` (`**`) advances while `!follows_separator`; because
+///   `\` flips `follows_separator` to `true` on Windows, `**` correctly bridges
+///   backslash-separated path segments without any pre-normalisation.
+///
+/// Therefore: **no forward-slash normalisation is needed** on Windows.  Both
+/// config patterns (expanded via `home.join(…)` → backslashes) and canonicalized
+/// resolved paths (backslashes after `canonicalize_simplified`) are matched
+/// correctly by the glob crate as-is.
+///
+/// # Case sensitivity
+///
+/// On Windows, NTFS is case-insensitive by default.  We mirror that by setting
+/// `case_sensitive: false` on Windows.  All other `MatchOptions` preserve the
+/// existing behaviour (`require_literal_separator: false`,
+/// `require_literal_leading_dot: false`).
+///
+/// ## Non-ASCII case folding on Windows
+///
+/// The glob crate's `case_sensitive: false` only folds ASCII characters, so a
+/// denylist pattern containing non-ASCII letters (é/É, ö/Ö, Cyrillic, etc.)
+/// could be bypassed by a case variant on NTFS (which uses the full Unicode
+/// upcase table).  To close this gap, on Windows we pre-lowercase **both** the
+/// pattern and the path with Rust's Unicode-aware `str::to_lowercase` before
+/// matching (and then match case-sensitively).  Rust's `to_lowercase` applies
+/// Unicode simple case-fold (é→é, É→é, Ö→ö, Cyrillic, etc.), which is strictly
+/// better than ASCII-only folding.  Note that this is Unicode simple-fold, not
+/// full NTFS upcase-table parity, but for a denylist the security direction is
+/// fail-closed: an unrecognised fold variant is still passed through (worst case
+/// a denylist miss), whereas the old ASCII-only code guaranteed the bypass for
+/// any non-ASCII case pair.  We keep `case_sensitive: false` as belt-and-
+/// suspenders for the ASCII range.
 fn glob_match(pattern: &str, path: &str) -> bool {
-    match glob::Pattern::new(pattern) {
-        Ok(p) => p.matches(path),
-        Err(_) => pattern == path,
+    #[cfg(windows)]
+    {
+        // Pre-fold both sides with Unicode-aware to_lowercase so that non-ASCII
+        // case pairs (é/É, ö/Ö, Cyrillic, etc.) are folded before the glob
+        // crate's ASCII-only case_sensitive:false matching runs over them.
+        let pattern_lower = pattern.to_lowercase();
+        let path_lower = path.to_lowercase();
+        let opts = glob::MatchOptions {
+            case_sensitive: false, // belt-and-suspenders for ASCII range
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        };
+        match glob::Pattern::new(&pattern_lower) {
+            Ok(p) => p.matches_with(&path_lower, opts),
+            Err(_) => {
+                // Pattern is invalid (e.g. unmatched `[`): fall back to
+                // Unicode-folded equality.
+                pattern_lower == path_lower
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let opts = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        };
+        match glob::Pattern::new(pattern) {
+            Ok(p) => p.matches_with(path, opts),
+            Err(_) => {
+                // Pattern is invalid (e.g. unmatched `[`): fall back to literal
+                // equality so we don't silently allow/deny everything.
+                pattern == path
+            }
+        }
     }
 }
 
@@ -519,5 +593,227 @@ mod tests {
         let got = canonicalize_or_parent(&missing).unwrap();
         assert!(!got.to_string_lossy().starts_with(r"\\?\"));
         assert!(got.ends_with("not/yet/here.txt") || got.ends_with(r"not\yet\here.txt"));
+    }
+
+    // -----------------------------------------------------------------------
+    // T4: Case-correct policy matching (Task 4 of the M4 security plan)
+    // -----------------------------------------------------------------------
+
+    /// On Windows, glob_match must be case-insensitive so that NTFS paths
+    /// whose on-disk casing differs from the config pattern are still matched.
+    ///
+    /// Separator note: glob 0.3.x treats both '/' and '\' as separators on
+    /// Windows via std::path::is_separator, so no normalisation is required.
+    /// Both ** and literal path segments match across backslash-separated paths.
+    #[cfg(windows)]
+    #[test]
+    fn windows_glob_match_case_insensitive_allow() {
+        // Pattern uses uppercase drive letter and mixed case; path is all lower.
+        assert!(
+            glob_match(r"C:\Users\X\**", r"c:\users\x\file.txt"),
+            "case-insensitive allowlist match must succeed on Windows"
+        );
+        // Forward-slash pattern against backslash path (separator parity).
+        assert!(
+            glob_match("C:/Users/X/**", r"c:\users\x\file.txt"),
+            "forward-slash pattern must match backslash path on Windows"
+        );
+    }
+
+    /// Security-critical: a denylist entry must block case-variant paths on
+    /// Windows. A user must not be able to bypass `.SSH` → `.ssh` denylist.
+    #[cfg(windows)]
+    #[test]
+    fn windows_denylist_case_variant_blocked() {
+        // This is the security invariant: `.ssh` denylist blocks `.SSH` path.
+        assert!(
+            glob_match(r"C:\Users\X\.ssh\**", r"c:\users\x\.SSH\id_rsa"),
+            "denylist must block case-variant path on Windows (security)"
+        );
+        // Reversed: uppercase pattern must block lowercase path.
+        assert!(
+            glob_match(r"C:\Users\X\.SSH\**", r"c:\users\x\.ssh\id_rsa"),
+            "denylist uppercase pattern must block lowercase path on Windows"
+        );
+    }
+
+    /// On Windows, a mixed-case allowlist pattern must admit the canonical
+    /// (OS-cased) resolved path produced by canonicalize_simplified.
+    #[cfg(windows)]
+    #[test]
+    fn windows_mixed_case_allowlist_admits_canonical_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = ahand_platform::paths::canonicalize_simplified(tmp.path()).unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+
+        // Build the allowlist pattern in uppercase (simulating operator config
+        // that doesn't match the canonical casing on disk).
+        let upper_pattern = root_str.to_uppercase();
+        let allowlist = vec![
+            format!("{}\\**", upper_pattern.trim_end_matches('\\')),
+            upper_pattern,
+        ];
+        let config = crate::config::FilePolicyConfig {
+            enabled: true,
+            path_allowlist: allowlist,
+            path_denylist: Vec::new(),
+            max_read_bytes: 100_000_000,
+            max_write_bytes: 100_000_000,
+            dangerous_paths: Vec::new(),
+        };
+        let checker = FilePolicyChecker::new(&config);
+        let file = root.join("test.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        // The canonical path (exact on-disk casing) must be admitted by the
+        // upper-cased allowlist pattern.
+        let result = checker.check_path(&file.to_string_lossy(), false, false);
+        assert!(
+            result.is_ok(),
+            "uppercase allowlist pattern must admit canonical path on Windows: {result:?}"
+        );
+    }
+
+    /// Security-critical: prove that the denylist case-bypass is blocked through
+    /// the REAL `check_path` flow (not just `glob_match` in isolation).
+    ///
+    /// Scenario: the operator's denylist uses the lowercase `.ssh` casing, but
+    /// an attacker supplies a write destination with `.SSH` (uppercase).  Because
+    /// the path does NOT yet exist, `canonicalize_or_parent` canonicalizes the
+    /// existing parent and re-appends the attacker-cased suffix — so the resolved
+    /// path retains `.SSH`.  The `glob_match` call with `case_sensitive: false`
+    /// must still match the lowercase denylist pattern against the uppercase path
+    /// and deny the request.
+    ///
+    /// The allowlist explicitly admits the parent directory so the denial is
+    /// provably from the denylist, not from an allowlist miss.
+    #[cfg(windows)]
+    #[test]
+    fn windows_denylist_case_bypass_blocked_through_check_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = canon_root(&tmp);
+
+        // Create the parent directory (.SSH does NOT exist — attacker casing).
+        // The denylist pattern uses canonical lowercase (.ssh); the write
+        // destination uses uppercase (.SSH).
+        let ssh_dir_lower = root.join(".ssh");
+        // Do NOT create .SSH — the path must be not-yet-existing so that
+        // canonicalize_or_parent re-appends the attacker-cased suffix.
+
+        // Denylist uses lowercase; allowlist admits the root so the parent
+        // directory (root itself) is allowed — isolating the denylist denial.
+        let denylist = vec![format!("{}/.ssh/**", root.display())];
+        let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &denylist, &[]));
+
+        // The write destination: .SSH (uppercase) / id_rsa — does not exist yet.
+        // Use the lowercase ssh_dir_lower as base but suffix with uppercase variant.
+        let root_str = root.to_string_lossy();
+        let attacker_path = format!(r"{}\.SSH\id_rsa", root_str);
+
+        let err = checker.check_path(&attacker_path, true, false).unwrap_err();
+        assert_eq!(
+            err.code,
+            FileErrorCode::PolicyDenied as i32,
+            "denylist must block case-variant path through check_path (not-yet-existing write): {err:?}"
+        );
+
+        // Suppress unused variable warning for ssh_dir_lower (intentionally not created).
+        let _ = ssh_dir_lower;
+    }
+
+    /// Regression: on Unix, glob_match must remain case-SENSITIVE.
+    /// Pattern `/Home/**` must NOT match `/home/x` (different capitalisation).
+    #[cfg(unix)]
+    #[test]
+    fn unix_glob_match_remains_case_sensitive() {
+        // Different casing → must NOT match on Unix.
+        assert!(
+            !glob_match("/Home/**", "/home/x"),
+            "Unix glob must be case-sensitive: /Home/** must not match /home/x"
+        );
+        // Same casing → must match.
+        assert!(
+            glob_match("/home/**", "/home/x"),
+            "Unix glob must match when casing is identical"
+        );
+        // Partial case difference in the middle of the path.
+        assert!(
+            !glob_match("/home/User/**", "/home/user/file.txt"),
+            "Unix glob must be case-sensitive for inner components"
+        );
+    }
+
+    // ── glob_match invalid-pattern fallback (fail-closed) ────────────────────
+
+    /// A malformed denylist pattern (e.g. unmatched `[`) must NOT match a
+    /// *different* path — the fallback is literal equality, not a wildcard.
+    /// This is the "fail-closed" invariant: a typo in a denylist entry must not
+    /// accidentally allow everything (fail-open) or silently block everything.
+    #[cfg(not(windows))]
+    #[test]
+    fn glob_match_invalid_pattern_does_not_match_different_path() {
+        // Malformed pattern with unmatched `[` must not match a different path.
+        assert!(
+            !glob_match("path/[unclosed", "path/anything"),
+            "a malformed denylist pattern must NOT match a different path (fail-closed, not fail-open)"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn glob_match_invalid_pattern_matches_itself_exactly() {
+        // The fallback is literal equality: a malformed pattern matches only the
+        // exact same string (so a denylist entry still blocks the verbatim path).
+        assert!(
+            glob_match("path/[unclosed", "path/[unclosed"),
+            "a malformed pattern must still match the identical literal string"
+        );
+    }
+
+    /// On Windows the invalid-pattern fallback is Unicode-folded case-insensitive
+    /// equality (both sides are lowercased before comparison).
+    #[cfg(windows)]
+    #[test]
+    fn windows_glob_match_invalid_pattern_case_folded_equality() {
+        // Same string with different ASCII casing → matches (fold applied).
+        assert!(
+            glob_match("path/[x", "PATH/[X"),
+            "Windows fallback must use Unicode-folded equality: 'path/[x' must match 'PATH/[X'"
+        );
+        // Completely different string → must not match.
+        assert!(
+            !glob_match("path/[x", "path/anything"),
+            "Windows fallback must NOT match a different string"
+        );
+    }
+
+    /// Security: on Windows, non-ASCII case variants (é/É, ö/Ö) in denylist
+    /// patterns must block the case-folded path variant.  The glob crate's
+    /// `case_sensitive: false` only folds ASCII; our Unicode-aware pre-fold via
+    /// `to_lowercase` closes the gap.  This is Unicode simple-fold (not full NTFS
+    /// upcase-table parity), strictly better than ASCII-only — fail-closed for
+    /// denylists.
+    #[cfg(windows)]
+    #[test]
+    fn windows_glob_match_non_ascii_case_fold() {
+        // é (U+00E9) / É (U+00C9): pattern uses uppercase É, path uses lowercase é.
+        assert!(
+            glob_match(r"C:\Users\ÉTÉ\**", r"C:\Users\été\file.txt"),
+            "denylist pattern with É must block path with é (Unicode fold)"
+        );
+        // Reversed: lowercase pattern, uppercase path variant.
+        assert!(
+            glob_match(r"C:\Users\été\**", r"C:\Users\ÉTÉ\file.txt"),
+            "denylist pattern with é must block path with É (Unicode fold)"
+        );
+        // ö (U+00F6) / Ö (U+00D6)
+        assert!(
+            glob_match(r"C:\Users\Öffnung\**", r"C:\Users\öffnung\secret.txt"),
+            "denylist pattern with Ö must block path with ö (Unicode fold)"
+        );
+        // ASCII range must still work (belt-and-suspenders).
+        assert!(
+            glob_match(r"C:\Users\X\**", r"c:\users\x\file.txt"),
+            "ASCII case-insensitive match must still work on Windows"
+        );
     }
 }
