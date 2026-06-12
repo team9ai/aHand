@@ -1,4 +1,5 @@
 mod ahand_client;
+mod app_tool_registry;
 mod approval;
 mod browser;
 mod browser_setup;
@@ -330,6 +331,9 @@ async fn main() -> anyhow::Result<()> {
 
     let file_policy_cfg = cfg.file_policy.clone().unwrap_or_default();
     let file_mgr = Arc::new(file_manager::FileManager::new(&file_policy_cfg));
+    // CLI daemon advertises an empty app-tool catalog; embedding apps
+    // populate this via DaemonHandle::register_app_tool instead.
+    let app_tools = Arc::new(app_tool_registry::AppToolRegistry::new());
 
     // Broadcast channel for pushing approval requests to all IPC clients.
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
@@ -374,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
                     ));
 
                     tokio::select! {
-                        r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx, Arc::clone(&browser_mgr), Arc::clone(&file_mgr)) => r,
+                        r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx, Arc::clone(&browser_mgr), Arc::clone(&file_mgr), Arc::clone(&app_tools)) => r,
                         r = ipc_handle => {
                             r??;
                             Ok(())
@@ -391,6 +395,7 @@ async fn main() -> anyhow::Result<()> {
                         approval_broadcast_tx,
                         browser_mgr,
                         file_mgr,
+                        app_tools,
                     )
                     .await
                 }

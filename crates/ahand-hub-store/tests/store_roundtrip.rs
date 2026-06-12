@@ -10,6 +10,7 @@ use ahand_hub_core::device::NewDevice;
 use ahand_hub_core::job::{JobFilter, JobStatus, NewJob};
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceStore, JobStore, OutboxStore};
+use ahand_hub_store::app_tool_store::{RedisAppToolStore, StoredAppTool, StoredAppToolCatalog};
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::job_output_store::{JobOutputRecord, RedisJobOutputStore};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -674,5 +675,135 @@ async fn outbox_send_rejects_non_owner() -> anyhow::Result<()> {
         .await
         .unwrap_err();
     assert!(matches!(err, HubError::Unauthorized));
+    Ok(())
+}
+
+fn make_catalog(revision: u64, stale: bool, tool_name: &str) -> StoredAppToolCatalog {
+    StoredAppToolCatalog {
+        revision,
+        stale,
+        tools: vec![StoredAppTool {
+            name: tool_name.into(),
+            description: "test tool".into(),
+            input_schema_json: r#"{"type":"object"}"#.into(),
+            requires_approval: false,
+        }],
+        updated_at_ms: 0,
+    }
+}
+
+#[tokio::test]
+async fn redis_app_tool_store_put_and_get_roundtrip() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let conn = ahand_hub_store::redis::connect_redis(stack.redis_url()).await?;
+    let store = RedisAppToolStore::new(conn);
+
+    // No catalog initially.
+    assert!(store.get_catalog("dev-at-1").await?.is_none());
+
+    // put_catalog → get_catalog equality.
+    let catalog = make_catalog(5, false, "my_tool");
+    store.put_catalog("dev-at-1", catalog.clone()).await?;
+
+    let stored = store
+        .get_catalog("dev-at-1")
+        .await?
+        .expect("catalog should be present");
+    assert_eq!(stored.revision, 5);
+    assert!(!stored.stale);
+    assert_eq!(stored.tools.len(), 1);
+    assert_eq!(stored.tools[0].name, "my_tool");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_app_tool_store_mark_stale_sets_flag_and_retains_content() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let conn = ahand_hub_store::redis::connect_redis(stack.redis_url()).await?;
+    let store = RedisAppToolStore::new(conn);
+
+    store
+        .put_catalog("dev-at-2", make_catalog(3, false, "tool_a"))
+        .await?;
+
+    // mark_stale → get shows stale=true, content retained.
+    let updated = store.mark_stale("dev-at-2").await?;
+    assert!(updated, "mark_stale should return true when catalog exists");
+
+    let stale = store
+        .get_catalog("dev-at-2")
+        .await?
+        .expect("catalog should exist");
+    assert!(stale.stale, "catalog must be stale after mark_stale");
+    assert_eq!(stale.revision, 3);
+    assert_eq!(stale.tools.len(), 1);
+    assert_eq!(stale.tools[0].name, "tool_a");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_app_tool_store_mark_stale_absent_returns_false() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let conn = ahand_hub_store::redis::connect_redis(stack.redis_url()).await?;
+    let store = RedisAppToolStore::new(conn);
+
+    // No catalog → mark_stale is a no-op returning Ok(false).
+    let result = store.mark_stale("dev-at-absent").await?;
+    assert!(!result, "mark_stale on absent key must return false");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_app_tool_store_mark_stale_idempotent() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let conn = ahand_hub_store::redis::connect_redis(stack.redis_url()).await?;
+    let store = RedisAppToolStore::new(conn);
+
+    store
+        .put_catalog("dev-at-3", make_catalog(7, false, "tool_b"))
+        .await?;
+    store.mark_stale("dev-at-3").await?;
+
+    // Second mark_stale on already-stale catalog: returns Ok(true), no error.
+    let second = store.mark_stale("dev-at-3").await?;
+    assert!(
+        second,
+        "second mark_stale must return true (already stale is still found)"
+    );
+
+    let catalog = store
+        .get_catalog("dev-at-3")
+        .await?
+        .expect("catalog must exist");
+    assert!(catalog.stale);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn redis_app_tool_store_delete_catalog_present_and_absent() -> anyhow::Result<()> {
+    let stack = TestStack::start().await?;
+    let conn = ahand_hub_store::redis::connect_redis(stack.redis_url()).await?;
+    let store = RedisAppToolStore::new(conn);
+
+    // delete on absent key → Ok(false), no error.
+    let absent = store.delete_catalog("dev-at-del-absent").await?;
+    assert!(!absent, "delete_catalog on absent key must return false");
+
+    // Insert then delete.
+    store
+        .put_catalog("dev-at-del-1", make_catalog(1, false, "tool_x"))
+        .await?;
+    let deleted = store.delete_catalog("dev-at-del-1").await?;
+    assert!(deleted, "delete_catalog on existing key must return true");
+
+    assert!(
+        store.get_catalog("dev-at-del-1").await?.is_none(),
+        "catalog must be gone after delete"
+    );
+
     Ok(())
 }

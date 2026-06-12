@@ -22,12 +22,15 @@ use tokio::task::JoinHandle;
 pub use ahand_protocol::SessionMode;
 
 use crate::ahand_client::{self, ClientReporter, ConnectOutcome};
+use crate::app_tool_registry::AppToolRegistry;
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::config::{BrowserConfig, Config, FilePolicyConfig, HubConfig};
 use crate::device_identity::DeviceIdentity;
 use crate::registry::JobRegistry;
 use crate::session::SessionManager;
+
+pub use crate::app_tool_registry::{AppToolDef, AppToolError, AppToolHandler};
 
 use crate::device_identity::IDENTITY_FILE as IDENTITY_FILE_NAME;
 
@@ -205,6 +208,7 @@ pub struct DaemonHandle {
     join: JoinHandle<anyhow::Result<()>>,
     status_rx: watch::Receiver<DaemonStatus>,
     device_id: String,
+    app_tools: Arc<AppToolRegistry>,
 }
 
 static ACTIVE_DAEMONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -265,6 +269,43 @@ impl DaemonHandle {
     pub fn device_id(&self) -> &str {
         &self.device_id
     }
+
+    /// Register an app-defined tool. The daemon will advertise an updated
+    /// snapshot to the hub immediately (if connected) and after every
+    /// subsequent reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `def.name` does not match `^[a-z0-9_-]{1,64}$`
+    /// - `def.input_schema` is not a JSON object
+    /// - a tool with the same name is already registered
+    ///
+    /// A failed registration does not change the advertised catalog; the hub
+    /// sees no new snapshot and the revision is not incremented.
+    ///
+    /// # Handler contract
+    ///
+    /// Handlers should complete promptly or honor cancellation by finishing.
+    /// A handler that never returns permanently consumes one of the 4
+    /// per-device concurrency slots: a timeout response is sent to the caller
+    /// when the configured `timeout_ms` elapses, but the slot is only released
+    /// when the handler task actually finishes (or is dropped). Four stuck
+    /// handlers will disable app tools on the device until daemon restart.
+    pub async fn register_app_tool(
+        &self,
+        def: AppToolDef,
+        handler: AppToolHandler,
+    ) -> anyhow::Result<()> {
+        self.app_tools.register(def, handler).await
+    }
+
+    /// Unregister an app-defined tool by name. Returns `true` if the tool
+    /// existed. The daemon pushes a new snapshot (without the tool) to the
+    /// hub immediately if connected.
+    pub async fn unregister_app_tool(&self, name: &str) -> bool {
+        self.app_tools.unregister(name).await
+    }
 }
 
 /// Spawn an `ahandd` instance wired against the cloud hub described by `config`.
@@ -311,6 +352,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     // (defaulted in `build_inner_config`).
     let file_policy_cfg = inner_config.file_policy.clone().unwrap_or_default();
     let file_mgr = Arc::new(crate::file_manager::FileManager::new(&file_policy_cfg));
+    let app_tools = Arc::new(AppToolRegistry::new());
 
     let status_tx_task = status_tx.clone();
     let device_id_for_task = device_id.clone();
@@ -319,6 +361,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     let reporter: Arc<dyn ClientReporter> =
         Arc::new(StatusReporter::new(reporter_status_tx, reporter_device_id));
 
+    let app_tools_for_task = Arc::clone(&app_tools);
     let join = tokio::spawn(async move {
         let _active_guard = active_guard;
         let run_fut = ahand_client::run_with_reporter(
@@ -331,6 +374,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
             approval_broadcast_tx,
             browser_mgr,
             file_mgr,
+            app_tools_for_task,
             reporter,
         );
 
@@ -362,6 +406,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         join,
         status_rx,
         device_id,
+        app_tools,
     })
 }
 
