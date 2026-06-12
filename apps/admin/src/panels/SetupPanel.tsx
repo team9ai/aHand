@@ -1,9 +1,12 @@
-import { createSignal, Show } from "solid-js";
-import { api } from "../lib/api";
+import { createResource, createSignal, Show } from "solid-js";
+import { api, StatusResponse } from "../lib/api";
 
 type Mode = "openclaw-gateway" | "ahand-cloud";
 
 export default function SetupPanel(props: { onComplete: () => void }) {
+  // Status works pre-daemon (paths come from dirs::home_dir()); fall back to
+  // the literal only if the call fails.
+  const [status] = createResource<StatusResponse>(api.getStatus);
   const [mode, setMode] = createSignal<Mode>("openclaw-gateway");
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -72,7 +75,7 @@ export default function SetupPanel(props: { onComplete: () => void }) {
         fallback={
           <div class="panel setup-done">
             <h2>Configuration saved</h2>
-            <p>Your config has been written to <code>~/.ahand/config.toml</code></p>
+            <p>Your config has been written to <code>{status()?.config_path ?? "~/.ahand/config.toml"}</code></p>
             <div class="setup-next">
               <p>Next, start the daemon:</p>
               <pre>ahandctl start</pre>

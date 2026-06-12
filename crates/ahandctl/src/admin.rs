@@ -19,6 +19,8 @@ struct StatusResponse {
     config_path: String,
     data_dir: String,
     data_dir_size: u64,
+    home_dir: String,
+    bin_dir: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -441,6 +443,10 @@ async fn get_status(config_path: &Path) -> Result<StatusResponse> {
     // Calculate data dir size
     let data_dir_size = calculate_dir_size(&data_dir).await.unwrap_or(0);
 
+    // Resolve platform-correct home and bin directories.
+    let home = dirs::home_dir().context("Failed to find home directory")?;
+    let bin_dir = home.join(".ahand").join("bin");
+
     Ok(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         daemon_running,
@@ -448,6 +454,8 @@ async fn get_status(config_path: &Path) -> Result<StatusResponse> {
         config_path: config_path.display().to_string(),
         data_dir: data_dir.display().to_string(),
         data_dir_size,
+        home_dir: home.display().to_string(),
+        bin_dir: bin_dir.display().to_string(),
     })
 }
 

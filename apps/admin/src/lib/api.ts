@@ -80,6 +80,8 @@ export interface StatusResponse {
   config_path: string;
   data_dir: string;
   data_dir_size: number;
+  home_dir: string;
+  bin_dir: string;
 }
 
 export type PluginStatus =
