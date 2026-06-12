@@ -1,5 +1,35 @@
 # @ahandai/sdk Changelog
 
+## 0.3.0 — 2026-06-11
+
+Released alongside `@ahandai/proto@0.3.0`.
+
+### Added
+
+- **`listAppTools(deviceId, opts?)` / `invokeAppTool(deviceId, name, args?, opts?)`** —
+  discover and invoke application-defined tools registered by host apps
+  embedding `ahandd`. Exported public types: **`AppToolCatalog`**,
+  **`AppToolInfo`**, **`ListAppToolsOptions`**, **`InvokeAppToolOptions`**.
+
+  - `listAppTools` returns an `AppToolCatalog` (numeric `revision`,
+    `stale` flag, `updatedAtMs` timestamp, `tools` array of `AppToolInfo`).
+  - `invokeAppTool` resolves with the daemon's `result` value on success.
+    When the daemon returns a successful response but omits `result`, `null`
+    is returned for a stable contract (callers can use `result ?? default`).
+  - Daemon-level failures throw `CloudClientError("app_tool_error")` with
+    the daemon code in `jobErrorCode`. Daemon error code set:
+    `TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE | APPROVAL_DENIED |
+    APPROVAL_TIMEOUT | EXECUTION_TIMEOUT | HANDLER_PANIC | HANDLER_ERROR |
+    CONCURRENCY_LIMIT`.
+  - Hub-level error codes reuse existing taxonomy:
+    `409 DEVICE_OFFLINE → device_offline` (same as `files()`),
+    `504 → timeout` (same as `files()` / `browser()`).
+  - Strict root-shape guard — null / non-object / array roots throw
+    `CloudClientError("server_error", ...)` rather than propagating raw
+    `TypeError`s. Same coercion-masks-regression philosophy as `files()`.
+  - `listAppTools` additionally requires an array `tools` field; a numeric
+    `revision` alone is insufficient.
+
 ## 0.2.2 — 2026-05-13
 
 ### Added

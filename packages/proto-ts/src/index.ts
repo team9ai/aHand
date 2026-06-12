@@ -63,3 +63,11 @@ export {
   DeleteMode,
   fileErrorCodeToJSON,
 } from "./generated/ahand/v1/file_ops.ts";
+
+export {
+  AppToolDescriptor,
+  AppToolError,
+  AppToolRequest,
+  AppToolResponse,
+  AppToolsUpdate,
+} from "./generated/ahand/v1/app_tool.ts";
