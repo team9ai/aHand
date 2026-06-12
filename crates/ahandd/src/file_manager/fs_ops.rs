@@ -2237,27 +2237,14 @@ mod tests {
         // Use a relative target: "../src_dir" — relative to links/ means src_dir.
         let relative_target = r"..\src_dir";
 
-        // Build a minimal request and call handle_create_symlink directly.
-        // We exercise the public handle() path so the file_manager dispatch layer
-        // (allowlist checks) is also covered; both link and target are under root.
-        let (mgr, _root_path) = {
-            use crate::file_manager::{FileManager, FileManagerConfig};
-            let allowed = vec![root.to_path_buf()];
-            let cfg = FileManagerConfig::new(allowed);
-            let mgr = FileManager::new(cfg);
-            (mgr, root.to_path_buf())
+        // Call handle_create_symlink directly — this is the function under test
+        // (dir/file probe on a relative target). No FileManager dispatch layer
+        // needed here; policy/allowlist checks are integration-tested in file_ops.rs.
+        let req = ahand_protocol::FileCreateSymlink {
+            target: relative_target.into(),
+            link_path: link.to_string_lossy().into_owned(),
         };
-
-        let req = ahand_protocol::FileRequest {
-            request_id: "rel-dir".into(),
-            operation: Some(ahand_protocol::file_request::Operation::CreateSymlink(
-                ahand_protocol::FileCreateSymlink {
-                    target: relative_target.into(),
-                    link_path: link.to_string_lossy().into_owned(),
-                },
-            )),
-        };
-        mgr.handle(&req)
+        super::handle_create_symlink(&req, &link)
             .await
             .expect("symlink creation must succeed");
 
