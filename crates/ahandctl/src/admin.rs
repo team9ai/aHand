@@ -19,6 +19,8 @@ struct StatusResponse {
     config_path: String,
     data_dir: String,
     data_dir_size: u64,
+    home_dir: String,
+    bin_dir: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -441,6 +443,10 @@ async fn get_status(config_path: &Path) -> Result<StatusResponse> {
     // Calculate data dir size
     let data_dir_size = calculate_dir_size(&data_dir).await.unwrap_or(0);
 
+    // Resolve platform-correct home and bin directories.
+    let home = dirs::home_dir().context("Failed to find home directory")?;
+    let bin_dir = ahand_bin_dir(&home);
+
     Ok(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         daemon_running,
@@ -448,6 +454,8 @@ async fn get_status(config_path: &Path) -> Result<StatusResponse> {
         config_path: config_path.display().to_string(),
         data_dir: data_dir.display().to_string(),
         data_dir_size,
+        home_dir: home.display().to_string(),
+        bin_dir: bin_dir.display().to_string(),
     })
 }
 
@@ -682,6 +690,12 @@ fn resolve_dist_path() -> Result<PathBuf> {
 fn get_data_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Failed to find home directory")?;
     Ok(home.join(".ahand").join("data"))
+}
+
+/// Resolve the `.ahand/bin` directory under the given home path.
+/// Pure (no I/O) so it can be unit-tested across platforms.
+fn ahand_bin_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".ahand").join("bin")
 }
 
 fn calculate_dir_size(
@@ -978,6 +992,66 @@ mod sse_adapter_tests {
             parsed.get("exit_code").and_then(|v| v.as_i64()),
             Some(0),
             "exit_code must be 0 on Ok: {data}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Path-helper test: ahand_bin_dir is the pure builder behind StatusResponse
+    // `bin_dir`. Build the expected path with `.join` so it stays correct on
+    // both POSIX (`/`) and Windows (`\`) separators.
+    // -------------------------------------------------------------------------
+
+    /// `ahand_bin_dir` appends `.ahand/bin` to the given home directory.
+    #[test]
+    fn ahand_bin_dir_appends_dot_ahand_bin() {
+        use std::path::Path;
+        let home = Path::new("/home/alice");
+        let expected = home.join(".ahand").join("bin");
+        assert_eq!(ahand_bin_dir(home), expected);
+    }
+
+    // -------------------------------------------------------------------------
+    // StatusResponse serde-contract test: the admin SPA reads these exact JSON
+    // keys (config_path, data_dir, home_dir, bin_dir). Pin the wire names so a
+    // field rename/drop is caught here instead of silently breaking the panel.
+    // -------------------------------------------------------------------------
+
+    /// `StatusResponse` serialises with the exact JSON keys the SPA depends on.
+    #[test]
+    fn status_response_serializes_expected_keys() {
+        let resp = StatusResponse {
+            version: "1.2.3".to_string(),
+            daemon_running: true,
+            daemon_pid: Some(4242),
+            config_path: "/home/alice/.ahand/config.toml".to_string(),
+            data_dir: "/home/alice/.ahand/data".to_string(),
+            data_dir_size: 1024,
+            home_dir: "/home/alice".to_string(),
+            bin_dir: "/home/alice/.ahand/bin".to_string(),
+        };
+
+        let value = serde_json::to_value(&resp).expect("StatusResponse must serialize");
+        let obj = value.as_object().expect("must serialize to a JSON object");
+
+        assert_eq!(
+            obj.get("config_path").and_then(|v| v.as_str()),
+            Some("/home/alice/.ahand/config.toml"),
+            "config_path key/value must match"
+        );
+        assert_eq!(
+            obj.get("data_dir").and_then(|v| v.as_str()),
+            Some("/home/alice/.ahand/data"),
+            "data_dir key/value must match"
+        );
+        assert_eq!(
+            obj.get("home_dir").and_then(|v| v.as_str()),
+            Some("/home/alice"),
+            "home_dir key/value must match"
+        );
+        assert_eq!(
+            obj.get("bin_dir").and_then(|v| v.as_str()),
+            Some("/home/alice/.ahand/bin"),
+            "bin_dir key/value must match"
         );
     }
 }
