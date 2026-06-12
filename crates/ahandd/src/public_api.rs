@@ -21,6 +21,8 @@ use tokio::task::JoinHandle;
 
 pub use ahand_protocol::SessionMode;
 
+use ahand_protocol::{ApprovalRequest, Envelope, envelope};
+
 use crate::ahand_client::{self, ClientReporter, ConnectOutcome};
 use crate::app_tool_registry::AppToolRegistry;
 use crate::approval::ApprovalManager;
@@ -202,13 +204,54 @@ impl PartialEq for DaemonStatus {
 /// Handle returned by [`spawn`]. Drop-safe — `shutdown()` is the preferred
 /// cleanup path, but dropping the handle also cancels the inner task via
 /// the embedded `oneshot` sender going out of scope.
-#[derive(Debug)]
 pub struct DaemonHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
     join: JoinHandle<anyhow::Result<()>>,
     status_rx: watch::Receiver<DaemonStatus>,
     device_id: String,
     app_tools: Arc<AppToolRegistry>,
+    approval_broadcast_tx: broadcast::Sender<Envelope>,
+    approval_mgr: Arc<ApprovalManager>,
+    session_mgr: Arc<SessionManager>,
+}
+
+impl std::fmt::Debug for DaemonHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonHandle")
+            .field("device_id", &self.device_id)
+            .field("status", &self.status_rx.borrow().clone())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Stream of approval requests for in-process embedders (Tauri apps etc.).
+///
+/// Wraps the daemon's internal `Envelope` broadcast and yields only
+/// [`ApprovalRequest`] payloads. Lagged subscribers skip missed messages
+/// (tokio broadcast semantics); `None` means the daemon shut down.
+pub struct ApprovalSubscription {
+    rx: broadcast::Receiver<Envelope>,
+}
+
+impl ApprovalSubscription {
+    /// Receive the next [`ApprovalRequest`].
+    ///
+    /// Returns `None` when the daemon broadcast channel is closed (i.e. the
+    /// daemon has shut down). Automatically skips lagged-out envelopes and
+    /// non-approval-request payloads.
+    pub async fn recv(&mut self) -> Option<ApprovalRequest> {
+        loop {
+            match self.rx.recv().await {
+                Ok(env) => {
+                    if let Some(envelope::Payload::ApprovalRequest(req)) = env.payload {
+                        return Some(req);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
 }
 
 static ACTIVE_DAEMONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -306,6 +349,49 @@ impl DaemonHandle {
     pub async fn unregister_app_tool(&self, name: &str) -> bool {
         self.app_tools.unregister(name).await
     }
+
+    /// Subscribe to in-process approval requests.
+    ///
+    /// Job, file, and app-tool paths all broadcast here. Each subscriber
+    /// receives every request independently (broadcast semantics). Lagged
+    /// subscribers automatically skip missed messages rather than blocking.
+    pub fn subscribe_approvals(&self) -> ApprovalSubscription {
+        ApprovalSubscription {
+            rx: self.approval_broadcast_tx.subscribe(),
+        }
+    }
+
+    /// Answer a pending approval from the embedding application.
+    ///
+    /// Mirrors the WS/IPC `ApprovalResponse` handling exactly:
+    /// - deny with non-empty `reason` → `resolve` + `record_refusal` (principal
+    ///   recorded as `"local"`)
+    /// - approve or deny without reason → `resolve` only
+    ///
+    /// `job_id` is [`ApprovalRequest::job_id`] verbatim (already namespaced,
+    /// e.g. `"app-tool:{id}"`).
+    ///
+    /// Returns `false` when no matching pending approval exists (already
+    /// resolved or expired).
+    pub async fn respond_approval(&self, job_id: &str, approved: bool, reason: &str) -> bool {
+        let resp = ahand_protocol::ApprovalResponse {
+            job_id: job_id.to_string(),
+            approved,
+            reason: reason.to_string(),
+            remember: false,
+        };
+        if !approved && !reason.is_empty() {
+            if let Some((req, _)) = self.approval_mgr.resolve(&resp).await {
+                self.session_mgr
+                    .record_refusal("local", &req.tool, reason)
+                    .await;
+                return true;
+            }
+            false
+        } else {
+            self.approval_mgr.resolve(&resp).await.is_some()
+        }
+    }
 }
 
 /// Spawn an `ahandd` instance wired against the cloud hub described by `config`.
@@ -361,6 +447,10 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     let reporter: Arc<dyn ClientReporter> =
         Arc::new(StatusReporter::new(reporter_status_tx, reporter_device_id));
 
+    let approval_broadcast_tx_for_handle = approval_broadcast_tx.clone();
+    let approval_mgr_for_handle = Arc::clone(&approval_mgr);
+    let session_mgr_for_handle = Arc::clone(&session_mgr);
+
     let app_tools_for_task = Arc::clone(&app_tools);
     let join = tokio::spawn(async move {
         let _active_guard = active_guard;
@@ -407,6 +497,9 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         status_rx,
         device_id,
         app_tools,
+        approval_broadcast_tx: approval_broadcast_tx_for_handle,
+        approval_mgr: approval_mgr_for_handle,
+        session_mgr: session_mgr_for_handle,
     })
 }
 

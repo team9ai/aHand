@@ -1776,3 +1776,174 @@ async fn approval_consuming_budget_shrinks_execution_timeout() {
     );
     handle.shutdown().await.expect("shutdown clean");
 }
+
+// ── Task 7: in-process approval API ──────────────────────────────────────────
+
+/// Helper: register a counted-echo tool and return the counter.
+/// Wraps the existing `register_counted_echo` helper, creating the counter
+/// internally so callers don't need to construct one explicitly.
+async fn register_counted_echo_new(
+    handle: &ahandd::DaemonHandle,
+    name: &str,
+    requires_approval: bool,
+) -> Arc<AtomicUsize> {
+    let counter = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(handle, name, requires_approval, Arc::clone(&counter)).await;
+    counter
+}
+
+/// In-process approve: grant approval via `respond_approval` → handler executes.
+///
+/// Flow: subscribe_approvals → send AppToolRequest → receive ApprovalRequest
+/// in-process → respond_approval(approved=true) → ResultJson arrives.
+#[tokio::test]
+async fn in_process_approve_executes_app_tool() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
+    let run_count = register_counted_echo_new(&handle, "demo_echo", false).await;
+
+    // Subscribe before registering so no broadcasts are missed.
+    let mut approvals = handle.subscribe_approvals();
+
+    // Wait for the tool snapshot.
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request("ipa-1", "demo_echo", r#"{}"#, 10_000)
+        .expect("send ok");
+
+    let req = tokio::time::timeout(Duration::from_secs(5), approvals.recv())
+        .await
+        .expect("timeout waiting for ApprovalRequest")
+        .expect("channel closed before receiving ApprovalRequest");
+
+    assert_eq!(
+        req.job_id, "app-tool:ipa-1",
+        "job_id must be namespaced 'app-tool:<tool_call_id>'"
+    );
+
+    // Approve in-process — respond_approval must return true (entry found).
+    assert!(
+        handle.respond_approval(&req.job_id, true, "").await,
+        "respond_approval should return true for a pending request"
+    );
+
+    // Handler should execute and result should arrive at the mock hub.
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(10))
+        .await
+        .expect("AppToolResponse not received within 10s after in-process approval");
+
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "ipa-1");
+    assert!(
+        matches!(&resp.result, Some(app_tool_response::Result::ResultJson(_))),
+        "expected ResultJson after in-process approval, got {:?}",
+        resp.result
+    );
+
+    assert_eq!(
+        run_count.load(Ordering::SeqCst),
+        1,
+        "handler ran exactly once"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// In-process deny: deny with reason → APPROVAL_DENIED; second request sees 1
+/// previous_refusal; principal recorded as "local".
+#[tokio::test]
+async fn in_process_deny_records_refusal_once() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
+    register_counted_echo_new(&handle, "demo_echo", false).await;
+
+    let mut approvals = handle.subscribe_approvals();
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    // First request — deny with reason "not now".
+    mock.send_app_tool_request("ipd-1", "demo_echo", r#"{}"#, 10_000)
+        .expect("send first ok");
+
+    let req = tokio::time::timeout(Duration::from_secs(5), approvals.recv())
+        .await
+        .expect("timeout waiting for first ApprovalRequest")
+        .expect("channel closed");
+
+    assert_eq!(req.job_id, "app-tool:ipd-1");
+
+    assert!(
+        handle.respond_approval(&req.job_id, false, "not now").await,
+        "deny with reason must return true"
+    );
+
+    // APPROVAL_DENIED should arrive.
+    let first_responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("APPROVAL_DENIED not received within 5s");
+
+    assert!(
+        matches!(
+            &first_responses[0].result,
+            Some(app_tool_response::Result::Error(e)) if e.code == "APPROVAL_DENIED"
+        ),
+        "expected APPROVAL_DENIED, got {:?}",
+        first_responses[0].result
+    );
+
+    // Second request (new tool_call_id) of the same tool → previous_refusals.len() == 1.
+    mock.send_app_tool_request("ipd-2", "demo_echo", r#"{}"#, 10_000)
+        .expect("send second ok");
+
+    let second_req = tokio::time::timeout(Duration::from_secs(5), approvals.recv())
+        .await
+        .expect("timeout waiting for second ApprovalRequest")
+        .expect("channel closed");
+
+    assert_eq!(second_req.job_id, "app-tool:ipd-2");
+    assert_eq!(
+        second_req.previous_refusals.len(),
+        1,
+        "second invocation must see exactly 1 previous_refusal from the in-process denial; got {}",
+        second_req.previous_refusals.len()
+    );
+
+    // Clean up — deny the second request too.
+    handle
+        .respond_approval(&second_req.job_id, false, "cleanup")
+        .await;
+    mock.wait_for_app_tool_responses(2, Duration::from_secs(5))
+        .await
+        .expect("second APPROVAL_DENIED not received");
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// In-process respond to unknown job → returns false (no panic, no hang).
+#[tokio::test]
+async fn in_process_respond_unknown_job_returns_false() {
+    let (_mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
+
+    let result = handle
+        .respond_approval("app-tool:nonexistent", true, "")
+        .await;
+    assert!(
+        !result,
+        "respond_approval for an unknown job_id must return false"
+    );
+
+    // Also test deny-with-reason path for an unknown job.
+    let result_deny = handle
+        .respond_approval("app-tool:also-nonexistent", false, "some reason")
+        .await;
+    assert!(
+        !result_deny,
+        "respond_approval (deny+reason) for an unknown job_id must return false"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
