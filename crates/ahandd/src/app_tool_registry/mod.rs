@@ -30,6 +30,9 @@ const MAX_CONCURRENT_APP_TOOLS: usize = 4;
 /// Maximum number of completed call results retained for idempotency replay.
 const MAX_COMPLETED_CALLS: usize = 256;
 
+// Bin target never constructs this directly; registration happens through
+// the embedder-facing lib API (`DaemonHandle::register_app_tool`).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct AppToolDef {
     pub name: String,
@@ -82,6 +85,9 @@ impl std::fmt::Debug for AppToolRegistry {
     }
 }
 
+// Bin target never calls this directly; exercised via the lib registration
+// path and unit tests.
+#[allow(dead_code)]
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
@@ -127,6 +133,9 @@ impl AppToolRegistry {
     ///
     /// A failed registration (invalid name or duplicate) leaves the revision
     /// unchanged — no watch notification is sent.
+    // Bin target never calls this directly; embedders register through
+    // `DaemonHandle::register_app_tool` on the lib API.
+    #[allow(dead_code)]
     pub async fn register(&self, def: AppToolDef, handler: AppToolHandler) -> anyhow::Result<()> {
         if !valid_name(&def.name) {
             anyhow::bail!(
@@ -162,6 +171,9 @@ impl AppToolRegistry {
     }
 
     /// Unregister a tool by name. Returns `true` if the tool existed.
+    // Bin target never calls this directly; embedders unregister through
+    // `DaemonHandle::unregister_app_tool` on the lib API.
+    #[allow(dead_code)]
     pub async fn unregister(&self, name: &str) -> bool {
         let mut tools = self.tools.lock().await;
         let existed = tools.remove(name).is_some();

@@ -50,25 +50,11 @@ pub fn read_exec_approvals_snapshot(path: &Path) -> Result<ExecApprovalsSnapshot
 
 /// Save exec approvals file
 pub fn save_exec_approvals(path: &Path, file: &ExecApprovalsFile) -> Result<()> {
-    // Ensure parent directory exists
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
-    }
-
     let content =
         serde_json::to_string_pretty(file).context("failed to serialize exec approvals")?;
 
-    std::fs::write(path, format!("{}\n", content))
+    ahand_platform::secure_file::write_secure_file(path, format!("{}\n", content).as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
-
-    // Set file permissions to 0600 (user read/write only)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(path, perms);
-    }
 
     Ok(())
 }
@@ -92,4 +78,84 @@ pub fn normalize_exec_approvals(file: ExecApprovalsFile) -> ExecApprovalsFile {
 pub fn redact_exec_approvals(file: ExecApprovalsFile) -> ExecApprovalsFile {
     // Currently no sensitive fields to redact, but keep this for future use
     file
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::protocol::AllowlistEntry;
+    use super::*;
+
+    fn make_test_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "ahandd-exec-approvals-{}-{}",
+                tag,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("exec-approvals.json")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_exec_approvals_uses_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = make_test_path("perms");
+        let file = ExecApprovalsFile {
+            version: Some(1),
+            security: None,
+            ask: None,
+            allowlist: None,
+            auto_allow_skills: None,
+        };
+
+        save_exec_approvals(&path, &file).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "exec-approvals.json must be owner-read/write only"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
+
+    #[test]
+    fn save_and_load_exec_approvals_round_trips() {
+        let path = make_test_path("roundtrip");
+        let file = ExecApprovalsFile {
+            version: Some(1),
+            security: Some("strict".to_string()),
+            ask: Some("always".to_string()),
+            allowlist: Some(vec![AllowlistEntry {
+                pattern: "cargo test".to_string(),
+                agent_id: Some("agent-abc".to_string()),
+                last_used_ms: Some(1_000_000),
+                use_count: Some(3),
+            }]),
+            auto_allow_skills: Some(true),
+        };
+
+        save_exec_approvals(&path, &file).unwrap();
+
+        let snapshot = read_exec_approvals_snapshot(&path).unwrap();
+        assert!(snapshot.exists);
+        assert!(!snapshot.hash.is_empty());
+        let loaded = snapshot.file;
+        assert_eq!(loaded.version, file.version);
+        assert_eq!(loaded.security, file.security);
+        assert_eq!(loaded.ask, file.ask);
+        assert_eq!(loaded.auto_allow_skills, file.auto_allow_skills);
+        let entries = loaded.allowlist.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pattern, "cargo test");
+        assert_eq!(entries[0].agent_id.as_deref(), Some("agent-abc"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(path.parent().unwrap());
+    }
 }

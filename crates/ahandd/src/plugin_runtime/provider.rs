@@ -66,6 +66,8 @@ impl CapabilityProviderRegistry {
         self.router.ensure(capability)
     }
 
+    // Plugin-runtime API surface; consumed by later plugin stages.
+    #[allow(dead_code)]
     pub fn active_wire_capabilities(&self) -> Vec<&'static str> {
         self.router.active_wire_capabilities()
     }

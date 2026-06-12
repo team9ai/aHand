@@ -10,5 +10,5 @@ output "task_role_arn" {
 
 output "file_ops_bucket_name" {
   description = "S3 bucket used by hub file operation staging in this env"
-  value       = aws_s3_bucket.file_ops.bucket
+  value       = local.selected_file_ops_bucket_name
 }

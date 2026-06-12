@@ -17,6 +17,7 @@ pub fn detect(config_override: Option<&str>) -> Option<DetectedBrowser> {
 }
 
 /// Detect all system browsers currently installed.
+#[allow(dead_code)] // future diagnostics / health-check surface
 pub fn detect_all() -> Vec<DetectedBrowser> {
     detect_all_with(&|p| Path::new(p).exists())
 }
@@ -25,15 +26,15 @@ fn detect_with(
     config_override: Option<&str>,
     exists: &dyn Fn(&str) -> bool,
 ) -> Option<DetectedBrowser> {
-    if let Some(path) = config_override {
-        if exists(path) {
-            return Some(DetectedBrowser {
-                name: "Configured Browser".into(),
-                path: PathBuf::from(path),
-                kind: BrowserKind::Chrome, // conservative default for config override
-                source: CheckSource::System,
-            });
-        }
+    if let Some(path) = config_override
+        && exists(path)
+    {
+        return Some(DetectedBrowser {
+            name: "Configured Browser".into(),
+            path: PathBuf::from(path),
+            kind: BrowserKind::Chrome, // conservative default for config override
+            source: CheckSource::System,
+        });
     }
 
     for c in candidates() {
@@ -49,6 +50,7 @@ fn detect_with(
     None
 }
 
+#[allow(dead_code)] // only called from detect_all; keep for testability
 fn detect_all_with(exists: &dyn Fn(&str) -> bool) -> Vec<DetectedBrowser> {
     candidates()
         .into_iter()

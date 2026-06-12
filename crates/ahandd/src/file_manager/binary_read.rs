@@ -320,18 +320,18 @@ fn encode_image(
     // met by resizing, which we don't do here. Return a single encode pass.
     if !format_supports_quality(format) {
         let bytes = encode_single(img, format, quality, req_path)?;
-        if let Some(budget) = max_bytes {
-            if bytes.len() as u64 > budget {
-                return Err(file_error(
-                    FileErrorCode::TooLarge,
-                    req_path,
-                    format!(
-                        "encoded image {} bytes exceeds requested max_bytes {} (lossless format has no quality knob)",
-                        bytes.len(),
-                        budget
-                    ),
-                ));
-            }
+        if let Some(budget) = max_bytes
+            && bytes.len() as u64 > budget
+        {
+            return Err(file_error(
+                FileErrorCode::TooLarge,
+                req_path,
+                format!(
+                    "encoded image {} bytes exceeds requested max_bytes {} (lossless format has no quality knob)",
+                    bytes.len(),
+                    budget
+                ),
+            ));
         }
         return Ok(EncodedImage {
             size: bytes.len() as u64,

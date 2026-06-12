@@ -34,6 +34,7 @@ pub enum CheckStatus {
 /// Where a detected component comes from.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Preinstalled will be used for Windows Edge detection (M4)
 pub enum CheckSource {
     /// Installed by ahandd under ~/.ahand/...
     Managed,
@@ -147,6 +148,9 @@ pub struct DetectedBrowser {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+// Chromium is not available as a pre-installed browser on Windows, so the
+// variant is constructed only in mac/linux cfg blocks; allow it on Windows.
+#[allow(dead_code)]
 pub enum BrowserKind {
     Chrome,
     Chromium,

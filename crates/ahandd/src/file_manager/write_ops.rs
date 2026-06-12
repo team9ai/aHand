@@ -34,12 +34,12 @@ pub async fn handle_write(
     };
 
     // create_parents applies only to methods that produce a file at `path`.
-    if req.create_parents {
-        if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| io_to_file_error(e, parent))?;
-        }
+    if req.create_parents
+        && let Some(parent) = resolved.parent()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| io_to_file_error(e, parent))?;
     }
 
     match method {

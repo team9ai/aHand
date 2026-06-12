@@ -6,7 +6,7 @@ ENV="${1:-}"
 [[ "$ENV" == "dev" || "$ENV" == "prod" ]] || { echo "Usage: $0 {dev|prod}"; exit 1; }
 
 AWS_REGION="us-east-1"
-ACCOUNT_ID="471112576951"
+ACCOUNT_ID="149614785083"
 ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 ECR_REPO="ahand-hub"
 GIT_SHA="${GIT_SHA:-$(git rev-parse --short HEAD)}"

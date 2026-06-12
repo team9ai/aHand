@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ahand-platform",
     "crates/ahand-protocol", "crates/ahandctl",
     "crates/ahandd",
     "crates/ahand-hub-core",
@@ -9,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.14"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -36,3 +37,4 @@ testcontainers = "0.24"
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+dunce = "1"

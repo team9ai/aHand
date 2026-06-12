@@ -1,6 +1,6 @@
 {
   "name": "@ahand/dev-cloud",
-  "version": "0.1.2",
+  "version": "0.1.14",
   "private": true,
   "description": "Development cloud server (WS endpoint + dashboard)",
   "main": "dist/index.js",

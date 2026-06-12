@@ -216,8 +216,8 @@ impl OpenClawClient {
                                     GatewayFrame::Event(evt) => {
                                         // Handle connect.challenge
                                         if evt.event == "connect.challenge" && !connect_sent {
-                                            if let Ok(challenge) = serde_json::from_value::<ConnectChallengePayload>(evt.payload.clone()) {
-                                                if let Some(nonce) = challenge.nonce {
+                                            if let Ok(challenge) = serde_json::from_value::<ConnectChallengePayload>(evt.payload.clone())
+                                                && let Some(nonce) = challenge.nonce {
                                                     connect_nonce = Some(nonce);
                                                     debug!("received connect challenge");
                                                     self.send_connect(
@@ -230,7 +230,6 @@ impl OpenClawClient {
                                                     )?;
                                                     connect_sent = true;
                                                 }
-                                            }
                                         }
                                         // Handle node.invoke.request
                                         else if evt.event == "node.invoke.request" && connected {
@@ -265,8 +264,8 @@ impl OpenClawClient {
                                             debug!("received tick");
                                         }
                                         // Handle pairing resolved (approved/rejected)
-                                        else if evt.event == "node.pair.resolved" {
-                                            if let Some(decision) = evt.payload.get("decision").and_then(|v| v.as_str()) {
+                                        else if evt.event == "node.pair.resolved"
+                                            && let Some(decision) = evt.payload.get("decision").and_then(|v| v.as_str()) {
                                                 if decision == "approved" {
                                                     info!("pairing approved! reconnecting...");
                                                     break; // Reconnect to establish authenticated session
@@ -274,7 +273,6 @@ impl OpenClawClient {
                                                     warn!(decision = %decision, "pairing request was not approved");
                                                 }
                                             }
-                                        }
                                     }
                                     GatewayFrame::Response(res) => {
                                         // Handle pending request response
@@ -284,13 +282,12 @@ impl OpenClawClient {
 
                                         // Check if this is connect response
                                         if res.ok {
-                                            if let Some(payload) = &res.payload {
-                                                if let Ok(_hello) = serde_json::from_value::<HelloOk>(payload.clone()) {
+                                            if let Some(payload) = &res.payload
+                                                && let Ok(_hello) = serde_json::from_value::<HelloOk>(payload.clone()) {
                                                     info!("connected to Gateway successfully");
                                                     connected = true;
                                                     pairing_requested = false;
                                                 }
-                                            }
                                         } else {
                                             if let Some(err) = &res.error {
                                                 // Handle NOT_PAIRED - Gateway automatically creates pairing request
@@ -440,6 +437,7 @@ impl OpenClawClient {
     }
 
     /// Send pairing request when NOT_PAIRED
+    #[allow(dead_code)] // pairing flow entry point; to be wired in M3
     fn send_pairing_request(
         &self,
         tx: &mpsc::UnboundedSender<Message>,

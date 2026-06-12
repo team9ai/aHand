@@ -26,7 +26,6 @@ use ahand_protocol::Envelope;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use config::ConnectionMode;
-use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 
 #[derive(Parser)]
@@ -52,11 +51,11 @@ struct Args {
     #[arg(long, env = "AHAND_DATA_DIR")]
     data_dir: Option<String>,
 
-    /// Enable debug IPC server (Unix socket)
+    /// Enable debug IPC server
     #[arg(long, env = "AHAND_DEBUG_IPC")]
     debug_ipc: bool,
 
-    /// Custom path for the IPC Unix socket
+    /// Custom IPC endpoint (Unix socket path; named pipe name on Windows)
     #[arg(long, env = "AHAND_IPC_SOCKET")]
     ipc_socket: Option<String>,
 
@@ -303,6 +302,9 @@ async fn main() -> anyhow::Result<()> {
         info!(pid = std::process::id(), path = %p.display(), "wrote PID file");
     }
 
+    // Clean up any stale binary left by a previous Windows self-update.
+    updater::cleanup_old_binary();
+
     let session_mgr = Arc::new(session::SessionManager::new(
         cfg.trust_timeout_mins.unwrap_or(60),
     ));
@@ -336,9 +338,9 @@ async fn main() -> anyhow::Result<()> {
     // Broadcast channel for pushing approval requests to all IPC clients.
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
 
-    // Set up signal handlers for graceful shutdown.
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
+    // Set up signal handlers for graceful shutdown (SIGTERM/SIGINT on Unix,
+    // Ctrl-C on Windows).
+    let shutdown = ahand_platform::signals::shutdown_signal()?;
 
     let main_future = async {
         match connection_mode {
@@ -455,12 +457,8 @@ async fn main() -> anyhow::Result<()> {
     // Race main event loop against shutdown signals.
     let result = tokio::select! {
         r = main_future => r,
-        _ = sigterm.recv() => {
-            info!("received SIGTERM, shutting down");
-            Ok(())
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT, shutting down");
+        sig = shutdown => {
+            info!(signal = sig, "received shutdown signal, shutting down");
             Ok(())
         }
     };

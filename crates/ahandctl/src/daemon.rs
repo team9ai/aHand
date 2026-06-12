@@ -1,3 +1,4 @@
+use ahand_platform::process::{self, TerminateMode};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 
@@ -16,88 +17,71 @@ fn get_log_path() -> Result<PathBuf> {
 
 /// Find the ahandd binary: installed path → sibling of current exe → error.
 fn find_ahandd_binary() -> Result<PathBuf> {
-    // 1. Installed location: ~/.ahand/bin/ahandd
-    if let Some(home) = dirs::home_dir() {
-        let installed = home.join(".ahand").join("bin").join("ahandd");
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    find_ahandd_binary_in(dirs::home_dir().as_deref(), exe_dir.as_deref())
+}
+
+/// Testable seam: resolve ahandd binary given explicit home and exe-dir.
+///
+/// Search order:
+/// 1. `home/.ahand/bin/ahandd[.exe]` (installed location)
+/// 2. `exe_dir/ahandd[.exe]`          (sibling of current executable, dev builds)
+/// 3. Error
+pub(crate) fn find_ahandd_binary_in(
+    home: Option<&std::path::Path>,
+    exe_dir: Option<&std::path::Path>,
+) -> Result<PathBuf> {
+    let bin = ahand_platform::paths::exe_name("ahandd");
+
+    // 1. Installed location: ~/.ahand/bin/ahandd[.exe]
+    if let Some(h) = home {
+        let installed = h.join(".ahand").join("bin").join(&bin);
         if installed.exists() {
             return Ok(installed);
         }
     }
 
     // 2. Sibling of current executable (dev builds: target/debug/)
-    if let Ok(current_exe) = std::env::current_exe() {
-        if let Some(dir) = current_exe.parent() {
-            let sibling = dir.join("ahandd");
-            if sibling.exists() {
-                return Ok(sibling);
-            }
+    if let Some(dir) = exe_dir {
+        let sibling = dir.join(&bin);
+        if sibling.exists() {
+            return Ok(sibling);
         }
     }
 
-    anyhow::bail!("Cannot find ahandd binary. Expected at ~/.ahand/bin/ahandd or next to ahandctl.")
+    anyhow::bail!("Cannot find ahandd binary. Expected at ~/.ahand/bin/{bin} or next to ahandctl.")
 }
 
 /// Read PID file and check if the process is still alive.
 fn read_running_pid() -> Result<Option<u32>> {
     let pid_path = get_pid_path()?;
+    read_running_pid_at(&pid_path)
+}
+
+/// Testable seam: read and validate a PID file at an explicit path.
+///
+/// - Missing file → `Ok(None)`
+/// - File contains a running PID → `Ok(Some(pid))`
+/// - File contains a dead PID → `Ok(None)` and file is removed (stale cleanup)
+/// - Garbage content → `Err`
+pub(crate) fn read_running_pid_at(pid_path: &std::path::Path) -> Result<Option<u32>> {
     if !pid_path.exists() {
         return Ok(None);
     }
-    let pid_str = std::fs::read_to_string(&pid_path)?;
+    let pid_str = std::fs::read_to_string(pid_path)?;
     let pid: u32 = pid_str
         .trim()
         .parse()
         .context("Invalid PID in daemon.pid")?;
-    if is_process_running(pid) {
+    if process::is_process_running(pid) {
         Ok(Some(pid))
     } else {
         // Stale PID file
-        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(pid_path);
         Ok(None)
     }
-}
-
-#[cfg(target_os = "linux")]
-fn is_process_running(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{}", pid)).exists()
-}
-
-#[cfg(windows)]
-fn is_process_running(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {}", pid), "/NH"])
-        .output()
-        .map(|output| {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // Check if the PID appears as a word in the output (locale-independent)
-            output.status.success()
-                && stdout
-                    .split_whitespace()
-                    .any(|w| w == pid.to_string().as_str())
-        })
-        .unwrap_or(false)
-}
-
-#[cfg(not(any(target_os = "linux", windows)))]
-fn is_process_running(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn send_signal(pid: u32, sig: &str) -> Result<()> {
-    let status = std::process::Command::new("kill")
-        .args([sig, &pid.to_string()])
-        .status()
-        .context("Failed to run kill command")?;
-    if !status.success() {
-        anyhow::bail!("kill {} {} failed", sig, pid);
-    }
-    Ok(())
 }
 
 pub async fn start(config: Option<String>) -> Result<()> {
@@ -129,12 +113,8 @@ pub async fn start(config: Option<String>) -> Result<()> {
     cmd.stderr(log_file_err);
     cmd.stdin(std::process::Stdio::null());
 
-    // Detach into a new process group so it survives terminal close.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
+    // Detach so the daemon survives terminal/console close.
+    process::configure_detached(&mut cmd);
 
     let child = cmd
         .spawn()
@@ -147,7 +127,7 @@ pub async fn start(config: Option<String>) -> Result<()> {
     // Brief wait to verify it didn't exit immediately.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-    if !is_process_running(pid) {
+    if !process::is_process_running(pid) {
         eprintln!("Warning: daemon may have exited immediately. Check logs:");
         eprintln!("  {}", log_path.display());
         std::process::exit(1);
@@ -157,7 +137,19 @@ pub async fn start(config: Option<String>) -> Result<()> {
 }
 
 pub async fn stop() -> Result<()> {
-    let pid = match read_running_pid()? {
+    stop_at(&get_data_dir()?).await
+}
+
+/// Stop the daemon whose PID file lives under `data_dir`.
+///
+/// This is the AHAND_DIR-aware variant used by the upgrade path: legacy
+/// `upgrade.sh` stopped the daemon via `$AHAND_DIR/data/daemon.pid`; the
+/// native upgrade path calls this function with
+/// `ahand_home.join("data")` so that a non-default `AHAND_DIR` is
+/// honoured consistently.
+pub async fn stop_at(data_dir: &std::path::Path) -> Result<()> {
+    let pid_path = data_dir.join("daemon.pid");
+    let pid = match read_running_pid_at(&pid_path)? {
         Some(pid) => pid,
         None => {
             println!("Daemon is not running.");
@@ -167,19 +159,19 @@ pub async fn stop() -> Result<()> {
 
     println!("Stopping daemon (PID {})...", pid);
 
-    if let Err(e) = send_signal(pid, "-TERM") {
-        eprintln!("Failed to send SIGTERM: {}", e);
+    if let Err(e) = process::terminate(pid, TerminateMode::Graceful) {
+        eprintln!("Failed to request stop: {e}");
     }
 
     // Wait for process to exit (up to 10 seconds).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        if !is_process_running(pid) {
+        if !process::is_process_running(pid) {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            eprintln!("Daemon did not stop within 10s, sending SIGKILL...");
-            let _ = send_signal(pid, "-KILL");
+            eprintln!("Daemon did not stop within 10s, force-killing...");
+            let _ = process::terminate(pid, TerminateMode::Force);
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             break;
         }
@@ -187,7 +179,6 @@ pub async fn stop() -> Result<()> {
     }
 
     // Clean up stale PID file if the daemon didn't remove it.
-    let pid_path = get_pid_path()?;
     if pid_path.exists() {
         let _ = std::fs::remove_file(&pid_path);
     }
@@ -208,4 +199,131 @@ pub async fn status() -> Result<()> {
         None => println!("Daemon is not running."),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── find_ahandd_binary_in ─────────────────────────────────────────────────
+
+    #[test]
+    fn find_ahandd_binary_in_installed_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_name = ahand_platform::paths::exe_name("ahandd");
+        let bin_dir = tmp.path().join(".ahand").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin_path = bin_dir.join(&bin_name);
+        std::fs::write(&bin_path, b"fake").unwrap();
+
+        let result = find_ahandd_binary_in(Some(tmp.path()), None).unwrap();
+        assert_eq!(result, bin_path);
+    }
+
+    #[test]
+    fn find_ahandd_binary_in_sibling_hit_when_installed_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_name = ahand_platform::paths::exe_name("ahandd");
+        let sibling_path = tmp.path().join(&bin_name);
+        std::fs::write(&sibling_path, b"fake").unwrap();
+
+        // No installed binary — only the sibling.
+        let empty_home = tempfile::tempdir().unwrap();
+        let result = find_ahandd_binary_in(Some(empty_home.path()), Some(tmp.path())).unwrap();
+        assert_eq!(result, sibling_path);
+    }
+
+    #[test]
+    fn find_ahandd_binary_in_neither_errors_with_expected_path_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = find_ahandd_binary_in(Some(tmp.path()), Some(tmp.path())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ahandd") || msg.contains("Cannot find"),
+            "error should mention ahandd binary: {msg}"
+        );
+    }
+
+    // ── read_running_pid_at ───────────────────────────────────────────────────
+
+    #[test]
+    fn read_running_pid_at_no_file_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("daemon.pid");
+        // File does not exist.
+        let result = read_running_pid_at(&pid_path).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn read_running_pid_at_current_process_returns_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("daemon.pid");
+        let pid = std::process::id();
+        std::fs::write(&pid_path, format!("{pid}\n")).unwrap();
+
+        let result = read_running_pid_at(&pid_path).unwrap();
+        assert_eq!(result, Some(pid));
+        // File should still exist (live process).
+        assert!(pid_path.exists());
+    }
+
+    #[test]
+    fn read_running_pid_at_dead_pid_returns_none_and_removes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("daemon.pid");
+        // u32::MAX - 7 is almost certainly not a running PID.
+        let dead_pid = u32::MAX - 7;
+        std::fs::write(&pid_path, format!("{dead_pid}\n")).unwrap();
+
+        let result = read_running_pid_at(&pid_path).unwrap();
+        assert!(result.is_none(), "dead pid should return None");
+        assert!(
+            !pid_path.exists(),
+            "stale PID file should be removed after dead-pid detection"
+        );
+    }
+
+    #[test]
+    fn read_running_pid_at_garbage_content_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("daemon.pid");
+        std::fs::write(&pid_path, b"not-a-pid\n").unwrap();
+
+        let err = read_running_pid_at(&pid_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid PID") || msg.contains("invalid digit"),
+            "garbage pid file should error: {msg}"
+        );
+    }
+
+    // ── stop_at ───────────────────────────────────────────────────────────────
+
+    /// stop_at with a dead PID in the pid file: must clean up the pid file and
+    /// return Ok(()).  This exercises the AHAND_DIR-aware variant without
+    /// actually sending a signal to a live process.
+    #[tokio::test]
+    async fn stop_at_with_dead_pid_cleans_up_and_returns_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let pid_path = data_dir.join("daemon.pid");
+
+        // Write a PID that is almost certainly not running.
+        let dead_pid = u32::MAX - 13;
+        std::fs::write(&pid_path, format!("{dead_pid}\n")).unwrap();
+
+        // stop_at must return Ok(()) — dead pid means "not running".
+        let result = stop_at(&data_dir).await;
+        assert!(
+            result.is_ok(),
+            "stop_at with a dead pid must return Ok, got: {result:?}"
+        );
+
+        // The stale pid file must have been removed during read_running_pid_at.
+        assert!(
+            !pid_path.exists(),
+            "stale pid file should be removed after stop_at with dead pid"
+        );
+    }
 }

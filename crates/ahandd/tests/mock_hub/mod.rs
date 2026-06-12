@@ -39,6 +39,11 @@ use tokio_tungstenite::tungstenite::{
     protocol::{CloseFrame, frame::coding::CloseCode},
 };
 
+/// mpsc sender used to inject envelopes into the active connection, paired
+/// with a generation counter so stale connection cleanup can't clobber a
+/// newer connection's sender.
+type InjectSlot = Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Envelope>)>>>;
+
 /// Handle returned by `start_*` helpers. Drop stops the listener task.
 pub struct Mock {
     pub port: u16,
@@ -48,10 +53,7 @@ pub struct Mock {
     app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>>,
     /// Captured ApprovalRequest envelopes received from the daemon.
     approval_requests: Arc<Mutex<Vec<ApprovalRequest>>>,
-    // mpsc sender used to inject envelopes into the active connection, paired
-    // with a generation counter so stale connection cleanup can't clobber a
-    // newer connection's sender.
-    inject_tx: Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Envelope>)>>>,
+    inject_tx: InjectSlot,
     _shutdown: oneshot::Sender<()>,
     _task: JoinHandle<()>,
 }
@@ -288,8 +290,7 @@ async fn start(behavior: Behavior) -> Mock {
     let app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>> = Arc::new(Mutex::new(Vec::new()));
     let app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>> = Arc::new(Mutex::new(Vec::new()));
     let approval_requests: Arc<Mutex<Vec<ApprovalRequest>>> = Arc::new(Mutex::new(Vec::new()));
-    let inject_tx: Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Envelope>)>>> =
-        Arc::new(Mutex::new(None));
+    let inject_tx: InjectSlot = Arc::new(Mutex::new(None));
     // Monotonically increasing connection generation counter.
     let conn_gen: Arc<std::sync::atomic::AtomicU64> =
         Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -342,6 +343,7 @@ async fn start(behavior: Behavior) -> Mock {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // test mock: capture sinks are individually threaded for clarity
 async fn handle_conn(
     stream: tokio::net::TcpStream,
     behavior: Behavior,
@@ -350,7 +352,7 @@ async fn handle_conn(
     app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>>,
     app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>>,
     approval_requests: Arc<Mutex<Vec<ApprovalRequest>>>,
-    inject_tx: Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Envelope>)>>>,
+    inject_tx: InjectSlot,
     conn_generation: u64,
 ) {
     let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
@@ -440,19 +442,19 @@ async fn handle_conn(
                             Some(envelope::Payload::AppToolsUpdate(update)) => {
                                 app_tools_updates.lock().unwrap().push(update);
                                 app_tools_count += 1;
-                                if let Some(limit) = drop_after_n_app_tools_updates {
-                                    if app_tools_count >= limit {
-                                        // Send a WS Close frame so the daemon's
-                                        // read loop sees a clean close and
-                                        // reconnects.
-                                        let _ = sink
-                                            .send(WsMessage::Close(Some(CloseFrame {
-                                                code: CloseCode::Normal,
-                                                reason: Cow::Borrowed("test-reconnect"),
-                                            })))
-                                            .await;
-                                        break;
-                                    }
+                                if let Some(limit) = drop_after_n_app_tools_updates
+                                    && app_tools_count >= limit
+                                {
+                                    // Send a WS Close frame so the daemon's
+                                    // read loop sees a clean close and
+                                    // reconnects.
+                                    let _ = sink
+                                        .send(WsMessage::Close(Some(CloseFrame {
+                                            code: CloseCode::Normal,
+                                            reason: Cow::Borrowed("test-reconnect"),
+                                        })))
+                                        .await;
+                                    break;
                                 }
                             }
                             Some(envelope::Payload::AppToolResponse(resp)) => {

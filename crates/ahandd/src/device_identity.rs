@@ -1,7 +1,7 @@
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::{fs::OpenOptions, io::Write};
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -24,6 +24,7 @@ struct StoredIdentity {
     private_key_base64: String,
 }
 
+#[allow(dead_code)] // generate_for_tests + public_key_b64 are test/SDK helpers
 impl DeviceIdentity {
     pub fn generate() -> Self {
         Self {
@@ -181,39 +182,7 @@ pub fn default_identity_path() -> PathBuf {
 }
 
 fn write_secure_file(path: &Path, content: &[u8]) -> Result<()> {
-    let tmp_path = path.with_extension(format!(
-        "tmp-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&tmp_path)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-    }
-
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    ahand_platform::secure_file::write_secure_file(path, content)
 }
 
 fn creation_lock_path(path: &Path) -> PathBuf {
@@ -256,7 +225,9 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceIdentity, write_secure_file};
+    use super::DeviceIdentity;
+    #[cfg(unix)]
+    use super::write_secure_file;
 
     #[cfg(unix)]
     #[test]

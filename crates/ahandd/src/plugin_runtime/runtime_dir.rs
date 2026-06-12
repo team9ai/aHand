@@ -20,10 +20,13 @@ impl RuntimeDirs {
         Self { root }
     }
 
+    // Plugin-runtime API surface; consumed by later plugin stages.
+    #[allow(dead_code)]
     pub fn runtime_json(&self) -> PathBuf {
         self.root.join("runtime.json")
     }
 
+    #[allow(dead_code)]
     pub fn plugins_dir(&self) -> PathBuf {
         self.root.join("plugins")
     }
@@ -79,11 +82,15 @@ mod tests {
             dirs.node_dir(),
             std::path::PathBuf::from("/tmp/cache/ahand-primary-runtime/dependencies/node")
         );
+        let cli_bin = if cfg!(windows) {
+            "playwright-cli.exe"
+        } else {
+            "playwright-cli"
+        };
         assert_eq!(
             dirs.playwright_cli_bin(),
-            std::path::PathBuf::from(
-                "/tmp/cache/ahand-primary-runtime/dependencies/node/bin/playwright-cli"
-            )
+            std::path::PathBuf::from("/tmp/cache/ahand-primary-runtime/dependencies/node/bin")
+                .join(cli_bin)
         );
     }
 

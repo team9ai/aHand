@@ -1,11 +1,11 @@
 variable "vpc_id" {
   type    = string
-  default = "vpc-028cd35f94f14d52b"
+  default = "vpc-05804f4c4dd8965f3"
 }
 
 variable "subnet_ids" {
   type    = list(string)
-  default = ["subnet-09eb68ab6cae3c581", "subnet-0c8ca567a8d4def31"]
+  default = ["subnet-0eaffec23bfd7eb63", "subnet-0cdb64bc3cf4c6ee3"]
 }
 
 variable "traefik_alb_name" {
@@ -15,15 +15,15 @@ variable "traefik_alb_name" {
 
 variable "traefik_security_group_id" {
   type    = string
-  default = "sg-07050efac1b71052b"
+  default = "sg-0368318519318a4ba"
 }
 
 variable "openclaw_rds_host" {
   type    = string
-  default = "openclaw-hive-dev.chq8i2se49qd.us-east-1.rds.amazonaws.com"
+  default = "openclaw-hive-dev.c89gkagwy37d.us-east-1.rds.amazonaws.com"
 }
 
 variable "openclaw_rds_security_group_id" {
   type    = string
-  default = "sg-03be90e5bf963ddc3"
+  default = "sg-0b7b9a007a8b5b7a6"
 }

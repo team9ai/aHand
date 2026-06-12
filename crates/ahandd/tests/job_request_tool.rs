@@ -15,6 +15,7 @@
 //! cases below and add a matching arm in `executor::resolve_tool` —
 //! ideally in the same PR.
 
+use ahand_platform::shell::default_shell;
 use ahandd::executor::{ResolvedTool, resolve_tool};
 
 #[derive(Debug)]
@@ -33,13 +34,14 @@ struct Case {
 }
 
 fn cases() -> Vec<Case> {
+    let shell = default_shell();
     vec![
         Case {
             tool: "$SHELL",
             shell_env: Some("/bin/zsh"),
             expected: ResolvedTool {
                 path: "/bin/zsh".into(),
-                leading_args: vec!["-l".into()],
+                leading_args: shell.login_args.clone(),
             },
             rationale: "canonical sentinel — SDK's recommended way to ask for the user's login shell",
         },
@@ -48,7 +50,7 @@ fn cases() -> Vec<Case> {
             shell_env: Some("/bin/bash"),
             expected: ResolvedTool {
                 path: "/bin/bash".into(),
-                leading_args: vec!["-l".into()],
+                leading_args: shell.login_args.clone(),
             },
             rationale: "older SDK callers emit the bare word `shell` — both must keep working",
         },
@@ -56,8 +58,8 @@ fn cases() -> Vec<Case> {
             tool: "$SHELL",
             shell_env: None,
             expected: ResolvedTool {
-                path: "/bin/sh".into(),
-                leading_args: vec!["-l".into()],
+                path: shell.path.clone(),
+                leading_args: shell.login_args.clone(),
             },
             rationale: "$SHELL unset (e.g. launchd) must still produce a runnable command, not ENOENT",
         },
@@ -65,8 +67,8 @@ fn cases() -> Vec<Case> {
             tool: "shell",
             shell_env: None,
             expected: ResolvedTool {
-                path: "/bin/sh".into(),
-                leading_args: vec!["-l".into()],
+                path: shell.path.clone(),
+                leading_args: shell.login_args.clone(),
             },
             rationale: "same fallback path as $SHELL — sentinel parity",
         },
@@ -133,20 +135,32 @@ fn sdk_to_daemon_tool_resolution_is_table_complete() {
 }
 
 #[test]
-fn sentinels_always_force_login_shell() {
-    // Independent invariant: every sentinel form must emit the `-l`
-    // login-shell flag. If a future refactor drops it for one variant
-    // but not the other, spawned commands silently lose their PATH
-    // (no brew/nvm/pyenv shims) — exactly the failure mode that today's
-    // debugging chased down.
+fn sentinels_always_inject_platform_login_args() {
+    // Independent invariant: every sentinel form must emit the platform
+    // login args (`-l` on Unix; empty on Windows by design). If a future
+    // refactor drops them for one variant but not the other, spawned
+    // commands silently lose their PATH (no brew/nvm/pyenv shims on Unix)
+    // — exactly the failure mode that today's debugging chased down.
+    let expected_login_args = default_shell().login_args;
+
+    // Anchor: on Unix the platform contract is exactly `-l`; this literal
+    // check makes the test self-sufficient even if default_shell() ever
+    // regresses to an empty slice.
+    #[cfg(unix)]
+    assert_eq!(
+        expected_login_args,
+        vec!["-l".to_string()],
+        "Unix sentinel must inject -l"
+    );
+
     for sentinel in ["$SHELL", "shell"] {
         for shell_env in [Some("/bin/zsh"), Some("/bin/bash"), None] {
             let r = resolve_tool(sentinel, shell_env);
             assert_eq!(
-                r.leading_args,
-                vec!["-l".to_string()],
-                "sentinel {sentinel:?} with $SHELL={shell_env:?} dropped -l; \
-                 spawned commands will lose access to user-shell PATH"
+                r.leading_args, expected_login_args,
+                "sentinel {sentinel:?} with $SHELL={shell_env:?} produced unexpected \
+                 leading_args; expected platform login args {:?}",
+                expected_login_args,
             );
         }
     }
@@ -159,7 +173,7 @@ fn non_sentinel_tools_never_inject_leading_args() {
     // arbitrary tools, the SDK's understanding of how `JobRequest.args`
     // ends up on argv silently diverges from reality.
     let pass_through = [
-        "/bin/sh",
+        "/bin/sh", // literal path — asserts resolution shape, not runnability on Windows
         "/bin/bash",
         "/usr/bin/whoami",
         "git",

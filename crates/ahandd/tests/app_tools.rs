@@ -596,10 +596,10 @@ async fn panic_isolated_daemon_survives() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let updates = mock.captured_app_tools_updates();
-            if let Some(snap) = updates.last() {
-                if snap.tools.len() >= 2 {
-                    break;
-                }
+            if let Some(snap) = updates.last()
+                && snap.tools.len() >= 2
+            {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

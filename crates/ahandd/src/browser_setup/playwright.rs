@@ -198,22 +198,21 @@ pub async fn ensure(
     }
 
     // Check cache (skip if unchanged and not forced)
-    if !force && cli.exists() {
-        if let Ok(out) = tokio::process::Command::new(&cli)
+    if !force
+        && cli.exists()
+        && let Ok(out) = tokio::process::Command::new(&cli)
             .arg("--version")
             .output()
             .await
-        {
-            if out.status.success() {
-                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                emit(
-                    progress,
-                    Phase::Done,
-                    format!("playwright-cli {ver} already installed"),
-                );
-                return Ok(inspect().await);
-            }
-        }
+        && out.status.success()
+    {
+        let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        emit(
+            progress,
+            Phase::Done,
+            format!("playwright-cli {ver} already installed"),
+        );
+        return Ok(inspect().await);
     }
 
     emit(
@@ -281,6 +280,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::sync::{Arc, Mutex};
 
     // ---------------------------------------------------------------------------
@@ -373,18 +373,36 @@ mod tests {
         std::fs::set_permissions(&script_path, perms).unwrap();
 
         let cb = |_: ProgressEvent| {};
-        let result = spawn_npm_with_progress(
-            &script_path,
-            &[
-                "install",
-                "-g",
-                "--prefix",
-                "/tmp/unused-prefix",
-                "fake@0.0.0",
-            ],
-            &cb,
-        )
-        .await;
+        // Retry on ETXTBSY (os error 26): cargo's parallel tests can fork
+        // while the freshly-written script's fd is still open in a sibling
+        // process, making the first exec attempt fail spuriously on Linux.
+        let mut result = None;
+        for _ in 0..5 {
+            let r = spawn_npm_with_progress(
+                &script_path,
+                &[
+                    "install",
+                    "-g",
+                    "--prefix",
+                    "/tmp/unused-prefix",
+                    "fake@0.0.0",
+                ],
+                &cb,
+            )
+            .await;
+            let is_etxtbsy = r
+                .as_ref()
+                .err()
+                .map(|e| format!("{e:#}").contains("os error 26"))
+                .unwrap_or(false);
+            if is_etxtbsy {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+            result = Some(r);
+            break;
+        }
+        let result = result.expect("spawn kept failing with ETXTBSY after retries");
 
         assert!(result.is_err());
         let msg = format!("{:#}", result.unwrap_err());
