@@ -263,10 +263,59 @@ fn canonicalize_no_follow(path: &Path) -> io::Result<PathBuf> {
 }
 
 /// Match a path against a glob pattern. Supports `*`, `**`, and `?`.
+///
+/// # Platform separator behaviour (evidence-based, not assumed)
+///
+/// `glob` 0.3.x uses `std::path::is_separator` throughout its matching code.
+/// On Windows that function returns `true` for **both** `/` and `\`.
+/// Concretely:
+///
+/// * `chars_eq(a, b, _)` (glob src line ~1041) short-circuits to `true`
+///   whenever both characters satisfy `is_separator`, so `/` and `\` are
+///   interchangeable in every character comparison.
+/// * `AnyRecursiveSequence` (`**`) advances while `!follows_separator`; because
+///   `\` flips `follows_separator` to `true` on Windows, `**` correctly bridges
+///   backslash-separated path segments without any pre-normalisation.
+///
+/// Therefore: **no forward-slash normalisation is needed** on Windows.  Both
+/// config patterns (expanded via `home.join(…)` → backslashes) and canonicalized
+/// resolved paths (backslashes after `canonicalize_simplified`) are matched
+/// correctly by the glob crate as-is.
+///
+/// # Case sensitivity
+///
+/// On Windows, NTFS is case-insensitive by default.  We mirror that by setting
+/// `case_sensitive: false` on Windows.  All other `MatchOptions` preserve the
+/// existing behaviour (`require_literal_separator: false`,
+/// `require_literal_leading_dot: false`).
 fn glob_match(pattern: &str, path: &str) -> bool {
+    #[cfg(windows)]
+    let opts = glob::MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+    #[cfg(not(windows))]
+    let opts = glob::MatchOptions {
+        case_sensitive: true,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
     match glob::Pattern::new(pattern) {
-        Ok(p) => p.matches(path),
-        Err(_) => pattern == path,
+        Ok(p) => p.matches_with(path, opts),
+        Err(_) => {
+            // Pattern is invalid (e.g. unmatched `[`): fall back to literal
+            // equality so we don't silently allow/deny everything.
+            #[cfg(windows)]
+            {
+                pattern.eq_ignore_ascii_case(path)
+            }
+            #[cfg(not(windows))]
+            {
+                pattern == path
+            }
+        }
     }
 }
 
@@ -519,5 +568,105 @@ mod tests {
         let got = canonicalize_or_parent(&missing).unwrap();
         assert!(!got.to_string_lossy().starts_with(r"\\?\"));
         assert!(got.ends_with("not/yet/here.txt") || got.ends_with(r"not\yet\here.txt"));
+    }
+
+    // -----------------------------------------------------------------------
+    // T4: Case-correct policy matching (Task 4 of the M4 security plan)
+    // -----------------------------------------------------------------------
+
+    /// On Windows, glob_match must be case-insensitive so that NTFS paths
+    /// whose on-disk casing differs from the config pattern are still matched.
+    ///
+    /// Separator note: glob 0.3.x treats both '/' and '\' as separators on
+    /// Windows via std::path::is_separator, so no normalisation is required.
+    /// Both ** and literal path segments match across backslash-separated paths.
+    #[cfg(windows)]
+    #[test]
+    fn windows_glob_match_case_insensitive_allow() {
+        // Pattern uses uppercase drive letter and mixed case; path is all lower.
+        assert!(
+            glob_match(r"C:\Users\X\**", r"c:\users\x\file.txt"),
+            "case-insensitive allowlist match must succeed on Windows"
+        );
+        // Forward-slash pattern against backslash path (separator parity).
+        assert!(
+            glob_match("C:/Users/X/**", r"c:\users\x\file.txt"),
+            "forward-slash pattern must match backslash path on Windows"
+        );
+    }
+
+    /// Security-critical: a denylist entry must block case-variant paths on
+    /// Windows. A user must not be able to bypass `.SSH` → `.ssh` denylist.
+    #[cfg(windows)]
+    #[test]
+    fn windows_denylist_case_variant_blocked() {
+        // This is the security invariant: `.ssh` denylist blocks `.SSH` path.
+        assert!(
+            glob_match(r"C:\Users\X\.ssh\**", r"c:\users\x\.SSH\id_rsa"),
+            "denylist must block case-variant path on Windows (security)"
+        );
+        // Reversed: uppercase pattern must block lowercase path.
+        assert!(
+            glob_match(r"C:\Users\X\.SSH\**", r"c:\users\x\.ssh\id_rsa"),
+            "denylist uppercase pattern must block lowercase path on Windows"
+        );
+    }
+
+    /// On Windows, a mixed-case allowlist pattern must admit the canonical
+    /// (OS-cased) resolved path produced by canonicalize_simplified.
+    #[cfg(windows)]
+    #[test]
+    fn windows_mixed_case_allowlist_admits_canonical_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = ahand_platform::paths::canonicalize_simplified(tmp.path()).unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+
+        // Build the allowlist pattern in uppercase (simulating operator config
+        // that doesn't match the canonical casing on disk).
+        let upper_pattern = root_str.to_uppercase();
+        let allowlist = vec![
+            format!("{}\\**", upper_pattern.trim_end_matches('\\')),
+            upper_pattern,
+        ];
+        let config = crate::config::FilePolicyConfig {
+            enabled: true,
+            path_allowlist: allowlist,
+            path_denylist: Vec::new(),
+            max_read_bytes: 100_000_000,
+            max_write_bytes: 100_000_000,
+            dangerous_paths: Vec::new(),
+        };
+        let checker = FilePolicyChecker::new(&config);
+        let file = root.join("test.txt");
+        std::fs::write(&file, b"hi").unwrap();
+        // The canonical path (exact on-disk casing) must be admitted by the
+        // upper-cased allowlist pattern.
+        let result = checker.check_path(&file.to_string_lossy(), false, false);
+        assert!(
+            result.is_ok(),
+            "uppercase allowlist pattern must admit canonical path on Windows: {result:?}"
+        );
+    }
+
+    /// Regression: on Unix, glob_match must remain case-SENSITIVE.
+    /// Pattern `/Home/**` must NOT match `/home/x` (different capitalisation).
+    #[cfg(unix)]
+    #[test]
+    fn unix_glob_match_remains_case_sensitive() {
+        // Different casing → must NOT match on Unix.
+        assert!(
+            !glob_match("/Home/**", "/home/x"),
+            "Unix glob must be case-sensitive: /Home/** must not match /home/x"
+        );
+        // Same casing → must match.
+        assert!(
+            glob_match("/home/**", "/home/x"),
+            "Unix glob must match when casing is identical"
+        );
+        // Partial case difference in the middle of the path.
+        assert!(
+            !glob_match("/home/User/**", "/home/user/file.txt"),
+            "Unix glob must be case-sensitive for inner components"
+        );
     }
 }
