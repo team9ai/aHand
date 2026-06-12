@@ -4505,9 +4505,11 @@ async fn windows_create_dir_symlink_creates_link() {
 
 // ── Windows ACL chmod integration tests ───────────────────────────────────
 //
-// These tests require a real Windows environment with icacls available.
-// The pure arg-builder (`build_icacls_acl_args` / `acl_mask_to_icacls_perms`)
-// is unit-tested in fs_ops.rs#[cfg(test)] and runs cross-platform.
+// These tests require a real Windows environment (they call into the Win32
+// security API via `SetNamedSecurityInfoW` and read ACLs back with icacls).
+// The pure SDDL builders (`build_dacl_sddl` / `acl_mask_to_sddl_rights` /
+// `sddl_principal_passthrough`) are unit-tested in fs_ops.rs#[cfg(test)] and run
+// cross-platform.
 
 #[cfg(windows)]
 mod windows_acl_chmod {
@@ -5248,6 +5250,107 @@ async fn windows_chmod_refuses_symlink_when_no_follow_set() {
         err.code,
         FileErrorCode::InvalidPath as i32,
         "no_follow_symlink=true on a symlink must return InvalidPath"
+    );
+}
+
+/// SECURITY-HIGH#2 regression: a recursive Windows ACL chmod must NOT follow a
+/// directory reparse point (symlink/junction) planted inside the allowed
+/// directory and modify ACLs of files OUTSIDE the allowlist.
+///
+/// The original `icacls /T` recursion followed junctions, so a reparse point
+/// inside an allowed dir could redirect the recursive chmod to external files.
+/// The fix self-walks the tree and SKIPS reparse points (matching the Unix
+/// recursive arm). This test plants a directory symlink inside `root` pointing
+/// at an OUTSIDE dir, runs a recursive chmod on `root`, and asserts the outside
+/// file's DACL is byte-for-byte unchanged — proving the reparse point was
+/// skipped and the recursion never escaped the allowlist.
+///
+/// We capture the outside file's `icacls` output before and after; equality
+/// proves no ACL write reached it. A real file (`inside.txt`) inside `root`
+/// confirms the recursive chmod DID run and DID modify in-allowlist entries
+/// (positive control), so the unchanged-outside assertion is not vacuous.
+///
+/// Uses `symlink_dir` for the same CI reasons as the glob escape test above.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_recursive_chmod_does_not_follow_symlink_dir_outside_allowlist() {
+    use ahand_protocol::{AclEntry, AclEntryType, WindowsAcl, file_chmod};
+
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+
+    // A real file inside the allowlist — the recursive chmod MUST reach this.
+    let inside = root.join("inside.txt");
+    fs::write(&inside, "inside").unwrap();
+
+    // An OUTSIDE temp dir with a file whose ACL must remain untouched.
+    let outside = TempDir::new().unwrap();
+    let outside_root = canon(outside.path());
+    let outside_file = outside_root.join("victim.txt");
+    fs::write(&outside_file, "do-not-touch").unwrap();
+
+    // Snapshot the outside file's ACL BEFORE the operation.
+    let acl_before = std::process::Command::new("icacls")
+        .arg(&outside_file)
+        .output()
+        .expect("icacls must be available on Windows CI");
+    let acl_before = String::from_utf8_lossy(&acl_before.stdout).into_owned();
+
+    // Plant a directory symlink inside root pointing at outside_root. The link
+    // is inside the allowlist; its target is not.
+    let link_dir = root.join("subdir_link");
+    std::os::windows::fs::symlink_dir(&outside_root, &link_dir).unwrap();
+
+    let username = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+
+    let req = FileRequest {
+        request_id: "acl-rec-escape".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: root.to_string_lossy().into_owned(),
+            recursive: true,
+            no_follow_symlink: false,
+            permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                entries: vec![AclEntry {
+                    principal: username.clone(),
+                    access_mask: 0x001F_01FF, // Full control
+                    entry_type: AclEntryType::Allow as i32,
+                }],
+            })),
+        })),
+    };
+
+    let resp = mgr.handle(&req).await;
+    let result = expect_chmod(resp);
+    // Positive control: the in-allowlist file was modified (root + inside.txt,
+    // and the symlink itself must NOT be counted since it is skipped).
+    assert!(
+        result.items_modified >= 2,
+        "recursive chmod must process root and inside.txt; got {}",
+        result.items_modified
+    );
+
+    // The in-allowlist file must now carry the user's ACE (recursion ran).
+    let inside_out = std::process::Command::new("icacls")
+        .arg(&inside)
+        .output()
+        .expect("icacls must be available on Windows CI");
+    let inside_text = String::from_utf8_lossy(&inside_out.stdout).to_lowercase();
+    assert!(
+        inside_text.contains(&username.to_lowercase()),
+        "recursive chmod must reach inside.txt: {inside_text}"
+    );
+
+    // THE security assertion: the OUTSIDE file's ACL must be byte-for-byte
+    // unchanged — the reparse point was skipped, not followed.
+    let acl_after = std::process::Command::new("icacls")
+        .arg(&outside_file)
+        .output()
+        .expect("icacls must be available on Windows CI");
+    let acl_after = String::from_utf8_lossy(&acl_after.stdout).into_owned();
+    assert_eq!(
+        acl_before, acl_after,
+        "recursive chmod must NOT follow the directory symlink and modify the \
+         outside file's ACL (HIGH#2). before={acl_before:?} after={acl_after:?}"
     );
 }
 

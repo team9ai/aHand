@@ -1192,41 +1192,56 @@ pub async fn handle_chmod(req: &FileChmod, resolved: &Path) -> Result<FileChmodR
             }
             #[cfg(windows)]
             {
-                // Apply Windows ACLs via icacls subprocess, consistent with the
-                // `secure_file::restrict_to_owner` precedent in ahand-platform.
+                // Apply Windows ACLs via the Win32 security API
+                // (`SetNamedSecurityInfoW`) using a PROTECTED DACL — a TRUE full
+                // DACL replacement.
+                //
+                // Why not icacls (the original M4 approach): icacls cannot
+                // achieve a true DACL replacement. `/inheritance:r` removes only
+                // INHERITED ACEs, and `/grant:r` only replaces the *same*
+                // principal's grant — any PRE-EXISTING EXPLICIT ACE on the file
+                // (e.g. an attacker-set `Everyone:F`) SURVIVES. So an
+                // "owner-only" WindowsAcl was not actually owner-only
+                // (SECURITY-HIGH#1, Codex review). icacls has no way to
+                // enumerate+remove unknown explicit ACEs.
+                //
+                // Fix: build the COMPLETE DACL from the supplied entries as an
+                // SDDL string (`D:P(...)...`), convert it to a SECURITY_DESCRIPTOR,
+                // extract its DACL, and call `SetNamedSecurityInfoW` with
+                // `DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION`.
+                // PROTECTED strips inheritance AND, because we supply the entire
+                // DACL, the OS replaces ALL explicit ACEs — so the file's
+                // effective DACL becomes EXACTLY the supplied entries. This is
+                // the true replacement icacls could not provide.
                 //
                 // Semantics: `WindowsAcl` is a FULL DACL REPLACEMENT — the
-                // file's effective DACL becomes EXACTLY the supplied entries
-                // (a set/replace operation, matching chmod and the
-                // `restrict_to_owner` precedent), NOT additive over inherited
-                // ACEs. `build_icacls_acl_args` prepends `/inheritance:r` to
-                // strip inherited ACEs first, so "owner-only" (a single
-                // `owner:F` allow) actually yields owner-only and a DENY is
-                // meaningful. DENY masks are exact-bit (deny R denies only the
-                // read bits) — the caller controls the complete effective ACL.
+                // file's effective DACL becomes EXACTLY the supplied entries (a
+                // set/replace, matching chmod). "owner-only" (a single `owner:F`
+                // allow) really yields owner-only; a DENY is meaningful because
+                // no inherited/pre-existing broad ALLOW survives. DENY masks are
+                // exact-bit — the caller controls the complete effective ACL.
                 //
-                // Design: the proto `WindowsAcl` exposes a structured list of
-                // `AclEntry { principal, access_mask, entry_type }` applied in a
-                // single icacls invocation (`/inheritance:r` then per-entry
-                // `/grant:r`/`/deny`), with `/T /C` appended when recursive.
-                //
-                // Limitation (proto note): `access_mask` maps to icacls
-                // permission letters via `acl_mask_to_icacls_perms`. Callers
-                // passing arbitrary 32-bit masks beyond the recognised set will
-                // receive a best-effort hex SDDL mask fallback, which icacls
-                // accepts. Future proto versions could add a `permission_string`
-                // field for explicit icacls permission letters if needed.
+                // Recursion (SECURITY-HIGH#2 fix): the Win32 API has no safe
+                // recursive mode (`icacls /T` followed junctions/symlinks out of
+                // the allowlist). We self-walk the tree and SKIP reparse points
+                // (symlinks/junctions) — matching the Unix recursive arm's
+                // explicit symlink skip — so a reparse point inside an allowed
+                // dir can never redirect the recursive chmod to external files.
                 let path_str = resolved.to_string_lossy().into_owned();
 
-                // Build the icacls argument list from ACE entries. This is a
-                // pure function so it is independently unit-tested. Honors
-                // `req.recursive` (adds `/T /C`) and rejects malformed
-                // principals before any subprocess launch.
-                let acl_args = build_icacls_acl_args(&acl.entries, req.recursive, &path_str)?;
-
+                // Resolve every principal to an SDDL SID string and validate the
+                // entries BEFORE touching the filesystem. `resolve_acl_to_sddl`
+                // calls into the Win32 account-lookup API, so it runs on the
+                // blocking pool; we hand it owned data.
+                let entries = acl.entries.clone();
+                let recursive = req.recursive;
                 let path_owned = resolved.to_path_buf();
+                let path_str_for_blocking = path_str.clone();
                 let items = tokio::task::spawn_blocking(move || -> Result<u32, FileError> {
-                    apply_icacls_acl(&path_owned, &acl_args, &path_str)
+                    // Build the complete-DACL SDDL once; reused for every path
+                    // in the (possibly recursive) walk.
+                    let sddl = resolve_acl_to_sddl(&entries, &path_str_for_blocking)?;
+                    apply_protected_dacl_walk(&path_owned, &sddl, recursive, &path_str_for_blocking)
                 })
                 .await
                 .map_err(|e| {
@@ -1299,70 +1314,47 @@ fn set_unix_mode_recursive(path: &Path, mode: u32, count: &mut u32) -> Result<()
     Ok(())
 }
 
-// ── Windows ACL ────────────────────────────────────────────────────────────
+// ── Windows ACL (true PROTECTED-DACL replacement) ───────────────────────────
+//
+// The file's effective DACL is set to EXACTLY the supplied `AclEntry` list via
+// the Win32 security API. We build an SDDL string `D:P(...)...` (one ACE per
+// entry), convert it to a SECURITY_DESCRIPTOR, extract the DACL, and call
+// `SetNamedSecurityInfoW` with `DACL_SECURITY_INFORMATION |
+// PROTECTED_DACL_SECURITY_INFORMATION`. PROTECTED + a complete DACL is what
+// makes this a TRUE replacement: the OS drops inherited ACEs AND all
+// pre-existing explicit ACEs (the bug icacls could not fix).
+//
+// The SDDL builder (`build_dacl_sddl`) and principal classifier
+// (`sddl_principal_passthrough`) are pure and compiled cross-platform under
+// cfg(test) so they can be unit-tested on macOS without Windows.
 
-/// Map a Windows access-mask value to an icacls permission abbreviation.
+/// Render a 32-bit access mask as the hex form an SDDL ACE rights field accepts,
+/// e.g. `0x001F01FF`. SDDL also accepts the two-letter right abbreviations
+/// (`FA`, `FR`, …), but the explicit hex mask is unambiguous and preserves the
+/// caller's exact bits — `deny R` denies exactly the read bits and nothing more.
 ///
-/// icacls recognises these simple-right letters and letter combinations:
-///   F  — Full control    (0x001F01FF)
-///   M  — Modify          (0x00000116 | 0x00000020 | 0x00000040 | 0x00000080 | … → FILE_GENERIC_WRITE without DELETE subset)
-///   RX — Read+Execute    (0x001200A9)
-///   R  — Read            (0x00120089)
-///   W  — Write           (0x00120116)
-///
-/// We match the common Windows `GENERIC_*` and `FILE_*_ACCESS` constants.
-/// Any access_mask that doesn't match a recognised abbreviation is rendered
-/// as a hex string in parentheses, which icacls also accepts as a raw ACE mask.
-/// This means callers passing well-known masks get human-readable letters; callers
-/// passing unusual masks still have their ACE honoured.
-///
-/// Compiled on Windows (production) and on all platforms under cfg(test) so the
-/// unit tests can run cross-platform without requiring Windows.
+/// Pure; compiled on all platforms (used by `build_dacl_sddl`).
 #[cfg(any(windows, test))]
-pub fn acl_mask_to_icacls_perms(access_mask: u32) -> String {
-    // Windows ACCESS_MASK constants (from winnt.h / Windows.h).
-    // Full control = 0x001F01FF — all standard + all specific file rights.
-    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
-    // Generic rights mapped to file-object rights:
-    const GENERIC_ALL: u32 = 0x1000_0000;
-    // Read+Execute = STANDARD_RIGHTS_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES |
-    //                FILE_READ_EA | FILE_EXECUTE | SYNCHRONIZE
-    const FILE_GENERIC_READ_EXECUTE: u32 = 0x0012_00A9;
-    // Read = STANDARD_RIGHTS_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES |
-    //         FILE_READ_EA | SYNCHRONIZE
-    const FILE_GENERIC_READ: u32 = 0x0012_0089;
-    // Write = STANDARD_RIGHTS_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
-    //          FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | SYNCHRONIZE
-    const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
-    // Modify = File_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE
-    // 0x001301BF is a common composite for icacls "M".
-    const FILE_GENERIC_MODIFY: u32 = 0x0013_01BF;
-
-    match access_mask {
-        FILE_ALL_ACCESS | GENERIC_ALL => "F".to_string(),
-        FILE_GENERIC_MODIFY => "M".to_string(),
-        FILE_GENERIC_READ_EXECUTE => "RX".to_string(),
-        FILE_GENERIC_READ => "R".to_string(),
-        FILE_GENERIC_WRITE => "W".to_string(),
-        other => format!("(0x{other:08X})"),
-    }
+fn acl_mask_to_sddl_rights(access_mask: u32) -> String {
+    format!("0x{access_mask:08X}")
 }
 
-/// Reject a principal token that cannot be safely embedded in an icacls
-/// `{principal}:{perms}` ACE argument.
+/// Reject a principal token that cannot be safely turned into an SDDL ACE.
 ///
-/// `Command::args` already prevents shell injection and prevents a malicious
-/// principal from being split into a second `/grant`/`/deny` flag (each arg is
-/// passed verbatim). This is defense-in-depth on top of that: a principal that
-/// contains a `:` would shift where icacls thinks the permission field starts
-/// (`Everyone:F` smuggled into the principal yields `Everyone:F:R`); whitespace
-/// is never part of a valid account token and a leading `/` looks like an
-/// icacls flag. Rejecting these up front beats relying on icacls's own parser
-/// to error on a corrupted ACE token.
+/// The resolved SID is embedded as the final, `;`-separated field of an SDDL
+/// ACE — `(A;;<rights>;;;<sid>)`. Even though we never interpolate the raw
+/// principal into the SDDL (we resolve it to a SID first, or pass through only
+/// after a strict alias/SID-string check), we still reject obviously malformed
+/// tokens up front as defense-in-depth and to give a clear, early error:
+/// a principal containing a `:` (e.g. `Everyone:F`) is the classic
+/// perm-smuggling attempt; whitespace is never part of a valid account token;
+/// a leading `/` looks like a flag. These are rejected before any SID lookup or
+/// filesystem touch.
 ///
 /// Returns `Ok(())` for a well-formed principal (e.g. `BUILTIN\Users`,
-/// `DOMAIN\user`, `Everyone`) and a `FileError` (InvalidPath, matching the
-/// file's existing path-style validation errors) otherwise.
+/// `DOMAIN\user`, `Everyone`, the SDDL aliases `BA`/`SY`/`WD`/`OW`, or a literal
+/// SID string `S-1-5-…`) and a `FileError` (InvalidPath, matching the file's
+/// existing path-style validation errors) otherwise.
 #[cfg(any(windows, test))]
 fn validate_principal(principal: &str, path_for_error: &str) -> Result<(), FileError> {
     if principal.is_empty() {
@@ -1373,6 +1365,9 @@ fn validate_principal(principal: &str, path_for_error: &str) -> Result<(), FileE
         ));
     }
     if principal.contains(':')
+        || principal.contains(';')
+        || principal.contains('(')
+        || principal.contains(')')
         || principal.chars().any(char::is_whitespace)
         || principal.starts_with('/')
     {
@@ -1381,51 +1376,91 @@ fn validate_principal(principal: &str, path_for_error: &str) -> Result<(), FileE
             path_for_error,
             format!(
                 "ACL entry has a malformed principal '{principal}' — a principal must not \
-                 contain ':' or whitespace or start with '/' (these corrupt the icacls ACE \
-                 token or look like icacls flags)"
+                 contain ':', ';', '(', ')' or whitespace or start with '/' (these corrupt \
+                 the SDDL ACE token)"
             ),
         ));
     }
     Ok(())
 }
 
-/// Build the icacls argument segments that REPLACE the file's effective DACL
-/// with exactly the supplied ACL entries (a set/replace operation, matching
-/// chmod semantics and the `secure_file::restrict_to_owner` precedent).
+/// Decide whether a principal is a recognised SDDL alias (e.g. `BA`, `SY`,
+/// `WD`, `OW`) or a literal SID string (`S-1-…`) that can be embedded into an
+/// SDDL ACE verbatim, WITHOUT going through `LookupAccountNameW`.
 ///
-/// The returned args ALWAYS begin with `/inheritance:r`, which strips inherited
-/// ACEs so the entry list is the *complete* effective DACL. Without this an
-/// "owner-only" request (a single `owner:F` allow) would leave inherited broad
-/// grants in place, and a DENY would be meaningless because inherited ALLOWs
-/// would still apply. With it:
-///   - "owner-only" (single `owner:F` allow) actually yields owner-only.
-///   - A DENY is meaningful: no inherited broad grant survives to be overridden.
+/// SDDL two-letter SID aliases are well-defined and case-insensitive in
+/// practice, but we accept only the canonical upper-case spelling to keep the
+/// passthrough conservative — anything else falls through to a real account
+/// lookup. Literal SID strings are accepted (case-insensitive `S-1-` prefix);
+/// SDDL embeds them directly.
 ///
-/// Each `AclEntry` then produces either:
-///   - ALLOW: `/grant:r`, `{principal}:{perms}` (`:r` replaces any prior grant
-///     for that principal rather than accumulating).
-///   - DENY:  `/deny`,    `{principal}:{perms}`
-///
-/// DENY masks are exact-bit: `deny R` denies only the read bits, nothing more —
-/// the caller controls the complete effective ACL.
-///
-/// When `recursive` is true the args also include `/T` (recurse into the
-/// directory tree) and `/C` (continue on per-file errors), giving parity with
-/// the Unix recursive chmod arm.
-///
-/// Returns an error if:
-///   - The entries list is empty (nothing to apply is an error, not a no-op).
-///   - Any principal is empty or malformed (see `validate_principal`).
-///
-/// The returned `Vec<String>` is appended directly to the icacls argument list
-/// after the file path. This is a pure function, compiled on all platforms for
-/// unit testing.
+/// Pure; compiled cross-platform for unit testing. The caller has already run
+/// `validate_principal`, so the token contains no SDDL-breaking characters.
 #[cfg(any(windows, test))]
-pub fn build_icacls_acl_args(
+fn sddl_principal_passthrough(principal: &str) -> Option<&str> {
+    // Canonical SDDL SID-string aliases we allow through. This is a curated
+    // subset (the common ones a caller would reasonably use); unknown aliases
+    // intentionally fall through to LookupAccountNameW, which also resolves
+    // them on a real system.
+    const ALIASES: &[&str] = &[
+        "BA", // Built-in Administrators
+        "BU", // Built-in Users
+        "SY", // Local System
+        "LS", // Local Service
+        "NS", // Network Service
+        "WD", // Everyone (World)
+        "OW", // Owner Rights
+        "AU", // Authenticated Users
+        "AN", // Anonymous
+        "IU", // Interactive Users
+        "CO", // Creator Owner
+        "CG", // Creator Group
+    ];
+    if ALIASES.contains(&principal) {
+        return Some(principal);
+    }
+    // Literal SID string, e.g. "S-1-5-18". SDDL accepts these directly.
+    let upper = principal.to_ascii_uppercase();
+    if upper.starts_with("S-1-")
+        && principal
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Some(principal);
+    }
+    None
+}
+
+/// Build the SDDL DACL string that, when applied as a PROTECTED DACL, makes the
+/// file's effective DACL EXACTLY the supplied entries — a true full replacement.
+///
+/// Output shape: `D:P(ace)(ace)…` where
+///   - `D:` introduces the DACL.
+///   - `P` marks it PROTECTED: no ACEs are inherited from the parent. Combined
+///     with applying the COMPLETE DACL via `PROTECTED_DACL_SECURITY_INFORMATION`,
+///     this drops BOTH inherited ACEs AND any pre-existing explicit ACEs on the
+///     file — so "owner-only" really is owner-only and a DENY is meaningful.
+///   - each ACE is `(A;;<rights-hex>;;;<sid>)` for ALLOW or `(D;;…)` for DENY.
+///     The rights field is the caller's exact 32-bit mask in hex, so a `deny R`
+///     denies only the read bits and nothing more.
+///
+/// Each entry's `principal` must already be resolved to an SDDL-embeddable SID
+/// string (a literal `S-1-…` or a two-letter alias). Resolution from a friendly
+/// name (`DOMAIN\user`, `Everyone`) to a SID happens in the Windows-only
+/// `resolve_acl_to_sddl`; this builder is pure and assembles the final string.
+///
+/// `sids` is parallel to `entries` (same length, same order). The DENY-before-
+/// ALLOW evaluation order is the Windows default and is preserved as given.
+///
+/// Returns an error if `entries` is empty (nothing to apply is an error, not a
+/// no-op) or if `entries.len() != sids.len()` (a programming error). Pure,
+/// compiled on all platforms for unit testing.
+#[cfg(any(windows, test))]
+pub fn build_dacl_sddl(
     entries: &[AclEntry],
-    recursive: bool,
+    sids: &[String],
     path_for_error: &str,
-) -> Result<Vec<String>, FileError> {
+) -> Result<String, FileError> {
     if entries.is_empty() {
         return Err(file_error(
             FileErrorCode::Unspecified,
@@ -1433,131 +1468,456 @@ pub fn build_icacls_acl_args(
             "WindowsAcl entries list is empty — at least one ACE is required",
         ));
     }
-
-    // `/inheritance:r` makes the entry list the COMPLETE effective DACL by
-    // stripping inherited ACEs first — WindowsAcl is a full DACL replacement.
-    let mut args: Vec<String> = Vec::with_capacity(entries.len() * 2 + 3);
-    args.push("/inheritance:r".to_string());
-    // Recurse the subtree (continue past per-file errors) for parity with the
-    // Unix recursive chmod arm.
-    if recursive {
-        args.push("/T".to_string());
-        args.push("/C".to_string());
+    if entries.len() != sids.len() {
+        // Defensive: callers always pass parallel slices. Treat a mismatch as an
+        // internal error rather than silently producing a malformed DACL.
+        return Err(file_error(
+            FileErrorCode::Unspecified,
+            path_for_error,
+            "internal error: ACL entry/SID count mismatch",
+        ));
     }
+
+    // `D:P` — DACL, PROTECTED (no inheritance; the complete DACL replaces all
+    // existing ACEs when applied with PROTECTED_DACL_SECURITY_INFORMATION).
+    let mut sddl = String::from("D:P");
+    for (entry, sid) in entries.iter().zip(sids.iter()) {
+        // AclEntryType::Allow = 0, AclEntryType::Deny = 1; any non-Deny is Allow.
+        let ace_type = if entry.entry_type == AclEntryType::Deny as i32 {
+            "D"
+        } else {
+            "A"
+        };
+        let rights = acl_mask_to_sddl_rights(entry.access_mask);
+        // (ace_type;ace_flags;rights;object_guid;inherit_object_guid;account_sid)
+        // We leave flags / object GUIDs empty.
+        sddl.push_str(&format!("({ace_type};;{rights};;;{sid})"));
+    }
+    Ok(sddl)
+}
+
+/// Validate every entry, resolve each principal to an SDDL SID string, and
+/// assemble the final PROTECTED-DACL SDDL via [`build_dacl_sddl`].
+///
+/// Principal resolution (per entry):
+///   1. `validate_principal` rejects empty/malformed tokens early.
+///   2. `sddl_principal_passthrough` accepts canonical SDDL aliases (`BA`,
+///      `SY`, `WD`, `OW`, …) and literal SID strings (`S-1-…`) verbatim.
+///   3. Otherwise `resolve_principal_to_sid` calls `LookupAccountNameW`
+///      (handles `DOMAIN\user`, bare names, well-known names) and stringifies
+///      the resulting SID. An unresolvable name maps to PermissionDenied.
+///
+/// Done once per chmod request (before the per-path walk) so the SDDL — and
+/// thus the account lookups — are computed a single time even for recursive
+/// applications.
+#[cfg(windows)]
+fn resolve_acl_to_sddl(entries: &[AclEntry], path_for_error: &str) -> Result<String, FileError> {
+    if entries.is_empty() {
+        return Err(file_error(
+            FileErrorCode::Unspecified,
+            path_for_error,
+            "WindowsAcl entries list is empty — at least one ACE is required",
+        ));
+    }
+    let mut sids: Vec<String> = Vec::with_capacity(entries.len());
     for entry in entries {
         validate_principal(&entry.principal, path_for_error)?;
-        let perms = acl_mask_to_icacls_perms(entry.access_mask);
-        // AclEntryType::Allow = 0, AclEntryType::Deny = 1
-        // We treat any non-Deny value as Allow (proto default = Allow).
-        let is_deny = entry.entry_type == AclEntryType::Deny as i32;
-        if is_deny {
-            args.push("/deny".to_string());
-            args.push(format!("{}:{}", entry.principal, perms));
-        } else {
-            args.push("/grant:r".to_string());
-            args.push(format!("{}:{}", entry.principal, perms));
-        }
-    }
-    Ok(args)
-}
-
-/// Parse the trailing "Successfully processed N files" count from icacls
-/// stdout into `items_modified`.
-///
-/// icacls prints a final summary line such as:
-///   `Successfully processed 1 files; Failed processing 0 files`
-/// (the noun is always plural "files", even for a count of 1). When `/T`
-/// recurses a directory the count reflects every processed entry.
-///
-/// Returns the parsed count, or `1` as a fallback if the summary cannot be
-/// found/parsed (a successful icacls run touched at least the target). Pure
-/// function, compiled on all platforms for unit testing.
-#[cfg(any(windows, test))]
-pub fn parse_icacls_items_processed(output: &str) -> u32 {
-    for line in output.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("Successfully processed ") else {
-            continue;
+        let sid = match sddl_principal_passthrough(&entry.principal) {
+            Some(s) => s.to_string(),
+            None => resolve_principal_to_sid(&entry.principal, path_for_error)?,
         };
-        // `rest` looks like "N files; Failed processing M files" — take the
-        // first whitespace-delimited token as N.
-        if let Some(tok) = rest.split_whitespace().next()
-            && let Ok(n) = tok.parse::<u32>()
-        {
-            return n;
-        }
+        sids.push(sid);
     }
-    1
+    build_dacl_sddl(entries, &sids, path_for_error)
 }
 
-/// Apply ACL arguments built by `build_icacls_acl_args` to `path` via
-/// the `icacls` subprocess. On success returns `items_modified` parsed from
-/// icacls's "Successfully processed N files" summary (fallback 1) — when the
-/// request is recursive (`/T`) this reflects every processed entry.
+/// Resolve a friendly account name (`DOMAIN\user`, `Everyone`, a bare username)
+/// to its SDDL SID string (`S-1-…`) via `LookupAccountNameW` +
+/// `ConvertSidToStringSidW`.
 ///
-/// icacls exit codes:
-///   0 → success
-///   non-0 → failure; stderr/stdout contain the reason (icacls mixes the two).
+/// An unresolvable name (the API reports `ERROR_NONE_MAPPED`) is surfaced as a
+/// `PermissionDenied` FileError — matching the prior icacls "invalid principal"
+/// behaviour the integration tests assert on. Any other failure is `Io`.
 ///
-/// Known failure modes surfaced as clear errors:
-///   - "No mapping between account names and security IDs" → invalid principal →
-///     PermissionDenied with an actionable message.
-///   - File not found (icacls output contains "No such file") → NotFound.
-///   - Any other non-zero exit → Io with the full icacls output.
+/// # Memory safety
+/// - `LookupAccountNameW` is called twice: first with null buffers to learn the
+///   required SID and domain sizes, then with exactly-sized owned buffers. The
+///   SID buffer is a `Vec<u8>` sized to `cb_sid`; the domain buffer a
+///   `Vec<u16>`. Both outlive the call.
+/// - The string SID from `ConvertSidToStringSidW` is `LocalAlloc`'d and is freed
+///   exactly once via a `LocalFree` guard on every return path.
 #[cfg(windows)]
-fn apply_icacls_acl(
-    path: &std::path::Path,
-    acl_args: &[String],
-    path_for_error: &str,
-) -> Result<u32, FileError> {
-    let output = std::process::Command::new("icacls")
-        .arg(path)
-        .args(acl_args)
-        .output()
-        .map_err(|e| {
-            file_error(
-                FileErrorCode::Io,
-                path_for_error,
-                format!("failed to launch icacls: {e}"),
-            )
-        })?;
+fn resolve_principal_to_sid(principal: &str, path_for_error: &str) -> Result<String, FileError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{LookupAccountNameW, PSID, SID_NAME_USE};
 
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Ok(parse_icacls_items_processed(&stdout));
+    // NUL-terminated UTF-16 account name for the W API.
+    let name_wide: Vec<u16> = std::ffi::OsStr::new(principal)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // First call: discover the required SID and domain buffer sizes. With null
+    // out-buffers the API is expected to fail with ERROR_INSUFFICIENT_BUFFER and
+    // fill cb_sid / cch_domain.
+    let mut cb_sid: u32 = 0;
+    let mut cch_domain: u32 = 0;
+    let mut sid_use: SID_NAME_USE = 0;
+
+    // SAFETY: `name_wide` is a valid NUL-terminated UTF-16 buffer alive for the
+    // call. We pass null for the system name (local machine), null SID and
+    // domain out-buffers with zeroed size out-params, so the call only reports
+    // the required sizes via cb_sid / cch_domain. It does not write through the
+    // null pointers.
+    let probe = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name_wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut cb_sid,
+            std::ptr::null_mut(),
+            &mut cch_domain,
+            &mut sid_use,
+        )
+    };
+    // The size-probe is expected to FAIL with ERROR_INSUFFICIENT_BUFFER. If it
+    // somehow succeeds (cb_sid == 0) or fails for another reason, classify it.
+    if probe != 0 {
+        return Err(file_error(
+            FileErrorCode::Io,
+            path_for_error,
+            format!("LookupAccountNameW size-probe unexpectedly succeeded for '{principal}'"),
+        ));
     }
-
-    // icacls writes messages to stdout (not stderr) in most cases.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-
-    // Classify the failure for a clear FileError.
-    if combined.contains("No mapping between account names") {
+    let probe_err = std::io::Error::last_os_error();
+    if probe_err.raw_os_error() == Some(ERROR_NONE_MAPPED as i32) {
         return Err(file_error(
             FileErrorCode::PermissionDenied,
             path_for_error,
             format!(
-                "icacls: invalid principal — one or more ACL entries reference an unknown \
-                 user or group name. Full output: {combined}"
+                "invalid principal — ACL entry references an unknown user or group name \
+                 '{principal}' (no SID mapping)"
             ),
         ));
     }
-    if combined.contains("No such file") || combined.contains("cannot find the file") {
+    if probe_err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) || cb_sid == 0 {
         return Err(file_error(
-            FileErrorCode::NotFound,
+            FileErrorCode::Io,
             path_for_error,
-            format!("icacls: file not found. Output: {combined}"),
+            format!("LookupAccountNameW size-probe failed for '{principal}': {probe_err}"),
         ));
     }
-    Err(file_error(
-        FileErrorCode::Io,
-        path_for_error,
-        format!(
-            "icacls failed (exit {:?}): {combined}",
-            output.status.code()
-        ),
-    ))
+
+    // Second call: exactly-sized owned buffers. Clamp the domain buffer to at
+    // least 1 element: for some built-in accounts the probe can report
+    // cch_domain == 0, but LookupAccountNameW still writes a NUL terminator, so
+    // a zero-length buffer would be an out-of-bounds write. `cch_domain` itself
+    // is left at the API-reported value (the size the call uses); only the
+    // allocation is widened.
+    let mut sid_buf: Vec<u8> = vec![0u8; cb_sid as usize];
+    let mut domain_buf: Vec<u16> = vec![0u16; (cch_domain as usize).max(1)];
+
+    // SAFETY: `name_wide` is still alive. `sid_buf`/`domain_buf` are owned,
+    // exactly the size the probe requested, and outlive the call. cb_sid /
+    // cch_domain hold those sizes. The API writes the binary SID into sid_buf
+    // and the domain name into domain_buf; neither pointer is retained.
+    let ok = unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name_wide.as_ptr(),
+            sid_buf.as_mut_ptr() as PSID,
+            &mut cb_sid,
+            domain_buf.as_mut_ptr(),
+            &mut cch_domain,
+            &mut sid_use,
+        )
+    };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        let code = if err.raw_os_error() == Some(ERROR_NONE_MAPPED as i32) {
+            FileErrorCode::PermissionDenied
+        } else {
+            FileErrorCode::Io
+        };
+        return Err(file_error(
+            code,
+            path_for_error,
+            format!("LookupAccountNameW failed for '{principal}': {err}"),
+        ));
+    }
+
+    // Stringify the binary SID. ConvertSidToStringSidW LocalAlloc's the result;
+    // we free it exactly once via the guard below.
+    let mut str_sid_ptr: windows_sys::core::PWSTR = std::ptr::null_mut();
+    // SAFETY: `sid_buf` holds a valid SID written by the successful
+    // LookupAccountNameW above and is alive for this call. `str_sid_ptr` is a
+    // valid out-pointer; on success the API sets it to a LocalAlloc'd
+    // NUL-terminated UTF-16 string that we own and free.
+    let conv_ok = unsafe { ConvertSidToStringSidW(sid_buf.as_mut_ptr() as PSID, &mut str_sid_ptr) };
+    if conv_ok == 0 || str_sid_ptr.is_null() {
+        let err = std::io::Error::last_os_error();
+        return Err(file_error(
+            FileErrorCode::Io,
+            path_for_error,
+            format!("ConvertSidToStringSidW failed for '{principal}': {err}"),
+        ));
+    }
+
+    // RAII free of the LocalAlloc'd string SID on every path below.
+    struct LocalStr(windows_sys::core::PWSTR);
+    impl Drop for LocalStr {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is the non-null LocalAlloc'd pointer from
+            // ConvertSidToStringSidW; LocalFree is the matching deallocator and
+            // runs exactly once. After this the pointer is not used.
+            unsafe {
+                LocalFree(self.0.cast());
+            }
+        }
+    }
+    let guard = LocalStr(str_sid_ptr);
+
+    // Read the NUL-terminated wide string into a Rust String.
+    // SAFETY: `guard.0` points at a valid NUL-terminated UTF-16 string owned by
+    // the guard for the duration of this read.
+    let sid_string = unsafe {
+        let mut len = 0usize;
+        while *guard.0.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(guard.0, len);
+        String::from_utf16_lossy(slice)
+    };
+    // `guard` drops here (LocalFree), after the string has been copied out.
+    Ok(sid_string)
+}
+
+/// Apply the COMPLETE, PROTECTED DACL described by `sddl` to a single path via
+/// `SetNamedSecurityInfoW`. This is the true full-DACL replacement: PROTECTED +
+/// the entire DACL means the OS drops both inherited and pre-existing explicit
+/// ACEs, leaving the path's effective DACL equal to exactly `sddl`'s entries.
+///
+/// # Memory safety
+/// - The SDDL is converted to a heap SECURITY_DESCRIPTOR via
+///   `ConvertStringSecurityDescriptorToSecurityDescriptorW`; the descriptor is
+///   owned by a `LocalFree` guard (`SecDesc`) and outlives the
+///   `SetNamedSecurityInfoW` call that reads through its DACL pointer.
+/// - `GetSecurityDescriptorDacl` yields a borrowed pointer INTO that descriptor,
+///   so the descriptor must (and does) stay alive across the set call.
+/// - The path is a NUL-terminated UTF-16 buffer that lives for the call.
+#[cfg(windows)]
+fn set_protected_dacl(path: &Path, sddl: &str, path_for_error: &str) -> Result<(), FileError> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{BOOL, ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    // RAII guard freeing the LocalAlloc'd SECURITY_DESCRIPTOR. Mirrors the T6
+    // (ipc.rs) pattern: tie LocalFree to scope exit so there is no leak, UAF, or
+    // double-free across early returns.
+    struct SecDesc(PSECURITY_DESCRIPTOR);
+    impl Drop for SecDesc {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is the non-null descriptor from the converter
+            // (LocalAlloc'd); LocalFree is the matching deallocator, run once.
+            unsafe {
+                LocalFree(self.0.cast());
+            }
+        }
+    }
+
+    let sddl_wide: Vec<u16> = std::ffi::OsStr::new(sddl)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut psd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+
+    // SAFETY: `sddl_wide` is a valid NUL-terminated UTF-16 buffer alive for the
+    // call; `psd` is a valid out-pointer. On success the API LocalAlloc's a
+    // descriptor we own (freed via SecDesc). Null size out-param is allowed.
+    let conv_ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl_wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut psd,
+            std::ptr::null_mut(),
+        )
+    };
+    // Capture the OS error BEFORE constructing the guard (Drop runs LocalFree,
+    // which would clobber the thread's last-error). Wrap `psd` in the guard
+    // FIRST, then check the result: if the converter failed but still set a
+    // non-null `psd` (the failure state is API-unspecified), the guard still
+    // frees it on the early return — no leak.
+    let conv_err = std::io::Error::last_os_error();
+    let sd = if psd.is_null() {
+        None
+    } else {
+        Some(SecDesc(psd))
+    };
+    if conv_ok == 0 || sd.is_none() {
+        return Err(file_error(
+            FileErrorCode::Io,
+            path_for_error,
+            format!("failed to build security descriptor from DACL SDDL '{sddl}': {conv_err}"),
+        ));
+    }
+    // Safe: the `sd.is_none()` case returned above.
+    let sd = sd.expect("descriptor guard present after success check");
+
+    // Extract the DACL pointer from the descriptor. It borrows INTO `sd`, so
+    // `sd` must stay alive through SetNamedSecurityInfoW (it does — dropped at
+    // end of scope).
+    let mut dacl_present: BOOL = 0;
+    let mut dacl_ptr: *mut ACL = std::ptr::null_mut();
+    let mut dacl_defaulted: BOOL = 0;
+    // SAFETY: `sd.0` is a valid descriptor. The three out-params are valid
+    // locals. On success `dacl_ptr` points into the descriptor owned by `sd`.
+    let get_ok = unsafe {
+        GetSecurityDescriptorDacl(sd.0, &mut dacl_present, &mut dacl_ptr, &mut dacl_defaulted)
+    };
+    if get_ok == 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(file_error(
+            FileErrorCode::Io,
+            path_for_error,
+            format!("GetSecurityDescriptorDacl failed: {err}"),
+        ));
+    }
+    if dacl_present == 0 || dacl_ptr.is_null() {
+        // Our SDDL always contains `D:P(...)`, so a present, non-null DACL is
+        // expected. A NULL DACL would grant Everyone full access — refuse to
+        // apply rather than weaken the file.
+        return Err(file_error(
+            FileErrorCode::Io,
+            path_for_error,
+            "built security descriptor unexpectedly had no DACL — refusing to apply",
+        ));
+    }
+
+    // NUL-terminated UTF-16 path for the W API.
+    let path_wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Apply the DACL as PROTECTED → strips inheritance AND replaces all explicit
+    // ACEs with exactly our DACL. owner/group/sacl are unchanged (null).
+    // SAFETY: `path_wide` is a valid NUL-terminated UTF-16 path alive for the
+    // call; `dacl_ptr` points into the live descriptor owned by `sd` (kept alive
+    // below). owner/group/sacl null means "do not change". The function copies
+    // the DACL it needs during the call and does not retain our pointers.
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            path_wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl_ptr,
+            std::ptr::null_mut(),
+        )
+    };
+
+    // Keep the descriptor alive until strictly AFTER the set call returns: the
+    // DACL pointer borrowed into it during the call. Explicit so the ordering is
+    // part of the code, not scope luck.
+    drop(sd);
+
+    if rc != ERROR_SUCCESS {
+        let err = std::io::Error::from_raw_os_error(rc as i32);
+        // ERROR_FILE_NOT_FOUND (2) / ERROR_PATH_NOT_FOUND (3) → NotFound.
+        let code = match rc {
+            2 | 3 => FileErrorCode::NotFound,
+            // ERROR_ACCESS_DENIED (5) → PermissionDenied.
+            5 => FileErrorCode::PermissionDenied,
+            _ => FileErrorCode::Io,
+        };
+        return Err(file_error(
+            code,
+            path_for_error,
+            format!("SetNamedSecurityInfoW failed (win32 {rc}): {err}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Apply the PROTECTED DACL `sddl` to `path` and, when `recursive`, to every
+/// non-reparse-point descendant.
+///
+/// SECURITY (HIGH#2): the recursive walk SKIPS reparse points
+/// (symlinks/junctions) — it neither descends into nor applies the DACL to them
+/// — exactly like the Unix recursive arm's symlink skip. This prevents a reparse
+/// point planted inside an allowed directory from redirecting the recursive
+/// chmod to files OUTSIDE the allowlist (the `icacls /T` escape). The leaf
+/// itself was already validated by the policy layer and the
+/// `reject_if_final_component_is_symlink` guard upstream, so applying to the
+/// leaf is safe.
+///
+/// Returns the number of paths whose DACL was set. Fails the whole operation on
+/// any per-path error (no `/C`-style continue) so a partial failure is visible.
+#[cfg(windows)]
+fn apply_protected_dacl_walk(
+    path: &Path,
+    sddl: &str,
+    recursive: bool,
+    path_for_error: &str,
+) -> Result<u32, FileError> {
+    // Always apply to the (already-validated) leaf.
+    set_protected_dacl(path, sddl, path_for_error)?;
+    let mut count = 1u32;
+
+    if recursive {
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| io_to_file_error(e, path))?;
+        // If the leaf is itself a reparse point we must NOT have followed it —
+        // the upstream no-follow guard handles the explicit no_follow case, but
+        // for defense-in-depth do not descend through a reparse-point leaf.
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            apply_protected_dacl_recursive(path, sddl, &mut count, path_for_error)?;
+        }
+    }
+    Ok(count)
+}
+
+/// Recursive descent for [`apply_protected_dacl_walk`]. Reparse points
+/// (symlinks/junctions) are skipped — never applied to and never descended into
+/// — so the recursion cannot escape the validated subtree via a planted
+/// junction. Path-based, matching the Unix `set_unix_mode_recursive` arm.
+#[cfg(windows)]
+fn apply_protected_dacl_recursive(
+    dir: &Path,
+    sddl: &str,
+    count: &mut u32,
+    path_for_error: &str,
+) -> Result<(), FileError> {
+    for entry in std::fs::read_dir(dir).map_err(|e| io_to_file_error(e, dir))? {
+        let entry = entry.map_err(|e| io_to_file_error(e, dir))?;
+        let ty = entry.file_type().map_err(|e| io_to_file_error(e, dir))?;
+        // SECURITY: skip reparse points (symlinks/junctions). On Windows a
+        // directory junction reports `is_symlink() == true` via
+        // symlink_metadata / DirEntry::file_type (both use the reparse tag), so
+        // this skip covers junctions as well as name-surrogate symlinks. A
+        // reparse point here could otherwise redirect the DACL set OUTSIDE the
+        // allowlist (HIGH#2).
+        if ty.is_symlink() {
+            continue;
+        }
+        let child = entry.path();
+        set_protected_dacl(&child, sddl, path_for_error)?;
+        *count += 1;
+        if ty.is_dir() {
+            apply_protected_dacl_recursive(&child, sddl, count, path_for_error)?;
+        }
+    }
+    Ok(())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -1809,59 +2169,76 @@ mod tests {
         );
     }
 
-    // ── build_icacls_acl_args / acl_mask_to_icacls_perms unit tests ──────────
-    // These run cross-platform because both functions are compiled under
-    // cfg(any(windows, test)).  They never invoke icacls — they only test the
-    // pure arg-building logic.
+    // ── Windows ACL SDDL builder unit tests ──────────────────────────────────
+    // These run cross-platform because the builders are compiled under
+    // cfg(any(windows, test)). They never touch the filesystem or the Win32 API
+    // — they only test the pure SDDL-string assembly, mask rendering, principal
+    // validation, and the alias/SID-string passthrough.
+
+    // ── acl_mask_to_sddl_rights: exact-bit hex rendering ─────────────────────
 
     #[test]
-    fn acl_mask_full_control_produces_f() {
-        assert_eq!(super::acl_mask_to_icacls_perms(0x001F_01FF), "F");
+    fn acl_mask_renders_full_control_hex() {
+        assert_eq!(super::acl_mask_to_sddl_rights(0x001F_01FF), "0x001F01FF");
     }
 
     #[test]
-    fn acl_mask_generic_all_produces_f() {
-        // GENERIC_ALL (0x10000000) maps to Full as well.
-        assert_eq!(super::acl_mask_to_icacls_perms(0x1000_0000), "F");
+    fn acl_mask_renders_read_hex() {
+        assert_eq!(super::acl_mask_to_sddl_rights(0x0012_0089), "0x00120089");
     }
 
     #[test]
-    fn acl_mask_modify_produces_m() {
-        assert_eq!(super::acl_mask_to_icacls_perms(0x0013_01BF), "M");
+    fn acl_mask_renders_arbitrary_mask_preserving_bits() {
+        // An unusual mask is preserved exactly (no lossy mapping to a letter).
+        assert_eq!(super::acl_mask_to_sddl_rights(0xDEAD_BEEF), "0xDEADBEEF");
+        assert_eq!(super::acl_mask_to_sddl_rights(0x0000_0001), "0x00000001");
+        assert_eq!(super::acl_mask_to_sddl_rights(0), "0x00000000");
+    }
+
+    // ── sddl_principal_passthrough: aliases + literal SID strings ────────────
+
+    #[test]
+    fn passthrough_accepts_canonical_aliases() {
+        for a in [
+            "BA", "BU", "SY", "WD", "OW", "AU", "AN", "IU", "CO", "CG", "LS", "NS",
+        ] {
+            assert_eq!(
+                super::sddl_principal_passthrough(a),
+                Some(a),
+                "alias {a} must pass through"
+            );
+        }
     }
 
     #[test]
-    fn acl_mask_read_execute_produces_rx() {
-        assert_eq!(super::acl_mask_to_icacls_perms(0x0012_00A9), "RX");
-    }
-
-    #[test]
-    fn acl_mask_read_produces_r() {
-        assert_eq!(super::acl_mask_to_icacls_perms(0x0012_0089), "R");
-    }
-
-    #[test]
-    fn acl_mask_write_produces_w() {
-        assert_eq!(super::acl_mask_to_icacls_perms(0x0012_0116), "W");
-    }
-
-    #[test]
-    fn acl_mask_unknown_produces_hex_fallback() {
-        // An unrecognised mask must produce a hex string icacls accepts.
-        let s = super::acl_mask_to_icacls_perms(0xDEAD_BEEF);
-        assert!(
-            s.starts_with("(0x") && s.ends_with(')'),
-            "unknown mask must render as (0x…): got {s}"
+    fn passthrough_accepts_literal_sid_string() {
+        assert_eq!(
+            super::sddl_principal_passthrough("S-1-5-18"),
+            Some("S-1-5-18")
         );
-        assert!(
-            s.to_uppercase().contains("DEADBEEF"),
-            "hex value must appear: {s}"
+        assert_eq!(
+            super::sddl_principal_passthrough("S-1-5-32-544"),
+            Some("S-1-5-32-544")
         );
     }
 
     #[test]
-    fn build_icacls_acl_args_empty_entries_returns_error() {
-        let err = super::build_icacls_acl_args(&[], false, "/some/path").unwrap_err();
+    fn passthrough_rejects_friendly_names() {
+        // Friendly names must fall through to LookupAccountNameW (None here).
+        assert_eq!(super::sddl_principal_passthrough("Everyone"), None);
+        assert_eq!(super::sddl_principal_passthrough("DOMAIN\\user"), None);
+        assert_eq!(super::sddl_principal_passthrough("Administrators"), None);
+        // Lower-case alias is NOT in the curated set → falls through.
+        assert_eq!(super::sddl_principal_passthrough("ba"), None);
+        // A SID-looking token with an illegal char is not a literal SID.
+        assert_eq!(super::sddl_principal_passthrough("S-1-5-1$8"), None);
+    }
+
+    // ── build_dacl_sddl: PROTECTED complete-DACL string assembly ─────────────
+
+    #[test]
+    fn build_dacl_sddl_empty_entries_returns_error() {
+        let err = super::build_dacl_sddl(&[], &[], "/some/path").unwrap_err();
         assert_eq!(err.code, ahand_protocol::FileErrorCode::Unspecified as i32);
         assert!(
             err.message.contains("empty"),
@@ -1871,144 +2248,88 @@ mod tests {
     }
 
     #[test]
-    fn build_icacls_acl_args_empty_principal_returns_error() {
+    fn build_dacl_sddl_count_mismatch_returns_error() {
         let entry = AclEntry {
-            principal: String::new(),
+            principal: "BA".to_string(),
             access_mask: 0x001F_01FF,
             entry_type: AclEntryType::Allow as i32,
         };
-        let err = super::build_icacls_acl_args(&[entry], false, "/p").unwrap_err();
+        // One entry, zero SIDs → internal mismatch.
+        let err = super::build_dacl_sddl(&[entry], &[], "/p").unwrap_err();
+        assert_eq!(err.code, ahand_protocol::FileErrorCode::Unspecified as i32);
+        assert!(err.message.contains("mismatch"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn build_dacl_sddl_single_allow_is_protected_complete_dacl() {
+        let entry = AclEntry {
+            principal: "S-1-5-21-1-2-3-1000".to_string(),
+            access_mask: 0x001F_01FF, // Full control
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let sddl =
+            super::build_dacl_sddl(&[entry], &["S-1-5-21-1-2-3-1000".to_string()], "/p").unwrap();
+        // PROTECTED DACL: `D:P` prefix is the marker that strips inheritance AND
+        // (when applied) replaces all explicit ACEs — the true-replacement fix.
+        assert!(
+            sddl.starts_with("D:P("),
+            "must be a PROTECTED DACL (D:P): {sddl}"
+        );
+        assert_eq!(sddl, "D:P(A;;0x001F01FF;;;S-1-5-21-1-2-3-1000)");
+    }
+
+    #[test]
+    fn build_dacl_sddl_deny_uses_d_ace_type_and_exact_mask() {
+        let entry = AclEntry {
+            principal: "WD".to_string(),
+            access_mask: 0x0012_0089, // Read
+            entry_type: AclEntryType::Deny as i32,
+        };
+        let sddl = super::build_dacl_sddl(&[entry], &["WD".to_string()], "/p").unwrap();
+        // DENY → `D` ace type; exact-bit mask preserved.
+        assert_eq!(sddl, "D:P(D;;0x00120089;;;WD)");
+    }
+
+    #[test]
+    fn build_dacl_sddl_multiple_entries_preserve_order() {
+        let entries = vec![
+            AclEntry {
+                principal: "BA".to_string(),
+                access_mask: 0x001F_01FF,
+                entry_type: AclEntryType::Allow as i32,
+            },
+            AclEntry {
+                principal: "WD".to_string(),
+                access_mask: 0x0012_0089,
+                entry_type: AclEntryType::Deny as i32,
+            },
+        ];
+        let sids = vec!["BA".to_string(), "WD".to_string()];
+        let sddl = super::build_dacl_sddl(&entries, &sids, "/p").unwrap();
+        assert_eq!(
+            sddl, "D:P(A;;0x001F01FF;;;BA)(D;;0x00120089;;;WD)",
+            "entry order must be preserved (DENY-before-ALLOW evaluation is the \
+             Windows default; we apply entries as given)"
+        );
+    }
+
+    // ── validate_principal: SDDL-breaking tokens rejected ────────────────────
+
+    #[test]
+    fn validate_principal_empty_returns_unspecified() {
+        let err = super::validate_principal("", "/p").unwrap_err();
         assert_eq!(err.code, ahand_protocol::FileErrorCode::Unspecified as i32);
         assert!(
             err.message.contains("empty principal"),
-            "error must mention 'empty principal': {}",
+            "got: {}",
             err.message
         );
     }
 
     #[test]
-    fn build_icacls_acl_args_allow_full_control() {
-        let entry = AclEntry {
-            principal: "DOMAIN\\user".to_string(),
-            access_mask: 0x001F_01FF, // Full control
-            entry_type: AclEntryType::Allow as i32,
-        };
-        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
-        // /inheritance:r is always prepended (full DACL replacement).
-        assert_eq!(args, vec!["/inheritance:r", "/grant:r", "DOMAIN\\user:F"]);
-    }
-
-    #[test]
-    fn build_icacls_acl_args_deny_read() {
-        let entry = AclEntry {
-            principal: "Everyone".to_string(),
-            access_mask: 0x0012_0089, // Read
-            entry_type: AclEntryType::Deny as i32,
-        };
-        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
-        assert_eq!(args, vec!["/inheritance:r", "/deny", "Everyone:R"]);
-    }
-
-    #[test]
-    fn build_icacls_acl_args_multiple_entries_in_order() {
-        let entries = vec![
-            AclEntry {
-                principal: "BUILTIN\\Administrators".to_string(),
-                access_mask: 0x001F_01FF, // Full
-                entry_type: AclEntryType::Allow as i32,
-            },
-            AclEntry {
-                principal: "Everyone".to_string(),
-                access_mask: 0x0012_0089, // Read
-                entry_type: AclEntryType::Deny as i32,
-            },
-        ];
-        let args = super::build_icacls_acl_args(&entries, false, "/p").unwrap();
-        assert_eq!(
-            args,
-            vec![
-                "/inheritance:r",
-                "/grant:r",
-                "BUILTIN\\Administrators:F",
-                "/deny",
-                "Everyone:R",
-            ]
-        );
-    }
-
-    #[test]
-    fn build_icacls_acl_args_unknown_mask_renders_hex() {
-        let entry = AclEntry {
-            principal: "TestUser".to_string(),
-            access_mask: 0x0000_0001, // unusual mask
-            entry_type: AclEntryType::Allow as i32,
-        };
-        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
-        // args[0] is /inheritance:r, args[1] is /grant:r, args[2] is the ACE.
-        assert_eq!(args[0], "/inheritance:r");
-        assert_eq!(args[1], "/grant:r");
-        assert!(args[2].starts_with("TestUser:(0x"), "got: {}", args[2]);
-    }
-
-    // ── C1+C2: /inheritance:r always prepended (full DACL replacement) ───────
-
-    #[test]
-    fn build_icacls_acl_args_always_strips_inheritance_first() {
-        let entry = AclEntry {
-            principal: "BUILTIN\\Users".to_string(),
-            access_mask: 0x001F_01FF,
-            entry_type: AclEntryType::Allow as i32,
-        };
-        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
-        assert_eq!(
-            args.first().map(String::as_str),
-            Some("/inheritance:r"),
-            "the DACL replacement must strip inheritance first: {args:?}"
-        );
-    }
-
-    // ── I2: recursive maps to /T /C (parity with the Unix arm) ───────────────
-
-    #[test]
-    fn build_icacls_acl_args_recursive_adds_t_and_c() {
-        let entry = AclEntry {
-            principal: "DOMAIN\\user".to_string(),
-            access_mask: 0x001F_01FF,
-            entry_type: AclEntryType::Allow as i32,
-        };
-        let args = super::build_icacls_acl_args(&[entry], true, "/p").unwrap();
-        assert_eq!(
-            args,
-            vec!["/inheritance:r", "/T", "/C", "/grant:r", "DOMAIN\\user:F"]
-        );
-    }
-
-    #[test]
-    fn build_icacls_acl_args_non_recursive_has_no_t_or_c() {
-        let entry = AclEntry {
-            principal: "DOMAIN\\user".to_string(),
-            access_mask: 0x001F_01FF,
-            entry_type: AclEntryType::Allow as i32,
-        };
-        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
-        assert!(
-            !args.iter().any(|a| a == "/T" || a == "/C"),
-            "non-recursive must not recurse: {args:?}"
-        );
-    }
-
-    // ── I4: malformed principals are rejected before any subprocess launch ───
-
-    #[test]
-    fn build_icacls_acl_args_rejects_principal_with_colon() {
-        // "Everyone:F" would smuggle a permission field into the principal,
-        // shifting where icacls thinks perms begin.
-        let entry = AclEntry {
-            principal: "Everyone:F".to_string(),
-            access_mask: 0x001F_01FF,
-            entry_type: AclEntryType::Allow as i32,
-        };
-        let err = super::build_icacls_acl_args(&[entry], false, "/p").unwrap_err();
+    fn validate_principal_rejects_colon() {
+        // "Everyone:F" — classic perm-smuggling attempt.
+        let err = super::validate_principal("Everyone:F", "/p").unwrap_err();
         assert_eq!(err.code, ahand_protocol::FileErrorCode::InvalidPath as i32);
         assert!(
             err.message.contains("malformed principal"),
@@ -2018,75 +2339,38 @@ mod tests {
     }
 
     #[test]
-    fn build_icacls_acl_args_rejects_principal_with_whitespace() {
-        let entry = AclEntry {
-            principal: "Local Service".to_string(),
-            access_mask: 0x001F_01FF,
-            entry_type: AclEntryType::Allow as i32,
-        };
-        let err = super::build_icacls_acl_args(&[entry], false, "/p").unwrap_err();
-        assert_eq!(err.code, ahand_protocol::FileErrorCode::InvalidPath as i32);
+    fn validate_principal_rejects_sddl_breaking_chars() {
+        // ';', '(', ')' would break out of / corrupt the SDDL ACE token.
+        for bad in ["a;b", "a(b", "a)b", "WD;DA"] {
+            let err = super::validate_principal(bad, "/p").unwrap_err();
+            assert_eq!(
+                err.code,
+                ahand_protocol::FileErrorCode::InvalidPath as i32,
+                "principal {bad:?} must be rejected"
+            );
+        }
     }
 
     #[test]
-    fn build_icacls_acl_args_rejects_principal_starting_with_slash() {
-        let entry = AclEntry {
-            principal: "/grant".to_string(),
-            access_mask: 0x001F_01FF,
-            entry_type: AclEntryType::Allow as i32,
-        };
-        let err = super::build_icacls_acl_args(&[entry], false, "/p").unwrap_err();
-        assert_eq!(err.code, ahand_protocol::FileErrorCode::InvalidPath as i32);
+    fn validate_principal_rejects_whitespace_and_leading_slash() {
+        assert_eq!(
+            super::validate_principal("Local Service", "/p")
+                .unwrap_err()
+                .code,
+            ahand_protocol::FileErrorCode::InvalidPath as i32
+        );
+        assert_eq!(
+            super::validate_principal("/grant", "/p").unwrap_err().code,
+            ahand_protocol::FileErrorCode::InvalidPath as i32
+        );
     }
 
     #[test]
-    fn build_icacls_acl_args_accepts_valid_domain_principal() {
+    fn validate_principal_accepts_valid_domain_account() {
         // A normal `DOMAIN\account` principal must NOT be rejected.
-        let entry = AclEntry {
-            principal: "BUILTIN\\Users".to_string(),
-            access_mask: 0x001F_01FF,
-            entry_type: AclEntryType::Allow as i32,
-        };
-        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
-        assert_eq!(args, vec!["/inheritance:r", "/grant:r", "BUILTIN\\Users:F"]);
-    }
-
-    // ── I3: parse_icacls_items_processed ─────────────────────────────────────
-
-    #[test]
-    fn parse_icacls_items_single_file() {
-        let out = "processed file: C:\\tmp\\a.txt\n\
-                   Successfully processed 1 files; Failed processing 0 files\n";
-        assert_eq!(super::parse_icacls_items_processed(out), 1);
-    }
-
-    #[test]
-    fn parse_icacls_items_recursive_many() {
-        let out = "processed file: C:\\tmp\\dir\n\
-                   processed file: C:\\tmp\\dir\\a.txt\n\
-                   processed file: C:\\tmp\\dir\\b.txt\n\
-                   Successfully processed 3 files; Failed processing 0 files\n";
-        assert_eq!(super::parse_icacls_items_processed(out), 3);
-    }
-
-    #[test]
-    fn parse_icacls_items_with_failures_uses_success_count() {
-        let out = "Successfully processed 5 files; Failed processing 2 files\n";
-        assert_eq!(super::parse_icacls_items_processed(out), 5);
-    }
-
-    #[test]
-    fn parse_icacls_items_unparseable_falls_back_to_one() {
-        // Output without a recognizable summary line falls back to 1.
-        assert_eq!(super::parse_icacls_items_processed(""), 1);
-        assert_eq!(
-            super::parse_icacls_items_processed("some unrelated icacls noise\n"),
-            1
-        );
-        // Summary present but the count token is non-numeric → fallback.
-        assert_eq!(
-            super::parse_icacls_items_processed("Successfully processed many files\n"),
-            1
-        );
+        assert!(super::validate_principal("BUILTIN\\Users", "/p").is_ok());
+        assert!(super::validate_principal("DOMAIN\\user", "/p").is_ok());
+        assert!(super::validate_principal("Everyone", "/p").is_ok());
+        assert!(super::validate_principal("S-1-5-18", "/p").is_ok());
     }
 }

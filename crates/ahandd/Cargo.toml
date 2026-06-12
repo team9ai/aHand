@@ -65,6 +65,21 @@ chardetng = "0.1"
 nix = { version = "0.28", features = ["fs", "dir"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+# Used by `file_manager::fs_ops` to perform a TRUE protected-DACL replacement
+# for Windows ACL chmod via the Win32 security API (SetNamedSecurityInfoW with
+# PROTECTED_DACL_SECURITY_INFORMATION), instead of icacls (which leaves
+# pre-existing explicit ACEs in place). Principal→SID resolution uses
+# LookupAccountNameW; the DACL is built from an SDDL string via
+# ConvertStringSecurityDescriptorToSecurityDescriptorW + GetSecurityDescriptorDacl.
+# Feature set mirrors ahand-platform/ipc.rs (T6) plus the Authorization module
+# for SetNamedSecurityInfoW / SE_FILE_OBJECT and SID stringification.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+
 [features]
 # Dev-only escape hatch for the manual TCP-keepalive smoke test in
 # tests/lib_spawn.rs::watchdog_disabled_still_recovers_via_tcp_keepalive.
