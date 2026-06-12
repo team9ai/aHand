@@ -15,8 +15,10 @@ pub mod store;
 pub mod updater;
 
 mod public_api;
+pub use ahand_protocol::ApprovalRequest;
 pub use device_identity::DeviceIdentity;
 pub use public_api::{
-    AppToolDef, AppToolError, AppToolHandler, DaemonConfig, DaemonConfigBuilder, DaemonHandle,
-    DaemonStatus, ErrorKind, SessionMode, load_or_create_identity, spawn,
+    AppToolDef, AppToolError, AppToolHandler, ApprovalSubscription, DaemonConfig,
+    DaemonConfigBuilder, DaemonHandle, DaemonStatus, ErrorKind, SessionMode,
+    load_or_create_identity, spawn,
 };
