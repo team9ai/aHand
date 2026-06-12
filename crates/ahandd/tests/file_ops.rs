@@ -73,7 +73,8 @@ fn stat_request(path: &Path) -> FileRequest {
     }
 }
 
-#[cfg(unix)]
+// Used by unix and windows no-follow tests.
+#[cfg(any(unix, windows))]
 fn stat_request_no_follow(path: &Path) -> FileRequest {
     FileRequest {
         request_id: "test".to_string(),
@@ -4118,6 +4119,7 @@ async fn verify_post_create_returns_ok_when_path_is_inside_allowlist() {
 //   3. **not** mutate either side of the would-be operation (no escape,
 //      no data loss).
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn mkdir_with_symlinked_parent_returns_policy_denied_and_does_not_escape() {
@@ -4168,6 +4170,7 @@ async fn mkdir_with_symlinked_parent_returns_policy_denied_and_does_not_escape()
     );
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn move_with_symlinked_destination_parent_does_not_destroy_source() {
@@ -4218,6 +4221,7 @@ async fn move_with_symlinked_destination_parent_does_not_destroy_source() {
     );
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn copy_single_file_with_symlinked_destination_parent_returns_policy_denied() {
@@ -4256,6 +4260,7 @@ async fn copy_single_file_with_symlinked_destination_parent_returns_policy_denie
     assert!(!attacker_root.join("copy.txt").exists());
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn create_symlink_with_symlinked_parent_returns_policy_denied() {
@@ -4292,6 +4297,7 @@ async fn create_symlink_with_symlinked_parent_returns_policy_denied() {
     );
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn chmod_with_symlinked_parent_does_not_modify_target_permissions() {
@@ -4342,6 +4348,7 @@ async fn chmod_with_symlinked_parent_does_not_modify_target_permissions() {
     );
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn linux_openat2_path_returns_policy_denied_for_symlinked_ancestor() {
@@ -4806,4 +4813,378 @@ mod windows_acl_chmod {
     // Non-Windows arm: sending Windows ACL on a non-Windows platform returns
     // Unspecified (no test needed here — the non-cfg(windows) arm in handle_chmod
     // is exercised implicitly; this module is only compiled on Windows anyway).
+}
+
+// ── T7: Windows security regression suite ─────────────────────────────────
+//
+// Inventory classification (per plan Task 7):
+//
+// (a) HAS windows analogue already written (T1/T2/T4):
+//   - create_symlink_creates_link                         → T1: windows_create_file_symlink_creates_link
+//   - create_symlink with dir target                      → T1: windows_create_dir_symlink_creates_link
+//   - check_request_approval_denies_symlink_target_outside_allowlist → T1: windows_create_symlink_target_outside_allowlist_is_denied
+//   - chmod_sets_unix_mode                                → T2: windows_acl_chmod::chmod_windows_grant_full_control_to_current_user
+//   - chmod_recursive_applies_to_children                 → T2: windows_acl_chmod::chmod_windows_recursive_applies_to_children
+//   - chmod_chown_not_supported_returns_permission_denied → T2: windows_acl_chmod::chmod_windows_invalid_principal_returns_permission_denied
+//   - glob_match / denylist case                          → T4: policy.rs windows_glob_match_case_insensitive_allow,
+//                                                                       windows_denylist_case_variant_blocked,
+//                                                                       windows_denylist_case_bypass_blocked_through_check_path
+//   - chmod_refuses_symlink_when_no_follow_set            → T2: reject_if_final_component_is_symlink (cross-platform)
+//   - mkdir_with_mode_sets_permissions                    → no meaningful Windows chmod equivalent (Windows ACL, not mode bits)
+//
+// (b) NEEDS windows analogue → written in this section (T7):
+//   - stat_symlink_follow_returns_target_type
+//   - stat_symlink_no_follow_returns_symlink_type (lstat-not-metadata behavior)
+//   - list_does_not_follow_symlink_into_target_metadata
+//   - glob_skips_symlink_pointing_outside_allowlist       ← THE key junction/symlink-escape denial test
+//   - write_refuses_symlink_when_no_follow_set
+//   - edit_refuses_symlink_when_no_follow_set
+//   - delete_symlink_no_follow_removes_link_not_target
+//   - check_request_approval_escalates_relative_symlink_target_into_dangerous_path
+//
+// (c) NO Windows equivalent — openat2/O_NOFOLLOW TOCTOU (left unix-gated):
+//   The following tests use `openat2`/`O_NOFOLLOW` dirfd chains that have no
+//   Windows equivalent. Windows has no openat2 TOCTOU — single-tenant
+//   assumption (spec M4):
+//   - mkdir_with_symlinked_parent_returns_policy_denied_and_does_not_escape
+//   - move_with_symlinked_destination_parent_does_not_destroy_source
+//   - copy_single_file_with_symlinked_destination_parent_returns_policy_denied
+//   - create_symlink_with_symlinked_parent_returns_policy_denied
+//   - chmod_with_symlinked_parent_does_not_modify_target_permissions
+//   - linux_openat2_path_returns_policy_denied_for_symlinked_ancestor
+//
+// Junction vs symlink_dir choice:
+//   Directory symlinks on Windows require Developer Mode or elevation (they
+//   use CreateSymbolicLink with SYMBOLIC_LINK_FLAG_DIRECTORY). Junctions
+//   (reparse points) do NOT require elevated privileges and are supported via
+//   `std::os::windows::fs::symlink_dir` on Windows CI with Developer Mode, OR
+//   via the `junction::create` API. To avoid adding a new crate dependency,
+//   we use `std::os::windows::fs::symlink_dir` (the T1 tests already use this
+//   and pass on CI — CI runs with Developer Mode enabled on windows-latest).
+//   The escape-denial test uses symlink_dir to create a directory symlink
+//   pointing OUTSIDE the allowlist, then attempts a file op THROUGH it and
+//   asserts PolicyDenied — proving that canonicalize_simplified resolves the
+//   symlink/junction target and then the policy checker re-validates.
+//
+// IMPORTANT: all fixtures use `canon()` (→ canonicalize_simplified) to strip
+// the Windows verbatim prefix (\\?\), matching what FilePolicyChecker returns.
+// No raw `.canonicalize()` calls appear in any test added here.
+
+/// Windows analogue of stat_symlink_follow_returns_target_type.
+/// A directory symlink whose target is a file: following the link reports the
+/// file's type and size, not the symlink's own metadata.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_stat_symlink_follow_returns_target_type() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "hi").unwrap();
+    let link = root.join("link_follow");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let resp = mgr.handle(&stat_request(&link)).await;
+    let stat = expect_stat(resp);
+
+    // follow: behaves like target
+    assert_eq!(stat.file_type, FileType::File as i32);
+    assert_eq!(stat.size, 2);
+}
+
+/// Windows analogue of stat_symlink_no_follow_returns_symlink_type.
+/// `no_follow_symlink=true` must use `symlink_metadata` (lstat semantics)
+/// and report the link itself as a Symlink, NOT the target file.
+/// This is the "lstat-not-metadata" behavior on Windows.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_stat_symlink_no_follow_returns_symlink_type() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "hi").unwrap();
+    let link = root.join("link_nofollow");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let resp = mgr.handle(&stat_request_no_follow(&link)).await;
+    let stat = expect_stat(resp);
+
+    assert_eq!(
+        stat.file_type,
+        FileType::Symlink as i32,
+        "no_follow_symlink=true must report the symlink itself, not the target"
+    );
+    assert!(
+        stat.symlink_target.is_some(),
+        "symlink_target must be populated for a symlink stat"
+    );
+}
+
+/// Windows analogue of list_does_not_follow_symlink_into_target_metadata.
+/// A symlink inside the listed directory must surface as `FileType::Symlink`
+/// and must NOT leak the target file's size/type/mtime via metadata following.
+/// Previously `handle_list` called `entry.metadata()` which follows symlinks.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_list_does_not_follow_symlink_into_target_metadata() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+
+    // Create a real file with a known size inside the sandbox.
+    let real_inside = root.join("real.txt");
+    fs::write(&real_inside, "1234567890").unwrap(); // 10 bytes
+
+    // Create an OUTSIDE directory with a large file to detect metadata leakage.
+    let outside = TempDir::new().unwrap();
+    let outside_root = canon(outside.path());
+    let big_outside = outside_root.join("big.bin");
+    fs::write(&big_outside, vec![0u8; 5000]).unwrap();
+
+    // Symlink inside root pointing to the outside directory.
+    // The link itself is inside the allowlist; the target is not.
+    let link = root.join("link-out");
+    std::os::windows::fs::symlink_dir(&outside_root, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::List(FileList {
+            path: root.to_string_lossy().into_owned(),
+            max_results: None,
+            offset: None,
+            include_hidden: false,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let list = expect_list(resp);
+    let link_entry = list
+        .entries
+        .iter()
+        .find(|e| e.name == "link-out")
+        .expect("link-out must appear in listing");
+    // The link must be reported as Symlink type, not Directory.
+    assert_eq!(
+        link_entry.file_type,
+        FileType::Symlink as i32,
+        "symlink must not be resolved to its target's file type"
+    );
+    // The target string must be populated so callers can see what it points at.
+    assert!(
+        link_entry.symlink_target.is_some(),
+        "symlink_target should be populated"
+    );
+    // And the real file must still be listed correctly alongside it.
+    let real_entry = list
+        .entries
+        .iter()
+        .find(|e| e.name == "real.txt")
+        .expect("real.txt must appear in listing");
+    assert_eq!(real_entry.file_type, FileType::File as i32);
+    assert_eq!(real_entry.size, 10);
+}
+
+/// THE key junction/symlink-escape DENIAL test (Windows security regression).
+///
+/// A directory symlink (created via `std::os::windows::fs::symlink_dir`) that
+/// points OUTSIDE the allowlist must be DENIED when a glob pattern traverses
+/// into it.  This proves that `glob_skips_symlink_pointing_outside_allowlist`
+/// security property holds on Windows: the daemon's glob re-checks policy per
+/// match and filters out any result whose canonicalized path escapes the
+/// allowlist, even when the entry appeared inside the allowed directory.
+///
+/// **Junction vs symlink_dir choice**: `std::os::windows::fs::symlink_dir` is
+/// used here because the T1 tests already exercise it on `windows-latest` CI
+/// (which runs with Developer Mode enabled).  Junctions would avoid the
+/// privilege requirement, but adding the `junction` crate as a dev-dependency
+/// is not needed when `symlink_dir` is already proven to work.  If CI ever
+/// reports ERROR_PRIVILEGE_NOT_HELD here, switch to the junction approach.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_glob_skips_symlink_dir_pointing_outside_allowlist() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+
+    // A real file inside the allowlist.
+    fs::write(root.join("inside.rs"), "x").unwrap();
+
+    // An outside temp dir with a real file we DO NOT want accessible.
+    let outside = TempDir::new().unwrap();
+    let outside_root = canon(outside.path());
+    fs::write(outside_root.join("escape.rs"), "secret").unwrap();
+
+    // Create a directory symlink inside root pointing at outside_root.
+    // The symlink itself is inside the allowlist; its canonical target is not.
+    let link_dir = root.join("subdir_link");
+    std::os::windows::fs::symlink_dir(&outside_root, &link_dir).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Glob(FileGlob {
+            pattern: "**/*.rs".into(),
+            base_path: Some(root.to_string_lossy().into_owned()),
+            max_results: None,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let glob = expect_glob(resp);
+
+    // Only `inside.rs` should survive — `subdir_link/escape.rs` gets filtered
+    // because its canonical path resolves to outside_root which is outside the
+    // allowlist. This proves escape-denial on Windows parity with Unix.
+    assert_eq!(
+        glob.total_matches, 1,
+        "symlink/junction-escape through glob must be filtered; got {} matches: {:?}",
+        glob.total_matches, glob.entries
+    );
+    assert!(
+        glob.entries.iter().any(|e| e.name.ends_with("inside.rs")),
+        "inside.rs must survive"
+    );
+    assert!(
+        glob.entries
+            .iter()
+            .all(|e| !e.name.contains("subdir_link") && !e.name.ends_with("escape.rs")),
+        "escape.rs through the symlink must be filtered out"
+    );
+}
+
+/// Windows analogue of write_refuses_symlink_when_no_follow_set.
+/// `no_follow_symlink=true` on a file symlink must refuse to write through it.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_write_refuses_symlink_when_no_follow_set() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "original").unwrap();
+    let link = root.join("link.txt");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: link.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: true,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::Content(b"hijacked".to_vec())),
+                ..Default::default()
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(
+        err.code,
+        FileErrorCode::InvalidPath as i32,
+        "no_follow_symlink=true on a symlink must return InvalidPath"
+    );
+    // Target must be untouched.
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "original",
+        "target file content must be unchanged"
+    );
+}
+
+/// Windows analogue of edit_refuses_symlink_when_no_follow_set.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_edit_refuses_symlink_when_no_follow_set() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "foo").unwrap();
+    let link = root.join("link.txt");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: link.to_string_lossy().into_owned(),
+            encoding: None,
+            no_follow_symlink: true,
+            method: Some(file_edit::Method::StringReplace(StringReplace {
+                old_string: "foo".into(),
+                new_string: "bar".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(
+        err.code,
+        FileErrorCode::InvalidPath as i32,
+        "no_follow_symlink=true on a symlink must return InvalidPath"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "foo",
+        "target file content must be unchanged"
+    );
+}
+
+/// Windows analogue of delete_symlink_no_follow_removes_link_not_target.
+/// When `no_follow_symlink=true`, delete must remove the symlink itself,
+/// leaving the target intact.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_delete_symlink_no_follow_removes_link_not_target() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "x").unwrap();
+    let link = root.join("link.txt");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Delete(FileDelete {
+            path: link.to_string_lossy().into_owned(),
+            recursive: false,
+            mode: DeleteMode::Permanent as i32,
+            no_follow_symlink: true,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_delete(resp);
+    // Symlink gone, target survived.
+    assert!(!link.exists(), "the symlink itself must be removed");
+    assert!(target.exists(), "the symlink target must survive");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "x",
+        "target content must be unchanged"
+    );
+}
+
+/// Windows analogue of check_request_approval_escalates_relative_symlink_target_into_dangerous_path.
+/// A FileCreateSymlink with a *relative* target that resolves into a path
+/// listed in `dangerous_paths` must escalate to approval on Windows too.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_create_symlink_relative_target_into_dangerous_path_escalates() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = manager_with_dangerous(&dir, &["secret.txt"]);
+    fs::write(root.join("secret.txt"), "shhh").unwrap();
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let link = sub.join("escape");
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: "../secret.txt".into(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let escalation = mgr
+        .check_request_approval(&req)
+        .await
+        .expect("relative target inside allowlist must not be denied")
+        .expect("relative target resolving into dangerous_paths must escalate");
+    assert_eq!(
+        escalation.kind,
+        ahandd::file_manager::EscalationKind::DangerousPath
+    );
 }
