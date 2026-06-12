@@ -18,6 +18,9 @@ use ahand_protocol::{
     FileGlob, FileGlobResult, FileList, FileListResult, FileMkdir, FileMkdirResult, FileMove,
     FileMoveResult, FileStat, FileStatResult, FileType, UnixPermission, file_chmod,
 };
+// AclEntry and AclEntryType are used in cfg(windows) and cfg(any(windows,test)) code paths.
+#[cfg(any(windows, test))]
+use ahand_protocol::{AclEntry, AclEntryType};
 
 use super::file_error;
 
@@ -1177,9 +1180,10 @@ pub async fn handle_chmod(req: &FileChmod, resolved: &Path) -> Result<FileChmodR
                 ))
             }
         }
-        file_chmod::Permission::Windows(_acl) => {
+        file_chmod::Permission::Windows(acl) => {
             #[cfg(not(windows))]
             {
+                let _ = acl;
                 Err(file_error(
                     FileErrorCode::Unspecified,
                     &req.path,
@@ -1188,13 +1192,43 @@ pub async fn handle_chmod(req: &FileChmod, resolved: &Path) -> Result<FileChmodR
             }
             #[cfg(windows)]
             {
-                // TODO(M4): wire up real Windows ACL setting. For now, report
-                // that only mode-based chmod is implemented.
-                Err(file_error(
-                    FileErrorCode::Unspecified,
-                    &req.path,
-                    "Windows ACL chmod is not yet implemented",
-                ))
+                // Apply Windows ACLs via icacls subprocess, consistent with the
+                // `secure_file::restrict_to_owner` precedent in ahand-platform.
+                //
+                // Design: the proto `WindowsAcl` exposes a structured list of
+                // `AclEntry { principal, access_mask, entry_type }` — one icacls
+                // invocation per ACE is straightforward and keeps the subprocess
+                // error granular (which principal/right failed).
+                //
+                // Limitation (proto note): `access_mask` maps to icacls
+                // permission letters via `acl_mask_to_icacls_perms`. Callers
+                // passing arbitrary 32-bit masks beyond the recognised set will
+                // receive a best-effort hex SDDL mask fallback, which icacls
+                // accepts. Future proto versions could add a `permission_string`
+                // field for explicit icacls permission letters if needed.
+                let path_str = resolved.to_string_lossy().into_owned();
+
+                // Build the icacls argument list from ACE entries. This is a
+                // pure function so it is independently unit-tested.
+                let acl_args = build_icacls_acl_args(&acl.entries, &path_str)?;
+
+                let path_owned = resolved.to_path_buf();
+                let items = tokio::task::spawn_blocking(move || -> Result<u32, FileError> {
+                    apply_icacls_acl(&path_owned, &acl_args, &path_str)
+                })
+                .await
+                .map_err(|e| {
+                    file_error(
+                        FileErrorCode::Io,
+                        &req.path,
+                        format!("Windows ACL chmod join error: {e}"),
+                    )
+                })??;
+
+                Ok(FileChmodResult {
+                    path: resolved.to_string_lossy().into_owned(),
+                    items_modified: items,
+                })
             }
         }
     }
@@ -1251,6 +1285,172 @@ fn set_unix_mode_recursive(path: &Path, mode: u32, count: &mut u32) -> Result<()
         }
     }
     Ok(())
+}
+
+// ── Windows ACL ────────────────────────────────────────────────────────────
+
+/// Map a Windows access-mask value to an icacls permission abbreviation.
+///
+/// icacls recognises these simple-right letters and letter combinations:
+///   F  — Full control    (0x001F01FF)
+///   M  — Modify          (0x00000116 | 0x00000020 | 0x00000040 | 0x00000080 | … → FILE_GENERIC_WRITE without DELETE subset)
+///   RX — Read+Execute    (0x001200A9)
+///   R  — Read            (0x00120089)
+///   W  — Write           (0x00120116)
+///
+/// We match the common Windows `GENERIC_*` and `FILE_*_ACCESS` constants.
+/// Any access_mask that doesn't match a recognised abbreviation is rendered
+/// as a hex string in parentheses, which icacls also accepts as a raw ACE mask.
+/// This means callers passing well-known masks get human-readable letters; callers
+/// passing unusual masks still have their ACE honoured.
+///
+/// Compiled on Windows (production) and on all platforms under cfg(test) so the
+/// unit tests can run cross-platform without requiring Windows.
+#[cfg(any(windows, test))]
+pub fn acl_mask_to_icacls_perms(access_mask: u32) -> String {
+    // Windows ACCESS_MASK constants (from winnt.h / Windows.h).
+    // Full control = 0x001F01FF — all standard + all specific file rights.
+    const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+    // Generic rights mapped to file-object rights:
+    const GENERIC_ALL: u32 = 0x1000_0000;
+    // Read+Execute = STANDARD_RIGHTS_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES |
+    //                FILE_READ_EA | FILE_EXECUTE | SYNCHRONIZE
+    const FILE_GENERIC_READ_EXECUTE: u32 = 0x0012_00A9;
+    // Read = STANDARD_RIGHTS_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES |
+    //         FILE_READ_EA | SYNCHRONIZE
+    const FILE_GENERIC_READ: u32 = 0x0012_0089;
+    // Write = STANDARD_RIGHTS_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+    //          FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | SYNCHRONIZE
+    const FILE_GENERIC_WRITE: u32 = 0x0012_0116;
+    // Modify = File_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE
+    // 0x001301BF is a common composite for icacls "M".
+    const FILE_GENERIC_MODIFY: u32 = 0x0013_01BF;
+
+    match access_mask {
+        FILE_ALL_ACCESS | GENERIC_ALL => "F".to_string(),
+        FILE_GENERIC_MODIFY => "M".to_string(),
+        FILE_GENERIC_READ_EXECUTE => "RX".to_string(),
+        FILE_GENERIC_READ => "R".to_string(),
+        FILE_GENERIC_WRITE => "W".to_string(),
+        other => format!("(0x{other:08X})"),
+    }
+}
+
+/// Build the icacls argument segments for a list of ACL entries.
+///
+/// Each `AclEntry` produces either:
+///   - ALLOW: `/grant:r`, `{principal}:{perms}`
+///   - DENY:  `/deny`,    `{principal}:{perms}`
+///
+/// Returns an error if:
+///   - The entries list is empty (nothing to apply is an error, not a no-op).
+///   - Any principal is empty (icacls rejects blank principal strings).
+///
+/// The returned `Vec<String>` is appended directly to the icacls argument list
+/// after the file path. This is a pure function, compiled on all platforms for
+/// unit testing.
+#[cfg(any(windows, test))]
+pub fn build_icacls_acl_args(
+    entries: &[AclEntry],
+    path_for_error: &str,
+) -> Result<Vec<String>, FileError> {
+    if entries.is_empty() {
+        return Err(file_error(
+            FileErrorCode::Unspecified,
+            path_for_error,
+            "WindowsAcl entries list is empty — at least one ACE is required",
+        ));
+    }
+
+    let mut args: Vec<String> = Vec::with_capacity(entries.len() * 2);
+    for entry in entries {
+        if entry.principal.is_empty() {
+            return Err(file_error(
+                FileErrorCode::Unspecified,
+                path_for_error,
+                "ACL entry has an empty principal — a valid Windows user or group name is required",
+            ));
+        }
+        let perms = acl_mask_to_icacls_perms(entry.access_mask);
+        // AclEntryType::Allow = 0, AclEntryType::Deny = 1
+        // We treat any non-Deny value as Allow (proto default = Allow).
+        let is_deny = entry.entry_type == AclEntryType::Deny as i32;
+        if is_deny {
+            args.push("/deny".to_string());
+            args.push(format!("{}:{}", entry.principal, perms));
+        } else {
+            args.push("/grant:r".to_string());
+            args.push(format!("{}:{}", entry.principal, perms));
+        }
+    }
+    Ok(args)
+}
+
+/// Apply ACL arguments built by `build_icacls_acl_args` to `path` via
+/// the `icacls` subprocess. Returns 1 (items_modified) on success.
+///
+/// icacls exit codes:
+///   0 → success
+///   non-0 → failure; stderr/stdout contain the reason (icacls mixes the two).
+///
+/// Known failure modes surfaced as clear errors:
+///   - "No mapping between account names and security IDs" → invalid principal →
+///     PermissionDenied with an actionable message.
+///   - File not found (icacls output contains "No such file") → NotFound.
+///   - Any other non-zero exit → Io with the full icacls output.
+#[cfg(windows)]
+fn apply_icacls_acl(
+    path: &std::path::Path,
+    acl_args: &[String],
+    path_for_error: &str,
+) -> Result<u32, FileError> {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args(acl_args)
+        .output()
+        .map_err(|e| {
+            file_error(
+                FileErrorCode::Io,
+                path_for_error,
+                format!("failed to launch icacls: {e}"),
+            )
+        })?;
+
+    if output.status.success() {
+        return Ok(1);
+    }
+
+    // icacls writes messages to stdout (not stderr) in most cases.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}{stderr}");
+
+    // Classify the failure for a clear FileError.
+    if combined.contains("No mapping between account names") {
+        return Err(file_error(
+            FileErrorCode::PermissionDenied,
+            path_for_error,
+            format!(
+                "icacls: invalid principal — one or more ACL entries reference an unknown \
+                 user or group name. Full output: {combined}"
+            ),
+        ));
+    }
+    if combined.contains("No such file") || combined.contains("cannot find the file") {
+        return Err(file_error(
+            FileErrorCode::NotFound,
+            path_for_error,
+            format!("icacls: file not found. Output: {combined}"),
+        ));
+    }
+    Err(file_error(
+        FileErrorCode::Io,
+        path_for_error,
+        format!(
+            "icacls failed (exit {:?}): {combined}",
+            output.status.code()
+        ),
+    ))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -1320,7 +1520,7 @@ pub fn io_to_file_error(err: io::Error, path: &Path) -> FileError {
 #[cfg(test)]
 mod tests {
     use super::{cross_device_move_fallback, is_cross_device_error};
-    use ahand_protocol::FileMove;
+    use ahand_protocol::{AclEntry, AclEntryType, FileMove};
     use std::io;
     use std::path::Path;
 
@@ -1500,5 +1700,142 @@ mod tests {
             ahand_protocol::FileErrorCode::NotFound as i32,
             "NotFound kind must map to NotFound code"
         );
+    }
+
+    // ── build_icacls_acl_args / acl_mask_to_icacls_perms unit tests ──────────
+    // These run cross-platform because both functions are compiled under
+    // cfg(any(windows, test)).  They never invoke icacls — they only test the
+    // pure arg-building logic.
+
+    #[test]
+    fn acl_mask_full_control_produces_f() {
+        assert_eq!(super::acl_mask_to_icacls_perms(0x001F_01FF), "F");
+    }
+
+    #[test]
+    fn acl_mask_generic_all_produces_f() {
+        // GENERIC_ALL (0x10000000) maps to Full as well.
+        assert_eq!(super::acl_mask_to_icacls_perms(0x1000_0000), "F");
+    }
+
+    #[test]
+    fn acl_mask_modify_produces_m() {
+        assert_eq!(super::acl_mask_to_icacls_perms(0x0013_01BF), "M");
+    }
+
+    #[test]
+    fn acl_mask_read_execute_produces_rx() {
+        assert_eq!(super::acl_mask_to_icacls_perms(0x0012_00A9), "RX");
+    }
+
+    #[test]
+    fn acl_mask_read_produces_r() {
+        assert_eq!(super::acl_mask_to_icacls_perms(0x0012_0089), "R");
+    }
+
+    #[test]
+    fn acl_mask_write_produces_w() {
+        assert_eq!(super::acl_mask_to_icacls_perms(0x0012_0116), "W");
+    }
+
+    #[test]
+    fn acl_mask_unknown_produces_hex_fallback() {
+        // An unrecognised mask must produce a hex string icacls accepts.
+        let s = super::acl_mask_to_icacls_perms(0xDEAD_BEEF);
+        assert!(
+            s.starts_with("(0x") && s.ends_with(')'),
+            "unknown mask must render as (0x…): got {s}"
+        );
+        assert!(
+            s.to_uppercase().contains("DEADBEEF"),
+            "hex value must appear: {s}"
+        );
+    }
+
+    #[test]
+    fn build_icacls_acl_args_empty_entries_returns_error() {
+        let err = super::build_icacls_acl_args(&[], "/some/path").unwrap_err();
+        assert_eq!(err.code, ahand_protocol::FileErrorCode::Unspecified as i32);
+        assert!(
+            err.message.contains("empty"),
+            "error must mention 'empty': {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn build_icacls_acl_args_empty_principal_returns_error() {
+        let entry = AclEntry {
+            principal: String::new(),
+            access_mask: 0x001F_01FF,
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let err = super::build_icacls_acl_args(&[entry], "/p").unwrap_err();
+        assert_eq!(err.code, ahand_protocol::FileErrorCode::Unspecified as i32);
+        assert!(
+            err.message.contains("empty principal"),
+            "error must mention 'empty principal': {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn build_icacls_acl_args_allow_full_control() {
+        let entry = AclEntry {
+            principal: "DOMAIN\\user".to_string(),
+            access_mask: 0x001F_01FF, // Full control
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let args = super::build_icacls_acl_args(&[entry], "/p").unwrap();
+        assert_eq!(args, vec!["/grant:r", "DOMAIN\\user:F"]);
+    }
+
+    #[test]
+    fn build_icacls_acl_args_deny_read() {
+        let entry = AclEntry {
+            principal: "Everyone".to_string(),
+            access_mask: 0x0012_0089, // Read
+            entry_type: AclEntryType::Deny as i32,
+        };
+        let args = super::build_icacls_acl_args(&[entry], "/p").unwrap();
+        assert_eq!(args, vec!["/deny", "Everyone:R"]);
+    }
+
+    #[test]
+    fn build_icacls_acl_args_multiple_entries_in_order() {
+        let entries = vec![
+            AclEntry {
+                principal: "BUILTIN\\Administrators".to_string(),
+                access_mask: 0x001F_01FF, // Full
+                entry_type: AclEntryType::Allow as i32,
+            },
+            AclEntry {
+                principal: "Everyone".to_string(),
+                access_mask: 0x0012_0089, // Read
+                entry_type: AclEntryType::Deny as i32,
+            },
+        ];
+        let args = super::build_icacls_acl_args(&entries, "/p").unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "/grant:r",
+                "BUILTIN\\Administrators:F",
+                "/deny",
+                "Everyone:R",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_icacls_acl_args_unknown_mask_renders_hex() {
+        let entry = AclEntry {
+            principal: "TestUser".to_string(),
+            access_mask: 0x0000_0001, // unusual mask
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let args = super::build_icacls_acl_args(&[entry], "/p").unwrap();
+        assert_eq!(args[0], "/grant:r");
+        assert!(args[1].starts_with("TestUser:(0x"), "got: {}", args[1]);
     }
 }

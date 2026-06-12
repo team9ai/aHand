@@ -17,6 +17,7 @@ use ahand_protocol::{
 };
 // FileCreateSymlink is used in both #[cfg(unix)] and #[cfg(windows)] tests.
 // UnixPermission and file_chmod are only used in #[cfg(unix)] tests.
+// AclEntry, AclEntryType, WindowsAcl are used in #[cfg(windows)] ACL tests.
 #[cfg(any(unix, windows))]
 use ahand_protocol::FileCreateSymlink;
 #[cfg(unix)]
@@ -4494,3 +4495,178 @@ async fn windows_create_dir_symlink_creates_link() {
 //   map_symlink_error_generic_permission_denied_passes_through
 //   map_symlink_error_already_exists_passes_through
 //   map_symlink_error_not_found_passes_through
+
+// ── Windows ACL chmod integration tests ───────────────────────────────────
+//
+// These tests require a real Windows environment with icacls available.
+// The pure arg-builder (`build_icacls_acl_args` / `acl_mask_to_icacls_perms`)
+// is unit-tested in fs_ops.rs#[cfg(test)] and runs cross-platform.
+
+#[cfg(windows)]
+mod windows_acl_chmod {
+    use super::*;
+    use ahand_protocol::{AclEntry, AclEntryType, WindowsAcl, file_chmod};
+
+    /// Apply a grant-full-control ACE for the current user to a temp file,
+    /// then read back the ACL with icacls and assert the principal appears.
+    #[tokio::test]
+    async fn chmod_windows_grant_full_control_to_current_user() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_test.txt");
+        fs::write(&file, "acl").unwrap();
+
+        let username = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+
+        let req = FileRequest {
+            request_id: "acl-grant".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![AclEntry {
+                        principal: username.clone(),
+                        access_mask: 0x001F_01FF, // FILE_ALL_ACCESS → "F"
+                        entry_type: AclEntryType::Allow as i32,
+                    }],
+                })),
+            })),
+        };
+
+        let resp = mgr.handle(&req).await;
+        let result = expect_chmod(resp);
+        assert_eq!(result.items_modified, 1);
+
+        // Read back via icacls and assert the user's entry appears.
+        let out = std::process::Command::new("icacls")
+            .arg(&file)
+            .output()
+            .expect("icacls must be available on Windows CI");
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        let username_lower = username.to_lowercase();
+        assert!(
+            text.contains(&username_lower),
+            "icacls output must contain the granted user '{username_lower}': {text}"
+        );
+    }
+
+    /// Deny Everyone read on a file — verify 'Everyone' appears in icacls output
+    /// with a deny entry.
+    #[tokio::test]
+    async fn chmod_windows_deny_everyone_read() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_deny.txt");
+        fs::write(&file, "deny").unwrap();
+
+        // First grant the current user full control so we retain access
+        // even after denying Everyone.
+        let username = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+
+        let req = FileRequest {
+            request_id: "acl-deny".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![
+                        AclEntry {
+                            principal: username.clone(),
+                            access_mask: 0x001F_01FF, // Full control
+                            entry_type: AclEntryType::Allow as i32,
+                        },
+                        AclEntry {
+                            principal: "Everyone".to_string(),
+                            access_mask: 0x0012_0089, // Read
+                            entry_type: AclEntryType::Deny as i32,
+                        },
+                    ],
+                })),
+            })),
+        };
+
+        let resp = mgr.handle(&req).await;
+        let result = expect_chmod(resp);
+        assert_eq!(result.items_modified, 1);
+
+        let out = std::process::Command::new("icacls")
+            .arg(&file)
+            .output()
+            .expect("icacls must be available on Windows CI");
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        // icacls shows denied entries as "(DENY)" in some locales; check presence.
+        assert!(
+            text.contains("everyone") || text.contains("deny"),
+            "icacls output must reflect the deny ACE: {text}"
+        );
+    }
+
+    /// An invalid principal (a string that is not a resolvable account) must
+    /// produce a clear PermissionDenied FileError, not a generic Io.
+    #[tokio::test]
+    async fn chmod_windows_invalid_principal_returns_permission_denied() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_bad.txt");
+        fs::write(&file, "bad").unwrap();
+
+        let req = FileRequest {
+            request_id: "acl-invalid".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![AclEntry {
+                        principal: "THIS_ACCOUNT_DOES_NOT_EXIST_XYZ12345".to_string(),
+                        access_mask: 0x001F_01FF,
+                        entry_type: AclEntryType::Allow as i32,
+                    }],
+                })),
+            })),
+        };
+
+        let err = expect_error(mgr.handle(&req).await);
+        assert_eq!(
+            err.code,
+            FileErrorCode::PermissionDenied as i32,
+            "invalid principal must map to PermissionDenied; got: {:?}",
+            err
+        );
+        assert!(
+            err.message.contains("invalid principal") || err.message.contains("account"),
+            "error message must identify the cause; got: {}",
+            err.message
+        );
+    }
+
+    /// Empty entries list must be rejected with Unspecified before reaching icacls.
+    #[tokio::test]
+    async fn chmod_windows_empty_entries_returns_unspecified_error() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_empty.txt");
+        fs::write(&file, "empty").unwrap();
+
+        let req = FileRequest {
+            request_id: "acl-empty".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![],
+                })),
+            })),
+        };
+
+        let err = expect_error(mgr.handle(&req).await);
+        assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+    }
+
+    // Non-Windows arm: sending Windows ACL on a non-Windows platform returns
+    // Unspecified (no test needed here — the non-cfg(windows) arm in handle_chmod
+    // is exercised implicitly; this module is only compiled on Windows anyway).
+}
