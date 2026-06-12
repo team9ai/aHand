@@ -4507,8 +4507,12 @@ mod windows_acl_chmod {
     use super::*;
     use ahand_protocol::{AclEntry, AclEntryType, WindowsAcl, file_chmod};
 
-    /// Apply a grant-full-control ACE for the current user to a temp file,
-    /// then read back the ACL with icacls and assert the principal appears.
+    /// Apply a single grant-full-control ACE for the current user to a temp
+    /// file. Because the entry list is the COMPLETE effective DACL
+    /// (`/inheritance:r` strips inherited ACEs), readback must show the user
+    /// AND no surviving inherited grant (no `(I)` marker, and the broad
+    /// `BUILTIN\Users` / `Everyone` principals are gone — owner-only really is
+    /// owner-only).
     #[tokio::test]
     async fn chmod_windows_grant_full_control_to_current_user() {
         let dir = TempDir::new().unwrap();
@@ -4549,10 +4553,34 @@ mod windows_acl_chmod {
             text.contains(&username_lower),
             "icacls output must contain the granted user '{username_lower}': {text}"
         );
+        // C1+C2: inheritance was stripped, so the DACL is owner-only — no
+        // inherited ACE (`(I)`) and no broad principals survive.
+        assert!(
+            !text.contains("(i)"),
+            "inheritance must be stripped (no inherited ACE): {text}"
+        );
+        assert!(
+            !text.contains("builtin\\users"),
+            "owner-only DACL must not retain BUILTIN\\Users: {text}"
+        );
+        assert!(
+            !text.contains("everyone"),
+            "owner-only DACL must not retain Everyone: {text}"
+        );
     }
 
-    /// Deny Everyone read on a file — verify 'Everyone' appears in icacls output
-    /// with a deny entry.
+    /// Deny Everyone read on a file. With `/inheritance:r` the supplied entries
+    /// are the COMPLETE effective DACL, so this proves the actual denial:
+    ///   1. Every readback line mentioning "everyone" is a DENY line
+    ///      (Everyone appears ONLY in a deny context — no surviving ALLOW).
+    ///   2. There is at least one such Everyone DENY line.
+    ///   3. No inherited broad ALLOW survives (the inheritance marker `(I)`
+    ///      is absent — inheritance was stripped).
+    ///
+    /// icacls output-shape assumption: `icacls <file>` prints one principal per
+    /// line; a denied ACE renders the principal with a `(DENY)` token, e.g.
+    /// `Everyone:(DENY)(R)`, while an allowed ACE has no `(DENY)` token and an
+    /// inherited ACE carries an `(I)` token. We lowercase before matching.
     #[tokio::test]
     async fn chmod_windows_deny_everyone_read() {
         let dir = TempDir::new().unwrap();
@@ -4596,11 +4624,85 @@ mod windows_acl_chmod {
             .output()
             .expect("icacls must be available on Windows CI");
         let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-        // icacls shows denied entries as "(DENY)" in some locales; check presence.
+
+        // Collect the lines that reference Everyone.
+        let everyone_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("everyone"))
+            .collect();
+
+        // (2) Everyone must appear at all — the deny ACE was applied.
         assert!(
-            text.contains("everyone") || text.contains("deny"),
-            "icacls output must reflect the deny ACE: {text}"
+            !everyone_lines.is_empty(),
+            "icacls output must reference Everyone: {text}"
         );
+        // (1) Every Everyone line must be a DENY — no surviving Everyone ALLOW.
+        for line in &everyone_lines {
+            assert!(
+                line.contains("(deny)"),
+                "Everyone must appear ONLY in a DENY context (no surviving ALLOW); \
+                 offending line: {line:?}; full output: {text}"
+            );
+        }
+        // (3) No inherited ACE survives — `/inheritance:r` stripped inheritance,
+        // so the `(I)` inherited marker must be absent from the DACL.
+        assert!(
+            !text.contains("(i)"),
+            "inheritance must be stripped — no inherited ACE may survive: {text}"
+        );
+    }
+
+    /// Recursive Windows ACL chmod (`/T /C`) must apply to a directory and its
+    /// children, and `items_modified` must reflect icacls's processed count
+    /// (more than 1 for a populated tree). Parity with the Unix recursive arm.
+    #[tokio::test]
+    async fn chmod_windows_recursive_applies_to_children() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let sub = root.join("acl_rec");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("a.txt"), "a").unwrap();
+        fs::write(sub.join("b.txt"), "b").unwrap();
+
+        let username = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+
+        let req = FileRequest {
+            request_id: "acl-rec".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: sub.to_string_lossy().into_owned(),
+                recursive: true,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![AclEntry {
+                        principal: username.clone(),
+                        access_mask: 0x001F_01FF, // Full control
+                        entry_type: AclEntryType::Allow as i32,
+                    }],
+                })),
+            })),
+        };
+
+        let resp = mgr.handle(&req).await;
+        let result = expect_chmod(resp);
+        // The dir + 2 children → at least 3 processed entries.
+        assert!(
+            result.items_modified >= 3,
+            "recursive chmod must process the dir and its children; got {}",
+            result.items_modified
+        );
+
+        // The child files must now carry the user's ACE.
+        for child in ["a.txt", "b.txt"] {
+            let out = std::process::Command::new("icacls")
+                .arg(sub.join(child))
+                .output()
+                .expect("icacls must be available on Windows CI");
+            let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            assert!(
+                text.contains(&username.to_lowercase()),
+                "recursive ACL must reach child {child}: {text}"
+            );
+        }
     }
 
     /// An invalid principal (a string that is not a resolvable account) must
@@ -4664,6 +4766,41 @@ mod windows_acl_chmod {
 
         let err = expect_error(mgr.handle(&req).await);
         assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+    }
+
+    /// I4: a malformed principal (one containing ':') must be rejected with
+    /// InvalidPath BEFORE any icacls subprocess launch (defense-in-depth).
+    #[tokio::test]
+    async fn chmod_windows_malformed_principal_rejected_before_icacls() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_malformed.txt");
+        fs::write(&file, "x").unwrap();
+
+        let req = FileRequest {
+            request_id: "acl-malformed".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![AclEntry {
+                        // ':' would smuggle a perm field into the principal.
+                        principal: "Everyone:F".to_string(),
+                        access_mask: 0x001F_01FF,
+                        entry_type: AclEntryType::Allow as i32,
+                    }],
+                })),
+            })),
+        };
+
+        let err = expect_error(mgr.handle(&req).await);
+        assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+        assert!(
+            err.message.contains("malformed principal"),
+            "got: {}",
+            err.message
+        );
     }
 
     // Non-Windows arm: sending Windows ACL on a non-Windows platform returns

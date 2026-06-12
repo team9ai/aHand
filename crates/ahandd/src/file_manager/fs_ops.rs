@@ -1195,10 +1195,20 @@ pub async fn handle_chmod(req: &FileChmod, resolved: &Path) -> Result<FileChmodR
                 // Apply Windows ACLs via icacls subprocess, consistent with the
                 // `secure_file::restrict_to_owner` precedent in ahand-platform.
                 //
+                // Semantics: `WindowsAcl` is a FULL DACL REPLACEMENT — the
+                // file's effective DACL becomes EXACTLY the supplied entries
+                // (a set/replace operation, matching chmod and the
+                // `restrict_to_owner` precedent), NOT additive over inherited
+                // ACEs. `build_icacls_acl_args` prepends `/inheritance:r` to
+                // strip inherited ACEs first, so "owner-only" (a single
+                // `owner:F` allow) actually yields owner-only and a DENY is
+                // meaningful. DENY masks are exact-bit (deny R denies only the
+                // read bits) — the caller controls the complete effective ACL.
+                //
                 // Design: the proto `WindowsAcl` exposes a structured list of
-                // `AclEntry { principal, access_mask, entry_type }` — one icacls
-                // invocation per ACE is straightforward and keeps the subprocess
-                // error granular (which principal/right failed).
+                // `AclEntry { principal, access_mask, entry_type }` applied in a
+                // single icacls invocation (`/inheritance:r` then per-entry
+                // `/grant:r`/`/deny`), with `/T /C` appended when recursive.
                 //
                 // Limitation (proto note): `access_mask` maps to icacls
                 // permission letters via `acl_mask_to_icacls_perms`. Callers
@@ -1209,8 +1219,10 @@ pub async fn handle_chmod(req: &FileChmod, resolved: &Path) -> Result<FileChmodR
                 let path_str = resolved.to_string_lossy().into_owned();
 
                 // Build the icacls argument list from ACE entries. This is a
-                // pure function so it is independently unit-tested.
-                let acl_args = build_icacls_acl_args(&acl.entries, &path_str)?;
+                // pure function so it is independently unit-tested. Honors
+                // `req.recursive` (adds `/T /C`) and rejects malformed
+                // principals before any subprocess launch.
+                let acl_args = build_icacls_acl_args(&acl.entries, req.recursive, &path_str)?;
 
                 let path_owned = resolved.to_path_buf();
                 let items = tokio::task::spawn_blocking(move || -> Result<u32, FileError> {
@@ -1336,15 +1348,74 @@ pub fn acl_mask_to_icacls_perms(access_mask: u32) -> String {
     }
 }
 
-/// Build the icacls argument segments for a list of ACL entries.
+/// Reject a principal token that cannot be safely embedded in an icacls
+/// `{principal}:{perms}` ACE argument.
 ///
-/// Each `AclEntry` produces either:
-///   - ALLOW: `/grant:r`, `{principal}:{perms}`
+/// `Command::args` already prevents shell injection and prevents a malicious
+/// principal from being split into a second `/grant`/`/deny` flag (each arg is
+/// passed verbatim). This is defense-in-depth on top of that: a principal that
+/// contains a `:` would shift where icacls thinks the permission field starts
+/// (`Everyone:F` smuggled into the principal yields `Everyone:F:R`); whitespace
+/// is never part of a valid account token and a leading `/` looks like an
+/// icacls flag. Rejecting these up front beats relying on icacls's own parser
+/// to error on a corrupted ACE token.
+///
+/// Returns `Ok(())` for a well-formed principal (e.g. `BUILTIN\Users`,
+/// `DOMAIN\user`, `Everyone`) and a `FileError` (InvalidPath, matching the
+/// file's existing path-style validation errors) otherwise.
+#[cfg(any(windows, test))]
+fn validate_principal(principal: &str, path_for_error: &str) -> Result<(), FileError> {
+    if principal.is_empty() {
+        return Err(file_error(
+            FileErrorCode::Unspecified,
+            path_for_error,
+            "ACL entry has an empty principal — a valid Windows user or group name is required",
+        ));
+    }
+    if principal.contains(':')
+        || principal.chars().any(char::is_whitespace)
+        || principal.starts_with('/')
+    {
+        return Err(file_error(
+            FileErrorCode::InvalidPath,
+            path_for_error,
+            format!(
+                "ACL entry has a malformed principal '{principal}' — a principal must not \
+                 contain ':' or whitespace or start with '/' (these corrupt the icacls ACE \
+                 token or look like icacls flags)"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Build the icacls argument segments that REPLACE the file's effective DACL
+/// with exactly the supplied ACL entries (a set/replace operation, matching
+/// chmod semantics and the `secure_file::restrict_to_owner` precedent).
+///
+/// The returned args ALWAYS begin with `/inheritance:r`, which strips inherited
+/// ACEs so the entry list is the *complete* effective DACL. Without this an
+/// "owner-only" request (a single `owner:F` allow) would leave inherited broad
+/// grants in place, and a DENY would be meaningless because inherited ALLOWs
+/// would still apply. With it:
+///   - "owner-only" (single `owner:F` allow) actually yields owner-only.
+///   - A DENY is meaningful: no inherited broad grant survives to be overridden.
+///
+/// Each `AclEntry` then produces either:
+///   - ALLOW: `/grant:r`, `{principal}:{perms}` (`:r` replaces any prior grant
+///     for that principal rather than accumulating).
 ///   - DENY:  `/deny`,    `{principal}:{perms}`
+///
+/// DENY masks are exact-bit: `deny R` denies only the read bits, nothing more —
+/// the caller controls the complete effective ACL.
+///
+/// When `recursive` is true the args also include `/T` (recurse into the
+/// directory tree) and `/C` (continue on per-file errors), giving parity with
+/// the Unix recursive chmod arm.
 ///
 /// Returns an error if:
 ///   - The entries list is empty (nothing to apply is an error, not a no-op).
-///   - Any principal is empty (icacls rejects blank principal strings).
+///   - Any principal is empty or malformed (see `validate_principal`).
 ///
 /// The returned `Vec<String>` is appended directly to the icacls argument list
 /// after the file path. This is a pure function, compiled on all platforms for
@@ -1352,6 +1423,7 @@ pub fn acl_mask_to_icacls_perms(access_mask: u32) -> String {
 #[cfg(any(windows, test))]
 pub fn build_icacls_acl_args(
     entries: &[AclEntry],
+    recursive: bool,
     path_for_error: &str,
 ) -> Result<Vec<String>, FileError> {
     if entries.is_empty() {
@@ -1362,15 +1434,18 @@ pub fn build_icacls_acl_args(
         ));
     }
 
-    let mut args: Vec<String> = Vec::with_capacity(entries.len() * 2);
+    // `/inheritance:r` makes the entry list the COMPLETE effective DACL by
+    // stripping inherited ACEs first — WindowsAcl is a full DACL replacement.
+    let mut args: Vec<String> = Vec::with_capacity(entries.len() * 2 + 3);
+    args.push("/inheritance:r".to_string());
+    // Recurse the subtree (continue past per-file errors) for parity with the
+    // Unix recursive chmod arm.
+    if recursive {
+        args.push("/T".to_string());
+        args.push("/C".to_string());
+    }
     for entry in entries {
-        if entry.principal.is_empty() {
-            return Err(file_error(
-                FileErrorCode::Unspecified,
-                path_for_error,
-                "ACL entry has an empty principal — a valid Windows user or group name is required",
-            ));
-        }
+        validate_principal(&entry.principal, path_for_error)?;
         let perms = acl_mask_to_icacls_perms(entry.access_mask);
         // AclEntryType::Allow = 0, AclEntryType::Deny = 1
         // We treat any non-Deny value as Allow (proto default = Allow).
@@ -1386,8 +1461,39 @@ pub fn build_icacls_acl_args(
     Ok(args)
 }
 
+/// Parse the trailing "Successfully processed N files" count from icacls
+/// stdout into `items_modified`.
+///
+/// icacls prints a final summary line such as:
+///   `Successfully processed 1 files; Failed processing 0 files`
+/// (the noun is always plural "files", even for a count of 1). When `/T`
+/// recurses a directory the count reflects every processed entry.
+///
+/// Returns the parsed count, or `1` as a fallback if the summary cannot be
+/// found/parsed (a successful icacls run touched at least the target). Pure
+/// function, compiled on all platforms for unit testing.
+#[cfg(any(windows, test))]
+pub fn parse_icacls_items_processed(output: &str) -> u32 {
+    for line in output.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("Successfully processed ") else {
+            continue;
+        };
+        // `rest` looks like "N files; Failed processing M files" — take the
+        // first whitespace-delimited token as N.
+        if let Some(tok) = rest.split_whitespace().next()
+            && let Ok(n) = tok.parse::<u32>()
+        {
+            return n;
+        }
+    }
+    1
+}
+
 /// Apply ACL arguments built by `build_icacls_acl_args` to `path` via
-/// the `icacls` subprocess. Returns 1 (items_modified) on success.
+/// the `icacls` subprocess. On success returns `items_modified` parsed from
+/// icacls's "Successfully processed N files" summary (fallback 1) — when the
+/// request is recursive (`/T`) this reflects every processed entry.
 ///
 /// icacls exit codes:
 ///   0 → success
@@ -1417,7 +1523,8 @@ fn apply_icacls_acl(
         })?;
 
     if output.status.success() {
-        return Ok(1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Ok(parse_icacls_items_processed(&stdout));
     }
 
     // icacls writes messages to stdout (not stderr) in most cases.
@@ -1754,7 +1861,7 @@ mod tests {
 
     #[test]
     fn build_icacls_acl_args_empty_entries_returns_error() {
-        let err = super::build_icacls_acl_args(&[], "/some/path").unwrap_err();
+        let err = super::build_icacls_acl_args(&[], false, "/some/path").unwrap_err();
         assert_eq!(err.code, ahand_protocol::FileErrorCode::Unspecified as i32);
         assert!(
             err.message.contains("empty"),
@@ -1770,7 +1877,7 @@ mod tests {
             access_mask: 0x001F_01FF,
             entry_type: AclEntryType::Allow as i32,
         };
-        let err = super::build_icacls_acl_args(&[entry], "/p").unwrap_err();
+        let err = super::build_icacls_acl_args(&[entry], false, "/p").unwrap_err();
         assert_eq!(err.code, ahand_protocol::FileErrorCode::Unspecified as i32);
         assert!(
             err.message.contains("empty principal"),
@@ -1786,8 +1893,9 @@ mod tests {
             access_mask: 0x001F_01FF, // Full control
             entry_type: AclEntryType::Allow as i32,
         };
-        let args = super::build_icacls_acl_args(&[entry], "/p").unwrap();
-        assert_eq!(args, vec!["/grant:r", "DOMAIN\\user:F"]);
+        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
+        // /inheritance:r is always prepended (full DACL replacement).
+        assert_eq!(args, vec!["/inheritance:r", "/grant:r", "DOMAIN\\user:F"]);
     }
 
     #[test]
@@ -1797,8 +1905,8 @@ mod tests {
             access_mask: 0x0012_0089, // Read
             entry_type: AclEntryType::Deny as i32,
         };
-        let args = super::build_icacls_acl_args(&[entry], "/p").unwrap();
-        assert_eq!(args, vec!["/deny", "Everyone:R"]);
+        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
+        assert_eq!(args, vec!["/inheritance:r", "/deny", "Everyone:R"]);
     }
 
     #[test]
@@ -1815,10 +1923,11 @@ mod tests {
                 entry_type: AclEntryType::Deny as i32,
             },
         ];
-        let args = super::build_icacls_acl_args(&entries, "/p").unwrap();
+        let args = super::build_icacls_acl_args(&entries, false, "/p").unwrap();
         assert_eq!(
             args,
             vec![
+                "/inheritance:r",
                 "/grant:r",
                 "BUILTIN\\Administrators:F",
                 "/deny",
@@ -1834,8 +1943,150 @@ mod tests {
             access_mask: 0x0000_0001, // unusual mask
             entry_type: AclEntryType::Allow as i32,
         };
-        let args = super::build_icacls_acl_args(&[entry], "/p").unwrap();
-        assert_eq!(args[0], "/grant:r");
-        assert!(args[1].starts_with("TestUser:(0x"), "got: {}", args[1]);
+        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
+        // args[0] is /inheritance:r, args[1] is /grant:r, args[2] is the ACE.
+        assert_eq!(args[0], "/inheritance:r");
+        assert_eq!(args[1], "/grant:r");
+        assert!(args[2].starts_with("TestUser:(0x"), "got: {}", args[2]);
+    }
+
+    // ── C1+C2: /inheritance:r always prepended (full DACL replacement) ───────
+
+    #[test]
+    fn build_icacls_acl_args_always_strips_inheritance_first() {
+        let entry = AclEntry {
+            principal: "BUILTIN\\Users".to_string(),
+            access_mask: 0x001F_01FF,
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("/inheritance:r"),
+            "the DACL replacement must strip inheritance first: {args:?}"
+        );
+    }
+
+    // ── I2: recursive maps to /T /C (parity with the Unix arm) ───────────────
+
+    #[test]
+    fn build_icacls_acl_args_recursive_adds_t_and_c() {
+        let entry = AclEntry {
+            principal: "DOMAIN\\user".to_string(),
+            access_mask: 0x001F_01FF,
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let args = super::build_icacls_acl_args(&[entry], true, "/p").unwrap();
+        assert_eq!(
+            args,
+            vec!["/inheritance:r", "/T", "/C", "/grant:r", "DOMAIN\\user:F"]
+        );
+    }
+
+    #[test]
+    fn build_icacls_acl_args_non_recursive_has_no_t_or_c() {
+        let entry = AclEntry {
+            principal: "DOMAIN\\user".to_string(),
+            access_mask: 0x001F_01FF,
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
+        assert!(
+            !args.iter().any(|a| a == "/T" || a == "/C"),
+            "non-recursive must not recurse: {args:?}"
+        );
+    }
+
+    // ── I4: malformed principals are rejected before any subprocess launch ───
+
+    #[test]
+    fn build_icacls_acl_args_rejects_principal_with_colon() {
+        // "Everyone:F" would smuggle a permission field into the principal,
+        // shifting where icacls thinks perms begin.
+        let entry = AclEntry {
+            principal: "Everyone:F".to_string(),
+            access_mask: 0x001F_01FF,
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let err = super::build_icacls_acl_args(&[entry], false, "/p").unwrap_err();
+        assert_eq!(err.code, ahand_protocol::FileErrorCode::InvalidPath as i32);
+        assert!(
+            err.message.contains("malformed principal"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn build_icacls_acl_args_rejects_principal_with_whitespace() {
+        let entry = AclEntry {
+            principal: "Local Service".to_string(),
+            access_mask: 0x001F_01FF,
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let err = super::build_icacls_acl_args(&[entry], false, "/p").unwrap_err();
+        assert_eq!(err.code, ahand_protocol::FileErrorCode::InvalidPath as i32);
+    }
+
+    #[test]
+    fn build_icacls_acl_args_rejects_principal_starting_with_slash() {
+        let entry = AclEntry {
+            principal: "/grant".to_string(),
+            access_mask: 0x001F_01FF,
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let err = super::build_icacls_acl_args(&[entry], false, "/p").unwrap_err();
+        assert_eq!(err.code, ahand_protocol::FileErrorCode::InvalidPath as i32);
+    }
+
+    #[test]
+    fn build_icacls_acl_args_accepts_valid_domain_principal() {
+        // A normal `DOMAIN\account` principal must NOT be rejected.
+        let entry = AclEntry {
+            principal: "BUILTIN\\Users".to_string(),
+            access_mask: 0x001F_01FF,
+            entry_type: AclEntryType::Allow as i32,
+        };
+        let args = super::build_icacls_acl_args(&[entry], false, "/p").unwrap();
+        assert_eq!(args, vec!["/inheritance:r", "/grant:r", "BUILTIN\\Users:F"]);
+    }
+
+    // ── I3: parse_icacls_items_processed ─────────────────────────────────────
+
+    #[test]
+    fn parse_icacls_items_single_file() {
+        let out = "processed file: C:\\tmp\\a.txt\n\
+                   Successfully processed 1 files; Failed processing 0 files\n";
+        assert_eq!(super::parse_icacls_items_processed(out), 1);
+    }
+
+    #[test]
+    fn parse_icacls_items_recursive_many() {
+        let out = "processed file: C:\\tmp\\dir\n\
+                   processed file: C:\\tmp\\dir\\a.txt\n\
+                   processed file: C:\\tmp\\dir\\b.txt\n\
+                   Successfully processed 3 files; Failed processing 0 files\n";
+        assert_eq!(super::parse_icacls_items_processed(out), 3);
+    }
+
+    #[test]
+    fn parse_icacls_items_with_failures_uses_success_count() {
+        let out = "Successfully processed 5 files; Failed processing 2 files\n";
+        assert_eq!(super::parse_icacls_items_processed(out), 5);
+    }
+
+    #[test]
+    fn parse_icacls_items_unparseable_falls_back_to_one() {
+        // Output without a recognizable summary line falls back to 1.
+        assert_eq!(super::parse_icacls_items_processed(""), 1);
+        assert_eq!(
+            super::parse_icacls_items_processed("some unrelated icacls noise\n"),
+            1
+        );
+        // Summary present but the count token is non-numeric → fallback.
+        assert_eq!(
+            super::parse_icacls_items_processed("Successfully processed many files\n"),
+            1
+        );
     }
 }
