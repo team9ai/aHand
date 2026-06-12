@@ -1489,26 +1489,27 @@ mod tests {
 
     /// Returns a shell command string that creates a marker file at `path`.
     ///
-    /// Unix:    `printf X > <path>` via sh  — writes "X", no trailing newline.
-    /// Windows: `echo X> <path>` via cmd.exe — cmd `echo` would prepend a trailing
-    ///          space before `>`; by writing `echo X>` (no space before `>`) the
-    ///          redirect is still parsed correctly and the file is created.
+    /// Unix:    `printf X > '<path>'` via sh  — single-quotes the path so names
+    ///          with spaces are handled correctly.
+    /// Windows: `echo X> "<path>"` via COMSPEC (typically cmd.exe) — double-quotes
+    ///          the path so names with spaces work; no space before `>` so cmd.exe
+    ///          doesn't include a trailing space in the redirect token.
     ///          Tests assert only `path.exists()`, not exact content, so the
     ///          trailing CRLF cmd adds is irrelevant.
     fn write_marker_command(path: &std::path::Path) -> String {
         #[cfg(unix)]
         {
-            format!("printf X > {}", path.display())
+            format!("printf X > '{}'", path.display())
         }
         #[cfg(windows)]
         {
             // No space before `>` so cmd.exe doesn't include a trailing space in
             // the redirect token.  The file is created; content is not asserted.
-            format!("echo X> {}", path.display())
+            format!("echo X> \"{}\"", path.display())
         }
         #[cfg(not(any(unix, windows)))]
         {
-            format!("printf X > {}", path.display())
+            format!("printf X > '{}'", path.display())
         }
     }
 
@@ -1519,7 +1520,10 @@ mod tests {
         approval_decision: Option<&str>,
     ) -> super::NodeInvokeRequest {
         let mut params = serde_json::Map::new();
-        params.insert("command".into(), json!(["sh"]));
+        // rawCommand is set so use_direct=false; the shell drives execution and the
+        // "command" array is ignored.  A non-empty placeholder is required because
+        // handle_invoke rejects an empty command array before reaching the run path.
+        params.insert("command".into(), json!(["<rawCommand>"]));
         params.insert("rawCommand".into(), json!(raw_command));
         params.insert("sessionKey".into(), json!(session_key));
         params.insert("runId".into(), json!("run-1"));
@@ -1548,7 +1552,9 @@ mod tests {
     async fn inactive_session_denies_system_run_without_execution() {
         let (handler, _session_mgr, _approval_mgr, _broadcast_tx) = test_handler(1);
         let output_path = unique_output_path();
-        let command = format!("printf denied > {}", output_path.display());
+        // Command never executes (session inactive); write_marker_command keeps
+        // the helper cross-platform-portable for consistency.
+        let command = write_marker_command(&output_path);
 
         let (result, event) = handler
             .handle_invoke(system_run_invoke("session-1", command, None, None))
@@ -1652,7 +1658,9 @@ mod tests {
             .await;
         let mut approval_rx = approval_broadcast_tx.subscribe();
         let output_path = unique_output_path();
-        let command = format!("printf should-not-run > {}", output_path.display());
+        // Command is denied before execution; write_marker_command keeps the
+        // helper cross-platform-portable and consistent with sibling tests.
+        let command = write_marker_command(&output_path);
 
         let resolver = tokio::spawn(async move {
             let envelope = approval_rx.recv().await.unwrap();
@@ -1697,7 +1705,9 @@ mod tests {
             .await;
         let mut approval_rx = approval_broadcast_tx.subscribe();
         let output_path = unique_output_path();
-        let command = format!("printf should-not-run > {}", output_path.display());
+        // Command times out before execution; write_marker_command keeps the
+        // helper cross-platform-portable and consistent with sibling tests.
+        let command = write_marker_command(&output_path);
 
         let (result, event) = handler
             .handle_invoke(system_run_invoke("session-1", command, None, None))
