@@ -288,31 +288,56 @@ fn canonicalize_no_follow(path: &Path) -> io::Result<PathBuf> {
 /// `case_sensitive: false` on Windows.  All other `MatchOptions` preserve the
 /// existing behaviour (`require_literal_separator: false`,
 /// `require_literal_leading_dot: false`).
+///
+/// ## Non-ASCII case folding on Windows
+///
+/// The glob crate's `case_sensitive: false` only folds ASCII characters, so a
+/// denylist pattern containing non-ASCII letters (é/É, ö/Ö, Cyrillic, etc.)
+/// could be bypassed by a case variant on NTFS (which uses the full Unicode
+/// upcase table).  To close this gap, on Windows we pre-lowercase **both** the
+/// pattern and the path with Rust's Unicode-aware `str::to_lowercase` before
+/// matching (and then match case-sensitively).  Rust's `to_lowercase` applies
+/// Unicode simple case-fold (é→é, É→é, Ö→ö, Cyrillic, etc.), which is strictly
+/// better than ASCII-only folding.  Note that this is Unicode simple-fold, not
+/// full NTFS upcase-table parity, but for a denylist the security direction is
+/// fail-closed: an unrecognised fold variant is still passed through (worst case
+/// a denylist miss), whereas the old ASCII-only code guaranteed the bypass for
+/// any non-ASCII case pair.  We keep `case_sensitive: false` as belt-and-
+/// suspenders for the ASCII range.
 fn glob_match(pattern: &str, path: &str) -> bool {
     #[cfg(windows)]
-    let opts = glob::MatchOptions {
-        case_sensitive: false,
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
-    };
-    #[cfg(not(windows))]
-    let opts = glob::MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: false,
-        require_literal_leading_dot: false,
-    };
-
-    match glob::Pattern::new(pattern) {
-        Ok(p) => p.matches_with(path, opts),
-        Err(_) => {
-            // Pattern is invalid (e.g. unmatched `[`): fall back to literal
-            // equality so we don't silently allow/deny everything.
-            #[cfg(windows)]
-            {
-                pattern.eq_ignore_ascii_case(path)
+    {
+        // Pre-fold both sides with Unicode-aware to_lowercase so that non-ASCII
+        // case pairs (é/É, ö/Ö, Cyrillic, etc.) are folded before the glob
+        // crate's ASCII-only case_sensitive:false matching runs over them.
+        let pattern_lower = pattern.to_lowercase();
+        let path_lower = path.to_lowercase();
+        let opts = glob::MatchOptions {
+            case_sensitive: false, // belt-and-suspenders for ASCII range
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        };
+        return match glob::Pattern::new(&pattern_lower) {
+            Ok(p) => p.matches_with(&path_lower, opts),
+            Err(_) => {
+                // Pattern is invalid (e.g. unmatched `[`): fall back to
+                // Unicode-folded equality.
+                pattern_lower == path_lower
             }
-            #[cfg(not(windows))]
-            {
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let opts = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: false,
+            require_literal_leading_dot: false,
+        };
+        match glob::Pattern::new(pattern) {
+            Ok(p) => p.matches_with(path, opts),
+            Err(_) => {
+                // Pattern is invalid (e.g. unmatched `[`): fall back to literal
+                // equality so we don't silently allow/deny everything.
                 pattern == path
             }
         }
@@ -714,6 +739,37 @@ mod tests {
         assert!(
             !glob_match("/home/User/**", "/home/user/file.txt"),
             "Unix glob must be case-sensitive for inner components"
+        );
+    }
+
+    /// Security: on Windows, non-ASCII case variants (é/É, ö/Ö) in denylist
+    /// patterns must block the case-folded path variant.  The glob crate's
+    /// `case_sensitive: false` only folds ASCII; our Unicode-aware pre-fold via
+    /// `to_lowercase` closes the gap.  This is Unicode simple-fold (not full NTFS
+    /// upcase-table parity), strictly better than ASCII-only — fail-closed for
+    /// denylists.
+    #[cfg(windows)]
+    #[test]
+    fn windows_glob_match_non_ascii_case_fold() {
+        // é (U+00E9) / É (U+00C9): pattern uses uppercase É, path uses lowercase é.
+        assert!(
+            glob_match(r"C:\Users\ÉTÉ\**", r"C:\Users\été\file.txt"),
+            "denylist pattern with É must block path with é (Unicode fold)"
+        );
+        // Reversed: lowercase pattern, uppercase path variant.
+        assert!(
+            glob_match(r"C:\Users\été\**", r"C:\Users\ÉTÉ\file.txt"),
+            "denylist pattern with é must block path with É (Unicode fold)"
+        );
+        // ö (U+00F6) / Ö (U+00D6)
+        assert!(
+            glob_match(r"C:\Users\Öffnung\**", r"C:\Users\öffnung\secret.txt"),
+            "denylist pattern with Ö must block path with ö (Unicode fold)"
+        );
+        // ASCII range must still work (belt-and-suspenders).
+        assert!(
+            glob_match(r"C:\Users\X\**", r"c:\users\x\file.txt"),
+            "ASCII case-insensitive match must still work on Windows"
         );
     }
 }

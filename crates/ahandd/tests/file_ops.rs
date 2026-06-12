@@ -284,7 +284,7 @@ fn expect_symlink(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileCre
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn expect_chmod(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileChmodResult {
     match resp.result {
         Some(file_response::Result::Chmod(r)) => r,

@@ -1401,6 +1401,14 @@ fn sanitize_env(overrides: &HashMap<String, String>) -> HashMap<String, String> 
         // Auto-sourced by bash when invoked non-interactively (e.g. via $SHELL);
         // allows arbitrary code injection into any bash subprocess the daemon spawns.
         "BASH_ENV",
+        // On Windows, cmd.exe consults PATHEXT to resolve the extension of a bare
+        // command name; a cloud JobRequest could override it to make an approved bare
+        // command resolve to an attacker-controlled script extension instead of .EXE.
+        "PATHEXT",
+        // On Windows, %COMSPEC% names the command interpreter; a child-env override
+        // redirects shell spawns to an attacker-controlled binary when the daemon
+        // invokes the shell by that variable rather than a hard-coded path.
+        "COMSPEC",
     ];
 
     const BLOCKED_PREFIXES: &[&str] = &["DYLD_", "LD_"];
@@ -2052,6 +2060,50 @@ mod tests {
         assert!(
             !result.contains_key("BASH_ENV"),
             "BASH_ENV must be stripped by sanitize_env"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_pathext() {
+        // On Windows, cmd.exe uses PATHEXT to resolve a bare command's extension;
+        // a cloud JobRequest could hide an env override that changes which
+        // script/exe an approved bare command resolves to.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("PATHEXT".to_string(), ".BAT;.CMD;.VBS".to_string());
+        overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert!(
+            !result.contains_key("PATHEXT"),
+            "PATHEXT must be stripped by sanitize_env"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("ok"),
+            "non-blocked variables must pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_comspec() {
+        // A child-env COMSPEC override redirects the command interpreter
+        // %COMSPEC% resolves to, allowing an attacker-controlled binary to be
+        // invoked as the shell.
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("COMSPEC".to_string(), r"C:\attacker\evil.exe".to_string());
+        overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert!(
+            !result.contains_key("COMSPEC"),
+            "COMSPEC must be stripped by sanitize_env"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("ok"),
+            "non-blocked variables must pass through"
         );
     }
 
