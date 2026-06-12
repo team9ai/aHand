@@ -355,6 +355,44 @@ impl DaemonHandle {
     /// Job, file, and app-tool paths all broadcast here. Each subscriber
     /// receives every request independently (broadcast semantics). Lagged
     /// subscribers automatically skip missed messages rather than blocking.
+    ///
+    /// # When requests appear
+    ///
+    /// Under the builder default [`SessionMode::AutoAccept`], approval requests
+    /// fire **only** for app tools registered with `requires_approval: true`
+    /// (and for policy-escalated file operations). Under
+    /// [`SessionMode::Strict`] every job, file, and app-tool call goes through
+    /// approval. An embedder subscribing under the default configuration may
+    /// therefore never receive a request unless it registers tools with
+    /// `requires_approval: true` or explicitly switches to `Strict` mode.
+    ///
+    /// ## `job_id` namespaces
+    ///
+    /// The `job_id` field on each [`ApprovalRequest`] is already namespaced:
+    ///
+    /// 1. **Real jobs** — raw `job_id` from the cloud `JobRequest`; tool is
+    ///    whatever the cloud sent (e.g. `"bash"`, `"computer"`).
+    /// 2. **File requests** — `"file-req:{request_id}"`; tool is `"file"`.
+    ///    The prefix prevents a `request_id` from evicting a same-named real
+    ///    job entry.
+    /// 3. **App-tool calls** — `"app-tool:{tool_call_id}"`; tool is
+    ///    `"app:{name}"`. The prefix prevents a cloud-chosen `tool_call_id`
+    ///    from colliding with a real job's pending entry.
+    ///
+    /// Pass the `job_id` verbatim to [`DaemonHandle::respond_approval`].
+    ///
+    /// ## Expiry
+    ///
+    /// Each request carries an `expires_ms` timestamp derived from
+    /// [`DaemonConfig::approval_timeout`]. For app tools the effective window
+    /// is further bounded by the call's own `timeout_ms`: approval must arrive
+    /// within `min(approval_timeout, timeout_ms)` of the request being sent.
+    ///
+    /// ## Subscribe-before-traffic and multi-subscriber semantics
+    ///
+    /// This channel does **not** replay missed messages — subscribe before
+    /// sending traffic (or before spawning the task that will send traffic).
+    /// Every active subscriber independently receives every request.
     pub fn subscribe_approvals(&self) -> ApprovalSubscription {
         ApprovalSubscription {
             rx: self.approval_broadcast_tx.subscribe(),
@@ -364,9 +402,12 @@ impl DaemonHandle {
     /// Answer a pending approval from the embedding application.
     ///
     /// Mirrors the WS/IPC `ApprovalResponse` handling exactly:
-    /// - deny with non-empty `reason` → `resolve` + `record_refusal` (principal
-    ///   recorded as `"local"`)
+    /// - deny with non-empty `reason` → `resolve` + `record_refusal`
     /// - approve or deny without reason → `resolve` only
+    ///
+    /// The refusal log is keyed by tool name today (`SessionManager::record_refusal`
+    /// ignores the caller principal). The `"local"` principal passed internally
+    /// is a forward-looking sentinel for when per-principal tracking is added.
     ///
     /// `job_id` is [`ApprovalRequest::job_id`] verbatim (already namespaced,
     /// e.g. `"app-tool:{id}"`).
@@ -380,17 +421,13 @@ impl DaemonHandle {
             reason: reason.to_string(),
             remember: false,
         };
-        if !approved && !reason.is_empty() {
-            if let Some((req, _)) = self.approval_mgr.resolve(&resp).await {
-                self.session_mgr
-                    .record_refusal("local", &req.tool, reason)
-                    .await;
-                return true;
-            }
-            false
-        } else {
-            self.approval_mgr.resolve(&resp).await.is_some()
-        }
+        crate::approval::apply_approval_response(
+            &self.approval_mgr,
+            &self.session_mgr,
+            &resp,
+            "local",
+        )
+        .await
     }
 }
 

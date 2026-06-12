@@ -648,16 +648,13 @@ async fn connect_with_auth(
             }
             Some(envelope::Payload::ApprovalResponse(resp)) => {
                 info!(job_id = %resp.job_id, approved = resp.approved, "received approval response from cloud");
-                // Record refusal if reason is provided.
-                if !resp.approved && !resp.reason.is_empty() {
-                    if let Some((req, _)) = approval_mgr.resolve(&resp).await {
-                        session_mgr
-                            .record_refusal(caller_uid, &req.tool, &resp.reason)
-                            .await;
-                    }
-                } else {
-                    approval_mgr.resolve(&resp).await;
-                }
+                crate::approval::apply_approval_response(
+                    approval_mgr,
+                    session_mgr,
+                    &resp,
+                    caller_uid,
+                )
+                .await;
             }
             Some(envelope::Payload::SetSessionMode(msg)) => {
                 handle_set_session_mode(device_id, session_mgr, &msg, &tx).await;

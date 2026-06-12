@@ -1779,10 +1779,10 @@ async fn approval_consuming_budget_shrinks_execution_timeout() {
 
 // ── Task 7: in-process approval API ──────────────────────────────────────────
 
-/// Helper: register a counted-echo tool and return the counter.
+/// Helper: register a counted-echo tool and return the counter handle.
 /// Wraps the existing `register_counted_echo` helper, creating the counter
 /// internally so callers don't need to construct one explicitly.
-async fn register_counted_echo_new(
+async fn register_counted_echo_handle(
     handle: &ahandd::DaemonHandle,
     name: &str,
     requires_approval: bool,
@@ -1799,9 +1799,9 @@ async fn register_counted_echo_new(
 #[tokio::test]
 async fn in_process_approve_executes_app_tool() {
     let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
-    let run_count = register_counted_echo_new(&handle, "demo_echo", false).await;
+    let run_count = register_counted_echo_handle(&handle, "demo_echo", false).await;
 
-    // Subscribe before registering so no broadcasts are missed.
+    // Subscribe before traffic starts so no broadcasts are missed.
     let mut approvals = handle.subscribe_approvals();
 
     // Wait for the tool snapshot.
@@ -1856,7 +1856,7 @@ async fn in_process_approve_executes_app_tool() {
 #[tokio::test]
 async fn in_process_deny_records_refusal_once() {
     let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
-    register_counted_echo_new(&handle, "demo_echo", false).await;
+    register_counted_echo_handle(&handle, "demo_echo", false).await;
 
     let mut approvals = handle.subscribe_approvals();
 
@@ -1946,4 +1946,102 @@ async fn in_process_respond_unknown_job_returns_false() {
     );
 
     handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Deny-without-reason: respond_approval(false, "") resolves the entry
+/// (returns true) and sends APPROVAL_DENIED, but does NOT record a refusal,
+/// so a follow-up request's `previous_refusals` is empty.
+#[tokio::test]
+async fn in_process_deny_without_reason_no_refusal_recorded() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
+    register_counted_echo_handle(&handle, "demo_echo", false).await;
+
+    // Subscribe before traffic starts so no broadcasts are missed.
+    let mut approvals = handle.subscribe_approvals();
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    // First request — deny with empty reason.
+    mock.send_app_tool_request("ipnr-1", "demo_echo", r#"{}"#, 10_000)
+        .expect("send first ok");
+
+    let req = tokio::time::timeout(Duration::from_secs(5), approvals.recv())
+        .await
+        .expect("timeout waiting for first ApprovalRequest")
+        .expect("channel closed");
+
+    assert_eq!(req.job_id, "app-tool:ipnr-1");
+
+    // Deny with empty reason — must still return true (entry resolved).
+    assert!(
+        handle.respond_approval(&req.job_id, false, "").await,
+        "deny with empty reason must return true (entry was pending)"
+    );
+
+    // APPROVAL_DENIED should arrive.
+    let first_responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("APPROVAL_DENIED not received within 5s");
+
+    assert!(
+        matches!(
+            &first_responses[0].result,
+            Some(app_tool_response::Result::Error(e)) if e.code == "APPROVAL_DENIED"
+        ),
+        "expected APPROVAL_DENIED, got {:?}",
+        first_responses[0].result
+    );
+
+    // Second request of the same tool — previous_refusals must be EMPTY
+    // because the denial carried no reason, so no refusal was recorded.
+    mock.send_app_tool_request("ipnr-2", "demo_echo", r#"{}"#, 10_000)
+        .expect("send second ok");
+
+    let second_req = tokio::time::timeout(Duration::from_secs(5), approvals.recv())
+        .await
+        .expect("timeout waiting for second ApprovalRequest")
+        .expect("channel closed");
+
+    assert_eq!(second_req.job_id, "app-tool:ipnr-2");
+    assert!(
+        second_req.previous_refusals.is_empty(),
+        "deny-without-reason must NOT record a refusal; previous_refusals should be empty, got {}",
+        second_req.previous_refusals.len()
+    );
+
+    // Clean up.
+    handle
+        .respond_approval(&second_req.job_id, false, "cleanup")
+        .await;
+    mock.wait_for_app_tool_responses(2, Duration::from_secs(5))
+        .await
+        .expect("second APPROVAL_DENIED not received");
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Shutdown pins channel closed: after handle.shutdown() the approval
+/// subscription recv() returns None (channel closed).
+#[tokio::test]
+async fn approval_subscription_closed_after_shutdown() {
+    let (_mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
+
+    // Subscribe before shutdown so we hold a receiver.
+    let mut approvals = handle.subscribe_approvals();
+
+    // Shut down — this consumes the handle.
+    handle.shutdown().await.expect("shutdown clean");
+
+    // The broadcast channel is now closed; recv() must return None promptly.
+    let result = tokio::time::timeout(Duration::from_secs(2), approvals.recv())
+        .await
+        .expect("recv did not return within 2s after shutdown");
+
+    assert!(
+        result.is_none(),
+        "recv() must return None after the daemon shuts down"
+    );
 }

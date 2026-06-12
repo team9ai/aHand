@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ahand_protocol::{ApprovalRequest, ApprovalResponse, JobRequest, RefusalContext};
@@ -137,6 +138,41 @@ impl ApprovalManager {
     /// The default timeout duration for approval requests.
     pub fn default_timeout(&self) -> Duration {
         self.default_timeout
+    }
+}
+
+/// Shared terminal handling for an [`ApprovalResponse`] arriving from any
+/// surface (cloud WS, local IPC, in-process embedder): resolve the pending
+/// entry; a denial carrying a non-empty reason records a refusal for the
+/// resolved tool. Returns `true` when a pending entry was resolved.
+///
+/// Callers that want a surface-specific log line (e.g. "received approval
+/// response from cloud") should emit it **before** calling this helper.
+/// The `principal` field identifies the source for future per-principal
+/// refusal tracking (currently ignored by `SessionManager::record_refusal`,
+/// which is tool-keyed today).
+pub(crate) async fn apply_approval_response(
+    approval_mgr: &Arc<ApprovalManager>,
+    session_mgr: &Arc<crate::session::SessionManager>,
+    resp: &ApprovalResponse,
+    principal: &str,
+) -> bool {
+    info!(
+        job_id = %resp.job_id,
+        approved = resp.approved,
+        principal,
+        "applying approval response"
+    );
+    if !resp.approved && !resp.reason.is_empty() {
+        if let Some((req, _)) = approval_mgr.resolve(resp).await {
+            session_mgr
+                .record_refusal(principal, &req.tool, &resp.reason)
+                .await;
+            return true;
+        }
+        false
+    } else {
+        approval_mgr.resolve(resp).await.is_some()
     }
 }
 
