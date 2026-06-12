@@ -317,14 +317,14 @@ fn glob_match(pattern: &str, path: &str) -> bool {
             require_literal_separator: false,
             require_literal_leading_dot: false,
         };
-        return match glob::Pattern::new(&pattern_lower) {
+        match glob::Pattern::new(&pattern_lower) {
             Ok(p) => p.matches_with(&path_lower, opts),
             Err(_) => {
                 // Pattern is invalid (e.g. unmatched `[`): fall back to
                 // Unicode-folded equality.
                 pattern_lower == path_lower
             }
-        };
+        }
     }
     #[cfg(not(windows))]
     {
