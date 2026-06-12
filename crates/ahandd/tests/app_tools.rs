@@ -1614,3 +1614,146 @@ async fn second_invocation_sees_one_previous_refusal() {
 
     handle.shutdown().await.expect("shutdown clean");
 }
+
+// ── Task 1: approval wait bounded by the invocation deadline ─────────────────
+
+/// Task 1 / Case A: approval_timeout_secs=3600, timeout_ms=2_000.
+/// Nobody approves → APPROVAL_TIMEOUT fires from the request deadline, elapsed < 6s.
+#[tokio::test]
+async fn approval_wait_is_bounded_by_request_timeout() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "bounded_echo", false, Arc::clone(&run_count)).await;
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+    let started = std::time::Instant::now();
+    mock.send_app_tool_request("call-bounded-timeout", "bounded_echo", r#"{}"#, 2_000)
+        .expect("send ok");
+    mock.wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s");
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(8))
+        .await
+        .expect("APPROVAL_TIMEOUT response not received within 8s");
+    let elapsed = started.elapsed();
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-bounded-timeout");
+    match &resp.result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(
+                err.code, "APPROVAL_TIMEOUT",
+                "expected APPROVAL_TIMEOUT, got: {}",
+                err.code
+            );
+        }
+        other => panic!("expected APPROVAL_TIMEOUT error, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(6),
+        "approval wait must be bounded by timeout_ms=2s not 3600s; elapsed={elapsed:?}"
+    );
+    assert_eq!(run_count.load(Ordering::SeqCst), 0, "handler must not run");
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Task 1 / Case B: approval_timeout_secs=3600, timeout_ms=10_000.
+/// Approve after ApprovalRequest arrives → ResultJson, handler ran once.
+#[tokio::test]
+async fn approve_within_deadline_executes_with_remaining_budget() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
+    let run_count = Arc::new(AtomicUsize::new(0));
+    register_counted_echo(&handle, "budget_echo", false, Arc::clone(&run_count)).await;
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+    mock.send_app_tool_request("call-budget-approve", "budget_echo", r#"{}"#, 10_000)
+        .expect("send ok");
+    let approval_reqs = mock
+        .wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s");
+    assert_eq!(
+        approval_reqs[0].job_id, "app-tool:call-budget-approve",
+        "job_id must be namespaced"
+    );
+    mock.send_approval_response("app-tool:call-budget-approve", true, "")
+        .expect("send approval ok");
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(8))
+        .await
+        .expect("AppToolResponse not received within 8s after approval");
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-budget-approve");
+    assert!(
+        matches!(&resp.result, Some(app_tool_response::Result::ResultJson(_))),
+        "expected ResultJson after approval, got {:?}",
+        resp.result
+    );
+    assert_eq!(run_count.load(Ordering::SeqCst), 1, "handler ran once");
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Task 1 / Case C: approval_timeout_secs=3600, timeout_ms=3_000.
+/// Sleep 1_500ms after ApprovalRequest, then approve → remaining budget ≈1.5s
+/// (floored at MIN_TIMEOUT_MS). Handler sleeps 60s → EXECUTION_TIMEOUT fires.
+/// Total elapsed < 8s.
+#[tokio::test]
+async fn approval_consuming_budget_shrinks_execution_timeout() {
+    let (mock, handle, _tmp) = setup_gated_daemon(SessionMode::Strict, 3600).await;
+    let run_count = Arc::new(AtomicUsize::new(0));
+    let def = AppToolDef {
+        name: "slow_approved_tool".into(),
+        description: "Sleeps 60s".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: true,
+    };
+    let run_count_clone = Arc::clone(&run_count);
+    let handler: AppToolHandler = Arc::new(move |_args| {
+        let c = Arc::clone(&run_count_clone);
+        Box::pin(async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(json!({"done": true}))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register ok");
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+    let started = std::time::Instant::now();
+    mock.send_app_tool_request("call-shrink-budget", "slow_approved_tool", r#"{}"#, 3_000)
+        .expect("send ok");
+    mock.wait_for_approval_requests(1, Duration::from_secs(5))
+        .await
+        .expect("ApprovalRequest not received within 5s");
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    mock.send_approval_response("app-tool:call-shrink-budget", true, "")
+        .expect("send approval ok");
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(8))
+        .await
+        .expect("EXECUTION_TIMEOUT response not received within 8s");
+    let elapsed = started.elapsed();
+    let resp = &responses[0];
+    assert_eq!(resp.tool_call_id, "call-shrink-budget");
+    match &resp.result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(
+                err.code, "EXECUTION_TIMEOUT",
+                "expected EXECUTION_TIMEOUT, got: {}",
+                err.code
+            );
+        }
+        other => panic!("expected EXECUTION_TIMEOUT error, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "total elapsed must be < 8s; elapsed={elapsed:?}"
+    );
+    handle.shutdown().await.expect("shutdown clean");
+}

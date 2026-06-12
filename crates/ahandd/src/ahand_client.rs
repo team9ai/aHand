@@ -1888,6 +1888,13 @@ fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: St
 /// approval waiter; here the entire execution is spawned because handler
 /// duration is unbounded (up to MAX_TIMEOUT_MS = 300s).
 ///
+/// Timeout semantics: `timeout_ms` bounds the WHOLE invocation (approval +
+/// execution). Approval wait = min(approval_timeout, clamp_timeout(timeout_ms));
+/// execution gets the remaining budget (floored at MIN_TIMEOUT_MS). This ensures
+/// the hub's `clamped_timeout + 2s` window always covers the daemon-side outcome
+/// and eliminates ghost execution (where a late approval would run a handler
+/// whose result nobody can receive because the hub has already moved on).
+///
 /// The approval waiter intentionally does NOT watch `close_rx` (unlike file-request
 /// waiters): the response rides the stamped outbox so a result produced across a
 /// reconnect is replayed to the hub; the cost is an orphaned waiter for up to
@@ -2064,7 +2071,15 @@ async fn handle_app_tool_request<T>(
         let tool_name = req.name.clone();
         let args_json = req.args_json.clone();
         let timeout_ms_req = req.timeout_ms;
-        let timeout = amgr.default_timeout();
+        // The call's clamped timeout is the TOTAL deadline for approval +
+        // execution. Bounding the approval wait by it guarantees the hub's
+        // `clamped + 2s` wait always covers the daemon-side outcome — no ghost
+        // execution after the caller's window closed (the hub mints a fresh
+        // tool_call_id per POST, so a late result would be unreachable anyway).
+        let total_deadline_ms = AppToolRegistry::clamp_timeout(timeout_ms_req);
+        let timeout = amgr
+            .default_timeout()
+            .min(Duration::from_millis(total_deadline_ms as u64));
         let approval_job_id_clone = approval_job_id.clone();
 
         tokio::spawn(async move {
@@ -2072,10 +2087,19 @@ async fn handle_app_tool_request<T>(
             let result = tokio::time::timeout(timeout, approval_rx).await;
             match result {
                 Ok(Ok(resp)) if resp.approved => {
+                    let approval_wait_ms = started.elapsed().as_millis() as u64;
+                    // Execution gets what's left of the total deadline
+                    // (clamp_timeout inside validate_and_execute floors this
+                    // at MIN_TIMEOUT_MS).
+                    let remaining_ms = (total_deadline_ms as u64)
+                        .saturating_sub(approval_wait_ms)
+                        .max(crate::app_tool_registry::MIN_TIMEOUT_MS as u64)
+                        as u32;
                     info!(
                         tool_call_id = %tool_call_id,
                         tool_name = %tool_name,
-                        approval_wait_ms = started.elapsed().as_millis() as u64,
+                        approval_wait_ms,
+                        remaining_ms,
                         "app tool approval granted"
                     );
                     // Proceed to args parse → permit → execute inside this task.
@@ -2084,7 +2108,7 @@ async fn handle_app_tool_request<T>(
                         tool_call_id,
                         tool_name,
                         args_json,
-                        timeout_ms_req,
+                        remaining_ms,
                         handler,
                         &tx_clone,
                         &app_tools_clone,
