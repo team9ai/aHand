@@ -86,7 +86,8 @@ three platforms; bootstrap scripts stay thin.
 - `browser_setup/node.rs` becomes layout-aware: Unix downloads `.tar.xz` with
   `node/bin/node`; Windows downloads `.zip` with `node.exe` at archive root
   (normalized into a consistent layout at install time). npm and playwright-cli
-  are invoked on Windows via `node.exe <js-entrypoint>` (or `cmd /C *.cmd`),
+  are invoked on Windows via `node.exe <js-entrypoint>` (npm-cli.js path, or
+  the `@playwright/cli` package.json `"bin"`-resolved JS entry),
   never by spawning the `.cmd` shim directly.
 - Bootstrap installers: existing `scripts/dist/install.sh` (macOS/Linux) plus
   new `scripts/dist/install.ps1` (`irm <url> | iex`): download + extract the
@@ -298,3 +299,77 @@ The M2 manual-verification checklist from the M1 Completion Record (items 1–7,
 **Known issue (pre-existing, not introduced by M2):**
 
 The `test` job in `test-dist-scripts.yml` (BATS, `ubuntu-latest` + `macos-latest`) has been stale-red on `main` since 2026-03-11, before M2 work began. This is under separate investigation; the `windows-install` job is independent and green.
+
+## M3 Completion Record (2026-06-11)
+
+M3 landed on `feat/cross-platform-m3` (plan:
+`docs/superpowers/plans/2026-05-13-ahand-plugin-runtime-stage1.md`).
+
+**What landed:**
+
+- **Windows Node install** — `browser_setup/node.rs` downloads the official
+  Windows `.zip` distribution from nodejs.org, extracts it with
+  traversal/symlink guards (component-level `ParentDir`/`RootDir`/`Prefix`
+  rejection, symlink entry rejection), then normalises the flat zip layout
+  (moving `node.exe` from the archive root into `bin/node.exe`) so that
+  `RuntimeDirs::node_bin()` — which always returns `<node_dir>/bin/node[.exe]`
+  — resolves correctly on all platforms without platform-specific branches in
+  `RuntimeDirs`.
+- **npm / playwright-cli invocation seams** — `RuntimeDirs::npm_invocation()`
+  returns `(node.exe, [npm-cli.js])` on Windows (program is `node.exe`, leading
+  arg is the `node_modules/npm/bin/npm-cli.js` path). No `npm.exe` assumption.
+  `RuntimeDirs::playwright_cli_invocation()` on Windows resolves the JS entry
+  from the `@playwright/cli` `package.json` `"bin"` field (string or object
+  form), falling back to the conventional `cli.js` path; returns `Err` (not a
+  bare fallback) when neither exists, so callers surface `CheckStatus::Missing`
+  cleanly.
+- **`browser.rs` platform PATH via `path_env`** — `build_env_vars()` uses
+  `crate::plugin_runtime::path_env::prepend_path_dirs` (which calls
+  `std::env::join_paths` internally, using `;` on Windows, `:` on Unix) to
+  prepend the managed `node/bin` directory to PATH. The three-priority CLI
+  chain (`cli_invocation_with`) is: (1) configured override → direct program,
+  no leading args; (2) managed runtime `playwright_cli_invocation()` — Ok only
+  when the binary / entry JS actually exists on disk; (3) bare
+  `exe_name("playwright-cli")` fallback relying on system PATH. The chain is
+  symmetric on error: managed-missing falls through to bare fallback, not a
+  hard error.
+- **Native `ahandctl browser-init`** — `crates/ahandctl/src/browser_init.rs`
+  calls `ahandd::browser_setup::run_all` directly (no bash subprocess, no
+  script file on disk required). The progress callback uses
+  `format_progress_line` (shared with `ahandd` CLI) for human-readable output.
+- **Admin SSE** — `ahandctl/src/admin.rs` `browser_init_stream` emits
+  `ProgressEvent`s as `{"line":"<escaped>"}` SSE events using
+  `progress_event_to_sse_line` (which delegates to `format_progress_line`
+  then serialises via `serde_json::json!` for correct JSON escaping including
+  embedded newlines from multi-line anyhow error chains). Wire format is
+  byte-compatible with the old bash-stream implementation for single-line
+  messages; serde correctly handles the multiline case the old hand-rolled
+  `replace('\\', …).replace('"', …)` did not. The terminal event is
+  `{"status":"done|error","exit_code":N}` (also serialised via serde_json).
+- **Shared progress formatter** — `browser_setup/progress_format.rs` is the
+  single rendering surface for both CLI and SSE. Rules: `Phase::Done` → `✓`,
+  `Phase::Failed` → `✗`, `Phase::Log` with `LogStream::Stderr` →
+  `[stderr] <msg>`, all other phases → message unchanged.
+- **`setup-browser.sh` deprecated** — header updated; no longer shipped by
+  native `ahandctl upgrade` (`upgrade/assets.rs` steps 4 and 10 removed).
+  `install.sh` / release pipelines still distribute it for legacy shell-based
+  installs. The file is kept in `scripts/dist/` for those paths only; no new
+  code should depend on it — all new browser setup must go through
+  `ahandctl browser-init` (native Rust).
+- **`browser-e2e` CI job green on ubuntu-latest + windows-latest** — real
+  nodejs.org / npm downloads, `ahandd browser-init` (with one retry on flake),
+  then `ahandd browser-doctor` asserting all-pass (`Node.js:`,
+  `playwright-cli:`, `System Browser:`, `all checks passed`). Chrome
+  auto-detected on both runners without manual install.
+
+**Deviations from the M3 spec:**
+
+No material deviations. `Phase::Failed` was added to the `Phase` enum as a
+presentation contract addition (emitted by the failure-wrapper path so
+formatters can render `✗` without inspecting the `Result`); this is an
+additive change to `types.rs` that does not break any callers.
+
+**M4 backlog:** unchanged from the M1 record. The browser chain no longer
+contributes any new M4 items beyond the existing list (TOCTOU, symlink ops,
+`sanitize_env` Windows blocklist, ACL chmod, shell e2e un-gating,
+named-pipe explicit security descriptor).

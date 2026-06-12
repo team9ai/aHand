@@ -126,20 +126,8 @@ impl RedisJobOutputStore {
     }
 
     pub async fn read_history(&self, job_id: &str) -> Result<Vec<StoredJobOutputRecord>> {
-        let mut connection = self
-            .client
-            .get_connection_manager()
-            .await
-            .map_err(redis_err)?;
-        let reply: StreamRangeReply = connection
-            .xrange_all(output_stream_key(job_id))
-            .await
-            .map_err(redis_err)?;
-        reply
-            .ids
-            .into_iter()
-            .map(parse_stream_record)
-            .collect::<Result<Vec<_>>>()
+        let mut connection = self.reader_connection().await?;
+        read_history_on(&mut connection, job_id).await
     }
 
     pub async fn read_live(
@@ -148,31 +136,99 @@ impl RedisJobOutputStore {
         last_stream_id: &str,
         block_ms: usize,
     ) -> Result<Vec<StoredJobOutputRecord>> {
-        let mut connection = self
-            .client
+        let mut connection = self.reader_connection().await?;
+        read_live_on(&mut connection, job_id, last_stream_id, block_ms).await
+    }
+
+    /// Open a dedicated reader for a single subscription.
+    ///
+    /// The streaming subscribe path issues blocking `XREAD` calls in a loop. A
+    /// blocking command monopolises the multiplexed connection it is issued on
+    /// (redis-rs pipelines requests FIFO, so a co-tenant command cannot get its
+    /// reply until the block resolves), so each subscriber must own a dedicated
+    /// connection rather than sharing one. Establishing that connection once at
+    /// subscribe time — instead of re-running `get_connection_manager` (TCP
+    /// connect + handshake + driver spawn) on every poll — also keeps first-event
+    /// delivery off the connection-setup critical path.
+    pub async fn open_reader(&self) -> Result<JobOutputReader> {
+        Ok(JobOutputReader {
+            connection: self.reader_connection().await?,
+        })
+    }
+
+    async fn reader_connection(&self) -> Result<ConnectionManager> {
+        self.client
             .get_connection_manager()
             .await
-            .map_err(redis_err)?;
-        let reply: Option<StreamReadReply> = connection
-            .xread_options(
-                &[output_stream_key(job_id)],
-                &[last_stream_id],
-                &StreamReadOptions::default().block(block_ms).count(128),
-            )
-            .await
-            .map_err(redis_err)?;
-
-        let Some(reply) = reply else {
-            return Ok(Vec::new());
-        };
-
-        reply
-            .keys
-            .into_iter()
-            .flat_map(|stream| stream.ids.into_iter())
-            .map(parse_stream_record)
-            .collect::<Result<Vec<_>>>()
+            .map_err(redis_err)
     }
+}
+
+/// A dedicated reader connection bound to a single subscription.
+///
+/// Created once via [`RedisJobOutputStore::open_reader`] and reused across every
+/// `read_history`/`read_live` poll of that subscription so the blocking `XREAD`
+/// loop never re-establishes a connection and never shares one with another
+/// subscriber.
+pub struct JobOutputReader {
+    connection: ConnectionManager,
+}
+
+impl JobOutputReader {
+    pub async fn read_history(&mut self, job_id: &str) -> Result<Vec<StoredJobOutputRecord>> {
+        read_history_on(&mut self.connection, job_id).await
+    }
+
+    pub async fn read_live(
+        &mut self,
+        job_id: &str,
+        last_stream_id: &str,
+        block_ms: usize,
+    ) -> Result<Vec<StoredJobOutputRecord>> {
+        read_live_on(&mut self.connection, job_id, last_stream_id, block_ms).await
+    }
+}
+
+async fn read_history_on(
+    connection: &mut ConnectionManager,
+    job_id: &str,
+) -> Result<Vec<StoredJobOutputRecord>> {
+    let reply: StreamRangeReply = connection
+        .xrange_all(output_stream_key(job_id))
+        .await
+        .map_err(redis_err)?;
+    reply
+        .ids
+        .into_iter()
+        .map(parse_stream_record)
+        .collect::<Result<Vec<_>>>()
+}
+
+async fn read_live_on(
+    connection: &mut ConnectionManager,
+    job_id: &str,
+    last_stream_id: &str,
+    block_ms: usize,
+) -> Result<Vec<StoredJobOutputRecord>> {
+    let reply: Option<StreamReadReply> = connection
+        .xread_options(
+            &[output_stream_key(job_id)],
+            &[last_stream_id],
+            &StreamReadOptions::default().block(block_ms).count(128),
+        )
+        .await
+        .map_err(redis_err)?;
+
+    let Some(reply) = reply else {
+        return Ok(Vec::new());
+    };
+
+    reply
+        .keys
+        .into_iter()
+        .flat_map(|stream| stream.ids.into_iter())
+        .map(parse_stream_record)
+        .collect::<Result<Vec<_>>>()
 }
 
 fn parse_stream_record(record: redis::streams::StreamId) -> Result<StoredJobOutputRecord> {

@@ -96,7 +96,13 @@ pub enum Phase {
     Extracting,
     Installing,
     Verifying,
+    /// Step completed successfully. Rendered with a `✓` prefix by formatters.
     Done,
+    /// Step completed with a failure. Emitted by `wrap_failure` instead of
+    /// `Phase::Done` so formatters can distinguish success from failure
+    /// without inspecting the `Result` from `run_all`/`run_step`.
+    /// Rendered with a `✗` prefix by formatters.
+    Failed,
     /// A raw log line from the running step. Check `ProgressEvent.stream`
     /// to disambiguate stdout / stderr / synthesized info messages.
     /// `message` carries the line content (no trailing newline);

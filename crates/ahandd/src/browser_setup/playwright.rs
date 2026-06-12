@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
 
@@ -11,35 +12,42 @@ use super::types::{
 
 pub const PLAYWRIGHT_CLI_VERSION: &str = "0.1.1";
 
-pub fn cli_path() -> Result<PathBuf> {
-    let dirs = Dirs::new()?;
-    Ok(dirs.playwright_cli_bin())
-}
-
 /// Read-only check: report current playwright-cli status.
 pub async fn inspect() -> CheckReport {
-    let Ok(cli) = cli_path() else {
+    let Ok(dirs) = Dirs::new() else {
         return missing_report();
     };
 
-    if !cli.exists() {
+    // Resolve the invocation — on Windows this checks the entry JS exists.
+    let Ok((program, leading_args)) = dirs.playwright_cli_invocation() else {
         return missing_report();
-    }
+    };
 
-    let output = tokio::process::Command::new(&cli)
-        .arg("--version")
-        .output()
-        .await;
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(leading_args.iter().map(|a| a.as_os_str()));
+    cmd.arg("--version");
+
+    let output = cmd.output().await;
 
     match output {
         Ok(out) if out.status.success() => {
             let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            // For the reported path: on unix it's the CLI binary itself; on Windows
+            // it's the entry JS (first leading arg) or the node binary if no args.
+            let reported_path = if cfg!(windows) {
+                leading_args
+                    .first()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| program.clone())
+            } else {
+                program.clone()
+            };
             CheckReport {
                 name: "playwright",
                 label: "playwright-cli",
                 status: CheckStatus::Ok {
                     version,
-                    path: cli,
+                    path: reported_path,
                     source: CheckSource::Managed,
                 },
                 fix_hint: None,
@@ -66,15 +74,19 @@ fn missing_report() -> CheckReport {
 /// on non-zero exit (so `classify_error` continues to see the same
 /// failure strings).
 ///
-/// `program` is the full path to the npm binary.
-/// `args` are the arguments to pass to npm (e.g. `["install", "-g", ...]`).
+/// `program` is the executable to run (e.g. npm on unix, node.exe on windows).
+/// `leading_args` are prepended before `npm_args` (empty on unix; on windows
+///   this is `[path/to/npm-cli.js]`).
+/// `npm_args` are the npm-level arguments (e.g. `["install", "-g", ...]`).
 async fn spawn_npm_with_progress(
     program: &std::path::Path,
-    args: &[&str],
+    leading_args: &[OsString],
+    npm_args: &[&str],
     progress: &(dyn Fn(ProgressEvent) + Send + Sync),
 ) -> anyhow::Result<()> {
     let mut child = tokio::process::Command::new(program)
-        .args(args)
+        .args(leading_args.iter().map(|a| a.as_os_str()))
+        .args(npm_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -157,7 +169,7 @@ async fn spawn_npm_with_progress(
         let tail = stderr_tail.join("\n");
         anyhow::bail!(
             "Failed to run npm {} (exit {}):\n{tail}",
-            args.first().copied().unwrap_or(""),
+            npm_args.first().copied().unwrap_or(""),
             status.code().unwrap_or(-1)
         );
     }
@@ -171,17 +183,32 @@ pub async fn ensure(
     progress: &(dyn Fn(ProgressEvent) + Send + Sync),
 ) -> Result<CheckReport> {
     let dirs = Dirs::new()?;
-    let npm = dirs.npm_bin();
-    if !npm.exists() {
+
+    // Obtain the npm invocation (program + leading args) via RuntimeDirs.
+    let (npm_program, npm_leading) = dirs.npm_invocation();
+
+    // Verify the npm program exists (node.exe on windows, npm on unix).
+    if !npm_program.exists() {
         anyhow::bail!(
             "npm not found at {} — install Node.js first (`ahandd browser-init --step node`)",
-            npm.display()
+            npm_program.display()
         );
     }
-    let cli = cli_path()?;
+
     let prefix = dirs.node.to_string_lossy().to_string();
 
-    if force && cli.exists() {
+    // Check whether playwright-cli is already installed:
+    // - Unix: the CLI is a native wrapper at node/bin/playwright-cli; check
+    //   its existence directly.
+    // - Windows: playwright_cli_invocation() resolves the entry JS and
+    //   returns Err if it is absent — use that as the existence check.
+    let already_installed = if cfg!(windows) {
+        dirs.playwright_cli_invocation().is_ok()
+    } else {
+        dirs.playwright_cli_bin().exists()
+    };
+
+    if force && already_installed {
         emit(
             progress,
             Phase::Starting,
@@ -190,7 +217,8 @@ pub async fn ensure(
         // Best-effort: ignore errors so that a partially-broken install
         // doesn't block the reinstall.
         let _ = spawn_npm_with_progress(
-            &npm,
+            &npm_program,
+            &npm_leading,
             &["uninstall", "-g", "--prefix", &prefix, "@playwright/cli"],
             progress,
         )
@@ -198,21 +226,24 @@ pub async fn ensure(
     }
 
     // Check cache (skip if unchanged and not forced)
-    if !force
-        && cli.exists()
-        && let Ok(out) = tokio::process::Command::new(&cli)
-            .arg("--version")
-            .output()
-            .await
-        && out.status.success()
-    {
-        let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        emit(
-            progress,
-            Phase::Done,
-            format!("playwright-cli {ver} already installed"),
-        );
-        return Ok(inspect().await);
+    if !force && already_installed {
+        // Run --version to confirm the CLI is actually working.
+        if let Ok((prog, leading)) = dirs.playwright_cli_invocation() {
+            let mut cmd = tokio::process::Command::new(&prog);
+            cmd.args(leading.iter().map(|a| a.as_os_str()));
+            cmd.arg("--version");
+            if let Ok(out) = cmd.output().await
+                && out.status.success()
+            {
+                let ver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                emit(
+                    progress,
+                    Phase::Done,
+                    format!("playwright-cli {ver} already installed"),
+                );
+                return Ok(inspect().await);
+            }
+        }
     }
 
     emit(
@@ -222,7 +253,8 @@ pub async fn ensure(
     );
 
     spawn_npm_with_progress(
-        &npm,
+        &npm_program,
+        &npm_leading,
         &[
             "install",
             "-g",
@@ -241,20 +273,21 @@ pub async fn ensure(
         "Verifying playwright-cli".into(),
     );
 
-    if !cli.exists() {
-        anyhow::bail!(
-            "playwright-cli was installed but binary not found at {}",
-            cli.display()
-        );
-    }
-
-    let version = tokio::process::Command::new(&cli)
-        .arg("--version")
-        .output()
-        .await
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "installed".to_string());
+    // Post-install verification: playwright_cli_invocation() returns Ok only
+    // when the binary (unix) or entry JS (windows) actually exists on disk.
+    let (prog, leading) = dirs
+        .playwright_cli_invocation()
+        .map_err(|e| anyhow::anyhow!("playwright-cli was installed but is not resolvable: {e}"))?;
+    let version = {
+        let mut cmd = tokio::process::Command::new(&prog);
+        cmd.args(leading.iter().map(|a| a.as_os_str()));
+        cmd.arg("--version");
+        cmd.output()
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "installed".to_string())
+    };
 
     emit(
         progress,
@@ -284,7 +317,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     // ---------------------------------------------------------------------------
-    // spawn_npm_with_progress tests
+    // spawn_npm_with_progress tests — drive the (program, leading_args, npm_args)
+    // seam honestly: on unix we point the "program" at a fake shell script and
+    // pass empty leading_args (mirrors the unix npm_invocation() shape).
     // ---------------------------------------------------------------------------
 
     #[cfg(unix)]
@@ -312,8 +347,10 @@ mod tests {
             events_cb.lock().unwrap().push(e);
         };
 
+        // Unix npm_invocation shape: program=fake-npm.sh, no leading_args.
         let result = spawn_npm_with_progress(
             &script_path,
+            &[], // unix: no leading args
             &[
                 "install",
                 "-g",
@@ -380,6 +417,7 @@ mod tests {
         for _ in 0..5 {
             let r = spawn_npm_with_progress(
                 &script_path,
+                &[], // unix: no leading args
                 &[
                     "install",
                     "-g",
@@ -423,12 +461,13 @@ mod tests {
     #[tokio::test]
     async fn inspect_returns_missing_when_cli_absent() {
         // This test is environment-dependent: it checks that if the user's
-        // ~/.ahand/node/bin/playwright-cli does NOT exist, inspect() returns Missing.
+        // managed playwright-cli does NOT exist, inspect() returns Missing.
         // Skip if it happens to exist on the test machine.
-        let Ok(cli) = cli_path() else {
+        let Ok(dirs) = Dirs::new() else {
             eprintln!("skipping: cannot determine home directory");
             return;
         };
+        let cli = dirs.playwright_cli_bin();
         if cli.exists() {
             eprintln!("skipping: {} already exists", cli.display());
             return;
