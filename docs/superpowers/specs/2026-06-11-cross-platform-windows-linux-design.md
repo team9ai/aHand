@@ -64,7 +64,7 @@ re-exported from the platform layer).
 
 | Module | Unix implementation (current behavior) | Windows implementation |
 |--------|----------------------------------------|------------------------|
-| `ipc` | `UnixListener`/`UnixStream`, socket at `~/.ahand/ahandd.sock`, `peer_cred` check, `0o660` | `tokio::net::windows::named_pipe`, pipe name `\\.\pipe\ahandd-<username>`, default per-user pipe ACL replaces `peer_cred` |
+| `ipc` | `UnixListener`/`UnixStream`, socket at `~/.ahand/ahandd.sock`, `peer_cred` check, `0o660` | `tokio::net::windows::named_pipe`, pipe name `\\.\pipe\ahandd-<username>`, **explicit owner-only DACL** `D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)` enforced in `create_secured_pipe` (M4; replaces `peer_cred`. The M1-era "default per-user ACL" was hardened to this code-enforced descriptor — see M4 Completion Record) |
 | `process` | spawn detached via `process_group(0)`; terminate via SIGTERM→SIGKILL; liveness via `/proc` / `ps` | spawn with `DETACHED_PROCESS \| CREATE_NO_WINDOW`; terminate via `taskkill` / `TerminateProcess`; liveness via Win32 process query |
 | `shell` | `SHELL` env → fallback `/bin/sh`; `sh -c <cmd>` | `COMSPEC` env → fallback `cmd.exe`; `cmd /C <cmd>` (PowerShell override: future option, not in M1) |
 | `secure_file` | open with mode `0o600` before write | write then restrict ACL to owner; single `write_secure_file()` used by all three secret-file writers |
@@ -422,3 +422,46 @@ backlog item. Likely fix: bypass the CRT quoter with
 command line by hand (escaping `"` as `""`/`^` per cmd rules), or document that
 `rawCommand` on Windows must already be a cmd-valid one-liner. Until then,
 quoted-argument `rawCommand`s are unsupported on Windows.
+
+**Full task ledger (all 7 M4 tasks landed on `feat/cross-platform-m4`).** The
+test-stabilisation pass above was the entry point; the bulk of the security
+hardening landed in the same PR. Final state of each plan task
+(`docs/superpowers/plans/2026-06-12-cross-platform-m4-security.md`):
+
+- **T1 — native symlink creation** (`fs_ops.rs::handle_create_symlink`): Windows
+  arm via `symlink_file`/`symlink_dir` chosen by target type, `ERROR_PRIVILEGE_NOT_HELD`
+  (1314) mapped to a clear error, target policy-checked. A nonexistent target
+  falls back to `symlink_file` (dangling link).
+- **T2 — ACL chmod** (`fs_ops.rs::handle_chmod`, `Permission::Windows`): uses
+  `SetNamedSecurityInfoW` + `PROTECTED_DACL_SECURITY_INFORMATION` for a true
+  owner-only DACL replacement (NOT `icacls` — `/inheritance:r` leaves explicit
+  ACEs; see `SECURITY-HIGH#1`). Recursive apply self-walks and skips reparse
+  points (NOT `icacls /T`, which follows junctions out of the allowlist —
+  `SECURITY-HIGH#2`). Principals resolve via `LookupAccountNameW`→SID, never raw
+  SDDL interpolation.
+- **T3 — hardened `sanitize_env`** (`handler.rs`): PATH overrides validated
+  prepend-only via `env::split_paths`; `BLOCKED_KEYS` adds `PATHEXT`/`COMSPEC`
+  (+ the existing loader/lookup keys); `BLOCKED_PREFIXES` = `DYLD_`, `LD_`. Each
+  entry carries a concrete injection-mechanism comment — no speculative padding.
+- **T4 — case-correct policy matching** (`policy.rs::glob_match`): Windows folds
+  both pattern and path with Unicode `to_lowercase` and matches with
+  `case_sensitive: false`; Unix stays case-sensitive. Malformed patterns fall
+  back to literal (case-folded on Windows) equality — fail-closed for denylists.
+- **T5 — un-gated strict-mode shell e2e** (`handler.rs`): the `strict_mode_*`
+  approval-invariant tests now run on both platforms via a `cmd.exe`-safe marker
+  command (see backlog note above for the residual production quoting gap).
+- **T6 — explicit named-pipe security descriptor** (`ahand-platform/src/ipc.rs`):
+  `create_secured_pipe` applies `D:P(A;;GA;;;OW)(A;;GA;;;SY)(A;;GA;;;BA)` to all
+  three `ServerOptions` create sites via `windows-sys`, with an RAII `LocalFree`
+  guard; `pipe_sddl()` is unit-pinned.
+- **T7 — Windows security regression suite** (`tests/file_ops.rs`): Windows
+  analogues for the `cfg(unix)` symlink/junction-escape, ACL, and case-denylist
+  tests; fixtures go through `canonicalize_simplified` (no raw `.canonicalize()`).
+  The openat2-only tests stay gated and annotated as having no Windows
+  equivalent (the deferred TOCTOU window — see scope boundary in the plan).
+
+**Test-completeness follow-up (same PR):** a coverage audit added regression
+tests for the three load-bearing-but-untested security branches — the
+`DYLD_`/`LD_` loader-injection prefix blocks, the case-insensitive key
+normalization (lowercase blocked-key bypass), and the `glob_match` malformed-
+pattern fail-closed fallback.
