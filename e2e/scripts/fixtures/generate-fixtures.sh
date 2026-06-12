@@ -79,4 +79,12 @@ EOF
   echo "  Generated checksums-rust.txt"
 fi
 
+# ── checksums-admin.txt ──────────────────────────────────────────
+# Real SHA256 of admin-spa.tar.gz so install.sh checksum verification
+# passes. Regenerated every run to stay in sync with the tar on disk
+# (gzip output is not byte-stable across regenerations).
+ADMIN_HASH=$(shasum -a 256 admin-spa.tar.gz | awk '{print $1}')
+printf '%s  admin-spa.tar.gz\n' "$ADMIN_HASH" > checksums-admin.txt
+echo "  Generated checksums-admin.txt"
+
 echo "Fixtures ready."

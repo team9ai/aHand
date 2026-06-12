@@ -35,6 +35,8 @@ resolve_fixture() {
       echo "$FIXTURE_DIR/github-releases.json" ;;
     *checksums-rust.txt)
       echo "$FIXTURE_DIR/checksums-rust.txt" ;;
+    *checksums-admin.txt)
+      echo "$FIXTURE_DIR/checksums-admin.txt" ;;
     *checksums-browser.txt)
       echo "$FIXTURE_DIR/checksums-browser.txt" ;;
     *admin-spa.tar.gz)

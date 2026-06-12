@@ -115,9 +115,18 @@ teardown() {
   assert_output --partial "Could not determine Rust release version"
 }
 
-@test "install: cleans up temp tar file" {
-  run bash "$DIST_DIR/install.sh"
+@test "install: cleans up temp files (no leftover temp dir)" {
+  # Point install.sh's mktemp at an isolated, per-test TMPDIR so this is
+  # parallel-safe (no shared global /tmp path). After a successful install
+  # the EXIT trap must have removed the per-invocation temp dir, leaving
+  # this dir empty.
+  local isolated_tmp="$TEST_HOME/temp"
+  mkdir -p "$isolated_tmp"
+  TMPDIR="$isolated_tmp" run bash "$DIST_DIR/install.sh"
   assert_success
+  # No leftover temp entries under the isolated TMPDIR.
+  [ -z "$(ls -A "$isolated_tmp")" ]
+  # And the legacy global path is never used.
   [ ! -f "/tmp/ahand-admin-spa.tar.gz" ]
 }
 
@@ -135,4 +144,37 @@ teardown() {
   assert_success
   assert_executable "$TEST_INSTALL_DIR/bin/ahandd"
   [ "$(cat "$TEST_INSTALL_DIR/version")" = "0.3.0" ]
+}
+
+# ── SHA-256 verification (cross-platform parity with install.ps1) ─
+
+@test "install: verifies checksums on happy path" {
+  run bash "$DIST_DIR/install.sh"
+  assert_success
+  assert_output --partial "Verifying checksums"
+  assert_output --partial "Checksum OK: ahandd-darwin-arm64"
+  assert_output --partial "Checksum OK: ahandctl-darwin-arm64"
+  assert_output --partial "Checksum OK: admin-spa.tar.gz"
+  assert_executable "$TEST_INSTALL_DIR/bin/ahandd"
+}
+
+@test "install: aborts on tampered artifact (checksum mismatch)" {
+  # Force the local digest to differ from the published checksum: the
+  # mock shasum returns a bogus hash, simulating a tampered/corrupt binary.
+  export MOCK_SHASUM_FAIL=true
+  run bash "$DIST_DIR/install.sh"
+  assert_failure
+  assert_output --partial "Checksum mismatch"
+  # Fail-closed: the unverified binary must NOT be installed.
+  [ ! -f "$TEST_INSTALL_DIR/bin/ahandd" ]
+}
+
+@test "install: fails closed when checksum file is missing" {
+  # The .sha256/checksum download 404s; install must abort, not skip.
+  export MOCK_CURL_FAIL_PATTERN="checksums-rust.txt"
+  run bash "$DIST_DIR/install.sh"
+  assert_failure
+  assert_output --partial "Checksum file not available"
+  # Fail-closed: nothing installed without integrity verification.
+  [ ! -f "$TEST_INSTALL_DIR/bin/ahandd" ]
 }
