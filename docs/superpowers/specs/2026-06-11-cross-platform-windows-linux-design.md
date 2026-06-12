@@ -109,7 +109,10 @@ three platforms; bootstrap scripts stay thin.
 - **TOCTOU protection on Windows is NOT implemented in M1** (M4 backlog):
   the planned `GetFinalPathNameByHandle` on-open re-verification has not been
   built; Windows file ops run without the openat2/symlinkat protection Unix
-  has. Accepted M1 gap, recorded in the M4 backlog.
+  has. Accepted M1 gap, recorded in the M4 backlog. **(Update: this remained
+  deferred through M4 — see the M4 plan's scope boundary and the M4 Completion
+  Record. The residual TOCTOU window is still open, mitigated only by the
+  single-tenant-host assumption.)**
 - **The daemon runs as a detached process on Windows** — no Windows service
   registration in v1 (parity with macOS, which has no launchd integration
   either). Auto-start is future work.
@@ -437,8 +440,12 @@ hardening landed in the same PR. Final state of each plan task
   owner-only DACL replacement (NOT `icacls` — `/inheritance:r` leaves explicit
   ACEs; see `SECURITY-HIGH#1`). Recursive apply self-walks and skips reparse
   points (NOT `icacls /T`, which follows junctions out of the allowlist —
-  `SECURITY-HIGH#2`). Principals resolve via `LookupAccountNameW`→SID, never raw
-  SDDL interpolation.
+  `SECURITY-HIGH#2`). Principal handling is injection-safe: `validate_principal`
+  runs first and rejects SDDL metacharacters (`: ; ( )`, control chars, leading
+  `/`); a curated allowlist of canonical SDDL aliases (`BA`/`SY`/`OW`/…) and
+  literal SID strings (`S-1-…`) then pass through verbatim, while every other
+  principal name resolves via `LookupAccountNameW`→SID — so attacker-controlled
+  names can never reach the SDDL string as raw interpolation.
 - **T3 — hardened `sanitize_env`** (`handler.rs`): PATH overrides validated
   prepend-only via `env::split_paths`; `BLOCKED_KEYS` adds `PATHEXT`/`COMSPEC`
   (+ the existing loader/lookup keys); `BLOCKED_PREFIXES` = `DYLD_`, `LD_`. Each
