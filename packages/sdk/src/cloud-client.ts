@@ -460,10 +460,10 @@ export interface InvokeAppToolOptions {
    * (1 s – 5 min).
    *
    * For approval-gated tools, set this to at least the expected approval
-   * latency (max `300_000`). An approval granted after the hub window still
-   * executes the handler on the daemon side, but the result is discarded and
-   * the audit `outcome` remains `"timeout"`. Correlate via a replay of the
-   * same call if needed.
+   * latency (max `300_000`). The approval wait on the daemon is bounded by
+   * `min(approval policy timeout, clamp(timeoutMs))` — a late approval finds
+   * the request already expired and nothing executes. This value is the hard
+   * deadline for both the approval dialog and execution.
    */
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -1942,9 +1942,9 @@ export class CloudClient {
    * codes. See `proto/ahand/v1/app_tool.proto` comments for details.
    *
    * For approval-gated tools, set `opts.timeoutMs` ≥ expected approval
-   * latency (max `300_000`); an approval granted after the hub window
-   * still executes the handler, but the result is discarded and the audit
-   * `outcome` remains `"timeout"`.
+   * latency (max `300_000`). The approval wait is bounded by
+   * `min(approval policy timeout, clamp(timeoutMs))` — a late approval finds
+   * the request already expired and nothing executes.
    *
    * Returns `body.result` on success. When the daemon returns a
    * successful response but omits the `result` field, `null` is returned
