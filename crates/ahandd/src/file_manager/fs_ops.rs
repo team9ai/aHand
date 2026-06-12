@@ -1029,8 +1029,59 @@ pub async fn handle_create_symlink(
         });
     }
 
-    // Non-Unix fallback — symlinks not yet supported. TODO(M4): port to Windows.
-    #[cfg(not(unix))]
+    // Windows arm: use std::os::windows::fs::{symlink_file, symlink_dir}.
+    // Choice of which to call is made by inspecting the resolved target:
+    //   - target EXISTS and IS a directory → symlink_dir
+    //   - otherwise (file, dangling/nonexistent, or any other type) → symlink_file
+    //     (a dangling target defaults to file-symlink, matching the behaviour of
+    //     mklink, ln, and most tooling on Windows)
+    // Requires Developer Mode or elevation; ERROR_PRIVILEGE_NOT_HELD (1314) is
+    // mapped to a human-readable error with remediation advice via map_symlink_error.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs as win_fs;
+
+        let link = link_resolved.to_path_buf();
+        let target = req.target.clone();
+        let link_path_str = req.link_path.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<(), FileError> {
+            // Determine whether the target is an existing directory so we can
+            // choose symlink_dir vs symlink_file.  We use std::fs::metadata
+            // (which follows symlinks) so that a symlink-to-dir target gives
+            // us symlink_dir, matching how the OS resolves it.  If stat fails
+            // (e.g. dangling target), we fall back to symlink_file.
+            let target_is_dir = std::fs::metadata(&target)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+
+            let result = if target_is_dir {
+                win_fs::symlink_dir(&target, &link)
+            } else {
+                win_fs::symlink_file(&target, &link)
+            };
+
+            result.map_err(|e| map_symlink_error(&e, &link_path_str))
+        })
+        .await
+        .map_err(|e| {
+            file_error(
+                FileErrorCode::Io,
+                &req.link_path,
+                format!("symlink join error: {e}"),
+            )
+        })??;
+    }
+    #[cfg(windows)]
+    {
+        return Ok(FileCreateSymlinkResult {
+            link_path: link_resolved.to_string_lossy().into_owned(),
+            target: req.target.clone(),
+        });
+    }
+
+    // Non-Windows, non-Unix fallback — symlinks not yet supported.
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = link_resolved;
         return Err(file_error(
@@ -1039,6 +1090,44 @@ pub async fn handle_create_symlink(
             "symlinks are not supported on this platform",
         ));
     }
+}
+
+/// Map a symlink creation I/O error to a `FileError`, with special handling for
+/// ERROR_PRIVILEGE_NOT_HELD (Windows raw OS error 1314).
+///
+/// On Windows, creating symlinks requires either Developer Mode to be enabled
+/// or the process to be elevated (run as Administrator). When this privilege is
+/// absent, the OS returns error code 1314. This function surfaces that condition
+/// with a clear, actionable message.
+///
+/// This is a pure function over a `std::io::Error` reference so it can be unit-tested
+/// without actually triggering a privilege error on the target machine.  The `link_path`
+/// string is embedded in the returned `FileError::path` field for diagnostics.
+///
+/// Compiled on Windows (production use) and on all platforms under `cfg(test)`
+/// so that unit tests can feed synthetic errors without triggering the real
+/// privilege check.
+#[cfg(any(windows, test))]
+pub fn map_symlink_error(err: &std::io::Error, link_path: &str) -> FileError {
+    // ERROR_PRIVILEGE_NOT_HELD = 1314 (0x522)
+    if err.raw_os_error() == Some(1314) {
+        return file_error(
+            FileErrorCode::PermissionDenied,
+            link_path,
+            "creating symlinks requires Developer Mode or elevation: \
+             enable Developer Mode in Windows Settings → System → For Developers, \
+             or re-run as Administrator",
+        );
+    }
+    // All other errors: map using the same logic as io_to_file_error but taking
+    // a reference (io_to_file_error consumes the error; we only have a reference here).
+    let code = match err.kind() {
+        io::ErrorKind::NotFound => FileErrorCode::NotFound,
+        io::ErrorKind::PermissionDenied => FileErrorCode::PermissionDenied,
+        io::ErrorKind::AlreadyExists => FileErrorCode::AlreadyExists,
+        _ => FileErrorCode::Io,
+    };
+    file_error(code, link_path, err.to_string())
 }
 
 // ── Chmod ──────────────────────────────────────────────────────────────────
@@ -1348,5 +1437,68 @@ mod tests {
         assert!(!src.exists(), "source tree should be gone");
         assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
         assert_eq!(std::fs::read(dst.join("nested/b.txt")).unwrap(), b"b");
+    }
+
+    // ── map_symlink_error unit tests ──────────────────────────────────────
+    // These tests run cross-platform (the function is compiled under cfg(test)).
+    // They feed synthetic io::Error values so no actual symlink privilege is needed.
+
+    #[test]
+    fn map_symlink_error_privilege_not_held_maps_to_permission_denied_with_remediation() {
+        // ERROR_PRIVILEGE_NOT_HELD = 1314 (Windows) — synthesised cross-platform.
+        let err = io::Error::from_raw_os_error(1314);
+        let fe = super::map_symlink_error(&err, "/tmp/link");
+        assert_eq!(
+            fe.code,
+            ahand_protocol::FileErrorCode::PermissionDenied as i32,
+            "1314 must map to PermissionDenied"
+        );
+        // The message must contain actionable remediation text.
+        assert!(
+            fe.message.contains("Developer Mode") || fe.message.contains("elevated"),
+            "remediation text must mention Developer Mode or elevation; got: {:?}",
+            fe.message
+        );
+        assert_eq!(fe.path, "/tmp/link", "path field must be preserved");
+    }
+
+    #[test]
+    fn map_symlink_error_generic_permission_denied_passes_through() {
+        // A generic PermissionDenied error must NOT be confused with the Windows
+        // 1314 privilege error — no Developer Mode messaging should appear.
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "generic denied");
+        let fe = super::map_symlink_error(&err, "/tmp/link2");
+        assert_eq!(
+            fe.code,
+            ahand_protocol::FileErrorCode::PermissionDenied as i32,
+            "PermissionDenied kind must map to PermissionDenied code"
+        );
+        assert!(
+            !fe.message.contains("Developer Mode"),
+            "generic error must not mention Developer Mode; got: {:?}",
+            fe.message
+        );
+    }
+
+    #[test]
+    fn map_symlink_error_already_exists_passes_through() {
+        let err = io::Error::new(io::ErrorKind::AlreadyExists, "already exists");
+        let fe = super::map_symlink_error(&err, "/tmp/existing");
+        assert_eq!(
+            fe.code,
+            ahand_protocol::FileErrorCode::AlreadyExists as i32,
+            "AlreadyExists kind must map to AlreadyExists code"
+        );
+    }
+
+    #[test]
+    fn map_symlink_error_not_found_passes_through() {
+        let err = io::Error::new(io::ErrorKind::NotFound, "not found");
+        let fe = super::map_symlink_error(&err, "/tmp/missing");
+        assert_eq!(
+            fe.code,
+            ahand_protocol::FileErrorCode::NotFound as i32,
+            "NotFound kind must map to NotFound code"
+        );
     }
 }

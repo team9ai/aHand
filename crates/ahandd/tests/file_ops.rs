@@ -15,9 +15,12 @@ use ahand_protocol::{
     StringReplace, WriteAction, file_edit, file_position, file_read_text, file_request,
     file_response, file_write, full_write,
 };
-// FileCreateSymlink, UnixPermission and file_chmod are only used in #[cfg(unix)] tests.
+// FileCreateSymlink is used in both #[cfg(unix)] and #[cfg(windows)] tests.
+// UnixPermission and file_chmod are only used in #[cfg(unix)] tests.
+#[cfg(any(unix, windows))]
+use ahand_protocol::FileCreateSymlink;
 #[cfg(unix)]
-use ahand_protocol::{FileCreateSymlink, UnixPermission, file_chmod};
+use ahand_protocol::{UnixPermission, file_chmod};
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
 use tempfile::TempDir;
@@ -271,7 +274,7 @@ fn expect_move(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileMoveRe
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn expect_symlink(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileCreateSymlinkResult {
     match resp.result {
         Some(file_response::Result::CreateSymlink(r)) => r,
@@ -4375,3 +4378,119 @@ async fn linux_openat2_path_returns_policy_denied_for_symlinked_ancestor() {
         "no inner dir must have been created at the symlink target",
     );
 }
+
+// ── Windows symlink tests ───────────────────────────────────────────────────
+//
+// These tests exercise the Windows arm of handle_create_symlink which uses
+// std::os::windows::fs::{symlink_file, symlink_dir}.  They run only on Windows
+// (the syscalls are unavailable elsewhere), but map_symlink_error is tested
+// cross-platform further below.
+
+/// R2 Windows analogue: a CreateSymlink request whose target lies outside the
+/// allowlist is rejected at the policy preflight with PolicyDenied.
+///
+/// The R2 check lives in the dispatch layer (file_manager/mod.rs), not in the
+/// platform-specific syscall arm, so this test verifies the security property
+/// holds on Windows without actually invoking symlink creation.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_create_symlink_target_outside_allowlist_is_denied() {
+    // R2 regression (Windows parity): FileCreateSymlink with a target pointing
+    // outside the allowlist must be rejected at policy preflight (PolicyDenied).
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let link = root.join("escape");
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            // C:\Windows\System32\drivers\etc\hosts is a reliable outside-allowlist
+            // path on any Windows installation.
+            target: r"C:\Windows\System32\drivers\etc\hosts".into(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let err = mgr.check_request_approval(&req).await.unwrap_err();
+    assert_eq!(
+        err.code,
+        FileErrorCode::PolicyDenied as i32,
+        "target outside allowlist must yield PolicyDenied; got: {:?}",
+        err,
+    );
+}
+
+/// Happy-path: create a file symlink on Windows (target is an existing file).
+/// Verifies that symlink_file is chosen when the target is not a directory, that
+/// the link inode is a symlink, and that it resolves back to the target.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_create_file_symlink_creates_link() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    let link = root.join("link_to_file");
+    fs::write(&target, "hello").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: target.to_string_lossy().into_owned(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_symlink(resp);
+
+    let link_meta = fs::symlink_metadata(&link).expect("symlink must exist");
+    assert!(
+        link_meta.file_type().is_symlink(),
+        "created path must be a symlink, not a regular file"
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        target,
+        "symlink must resolve to the original target"
+    );
+}
+
+/// Happy-path: create a directory symlink on Windows (target is an existing dir).
+/// Verifies that symlink_dir is chosen when the target is a directory and that
+/// the link resolves to the target directory.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_create_dir_symlink_creates_link() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target_dir = root.join("target_dir");
+    let link = root.join("link_to_dir");
+    fs::create_dir(&target_dir).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: target_dir.to_string_lossy().into_owned(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_symlink(resp);
+
+    let link_meta = fs::symlink_metadata(&link).expect("directory symlink must exist");
+    assert!(
+        link_meta.file_type().is_symlink(),
+        "created path must be a symlink, not a plain directory"
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        target_dir,
+        "directory symlink must resolve to the target directory"
+    );
+}
+
+// Note: map_symlink_error unit tests live in the fs_ops.rs #[cfg(test)] block
+// (crates/ahandd/src/file_manager/fs_ops.rs) where the function is also compiled
+// under cfg(test) cross-platform.  See:
+//   map_symlink_error_privilege_not_held_maps_to_permission_denied_with_remediation
+//   map_symlink_error_generic_permission_denied_passes_through
+//   map_symlink_error_already_exists_passes_through
+//   map_symlink_error_not_found_passes_through
