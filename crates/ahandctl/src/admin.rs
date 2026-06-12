@@ -1009,4 +1009,49 @@ mod sse_adapter_tests {
         let expected = home.join(".ahand").join("bin");
         assert_eq!(ahand_bin_dir(home), expected);
     }
+
+    // -------------------------------------------------------------------------
+    // StatusResponse serde-contract test: the admin SPA reads these exact JSON
+    // keys (config_path, data_dir, home_dir, bin_dir). Pin the wire names so a
+    // field rename/drop is caught here instead of silently breaking the panel.
+    // -------------------------------------------------------------------------
+
+    /// `StatusResponse` serialises with the exact JSON keys the SPA depends on.
+    #[test]
+    fn status_response_serializes_expected_keys() {
+        let resp = StatusResponse {
+            version: "1.2.3".to_string(),
+            daemon_running: true,
+            daemon_pid: Some(4242),
+            config_path: "/home/alice/.ahand/config.toml".to_string(),
+            data_dir: "/home/alice/.ahand/data".to_string(),
+            data_dir_size: 1024,
+            home_dir: "/home/alice".to_string(),
+            bin_dir: "/home/alice/.ahand/bin".to_string(),
+        };
+
+        let value = serde_json::to_value(&resp).expect("StatusResponse must serialize");
+        let obj = value.as_object().expect("must serialize to a JSON object");
+
+        assert_eq!(
+            obj.get("config_path").and_then(|v| v.as_str()),
+            Some("/home/alice/.ahand/config.toml"),
+            "config_path key/value must match"
+        );
+        assert_eq!(
+            obj.get("data_dir").and_then(|v| v.as_str()),
+            Some("/home/alice/.ahand/data"),
+            "data_dir key/value must match"
+        );
+        assert_eq!(
+            obj.get("home_dir").and_then(|v| v.as_str()),
+            Some("/home/alice"),
+            "home_dir key/value must match"
+        );
+        assert_eq!(
+            obj.get("bin_dir").and_then(|v| v.as_str()),
+            Some("/home/alice/.ahand/bin"),
+            "bin_dir key/value must match"
+        );
+    }
 }

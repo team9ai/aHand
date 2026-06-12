@@ -7,6 +7,10 @@ export default function SetupPanel(props: { onComplete: () => void }) {
   // Status works pre-daemon (paths come from dirs::home_dir()); fall back to
   // the literal only if the call fails.
   const [status] = createResource<StatusResponse>(api.getStatus);
+  // Reading an errored resource accessor re-throws; guard so a failed
+  // /api/status degrades to the literal path instead of crashing the panel
+  // (no ErrorBoundary).
+  const statusOrNull = () => (status.error ? undefined : status());
   const [mode, setMode] = createSignal<Mode>("openclaw-gateway");
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
@@ -75,7 +79,7 @@ export default function SetupPanel(props: { onComplete: () => void }) {
         fallback={
           <div class="panel setup-done">
             <h2>Configuration saved</h2>
-            <p>Your config has been written to <code>{status()?.config_path ?? "~/.ahand/config.toml"}</code></p>
+            <p>Your config has been written to <code>{statusOrNull()?.config_path ?? "~/.ahand/config.toml"}</code></p>
             <div class="setup-next">
               <p>Next, start the daemon:</p>
               <pre>ahandctl start</pre>
