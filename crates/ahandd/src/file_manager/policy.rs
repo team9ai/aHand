@@ -648,6 +648,53 @@ mod tests {
         );
     }
 
+    /// Security-critical: prove that the denylist case-bypass is blocked through
+    /// the REAL `check_path` flow (not just `glob_match` in isolation).
+    ///
+    /// Scenario: the operator's denylist uses the lowercase `.ssh` casing, but
+    /// an attacker supplies a write destination with `.SSH` (uppercase).  Because
+    /// the path does NOT yet exist, `canonicalize_or_parent` canonicalizes the
+    /// existing parent and re-appends the attacker-cased suffix — so the resolved
+    /// path retains `.SSH`.  The `glob_match` call with `case_sensitive: false`
+    /// must still match the lowercase denylist pattern against the uppercase path
+    /// and deny the request.
+    ///
+    /// The allowlist explicitly admits the parent directory so the denial is
+    /// provably from the denylist, not from an allowlist miss.
+    #[cfg(windows)]
+    #[test]
+    fn windows_denylist_case_bypass_blocked_through_check_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = canon_root(&tmp);
+
+        // Create the parent directory (.SSH does NOT exist — attacker casing).
+        // The denylist pattern uses canonical lowercase (.ssh); the write
+        // destination uses uppercase (.SSH).
+        let ssh_dir_lower = root.join(".ssh");
+        // Do NOT create .SSH — the path must be not-yet-existing so that
+        // canonicalize_or_parent re-appends the attacker-cased suffix.
+
+        // Denylist uses lowercase; allowlist admits the root so the parent
+        // directory (root itself) is allowed — isolating the denylist denial.
+        let denylist = vec![format!("{}/.ssh/**", root.display())];
+        let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &denylist, &[]));
+
+        // The write destination: .SSH (uppercase) / id_rsa — does not exist yet.
+        // Use the lowercase ssh_dir_lower as base but suffix with uppercase variant.
+        let root_str = root.to_string_lossy();
+        let attacker_path = format!(r"{}\.SSH\id_rsa", root_str);
+
+        let err = checker.check_path(&attacker_path, true, false).unwrap_err();
+        assert_eq!(
+            err.code,
+            FileErrorCode::PolicyDenied as i32,
+            "denylist must block case-variant path through check_path (not-yet-existing write): {err:?}"
+        );
+
+        // Suppress unused variable warning for ssh_dir_lower (intentionally not created).
+        let _ = ssh_dir_lower;
+    }
+
     /// Regression: on Unix, glob_match must remain case-SENSITIVE.
     /// Pattern `/Home/**` must NOT match `/home/x` (different capitalisation).
     #[cfg(unix)]

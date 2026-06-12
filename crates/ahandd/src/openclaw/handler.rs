@@ -1344,6 +1344,10 @@ fn truncate_output(raw: &str, max_chars: usize) -> String {
 /// "all entries are prepended to an empty base", mirroring the common case
 /// where the daemon starts with `PATH=""` (e.g. in a stripped sandbox).
 /// An empty `override_val` is rejected (nothing meaningful was prepended).
+///
+/// Windows note: case-variant base entries (e.g. `C:\Windows` vs `c:\windows`)
+/// fail the suffix equality check and the override is dropped, so the daemon's
+/// own PATH is used unchanged.  This is intentional fail-closed behaviour.
 fn path_override_is_prepend_only(override_val: &str, base: &str) -> bool {
     // Filter out empty path entries produced by split_paths("").
     let non_empty = |p: &std::path::PathBuf| !p.as_os_str().is_empty();
@@ -1390,6 +1394,13 @@ fn sanitize_env(overrides: &HashMap<String, String>) -> HashMap<String, String> 
         // allows arbitrary code injection into any python subprocess the
         // daemon spawns.
         "PYTHONSTARTUP",
+        // Injects module-resolution directories into Node.js require(); a
+        // plugin could use it to preload attacker-controlled code when the
+        // daemon spawns node for a managed runtime.
+        "NODE_PATH",
+        // Auto-sourced by bash when invoked non-interactively (e.g. via $SHELL);
+        // allows arbitrary code injection into any bash subprocess the daemon spawns.
+        "BASH_ENV",
     ];
 
     const BLOCKED_PREFIXES: &[&str] = &["DYLD_", "LD_"];
@@ -1919,6 +1930,20 @@ mod tests {
         );
     }
 
+    /// An override that is the base entries followed by an extra entry is an
+    /// append, not a prepend — and must be rejected.  The base entries appear
+    /// as a PREFIX of the override, not a suffix.
+    #[test]
+    fn path_override_append_is_rejected() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        // base entries first, then an extra entry — this is an append, not a prepend.
+        let override_val = join_path_entries(&["/usr/bin", "/bin", "/evil"]);
+        assert!(
+            !super::path_override_is_prepend_only(&override_val, &base),
+            "appending an entry after base entries must be rejected (not a pure prepend)"
+        );
+    }
+
     // ── sanitize_env blocked-key tests ───────────────────────────────────────
 
     #[test]
@@ -1956,6 +1981,41 @@ mod tests {
         assert!(
             !result.contains_key("PYTHONSTARTUP"),
             "PYTHONSTARTUP must be stripped by sanitize_env"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_node_path() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "NODE_PATH".to_string(),
+            "/attacker/node_modules".to_string(),
+        );
+        overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert!(
+            !result.contains_key("NODE_PATH"),
+            "NODE_PATH must be stripped by sanitize_env"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("ok"),
+            "non-blocked variables must pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_bash_env() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("BASH_ENV".to_string(), "/attacker/inject.sh".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert!(
+            !result.contains_key("BASH_ENV"),
+            "BASH_ENV must be stripped by sanitize_env"
         );
     }
 
