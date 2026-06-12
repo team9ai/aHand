@@ -4871,7 +4871,7 @@ mod windows_acl_chmod {
 // No raw `.canonicalize()` calls appear in any test added here.
 
 /// Windows analogue of stat_symlink_follow_returns_target_type.
-/// A directory symlink whose target is a file: following the link reports the
+/// A file symlink whose target is a file: following the link reports the
 /// file's type and size, not the symlink's own metadata.
 #[cfg(windows)]
 #[tokio::test]
@@ -4990,6 +4990,15 @@ async fn windows_list_does_not_follow_symlink_into_target_metadata() {
 /// match and filters out any result whose canonicalized path escapes the
 /// allowlist, even when the entry appeared inside the allowed directory.
 ///
+/// **Positive-control sub-assertion**: we also create a `FileManager` whose
+/// allowlist includes BOTH `root` AND `outside_root`, run the same glob, and
+/// assert it returns 3 matches (`inside.rs + escape.rs + witness.rs`).  This
+/// proves that the glob engine DOES traverse the symlinked directory — so the
+/// `total_matches==1` result in the restrictive-policy run is caused by the
+/// policy filter, not by the glob silently skipping the symlink.  Without
+/// this companion assertion a non-traversing glob would also yield 1 match,
+/// making the security assertion trivially vacuous.
+///
 /// **Junction vs symlink_dir choice**: `std::os::windows::fs::symlink_dir` is
 /// used here because the T1 tests already exercise it on `windows-latest` CI
 /// (which runs with Developer Mode enabled).  Junctions would avoid the
@@ -5005,44 +5014,86 @@ async fn windows_glob_skips_symlink_dir_pointing_outside_allowlist() {
     // A real file inside the allowlist.
     fs::write(root.join("inside.rs"), "x").unwrap();
 
-    // An outside temp dir with a real file we DO NOT want accessible.
+    // An outside temp dir with TWO real files we DO NOT want accessible.
+    // Two files are required: if a non-traversing glob silently skips the
+    // symlinked dir it would still yield total_matches==1, indistinguishable
+    // from "policy filtered the outside files". With two outside candidates,
+    // a traversing-but-unfiltered glob returns 3 — the count distinguishes
+    // traversal-without-policy (3) from policy-filtered (1).
     let outside = TempDir::new().unwrap();
     let outside_root = canon(outside.path());
     fs::write(outside_root.join("escape.rs"), "secret").unwrap();
+    fs::write(outside_root.join("witness.rs"), "also-secret").unwrap();
 
     // Create a directory symlink inside root pointing at outside_root.
     // The symlink itself is inside the allowlist; its canonical target is not.
     let link_dir = root.join("subdir_link");
     std::os::windows::fs::symlink_dir(&outside_root, &link_dir).unwrap();
 
-    let req = FileRequest {
+    let glob_req = |base: &std::path::Path| FileRequest {
         request_id: "t".into(),
         operation: Some(file_request::Operation::Glob(FileGlob {
             pattern: "**/*.rs".into(),
-            base_path: Some(root.to_string_lossy().into_owned()),
+            base_path: Some(base.to_string_lossy().into_owned()),
             max_results: None,
         })),
     };
-    let resp = mgr.handle(&req).await;
+
+    // ── Positive-control: allowlist covers both root AND outside_root ──────
+    // This proves the glob DOES traverse the symlinked directory.
+    {
+        let outside_root_str = outside_root.to_string_lossy().into_owned();
+        let root_str = root.to_string_lossy().into_owned();
+        let permissive_mgr = FileManager::new(&FilePolicyConfig {
+            enabled: true,
+            path_allowlist: vec![
+                format!("{}/**", root_str.trim_end_matches('/')),
+                root_str.clone(),
+                format!("{}/**", outside_root_str.trim_end_matches('/')),
+                outside_root_str.clone(),
+            ],
+            path_denylist: vec![],
+            max_read_bytes: 100_000_000,
+            max_write_bytes: 100_000_000,
+            dangerous_paths: vec![],
+        });
+        let resp = permissive_mgr.handle(&glob_req(&root)).await;
+        let glob = expect_glob(resp);
+        assert_eq!(
+            glob.total_matches, 3,
+            "permissive policy must return all 3 .rs files (inside.rs + escape.rs + witness.rs), \
+             proving glob traverses the symlink; got {} matches: {:?}",
+            glob.total_matches, glob.entries
+        );
+    }
+
+    // ── Restrictive policy: only root is allowed ───────────────────────────
+    // With traversal confirmed above, total_matches==1 here proves that
+    // policy filtered the two outside matches — not that glob skipped the dir.
+    let resp = mgr.handle(&glob_req(&root)).await;
     let glob = expect_glob(resp);
 
-    // Only `inside.rs` should survive — `subdir_link/escape.rs` gets filtered
-    // because its canonical path resolves to outside_root which is outside the
-    // allowlist. This proves escape-denial on Windows parity with Unix.
     assert_eq!(
         glob.total_matches, 1,
         "symlink/junction-escape through glob must be filtered; got {} matches: {:?}",
         glob.total_matches, glob.entries
     );
-    assert!(
-        glob.entries.iter().any(|e| e.name.ends_with("inside.rs")),
-        "inside.rs must survive"
+    // The single survivor must be inside.rs specifically.
+    assert_eq!(
+        glob.entries.len(),
+        1,
+        "exactly one entry must remain after filtering"
     );
     assert!(
-        glob.entries
-            .iter()
-            .all(|e| !e.name.contains("subdir_link") && !e.name.ends_with("escape.rs")),
-        "escape.rs through the symlink must be filtered out"
+        glob.entries[0].name.ends_with("inside.rs"),
+        "the surviving entry must be inside.rs, got: {:?}",
+        glob.entries[0].name
+    );
+    assert!(
+        glob.entries.iter().all(|e| !e.name.contains("subdir_link")
+            && !e.name.ends_with("escape.rs")
+            && !e.name.ends_with("witness.rs")),
+        "escape.rs and witness.rs through the symlink must be filtered out"
     );
 }
 
@@ -5155,6 +5206,48 @@ async fn windows_delete_symlink_no_follow_removes_link_not_target() {
         fs::read_to_string(&target).unwrap(),
         "x",
         "target content must be unchanged"
+    );
+}
+
+/// Windows analogue of chmod_refuses_symlink_when_no_follow_set.
+/// `no_follow_symlink=true` on a file symlink must be refused before any ACL
+/// operation is attempted — `reject_if_final_component_is_symlink` fires and
+/// returns `InvalidPath`, leaving the target's ACL untouched.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_chmod_refuses_symlink_when_no_follow_set() {
+    use ahand_protocol::{AclEntry, AclEntryType, WindowsAcl, file_chmod};
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "x").unwrap();
+    let link = root.join("link.txt");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    // Attempt a chmod through the symlink with no_follow_symlink=true.
+    // The ACL principal is irrelevant — the request must be rejected before
+    // any ACL operation is attempted.
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: link.to_string_lossy().into_owned(),
+            recursive: false,
+            no_follow_symlink: true,
+            permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                entries: vec![AclEntry {
+                    principal: "Everyone".into(),
+                    access_mask: 0x001F_01FF, // FILE_ALL_ACCESS
+                    entry_type: AclEntryType::Allow as i32,
+                }],
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(
+        err.code,
+        FileErrorCode::InvalidPath as i32,
+        "no_follow_symlink=true on a symlink must return InvalidPath"
     );
 }
 
