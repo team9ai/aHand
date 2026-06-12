@@ -1331,6 +1331,48 @@ fn truncate_output(raw: &str, max_chars: usize) -> String {
     }
 }
 
+/// Returns `true` iff `override_val` is a strict PATH-prepend of `base`:
+/// the entries of `base` must appear as a contiguous suffix of the entries
+/// in `override_val`.  Uses `std::env::split_paths` so the separator is
+/// platform-correct (`;` on Windows, `:` on Unix).
+///
+/// Note: `std::env::split_paths("")` yields a single empty-string entry on
+/// some platforms; we filter those out so that an empty-string input is
+/// treated as "no entries".
+///
+/// Decision for empty `base`: a non-empty `override_val` is accepted as
+/// "all entries are prepended to an empty base", mirroring the common case
+/// where the daemon starts with `PATH=""` (e.g. in a stripped sandbox).
+/// An empty `override_val` is rejected (nothing meaningful was prepended).
+fn path_override_is_prepend_only(override_val: &str, base: &str) -> bool {
+    // Filter out empty path entries produced by split_paths("").
+    let non_empty = |p: &std::path::PathBuf| !p.as_os_str().is_empty();
+    let override_entries: Vec<_> = std::env::split_paths(override_val)
+        .filter(non_empty)
+        .collect();
+    let base_entries: Vec<_> = std::env::split_paths(base).filter(non_empty).collect();
+
+    if override_entries.is_empty() {
+        // An empty override adds nothing; reject.
+        return false;
+    }
+
+    if base_entries.is_empty() {
+        // Empty base: any non-empty override is acceptable — all entries are
+        // "prepended" to an empty base.
+        return true;
+    }
+
+    // The base entries must form a contiguous suffix of the override entries.
+    let base_len = base_entries.len();
+    let over_len = override_entries.len();
+    if base_len > over_len {
+        return false;
+    }
+    let suffix_start = over_len - base_len;
+    override_entries[suffix_start..] == base_entries[..]
+}
+
 /// Sanitize environment variables
 fn sanitize_env(overrides: &HashMap<String, String>) -> HashMap<String, String> {
     const BLOCKED_KEYS: &[&str] = &[
@@ -1340,6 +1382,14 @@ fn sanitize_env(overrides: &HashMap<String, String>) -> HashMap<String, String> 
         "PERL5LIB",
         "PERL5OPT",
         "RUBYOPT",
+        // Redirects the Python interpreter binary; a plugin could use it to
+        // run an attacker-controlled python executable when the daemon spawns
+        // python for a managed runtime.
+        "PYTHONEXECUTABLE",
+        // Auto-executes a script every time the Python interpreter starts;
+        // allows arbitrary code injection into any python subprocess the
+        // daemon spawns.
+        "PYTHONSTARTUP",
     ];
 
     const BLOCKED_PREFIXES: &[&str] = &["DYLD_", "LD_"];
@@ -1356,8 +1406,11 @@ fn sanitize_env(overrides: &HashMap<String, String>) -> HashMap<String, String> 
             if trimmed.is_empty() {
                 continue;
             }
-            // Only allow PATH if it prepends to current PATH
-            if trimmed == base_path || trimmed.ends_with(&format!(":{}", base_path)) {
+            // Only allow PATH overrides that strictly prepend to the current
+            // PATH (platform-correct: split_paths uses `;` on Windows, `:` on
+            // Unix).  Overrides that replace or reorder existing entries are
+            // rejected to prevent DLL/binary hijacking.
+            if path_override_is_prepend_only(trimmed, &base_path) {
                 result.retain(|existing_key, _| {
                     !crate::plugin_runtime::path_env::is_path_env_key(existing_key)
                 });
@@ -1762,6 +1815,223 @@ mod tests {
         assert_eq!(
             stdout, "hello&world",
             "ampersand must be passed verbatim, not shell-interpreted; got: {stdout:?}"
+        );
+    }
+
+    // ── path_override_is_prepend_only tests ──────────────────────────────────
+
+    /// Build a platform-correct PATH string from a list of directory strings
+    /// using std::env::join_paths so the separator is always correct.
+    fn join_path_entries(entries: &[&str]) -> String {
+        let paths: Vec<std::path::PathBuf> = entries.iter().map(std::path::PathBuf::from).collect();
+        std::env::join_paths(&paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn path_override_prepend_single_entry_is_accepted() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        let override_val = join_path_entries(&["/custom/bin", "/usr/bin", "/bin"]);
+        assert!(
+            super::path_override_is_prepend_only(&override_val, &base),
+            "prepending one entry to base must be accepted"
+        );
+    }
+
+    #[test]
+    fn path_override_prepend_multiple_entries_is_accepted() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        let override_val = join_path_entries(&["/a", "/b", "/usr/bin", "/bin"]);
+        assert!(
+            super::path_override_is_prepend_only(&override_val, &base),
+            "prepending multiple entries to base must be accepted"
+        );
+    }
+
+    #[test]
+    fn path_override_identical_to_base_is_accepted() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        // Same entries, zero prepended — still valid (nothing harmful added).
+        assert!(
+            super::path_override_is_prepend_only(&base, &base),
+            "PATH identical to base must be accepted"
+        );
+    }
+
+    #[test]
+    fn path_override_full_replace_is_rejected() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        let override_val = join_path_entries(&["/attacker/bin", "/other"]);
+        assert!(
+            !super::path_override_is_prepend_only(&override_val, &base),
+            "full replacement of base entries must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_override_middle_insert_is_rejected() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        // Insert an entry between the two base entries — this is not a pure prepend.
+        let override_val = join_path_entries(&["/usr/bin", "/injected", "/bin"]);
+        assert!(
+            !super::path_override_is_prepend_only(&override_val, &base),
+            "inserting an entry in the middle of base entries must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_override_reorder_is_rejected() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        // Reversed order — base entries are present but not as a suffix.
+        let override_val = join_path_entries(&["/bin", "/usr/bin"]);
+        assert!(
+            !super::path_override_is_prepend_only(&override_val, &base),
+            "reordering base entries must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_override_empty_override_is_rejected() {
+        let base = join_path_entries(&["/usr/bin"]);
+        assert!(
+            !super::path_override_is_prepend_only("", &base),
+            "empty override must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_override_empty_base_non_empty_override_is_accepted() {
+        // Empty base: any non-empty override is treated as "all prepended".
+        let override_val = join_path_entries(&["/custom/bin"]);
+        assert!(
+            super::path_override_is_prepend_only(&override_val, ""),
+            "non-empty override with empty base must be accepted"
+        );
+    }
+
+    #[test]
+    fn path_override_empty_base_empty_override_is_rejected() {
+        assert!(
+            !super::path_override_is_prepend_only("", ""),
+            "both empty must be rejected (empty override adds nothing)"
+        );
+    }
+
+    // ── sanitize_env blocked-key tests ───────────────────────────────────────
+
+    #[test]
+    fn sanitize_env_strips_pythonexecutable() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "PYTHONEXECUTABLE".to_string(),
+            "/attacker/python".to_string(),
+        );
+        overrides.insert("SAFE_VAR".to_string(), "hello".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert!(
+            !result.contains_key("PYTHONEXECUTABLE"),
+            "PYTHONEXECUTABLE must be stripped by sanitize_env"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("hello"),
+            "non-blocked variables must pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_pythonstartup() {
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert(
+            "PYTHONSTARTUP".to_string(),
+            "/attacker/startup.py".to_string(),
+        );
+
+        let result = super::sanitize_env(&overrides);
+
+        assert!(
+            !result.contains_key("PYTHONSTARTUP"),
+            "PYTHONSTARTUP must be stripped by sanitize_env"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_existing_blocked_keys() {
+        let blocked = &[
+            "NODE_OPTIONS",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PERL5LIB",
+            "PERL5OPT",
+            "RUBYOPT",
+        ];
+        let mut overrides = std::collections::HashMap::new();
+        for key in blocked {
+            overrides.insert((*key).to_string(), "injected".to_string());
+        }
+
+        let result = super::sanitize_env(&overrides);
+
+        for key in blocked {
+            assert!(
+                !result.contains_key(*key),
+                "{key} must be stripped by sanitize_env"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_env_path_prepend_is_accepted() {
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        if base_path.is_empty() {
+            // Can't meaningfully test PATH prepend without a base PATH.
+            return;
+        }
+        let new_dir = join_path_entries(&["/prepended/bin"]);
+        let prepended = format!(
+            "{}",
+            std::env::join_paths(
+                std::iter::once(std::path::PathBuf::from("/prepended/bin"))
+                    .chain(std::env::split_paths(&base_path))
+            )
+            .unwrap()
+            .to_string_lossy()
+        );
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("PATH".to_string(), prepended.clone());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_eq!(
+            result.get("PATH").map(String::as_str),
+            Some(prepended.as_str()),
+            "PATH prepend must be accepted; base_path={base_path:?} new_dir={new_dir:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_path_full_replace_is_rejected() {
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        if base_path.is_empty() {
+            return;
+        }
+        let replace = join_path_entries(&["/attacker/bin"]);
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("PATH".to_string(), replace);
+
+        let result = super::sanitize_env(&overrides);
+
+        // The PATH in result must still be the original base (not the attacker's).
+        assert_ne!(
+            result.get("PATH").map(String::as_str),
+            Some("/attacker/bin"),
+            "full PATH replacement must be rejected"
         );
     }
 }
