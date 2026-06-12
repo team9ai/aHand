@@ -497,8 +497,8 @@ export default function ConfigPanel() {
                   updateNestedField("browser", "binary_path", e.currentTarget.value)
                 }
                 placeholder={
-                  status()?.bin_dir
-                    ? `${status()!.bin_dir}/agent-browser`
+                  status()?.bin_dir != null
+                    ? `${status()?.bin_dir}/agent-browser`
                     : "~/.ahand/bin/agent-browser"
                 }
               />

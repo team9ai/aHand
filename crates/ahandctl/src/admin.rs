@@ -445,7 +445,7 @@ async fn get_status(config_path: &Path) -> Result<StatusResponse> {
 
     // Resolve platform-correct home and bin directories.
     let home = dirs::home_dir().context("Failed to find home directory")?;
-    let bin_dir = home.join(".ahand").join("bin");
+    let bin_dir = ahand_bin_dir(&home);
 
     Ok(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -690,6 +690,12 @@ fn resolve_dist_path() -> Result<PathBuf> {
 fn get_data_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("Failed to find home directory")?;
     Ok(home.join(".ahand").join("data"))
+}
+
+/// Resolve the `.ahand/bin` directory under the given home path.
+/// Pure (no I/O) so it can be unit-tested across platforms.
+fn ahand_bin_dir(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".ahand").join("bin")
 }
 
 fn calculate_dir_size(
@@ -987,5 +993,20 @@ mod sse_adapter_tests {
             Some(0),
             "exit_code must be 0 on Ok: {data}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Path-helper test: ahand_bin_dir is the pure builder behind StatusResponse
+    // `bin_dir`. Build the expected path with `.join` so it stays correct on
+    // both POSIX (`/`) and Windows (`\`) separators.
+    // -------------------------------------------------------------------------
+
+    /// `ahand_bin_dir` appends `.ahand/bin` to the given home directory.
+    #[test]
+    fn ahand_bin_dir_appends_dot_ahand_bin() {
+        use std::path::Path;
+        let home = Path::new("/home/alice");
+        let expected = home.join(".ahand").join("bin");
+        assert_eq!(ahand_bin_dir(home), expected);
     }
 }
