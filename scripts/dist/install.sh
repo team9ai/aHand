@@ -110,8 +110,12 @@ verify_checksum() {
     exit 1
   fi
 
+  # Exact filename match (no regex): the checksum filename is compared
+  # literally, so `.` in names like `admin-spa.tar.gz` cannot act as a
+  # wildcard and select a decoy line. Handles both `shasum` (`<hash>  <file>`,
+  # two spaces) and `sha256sum` binary mode (`<hash> *<file>`).
   local expected
-  expected=$(grep " \*\{0,1\}${checksum_name}\$" "$checksum_file" 2>/dev/null | head -1 | awk '{print $1}')
+  expected=$(awk -v n="$checksum_name" '$2==n || $2=="*"n {print $1; exit}' "$checksum_file" 2>/dev/null)
   if [ -z "$expected" ]; then
     echo "ERROR: No checksum entry for ${checksum_name} in checksum file — refusing to install unverified artifact."
     exit 1

@@ -47,7 +47,7 @@ The dashboard can be deployed independently first. The compose stack runs the hu
 curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.sh | bash
 ```
 
-The installer verifies the SHA-256 checksum of every downloaded artifact before installing (fail-closed: aborts if the checksum file is missing or mismatches). Gatekeeper quarantine (`com.apple.quarantine`) is removed automatically for the installed binaries. After installation the installer prints the exact shell profile line to add `~/.ahand/bin` to your `PATH` — paste and run it, then open a new terminal.
+The installer verifies the SHA-256 checksum of the daemon, CLI, and admin-panel artifacts before installing (fail-closed: aborts if the checksum file is missing or mismatches). Gatekeeper quarantine (`com.apple.quarantine`) is removed automatically for the installed binaries. After installation the installer prints the exact shell profile line to add `~/.ahand/bin` to your `PATH` — paste and run it, then open a new terminal.
 
 #### Linux
 
@@ -55,7 +55,7 @@ The installer verifies the SHA-256 checksum of every downloaded artifact before 
 curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.sh | bash
 ```
 
-The installer verifies the SHA-256 checksum of every downloaded artifact before installing (fail-closed). There is no Gatekeeper step. After installation the installer prints the exact shell profile line to add `~/.ahand/bin` to your `PATH` — paste and run it, then open a new terminal.
+The installer verifies the SHA-256 checksum of the daemon, CLI, and admin-panel artifacts before installing (fail-closed). There is no Gatekeeper step. After installation the installer prints the exact shell profile line to add `~/.ahand/bin` to your `PATH` — paste and run it, then open a new terminal.
 
 > **Linux binary note:** Released Linux binaries are glibc builds for `x86_64` and `aarch64`. musl/Alpine and `armv7` builds are not provided.
 

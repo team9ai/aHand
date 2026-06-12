@@ -182,3 +182,15 @@ teardown() {
   # Fail-closed: nothing installed without integrity verification.
   [ ! -f "$TEST_INSTALL_DIR/bin/ahandd" ]
 }
+
+@test "install: fails closed when checksum entry is missing for artifact" {
+  # The checksum file downloads fine (present + readable, valid format) but
+  # contains NO line for the requested artifact — verify_checksum must still
+  # abort (the "no entry" fail-closed branch), not silently skip verification.
+  export MOCK_CURL_CHECKSUM_NOMATCH=1
+  run bash "$DIST_DIR/install.sh"
+  assert_failure
+  assert_output --partial "No checksum entry"
+  # Fail-closed: the unverified binary must NOT be installed.
+  [ ! -f "$TEST_INSTALL_DIR/bin/ahandd" ]
+}
