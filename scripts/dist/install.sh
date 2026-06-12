@@ -77,6 +77,61 @@ download() {
   curl -fsSL "$url" -o "$dest"
 }
 
+# ── Checksum helpers ──────────────────────────────────────────────
+# Detect the available SHA-256 tool: `shasum -a 256` (macOS) or
+# `sha256sum` (Linux). Mirrors the fallback logic in upgrade.sh and
+# the test mock. Prints the hex digest of "$1" on stdout.
+
+sha256_of() {
+  local file="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  else
+    echo "ERROR: No SHA-256 tool found (need 'shasum' or 'sha256sum')" >&2
+    exit 1
+  fi
+}
+
+# Verify a downloaded file against a checksum file (FAIL-CLOSED).
+#   $1 = path to the local downloaded file
+#   $2 = name to look up inside the checksum file (the released filename)
+#   $3 = path to the checksum file (format: "<hex>  <filename>")
+# Aborts the install on a missing/unreadable checksum or a mismatch.
+
+verify_checksum() {
+  local file="$1"
+  local checksum_name="$2"
+  local checksum_file="$3"
+
+  if [ ! -r "$checksum_file" ]; then
+    echo "ERROR: Checksum file not available for ${checksum_name} — refusing to install unverified artifact."
+    exit 1
+  fi
+
+  # Exact filename match (no regex): the checksum filename is compared
+  # literally, so `.` in names like `admin-spa.tar.gz` cannot act as a
+  # wildcard and select a decoy line. Handles both `shasum` (`<hash>  <file>`,
+  # two spaces) and `sha256sum` binary mode (`<hash> *<file>`).
+  local expected
+  expected=$(awk -v n="$checksum_name" '$2==n || $2=="*"n {print $1; exit}' "$checksum_file" 2>/dev/null)
+  if [ -z "$expected" ]; then
+    echo "ERROR: No checksum entry for ${checksum_name} in checksum file — refusing to install unverified artifact."
+    exit 1
+  fi
+
+  local actual
+  actual=$(sha256_of "$file")
+  if [ "$expected" != "$actual" ]; then
+    echo "ERROR: Checksum mismatch for ${checksum_name}"
+    echo "  Expected: $expected"
+    echo "  Actual:   $actual"
+    exit 1
+  fi
+  echo "  Checksum OK: ${checksum_name}"
+}
+
 # ── Main ──────────────────────────────────────────────────────────
 
 main() {
@@ -88,15 +143,42 @@ main() {
 
   RUST_URL="https://github.com/${GITHUB_REPO}/releases/download/rust-v${RUST_VERSION}"
 
+  # Per-invocation temp dir (parallel-safe; auto-cleaned on exit).
+  # Use an explicit template so TMPDIR is honoured on macOS (bare `mktemp -d`
+  # on macOS ignores TMPDIR in favour of CS_DARWIN_USER_TEMP_DIR).
+  TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ahand-install-XXXXXX") || { echo "ERROR: failed to create temp dir" >&2; exit 1; }
+  trap 'rm -rf "$TMP_DIR"' EXIT
+
   # Create directories
   mkdir -p "$BIN_DIR"
 
-  # Download Rust binaries (required)
+  # Download Rust binaries (required) into temp, then verify before installing
   echo
   echo "==> Downloading binaries (rust-v${RUST_VERSION})..."
-  download "${RUST_URL}/ahandd-${SUFFIX}" "$BIN_DIR/ahandd"
+  download "${RUST_URL}/ahandd-${SUFFIX}" "$TMP_DIR/ahandd"
+  download "${RUST_URL}/ahandctl-${SUFFIX}" "$TMP_DIR/ahandctl"
+
+  # Verify SHA-256 checksums (fail-closed) before installing anything.
+  # The checksum download is tolerant of network failure so that a missing
+  # checksum surfaces verify_checksum's clear fail-closed error rather than an
+  # opaque curl error. verify_checksum still aborts when the file is absent.
+  #
+  # INTENTIONAL FAIL-CLOSED ASYMMETRY: install.sh treats a missing or
+  # unreadable checksum as a hard abort (first-run trust boundary — we have
+  # no previously-verified install to fall back on, so a checksum-strip MITM
+  # attack must be rejected).  upgrade.sh and install.ps1 are intentionally
+  # lenient-on-missing because the existing install is already trusted.
+  # Do NOT relax this to match the lenient siblings.
+  echo
+  echo "==> Verifying checksums..."
+  download "${RUST_URL}/checksums-rust.txt" "$TMP_DIR/checksums-rust.txt" || true
+  verify_checksum "$TMP_DIR/ahandd"   "ahandd-${SUFFIX}"   "$TMP_DIR/checksums-rust.txt"
+  verify_checksum "$TMP_DIR/ahandctl" "ahandctl-${SUFFIX}" "$TMP_DIR/checksums-rust.txt"
+
+  # Install verified binaries.
+  cp "$TMP_DIR/ahandd" "$BIN_DIR/ahandd"
   chmod +x "$BIN_DIR/ahandd"
-  download "${RUST_URL}/ahandctl-${SUFFIX}" "$BIN_DIR/ahandctl"
+  cp "$TMP_DIR/ahandctl" "$BIN_DIR/ahandctl"
   chmod +x "$BIN_DIR/ahandctl"
 
   # Remove macOS quarantine attribute (Gatekeeper)
@@ -111,9 +193,10 @@ main() {
     echo
     echo "==> Downloading admin panel (admin-v${ADMIN_VERSION})..."
     mkdir -p "$INSTALL_DIR/admin/dist"
-    download "${ADMIN_URL}/admin-spa.tar.gz" "/tmp/ahand-admin-spa.tar.gz"
-    tar xzf /tmp/ahand-admin-spa.tar.gz -C "$INSTALL_DIR/admin/dist/"
-    rm /tmp/ahand-admin-spa.tar.gz
+    download "${ADMIN_URL}/admin-spa.tar.gz" "$TMP_DIR/admin-spa.tar.gz"
+    download "${ADMIN_URL}/checksums-admin.txt" "$TMP_DIR/checksums-admin.txt" || true
+    verify_checksum "$TMP_DIR/admin-spa.tar.gz" "admin-spa.tar.gz" "$TMP_DIR/checksums-admin.txt"
+    tar xzf "$TMP_DIR/admin-spa.tar.gz" -C "$INSTALL_DIR/admin/dist/"
   fi
 
   # Download scripts (optional — skip if no browser release exists)

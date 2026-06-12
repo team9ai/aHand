@@ -1,5 +1,5 @@
 import { createEffect, createResource, createSignal, Show } from "solid-js";
-import { api, getToken } from "../lib/api";
+import { api, getToken, StatusResponse } from "../lib/api";
 
 interface ConfigData {
   mode?: string;
@@ -48,6 +48,12 @@ interface ConfigData {
 
 export default function ConfigPanel() {
   const [config, { refetch }] = createResource<ConfigData>(api.getConfig);
+  // Real platform-correct paths for placeholders; degrades to literals on error.
+  const [status] = createResource<StatusResponse>(api.getStatus);
+  // Reading an errored resource accessor re-throws; guard so a failed
+  // /api/status degrades to the literal placeholder instead of crashing
+  // the panel (no ErrorBoundary).
+  const statusOrNull = () => (status.error ? undefined : status());
   const [editMode, setEditMode] = createSignal<"form" | "json">("form");
   const [viewMode, setViewMode] = createSignal<"simple" | "advanced">("simple");
   const [jsonValue, setJsonValue] = createSignal("");
@@ -360,7 +366,7 @@ export default function ConfigPanel() {
                 type="text"
                 value={formData().data_dir || ""}
                 onInput={(e) => updateField("data_dir", e.currentTarget.value)}
-                placeholder="~/.ahand/data"
+                placeholder={statusOrNull()?.data_dir ?? "~/.ahand/data"}
               />
             </div>
 
@@ -494,7 +500,11 @@ export default function ConfigPanel() {
                 onInput={(e) =>
                   updateNestedField("browser", "binary_path", e.currentTarget.value)
                 }
-                placeholder="~/.ahand/bin/agent-browser"
+                placeholder={
+                  statusOrNull()?.bin_dir != null
+                    ? `${statusOrNull()?.bin_dir}/agent-browser`
+                    : "~/.ahand/bin/agent-browser"
+                }
               />
             </div>
 

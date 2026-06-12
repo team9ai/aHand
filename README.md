@@ -41,19 +41,33 @@ The dashboard can be deployed independently first. The compose stack runs the hu
 
 ### 1. Install
 
-**macOS / Linux:**
+#### macOS
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.sh | bash
 ```
 
-**Windows (PowerShell, run as your normal user):**
+The installer verifies the SHA-256 checksum of the daemon, CLI, and admin-panel artifacts before installing (fail-closed: aborts if the checksum file is missing or mismatches). Gatekeeper quarantine (`com.apple.quarantine`) is removed automatically for the installed binaries. After installation the installer prints the exact shell profile line to add `~/.ahand/bin` to your `PATH` — paste and run it, then open a new terminal.
+
+#### Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.sh | bash
+```
+
+The installer verifies the SHA-256 checksum of the daemon, CLI, and admin-panel artifacts before installing (fail-closed). There is no Gatekeeper step. After installation the installer prints the exact shell profile line to add `~/.ahand/bin` to your `PATH` — paste and run it, then open a new terminal.
+
+> **Linux binary note:** Released Linux binaries are glibc builds for `x86_64` and `aarch64`. musl/Alpine and `armv7` builds are not provided.
+
+#### Windows
 
 ```powershell
 irm https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.ps1 | iex
 ```
 
-Requires Windows 10 1809 or later (daemon PTY support; the installer itself works on 1803+).
+Run in a regular (non-admin) PowerShell terminal. Requires Windows 10 1809 or later for full daemon PTY support (the installer itself requires Windows 10 1803+ for in-box `tar`). The installer verifies SHA-256 checksums when the checksum file is available, then automatically adds `%USERPROFILE%\.ahand\bin` to your user `PATH`. Open a **new terminal** after installation for the PATH change to take effect.
+
+#### All platforms
 
 This installs `ahandd`, `ahandctl`, and the admin panel to `~/.ahand/` (macOS/Linux) or `%USERPROFILE%\.ahand\` (Windows).
 
@@ -78,7 +92,7 @@ ahandctl stop               # stop the daemon
 ahandctl restart             # restart the daemon
 ```
 
-Logs are written to `~/.ahand/data/daemon.log`.
+Logs are written to `~/.ahand/data/daemon.log` (macOS/Linux) or `%USERPROFILE%\.ahand\data\daemon.log` (Windows).
 
 ### Upgrade
 

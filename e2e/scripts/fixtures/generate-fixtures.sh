@@ -6,6 +6,18 @@ set -e
 FIXTURE_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$FIXTURE_DIR"
 
+# ── Portable SHA-256 helper ───────────────────────────────────────
+# `shasum` is macOS/Perl-only; Linux uses `sha256sum`. Mirror the
+# fallback logic from install.sh's sha256_of() so fixtures generate
+# correctly on both platforms.
+sha256_fixture() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
 # ── admin-spa.tar.gz ─────────────────────────────────────────────
 if [ ! -f admin-spa.tar.gz ]; then
   TMP=$(mktemp -d)
@@ -64,8 +76,8 @@ fi
 # Compute real SHA256 sums of the fake binaries so checksum verification
 # passes. Generate for all platform suffixes.
 if [ ! -f checksums-rust.txt ]; then
-  AHANDD_HASH=$(shasum -a 256 ahandd-fake | awk '{print $1}')
-  AHANDCTL_HASH=$(shasum -a 256 ahandctl-fake | awk '{print $1}')
+  AHANDD_HASH=$(sha256_fixture ahandd-fake)
+  AHANDCTL_HASH=$(sha256_fixture ahandctl-fake)
   cat > checksums-rust.txt <<EOF
 ${AHANDD_HASH}  ahandd-darwin-arm64
 ${AHANDD_HASH}  ahandd-darwin-x64
@@ -78,5 +90,13 @@ ${AHANDCTL_HASH}  ahandctl-linux-arm64
 EOF
   echo "  Generated checksums-rust.txt"
 fi
+
+# ── checksums-admin.txt ──────────────────────────────────────────
+# Real SHA256 of admin-spa.tar.gz so install.sh checksum verification
+# passes. Regenerated every run to stay in sync with the tar on disk
+# (gzip output is not byte-stable across regenerations).
+ADMIN_HASH=$(sha256_fixture admin-spa.tar.gz)
+printf '%s  admin-spa.tar.gz\n' "$ADMIN_HASH" > checksums-admin.txt
+echo "  Generated checksums-admin.txt"
 
 echo "Fixtures ready."
