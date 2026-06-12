@@ -140,7 +140,9 @@ main() {
   RUST_URL="https://github.com/${GITHUB_REPO}/releases/download/rust-v${RUST_VERSION}"
 
   # Per-invocation temp dir (parallel-safe; auto-cleaned on exit).
-  TMP_DIR=$(mktemp -d)
+  # Use an explicit template so TMPDIR is honoured on macOS (bare `mktemp -d`
+  # on macOS ignores TMPDIR in favour of CS_DARWIN_USER_TEMP_DIR).
+  TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ahand-install-XXXXXX") || { echo "ERROR: failed to create temp dir" >&2; exit 1; }
   trap 'rm -rf "$TMP_DIR"' EXIT
 
   # Create directories
@@ -156,6 +158,13 @@ main() {
   # The checksum download is tolerant of network failure so that a missing
   # checksum surfaces verify_checksum's clear fail-closed error rather than an
   # opaque curl error. verify_checksum still aborts when the file is absent.
+  #
+  # INTENTIONAL FAIL-CLOSED ASYMMETRY: install.sh treats a missing or
+  # unreadable checksum as a hard abort (first-run trust boundary — we have
+  # no previously-verified install to fall back on, so a checksum-strip MITM
+  # attack must be rejected).  upgrade.sh and install.ps1 are intentionally
+  # lenient-on-missing because the existing install is already trusted.
+  # Do NOT relax this to match the lenient siblings.
   echo
   echo "==> Verifying checksums..."
   download "${RUST_URL}/checksums-rust.txt" "$TMP_DIR/checksums-rust.txt" || true

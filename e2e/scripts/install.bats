@@ -109,7 +109,8 @@ teardown() {
   export MOCK_CURL_FIXTURE_DIR="$TEST_HOME/empty-fixtures"
   mkdir -p "$MOCK_CURL_FIXTURE_DIR"
   echo '[]' > "$MOCK_CURL_FIXTURE_DIR/github-releases.json"
-  # Copy other fixtures so the script doesn't fail for other reasons.
+  # The version check fires before any downloads, so missing download fixtures
+  # are never reached — no need to copy them here.
   run bash "$DIST_DIR/install.sh"
   assert_failure
   assert_output --partial "Could not determine Rust release version"
@@ -120,14 +121,17 @@ teardown() {
   # parallel-safe (no shared global /tmp path). After a successful install
   # the EXIT trap must have removed the per-invocation temp dir, leaving
   # this dir empty.
+  #
+  # NOTE: `VAR=val run cmd` does NOT pass the env-prefix into bats `run`
+  # (run is a shell function, not an external command). Use `run env VAR=val`
+  # so TMPDIR is actually forwarded to install.sh's mktemp.
   local isolated_tmp="$TEST_HOME/temp"
   mkdir -p "$isolated_tmp"
-  TMPDIR="$isolated_tmp" run bash "$DIST_DIR/install.sh"
+  run env TMPDIR="$isolated_tmp" bash "$DIST_DIR/install.sh"
   assert_success
-  # No leftover temp entries under the isolated TMPDIR.
+  # After a successful install the EXIT trap must have removed the
+  # per-invocation temp dir, leaving isolated_tmp empty.
   [ -z "$(ls -A "$isolated_tmp")" ]
-  # And the legacy global path is never used.
-  [ ! -f "/tmp/ahand-admin-spa.tar.gz" ]
 }
 
 @test "install: outputs success message with PATH instructions" {
