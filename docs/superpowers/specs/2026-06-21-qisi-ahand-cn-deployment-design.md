@@ -274,11 +274,6 @@ Optional keys:
 ```dotenv
 AHAND_HUB_WEBHOOK_URL=
 AHAND_HUB_WEBHOOK_SECRET=
-AHAND_HUB_S3_BUCKET=
-AHAND_HUB_S3_REGION=
-AHAND_HUB_S3_ENDPOINT=
-AHAND_HUB_S3_THRESHOLD_BYTES=
-AHAND_HUB_S3_URL_EXPIRATION_SECS=
 AWS_ACCESS_KEY_ID=
 AWS_SECRET_ACCESS_KEY=
 SENTRY_DSN=
@@ -287,7 +282,19 @@ SENTRY_DSN=
 For Aliyun OSS compatibility, `AHAND_HUB_S3_ENDPOINT` should be set when using
 an OSS S3-compatible endpoint. S3/OSS can be left unset for a first deployment;
 large file transfer endpoints will then return the existing `S3_DISABLED`
-application response.
+application response. The S3/OSS variables must be omitted or commented out
+until enabled, because `AHAND_HUB_S3_BUCKET=` with an empty value still causes
+the hub to treat S3 as configured.
+
+Commented S3/OSS template:
+
+```dotenv
+# AHAND_HUB_S3_BUCKET=
+# AHAND_HUB_S3_REGION=cn-shanghai
+# AHAND_HUB_S3_ENDPOINT=https://oss-cn-shanghai.aliyuncs.com
+# AHAND_HUB_S3_THRESHOLD_BYTES=1048576
+# AHAND_HUB_S3_URL_EXPIRATION_SECS=3600
+```
 
 `.env.images` is written by CI and contains active image tags:
 
