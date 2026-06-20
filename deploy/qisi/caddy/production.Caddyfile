@@ -1,0 +1,7 @@
+ahand-hub.coffice.qisiai.top {
+	reverse_proxy 127.0.0.1:3815
+}
+
+admin.ahand.coffice.qisiai.top {
+	reverse_proxy 127.0.0.1:3816
+}
