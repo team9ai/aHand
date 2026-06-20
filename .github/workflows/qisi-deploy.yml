@@ -1,0 +1,160 @@
+name: Qisi aHand Deploy
+
+on:
+  push:
+    branches: [dev, staging, main]
+    paths:
+      - ".dockerignore"
+      - "apps/hub-dashboard/**"
+      - "crates/ahand-hub/**"
+      - "crates/ahand-hub-core/**"
+      - "crates/ahand-hub-store/**"
+      - "crates/ahand-protocol/**"
+      - "proto/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Cross.toml"
+      - "package.json"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "turbo.json"
+      - "deploy/hub/Dockerfile"
+      - "deploy/qisi/**"
+      - ".github/workflows/qisi-deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: qisi-ahand-deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: registry.image.coffice.qisiai.top
+  IMAGE_NAMESPACE: coffice/ahand
+
+jobs:
+  resolve-target:
+    runs-on: ubuntu-latest
+    outputs:
+      env_name: ${{ steps.target.outputs.env_name }}
+      deploy_dir: ${{ steps.target.outputs.deploy_dir }}
+    steps:
+      - id: target
+        shell: bash
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            dev)
+              echo "env_name=dev" >> "$GITHUB_OUTPUT"
+              echo "deploy_dir=/opt/ahand-hub/dev" >> "$GITHUB_OUTPUT"
+              ;;
+            staging)
+              echo "env_name=staging" >> "$GITHUB_OUTPUT"
+              echo "deploy_dir=/opt/ahand-hub/staging" >> "$GITHUB_OUTPUT"
+              ;;
+            main)
+              echo "env_name=production" >> "$GITHUB_OUTPUT"
+              echo "deploy_dir=/opt/ahand-hub/production" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unsupported branch: ${GITHUB_REF_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+  build-images:
+    needs: resolve-target
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ahand-hub
+            target: hub
+          - image: ahand-hub-dashboard
+            target: dashboard
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.QISI_REGISTRY_USERNAME }}
+          password: ${{ secrets.QISI_REGISTRY_PASSWORD }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/hub/Dockerfile
+          target: ${{ matrix.target }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ needs.resolve-target.outputs.env_name }}-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ needs.resolve-target.outputs.env_name }}
+          cache-from: type=gha,scope=qisi-ahand-${{ matrix.image }}
+          cache-to: type=gha,scope=qisi-ahand-${{ matrix.image }},mode=max
+
+  deploy:
+    needs: [resolve-target, build-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve SSH host
+        shell: bash
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            dev|staging)
+              echo "SSH_HOST=${{ secrets.QISI_DEV_SSH_HOST }}" >> "$GITHUB_ENV"
+              ;;
+            main)
+              echo "SSH_HOST=${{ secrets.QISI_SSH_HOST }}" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "unsupported branch: ${GITHUB_REF_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.QISI_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "${{ secrets.QISI_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Write image env
+        shell: bash
+        run: |
+          cat > .env.images.next <<EOF
+          AHAND_HUB_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ahand-hub:${{ needs.resolve-target.outputs.env_name }}-${{ github.sha }}
+          AHAND_HUB_DASHBOARD_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ahand-hub-dashboard:${{ needs.resolve-target.outputs.env_name }}-${{ github.sha }}
+          GIT_SHA=${{ github.sha }}
+          SENTRY_RELEASE=${{ github.sha }}
+          EOF
+
+      - name: Sync deploy files
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.QISI_SSH_USER }}@$SSH_HOST" \
+            "mkdir -p '${{ needs.resolve-target.outputs.deploy_dir }}/scripts'"
+          scp -i ~/.ssh/id_ed25519 deploy/qisi/compose.yml \
+            "${{ secrets.QISI_SSH_USER }}@$SSH_HOST:${{ needs.resolve-target.outputs.deploy_dir }}/compose.yml"
+          scp -i ~/.ssh/id_ed25519 deploy/qisi/scripts/deploy.sh deploy/qisi/scripts/healthcheck.sh \
+            "${{ secrets.QISI_SSH_USER }}@$SSH_HOST:${{ needs.resolve-target.outputs.deploy_dir }}/scripts/"
+          scp -i ~/.ssh/id_ed25519 .env.images.next \
+            "${{ secrets.QISI_SSH_USER }}@$SSH_HOST:${{ needs.resolve-target.outputs.deploy_dir }}/.env.images.next"
+
+      - name: Deploy on host
+        shell: bash
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.QISI_SSH_USER }}@$SSH_HOST" \
+            "cd '${{ needs.resolve-target.outputs.deploy_dir }}' && bash scripts/deploy.sh .env.images.next"
