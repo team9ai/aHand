@@ -1,5 +1,9 @@
 use ahand_hub_core::job::JobFilter;
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
 use serde::Serialize;
 
 use crate::auth::AuthContextExt;
@@ -20,6 +24,34 @@ pub struct StatsResponse {
 
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { ok: true })
+}
+
+pub async fn sentry_smoke(headers: HeaderMap) -> ApiResult<Json<HealthResponse>> {
+    let expected = std::env::var("AHAND_HUB_SENTRY_SMOKE_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let Some(expected) = expected else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "Not found",
+        ));
+    };
+
+    let actual = headers
+        .get("x-ahand-sentry-smoke-token")
+        .and_then(|value| value.to_str().ok());
+    if actual != Some(expected.as_str()) {
+        return Err(ApiError::forbidden());
+    }
+
+    tracing::error!(
+        target: "ahand_hub_sentry_smoke",
+        smoke = true,
+        "aHand hub Sentry smoke test"
+    );
+    Ok(Json(HealthResponse { ok: true }))
 }
 
 pub async fn stats(

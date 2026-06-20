@@ -1,10 +1,22 @@
+mod observability;
+
 use ahand_hub::{build_app, config::Config, state::AppState};
-use tracing_subscriber::EnvFilter;
+use observability::{hub_sentry_config_from_env, init_sentry};
+use sentry::integrations::tracing::EventFilter;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    init_tracing();
+fn main() -> anyhow::Result<()> {
+    let sentry = init_sentry(hub_sentry_config_from_env());
+    init_tracing(sentry.is_some());
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     tracing::info!(
         git_sha = std::env::var("GIT_SHA").as_deref().unwrap_or("unknown"),
         "ahand-hub starting"
@@ -28,16 +40,41 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+fn init_tracing(sentry_enabled: bool) {
     let level = std::env::var("AHAND_HUB_LOG_LEVEL").unwrap_or_else(|_| "info".into());
     let filter = EnvFilter::try_new(&level).unwrap_or_else(|_| EnvFilter::new("info"));
     let format = std::env::var("AHAND_HUB_LOG_FORMAT").unwrap_or_default();
 
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
     if format.eq_ignore_ascii_case("json") {
-        builder.json().init();
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json());
+        if sentry_enabled {
+            subscriber
+                .with(sentry::integrations::tracing::layer().event_filter(sentry_event_filter))
+                .init();
+        } else {
+            subscriber.init();
+        }
     } else {
-        builder.init();
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer());
+        if sentry_enabled {
+            subscriber
+                .with(sentry::integrations::tracing::layer().event_filter(sentry_event_filter))
+                .init();
+        } else {
+            subscriber.init();
+        }
+    }
+}
+
+fn sentry_event_filter(metadata: &tracing::Metadata<'_>) -> EventFilter {
+    if *metadata.level() == tracing::Level::ERROR {
+        EventFilter::Event
+    } else {
+        EventFilter::Ignore
     }
 }
 

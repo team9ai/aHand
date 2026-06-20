@@ -10,6 +10,33 @@ use axum::http::{Request, StatusCode, header};
 use futures_util::{SinkExt, StreamExt};
 use tower::ServiceExt;
 
+static SENTRY_SMOKE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: Option<&str>) -> Self {
+        let previous = std::env::var(key).ok();
+        match value {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
 async fn wait_for_audit_count(
     state: &ahand_hub::state::AppState,
     action: &str,
@@ -47,6 +74,68 @@ async fn health_endpoint_reports_ok() {
         .oneshot(
             Request::builder()
                 .uri("/api/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn sentry_smoke_route_is_hidden_without_token_config() {
+    let _lock = SENTRY_SMOKE_ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("AHAND_HUB_SENTRY_SMOKE_TOKEN", None);
+    let app = support::build_test_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/sentry-smoke")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sentry_smoke_route_rejects_wrong_token() {
+    let _lock = SENTRY_SMOKE_ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("AHAND_HUB_SENTRY_SMOKE_TOKEN", Some("smoke-secret"));
+    let app = support::build_test_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/sentry-smoke")
+                .header("x-ahand-sentry-smoke-token", "wrong")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn sentry_smoke_route_accepts_matching_token() {
+    let _lock = SENTRY_SMOKE_ENV_LOCK.lock().await;
+    let _env = EnvGuard::set("AHAND_HUB_SENTRY_SMOKE_TOKEN", Some("smoke-secret"));
+    let app = support::build_test_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/system/sentry-smoke")
+                .header("x-ahand-sentry-smoke-token", "smoke-secret")
                 .body(Body::empty())
                 .unwrap(),
         )
