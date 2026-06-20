@@ -11,13 +11,16 @@ This design covers:
 
 - Docker image publishing to the qisi registry.
 - Branch-based GitHub Actions rollout over SSH.
+- CI-triggered CN rollout whenever the global hub deployment workflow would
+  update the AWS/t9 environment for the same branch and hub-related changes.
 - Per-environment Docker Compose projects.
 - Caddy routing, public domains, and loopback-bound host ports.
 - Environment file layout, secret handling, health checks, and rollback.
 
 This design does not replace or modify the existing AWS/t9 deployment. The
 existing `.github/workflows/deploy-hub.yml`, ECS task definition, and AWS
-infrastructure remain the global deployment path.
+infrastructure remain the global deployment path. The CN workflow is additive:
+hub updates should keep deploying to global and should also deploy to qisi.
 
 It also does not provision Aliyun RDS, Redis, OSS, DNS, or Sentry resources.
 Those resources are operator-managed and are injected through host-local
@@ -305,6 +308,29 @@ Triggers:
 - Push to `staging`
 - Push to `main`
 - Manual `workflow_dispatch`
+
+The `dev` and `main` push triggers must include the same hub-related path set as
+`.github/workflows/deploy-hub.yml`, plus qisi deployment files. This keeps CN
+deploys synchronized with global hub deploys while avoiding a qisi rollout for
+unrelated docs or client-only changes. `staging` uses the same path set for a
+pre-production qisi validation lane.
+
+Required path set:
+
+- `apps/hub-dashboard/**`
+- `crates/ahand-hub/**`
+- `crates/ahand-hub-core/**`
+- `crates/ahand-hub-store/**`
+- `crates/ahand-protocol/**`
+- `proto/**`
+- `Cargo.lock`
+- `package.json`
+- `pnpm-lock.yaml`
+- `pnpm-workspace.yaml`
+- `turbo.json`
+- `deploy/hub/Dockerfile`
+- `deploy/qisi/**`
+- `.github/workflows/qisi-deploy.yml`
 
 Concurrency:
 
