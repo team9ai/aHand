@@ -32,7 +32,11 @@ pub async fn sentry_smoke(headers: HeaderMap) -> ApiResult<Json<HealthResponse>>
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
     let Some(expected) = expected else {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "NOT_FOUND", "Not found"));
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "Not found",
+        ));
     };
 
     let actual = headers
