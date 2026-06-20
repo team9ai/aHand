@@ -1,0 +1,61 @@
+name: ahand-hub-${DEPLOY_ENV}
+
+services:
+  hub:
+    image: ${AHAND_HUB_IMAGE}
+    container_name: ahand-hub-${DEPLOY_ENV}-hub
+    restart: unless-stopped
+    env_file:
+      - .env
+      - .env.secrets
+      - .env.images
+    environment:
+      AHAND_HUB_BIND_ADDR: ${AHAND_HUB_BIND_ADDR:-0.0.0.0:1515}
+      AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS: ${AHAND_HUB_DASHBOARD_ALLOWED_ORIGINS}
+      AHAND_HUB_LOG_FORMAT: ${AHAND_HUB_LOG_FORMAT:-json}
+      AHAND_HUB_LOG_LEVEL: ${AHAND_HUB_LOG_LEVEL:-info}
+      AHAND_HUB_AUDIT_RETENTION_DAYS: ${AHAND_HUB_AUDIT_RETENTION_DAYS:-90}
+      AHAND_HUB_AUDIT_FALLBACK_PATH: ${AHAND_HUB_AUDIT_FALLBACK_PATH:-/var/lib/ahand-hub/audit-fallback.jsonl}
+      AHAND_HUB_WEBHOOK_MAX_RETRIES: ${AHAND_HUB_WEBHOOK_MAX_RETRIES:-8}
+      AHAND_HUB_WEBHOOK_TIMEOUT_MS: ${AHAND_HUB_WEBHOOK_TIMEOUT_MS:-5000}
+      GIT_SHA: ${GIT_SHA:-unknown}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+      SENTRY_RELEASE: ${SENTRY_RELEASE:-unknown}
+    ports:
+      - "127.0.0.1:${AHAND_HUB_HOST_PORT}:1515"
+    volumes:
+      - hub-audit-data:/var/lib/ahand-hub
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1515/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  dashboard:
+    image: ${AHAND_HUB_DASHBOARD_IMAGE}
+    container_name: ahand-hub-${DEPLOY_ENV}-dashboard
+    restart: unless-stopped
+    depends_on:
+      hub:
+        condition: service_healthy
+    env_file:
+      - .env
+      - .env.images
+    environment:
+      AHAND_HUB_BASE_URL: http://hub:1515
+      NODE_ENV: production
+      PORT: "1516"
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+      SENTRY_RELEASE: ${SENTRY_RELEASE:-unknown}
+    ports:
+      - "127.0.0.1:${AHAND_HUB_DASHBOARD_HOST_PORT}:1516"
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:1516/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  hub-audit-data:
