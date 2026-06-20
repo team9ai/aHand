@@ -4,4 +4,4 @@ target
 **/.next
 **/dist
 **/coverage
-
+**/*.tsbuildinfo
