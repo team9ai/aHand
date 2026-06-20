@@ -41,13 +41,18 @@ services:
         condition: service_healthy
     env_file:
       - .env
+      - .env.secrets
       - .env.images
     environment:
       AHAND_HUB_BASE_URL: http://hub:1515
       NODE_ENV: production
       PORT: "1516"
+      SENTRY_DSN: ${AHAND_HUB_DASHBOARD_SENTRY_DSN:-}
       SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-production}
+      SENTRY_ORG: ${SENTRY_ORG:-sentry}
+      SENTRY_PROJECT: ${SENTRY_DASHBOARD_PROJECT:-ahand-dashboard}
       SENTRY_RELEASE: ${SENTRY_RELEASE:-unknown}
+      NEXT_PUBLIC_SENTRY_DSN: ${AHAND_HUB_DASHBOARD_SENTRY_DSN:-}
     ports:
       - "127.0.0.1:${AHAND_HUB_DASHBOARD_HOST_PORT}:1516"
     healthcheck:
