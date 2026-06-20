@@ -6,10 +6,7 @@ on:
     paths:
       - ".dockerignore"
       - "apps/hub-dashboard/**"
-      - "crates/ahand-hub/**"
-      - "crates/ahand-hub-core/**"
-      - "crates/ahand-hub-store/**"
-      - "crates/ahand-protocol/**"
+      - "crates/**"
       - "proto/**"
       - "Cargo.lock"
       - "Cargo.toml"
