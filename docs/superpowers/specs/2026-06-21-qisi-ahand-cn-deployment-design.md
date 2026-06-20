@@ -213,7 +213,7 @@ Service `dashboard`:
 - Image variable: `AHAND_HUB_DASHBOARD_IMAGE`
 - Restart policy: `unless-stopped`
 - Depends on healthy `hub`
-- Env files: `.env`, `.env.secrets`, `.env.images`
+- Env files: `.env`, `.env.images`
 - Host port: `127.0.0.1:${AHAND_HUB_DASHBOARD_HOST_PORT}:1516`
 - Runtime hub URL: `AHAND_HUB_BASE_URL=http://hub:1515`
 - Health check: `curl -fsS http://127.0.0.1:1516/login`
