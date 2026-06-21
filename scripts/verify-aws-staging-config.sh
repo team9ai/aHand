@@ -16,6 +16,12 @@ require_match() {
   rg -q "$pattern" "$file" || fail "$file lacks $pattern"
 }
 
+forbid_match() {
+  local pattern="$1"
+  local file="$2"
+  ! rg -q "$pattern" "$file" || fail "$file still contains forbidden $pattern"
+}
+
 require_file infra/envs/staging/backend.tf
 require_file infra/envs/staging/main.tf
 require_file infra/envs/staging/providers.tf
@@ -24,13 +30,18 @@ require_file infra/envs/staging/versions.tf
 
 require_match 'contains\(\["prod", "dev", "staging"\], var\.env\)' infra/modules/ahand-hub/variables.tf
 require_match 'branches: \[main, dev, staging\]' .github/workflows/deploy-hub.yml
+require_match '149614785083\.dkr\.ecr\.us-east-1\.amazonaws\.com' .github/workflows/deploy-hub.yml
+require_match 'arn:aws:iam::149614785083:role/GitHubActionsAhandHubDeploy' .github/workflows/deploy-hub.yml
 require_match 'refs/heads/staging' .github/workflows/deploy-hub.yml
 require_match 'SERVICE_NAME=ahand-hub-staging' .github/workflows/deploy-hub.yml
 require_match 'openclaw-hive-dev' .github/workflows/deploy-hub.yml
+forbid_match '471112576951' .github/workflows/deploy-hub.yml
 
 require_match '\[\[ "\$ENV" == "dev" \|\| "\$ENV" == "staging" \|\| "\$ENV" == "prod" \]\]' deploy/hub/deploy.sh
+require_match 'ACCOUNT_ID="149614785083"' deploy/hub/deploy.sh
 require_match 'SERVICE_NAME="ahand-hub-staging"' deploy/hub/deploy.sh
 require_match 'API_DOMAIN="ahand-hub\.staging\.team9\.ai"' deploy/hub/deploy.sh
+forbid_match '471112576951' deploy/hub/deploy.sh
 
 require_match 'env[[:space:]]*=[[:space:]]*"staging"' infra/envs/staging/main.tf
 require_match 'ecs_cluster_name[[:space:]]*=[[:space:]]*"openclaw-hive-dev"' infra/envs/staging/main.tf

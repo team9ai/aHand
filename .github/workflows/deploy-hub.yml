@@ -20,7 +20,7 @@ permissions:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REGISTRY: 471112576951.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REGISTRY: 149614785083.dkr.ecr.us-east-1.amazonaws.com
   ECR_REPO: ahand-hub
 
 jobs:
@@ -45,7 +45,7 @@ jobs:
           fi
       - uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: arn:aws:iam::471112576951:role/GitHubActionsAhandHubDeploy
+          role-to-assume: arn:aws:iam::149614785083:role/GitHubActionsAhandHubDeploy
           aws-region: ${{ env.AWS_REGION }}
       - uses: aws-actions/amazon-ecr-login@v2
       - name: Build image (hub target)
