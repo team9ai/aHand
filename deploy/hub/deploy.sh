@@ -3,7 +3,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ENV="${1:-}"
-[[ "$ENV" == "dev" || "$ENV" == "prod" ]] || { echo "Usage: $0 {dev|prod}"; exit 1; }
+[[ "$ENV" == "dev" || "$ENV" == "staging" || "$ENV" == "prod" ]] || { echo "Usage: $0 {dev|staging|prod}"; exit 1; }
 
 AWS_REGION="us-east-1"
 ACCOUNT_ID="149614785083"
@@ -11,15 +11,23 @@ ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 ECR_REPO="ahand-hub"
 GIT_SHA="${GIT_SHA:-$(git rev-parse --short HEAD)}"
 
-if [[ "$ENV" == "prod" ]]; then
-  ECS_CLUSTER="openclaw-hive"
-  SERVICE_NAME="ahand-hub-prod"
-  API_DOMAIN="ahand-hub.team9.ai"
-else
-  ECS_CLUSTER="openclaw-hive-dev"
-  SERVICE_NAME="ahand-hub-dev"
-  API_DOMAIN="ahand-hub.dev.team9.ai"
-fi
+case "$ENV" in
+  prod)
+    ECS_CLUSTER="openclaw-hive"
+    SERVICE_NAME="ahand-hub-prod"
+    API_DOMAIN="ahand-hub.team9.ai"
+    ;;
+  staging)
+    ECS_CLUSTER="openclaw-hive-dev"
+    SERVICE_NAME="ahand-hub-staging"
+    API_DOMAIN="ahand-hub.staging.team9.ai"
+    ;;
+  dev)
+    ECS_CLUSTER="openclaw-hive-dev"
+    SERVICE_NAME="ahand-hub-dev"
+    API_DOMAIN="ahand-hub.dev.team9.ai"
+    ;;
+esac
 
 ECR_IMAGE="${ECR_REGISTRY}/${ECR_REPO}:${ENV}"
 SSM_PREFIX="arn:aws:ssm:${AWS_REGION}:${ACCOUNT_ID}:parameter/ahand-hub/${ENV}"
