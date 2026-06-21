@@ -1,3 +1,5 @@
+pub mod path_policy;
+pub mod registry;
 pub mod types;
 
 pub use types::{
