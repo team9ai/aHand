@@ -213,6 +213,7 @@ pub struct AppToolDef {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    pub requires_approval: bool,
 }
 
 /// Error returned by an embedding app tool handler.

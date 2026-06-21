@@ -62,6 +62,7 @@ async fn daemon_handle_registers_app_tool_handlers() {
                         "fileRefId": { "type": "string" }
                     }
                 }),
+                requires_approval: false,
             },
             handler.clone(),
         )
@@ -73,6 +74,7 @@ async fn daemon_handle_registers_app_tool_handlers() {
                 name: " ".to_string(),
                 description: "invalid".to_string(),
                 input_schema: serde_json::json!({ "type": "object" }),
+                requires_approval: false,
             },
             handler,
         )
