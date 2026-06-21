@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
 pub use ahand_protocol::SessionMode;
@@ -27,6 +27,12 @@ use crate::browser::BrowserManager;
 use crate::config::{BrowserConfig, Config, FilePolicyConfig, HubConfig};
 use crate::device_identity::DeviceIdentity;
 use crate::registry::JobRegistry;
+use crate::sandbox::{
+    CommitResult, FileVersion, HostFileRef, PermissionSnapshot, RegisterVersionRequest,
+    RuntimeExecuteRequest, RuntimeExecuteResult, RuntimeProviderConfig, SandboxFile,
+    SandboxPermissionMode, SandboxResult, SandboxSessionConfig, file_lifecycle,
+    registry::SandboxRegistry,
+};
 use crate::session::SessionManager;
 
 use crate::device_identity::IDENTITY_FILE as IDENTITY_FILE_NAME;
@@ -205,6 +211,7 @@ pub struct DaemonHandle {
     join: JoinHandle<anyhow::Result<()>>,
     status_rx: watch::Receiver<DaemonStatus>,
     device_id: String,
+    sandbox_registry: Arc<AsyncMutex<SandboxRegistry>>,
 }
 
 static ACTIVE_DAEMONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -264,6 +271,69 @@ impl DaemonHandle {
     /// Device ID assigned at spawn time. Stable for the lifetime of the handle.
     pub fn device_id(&self) -> &str {
         &self.device_id
+    }
+
+    pub async fn create_sandbox_session(&self, config: SandboxSessionConfig) -> SandboxResult<()> {
+        self.sandbox_registry.lock().await.create_session(config)
+    }
+
+    pub async fn update_sandbox_permission_mode(
+        &self,
+        session_id: &str,
+        mode: SandboxPermissionMode,
+    ) -> SandboxResult<PermissionSnapshot> {
+        self.sandbox_registry
+            .lock()
+            .await
+            .update_permission(session_id, mode)
+    }
+
+    pub async fn register_sandbox_runtime(
+        &self,
+        session_id: &str,
+        provider: RuntimeProviderConfig,
+    ) -> SandboxResult<()> {
+        let mut registry = self.sandbox_registry.lock().await;
+        let session = registry.session_mut(session_id)?;
+        session.runtimes.insert(provider.name.clone(), provider);
+        Ok(())
+    }
+
+    pub async fn import_sandbox_file(
+        &self,
+        session_id: &str,
+        file_ref: HostFileRef,
+    ) -> SandboxResult<SandboxFile> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::import_file(&mut registry, session_id, file_ref)
+    }
+
+    pub async fn execute_sandbox_runtime(
+        &self,
+        _session_id: &str,
+        _request: RuntimeExecuteRequest,
+    ) -> SandboxResult<RuntimeExecuteResult> {
+        Err(crate::sandbox::SandboxError::unavailable(
+            "sandbox runtime execution is not fully wired yet",
+        ))
+    }
+
+    pub async fn register_sandbox_file_version(
+        &self,
+        session_id: &str,
+        request: RegisterVersionRequest,
+    ) -> SandboxResult<FileVersion> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::register_file_version(&mut registry, session_id, request)
+    }
+
+    pub async fn commit_sandbox_file_version(
+        &self,
+        session_id: &str,
+        version_id: &str,
+    ) -> SandboxResult<CommitResult> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::commit_file_version(&mut registry, session_id, version_id)
     }
 }
 
@@ -362,6 +432,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         join,
         status_rx,
         device_id,
+        sandbox_registry: Arc::new(AsyncMutex::new(SandboxRegistry::default())),
     })
 }
 
