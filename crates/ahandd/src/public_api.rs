@@ -30,8 +30,9 @@ use crate::registry::JobRegistry;
 use crate::sandbox::{
     CommitResult, FileVersion, HostFileRef, PermissionSnapshot, RegisterVersionRequest,
     RuntimeExecuteRequest, RuntimeExecuteResult, RuntimeProviderConfig, SandboxFile,
-    SandboxPermissionMode, SandboxResult, SandboxSessionConfig, file_lifecycle,
+    SandboxPermissionMode, SandboxResult, SandboxSessionConfig, file_lifecycle, path_policy,
     registry::SandboxRegistry,
+    runner::{self, PlatformExecuteRequest, RuntimeSandboxPolicy},
 };
 use crate::session::SessionManager;
 
@@ -310,12 +311,55 @@ impl DaemonHandle {
 
     pub async fn execute_sandbox_runtime(
         &self,
-        _session_id: &str,
-        _request: RuntimeExecuteRequest,
+        session_id: &str,
+        request: RuntimeExecuteRequest,
     ) -> SandboxResult<RuntimeExecuteResult> {
-        Err(crate::sandbox::SandboxError::unavailable(
-            "sandbox runtime execution is not fully wired yet",
-        ))
+        let (workspace_root, network, provider) = {
+            let registry = self.sandbox_registry.lock().await;
+            let session = registry.session(session_id)?;
+            let provider = session
+                .runtimes
+                .get(&request.runtime)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::sandbox::SandboxError::runtime_not_registered(format!(
+                        "sandbox runtime '{}' is not registered",
+                        request.runtime
+                    ))
+                })?;
+            (session.workspace_root.clone(), session.network, provider)
+        };
+
+        std::fs::create_dir_all(&workspace_root).map_err(|e| {
+            crate::sandbox::SandboxError::unavailable(format!(
+                "failed to create sandbox workspace root: {e}"
+            ))
+        })?;
+        let cwd = match request.cwd {
+            Some(cwd) => {
+                path_policy::resolve_existing_sandbox_path(&workspace_root, &cwd.to_string_lossy())?
+            }
+            None => workspace_root.canonicalize().map_err(|e| {
+                crate::sandbox::SandboxError::invalid_sandbox_path(format!(
+                    "failed to resolve sandbox workspace root: {e}"
+                ))
+            })?,
+        };
+        let mut env = provider.env.clone();
+        env.extend(request.env);
+        let timeout = request.timeout.unwrap_or(provider.default_timeout);
+        let executable = provider.executable.clone();
+        let policy = RuntimeSandboxPolicy::new(workspace_root, provider, network);
+
+        runner::execute(PlatformExecuteRequest {
+            executable,
+            args: request.args,
+            cwd,
+            env,
+            timeout,
+            policy,
+        })
+        .await
     }
 
     pub async fn register_sandbox_file_version(

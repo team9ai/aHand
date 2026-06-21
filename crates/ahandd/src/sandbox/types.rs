@@ -149,6 +149,10 @@ impl SandboxError {
     pub fn invalid_sandbox_path(message: impl Into<String>) -> Self {
         Self::new(CODE_INVALID_SANDBOX_PATH, message)
     }
+
+    pub fn runtime_not_registered(message: impl Into<String>) -> Self {
+        Self::new(CODE_RUNTIME_NOT_REGISTERED, message)
+    }
 }
 
 #[cfg(test)]

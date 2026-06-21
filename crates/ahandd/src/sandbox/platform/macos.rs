@@ -8,6 +8,37 @@ use crate::sandbox::runner::{PlatformExecuteRequest, RuntimeSandboxPolicy};
 use crate::sandbox::types::{NetworkPolicy, RuntimeExecuteResult, SandboxError, SandboxResult};
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+const SYSTEM_READONLY_ROOTS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/sbin",
+    "/usr/share",
+    "/System/Library/CoreServices",
+    "/System/Library/Extensions",
+    "/System/Library/Frameworks",
+    "/System/Library/PrivateFrameworks",
+    "/System/Library/SubFrameworks",
+    "/System/Volumes/Preboot/Cryptexes/OS",
+    "/Library/Apple",
+    "/Library/Preferences",
+];
+const SYSTEM_EXECUTABLE_ROOTS: &[&str] = &[
+    "/bin",
+    "/sbin",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/sbin",
+    "/System/Library/Extensions",
+    "/System/Library/Frameworks",
+    "/System/Library/PrivateFrameworks",
+    "/System/Library/SubFrameworks",
+    "/System/Volumes/Preboot/Cryptexes/OS",
+    "/Library/Apple",
+];
 
 pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
     let policy = render_policy(&request.policy);
@@ -73,8 +104,23 @@ pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeEx
 
 pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
     let mut sbpl = String::from("(version 1)\n(deny default)\n");
-    sbpl.push_str("(allow process*)\n");
+    sbpl.push_str("(allow process-exec)\n");
+    sbpl.push_str("(allow process-fork)\n");
+    sbpl.push_str("(allow signal (target same-sandbox))\n");
+    sbpl.push_str("(allow process-info* (target same-sandbox))\n");
     sbpl.push_str("(allow file-read-metadata)\n");
+    sbpl.push_str("(allow file-read* (literal \"/\"))\n");
+    sbpl.push_str(
+        "(allow sysctl-read\n  (sysctl-name \"security.mac.lockdown_mode_state\")\n  (sysctl-name \"kern.bootargs\"))\n",
+    );
+    for root in SYSTEM_READONLY_ROOTS {
+        sbpl.push_str(&format!("(allow file-read* (subpath \"{root}\"))\n"));
+    }
+    for root in SYSTEM_EXECUTABLE_ROOTS {
+        sbpl.push_str(&format!(
+            "(allow file-map-executable (subpath \"{root}\"))\n"
+        ));
+    }
     for root in &policy.readonly_roots {
         sbpl.push_str(&format!(
             "(allow file-read* (subpath \"{}\"))\n",
@@ -123,6 +169,9 @@ mod tests {
         assert!(sbpl.contains("(allow file-write*"));
         assert!(sbpl.contains("/sessions/s1"));
         assert!(sbpl.contains("(allow network*"));
+        assert!(sbpl.contains("security.mac.lockdown_mode_state"));
+        assert!(sbpl.contains("(allow file-read* (literal \"/\"))"));
+        assert!(!sbpl.contains("(subpath \"/etc\")"));
     }
 
     #[tokio::test]
