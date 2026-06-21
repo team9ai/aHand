@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use ahandd::{
-    DaemonConfig,
+    AppToolDef, AppToolHandler, DaemonConfig,
     sandbox::{
         NetworkPolicy, RuntimeExecuteRequest, RuntimeProviderConfig, SandboxPermissionMode,
         SandboxSessionConfig,
@@ -35,6 +35,70 @@ async fn daemon_handle_exposes_sandbox_permission_updates() {
 
     assert_eq!(snapshot.mode, SandboxPermissionMode::Full);
     assert_eq!(snapshot.version, 2);
+
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_handle_registers_app_tool_handlers() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+        .heartbeat_interval(Duration::from_millis(50))
+        .build();
+    let handle = ahandd::spawn(cfg).await.unwrap();
+    let handler: AppToolHandler = std::sync::Arc::new(|args| {
+        Box::pin(async move { Ok(serde_json::json!({ "received": args })) })
+    });
+
+    handle
+        .register_app_tool(
+            AppToolDef {
+                name: "import_file".to_string(),
+                description: "Import a Coffice file pointer into the sandbox".to_string(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "fileRefId": { "type": "string" }
+                    }
+                }),
+            },
+            handler.clone(),
+        )
+        .await
+        .unwrap();
+    let err = handle
+        .register_app_tool(
+            AppToolDef {
+                name: " ".to_string(),
+                description: "invalid".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+            handler,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("app tool name cannot be empty"));
+
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_handle_exposes_approval_subscription_and_response() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+        .heartbeat_interval(Duration::from_millis(50))
+        .build();
+    let handle = ahandd::spawn(cfg).await.unwrap();
+    let _subscription = handle.subscribe_approvals();
+
+    assert!(
+        !handle
+            .respond_approval("missing-job", false, "not approved")
+            .await
+    );
 
     handle.shutdown().await.unwrap();
 }

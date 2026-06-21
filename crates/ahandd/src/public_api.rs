@@ -11,15 +11,19 @@
 //! Only the `ahand-cloud` connection mode is supported here — the
 //! `openclaw-gateway` path remains CLI-only for now.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
-pub use ahand_protocol::SessionMode;
+pub use ahand_protocol::{ApprovalRequest, SessionMode};
+use ahand_protocol::{ApprovalResponse, Envelope, envelope};
 
 use crate::ahand_client::{self, ClientReporter, ConnectOutcome};
 use crate::approval::ApprovalManager;
@@ -203,16 +207,70 @@ impl PartialEq for DaemonStatus {
     }
 }
 
+/// Tool definition registered by an embedding app such as Coffice.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppToolDef {
+    pub name: String,
+    pub description: String,
+    pub input_schema: Value,
+}
+
+/// Error returned by an embedding app tool handler.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppToolError {
+    pub code: String,
+    pub message: String,
+}
+
+pub type AppToolResult = Result<Value, AppToolError>;
+pub type AppToolFuture = Pin<Box<dyn Future<Output = AppToolResult> + Send>>;
+pub type AppToolHandler = Arc<dyn Fn(Value) -> AppToolFuture + Send + Sync>;
+
+/// Cursor over daemon approval requests for embedding UIs.
+pub struct ApprovalSubscription {
+    rx: broadcast::Receiver<Envelope>,
+}
+
+impl ApprovalSubscription {
+    fn new(rx: broadcast::Receiver<Envelope>) -> Self {
+        Self { rx }
+    }
+
+    pub async fn recv(&mut self) -> Option<ApprovalRequest> {
+        loop {
+            match self.rx.recv().await {
+                Ok(envelope) => match envelope.payload {
+                    Some(envelope::Payload::ApprovalRequest(req)) => return Some(req),
+                    _ => continue,
+                },
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
 /// Handle returned by [`spawn`]. Drop-safe — `shutdown()` is the preferred
 /// cleanup path, but dropping the handle also cancels the inner task via
 /// the embedded `oneshot` sender going out of scope.
-#[derive(Debug)]
 pub struct DaemonHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
     join: JoinHandle<anyhow::Result<()>>,
     status_rx: watch::Receiver<DaemonStatus>,
     device_id: String,
+    approval_mgr: Arc<ApprovalManager>,
+    approval_broadcast_tx: broadcast::Sender<Envelope>,
+    app_tools: Arc<AsyncMutex<BTreeMap<String, (AppToolDef, AppToolHandler)>>>,
     sandbox_registry: Arc<AsyncMutex<SandboxRegistry>>,
+}
+
+impl std::fmt::Debug for DaemonHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonHandle")
+            .field("device_id", &self.device_id)
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
 }
 
 static ACTIVE_DAEMONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -272,6 +330,35 @@ impl DaemonHandle {
     /// Device ID assigned at spawn time. Stable for the lifetime of the handle.
     pub fn device_id(&self) -> &str {
         &self.device_id
+    }
+
+    pub async fn register_app_tool(
+        &self,
+        def: AppToolDef,
+        handler: AppToolHandler,
+    ) -> anyhow::Result<()> {
+        if def.name.trim().is_empty() {
+            anyhow::bail!("app tool name cannot be empty");
+        }
+        self.app_tools
+            .lock()
+            .await
+            .insert(def.name.clone(), (def, handler));
+        Ok(())
+    }
+
+    pub fn subscribe_approvals(&self) -> ApprovalSubscription {
+        ApprovalSubscription::new(self.approval_broadcast_tx.subscribe())
+    }
+
+    pub async fn respond_approval(&self, job_id: &str, approved: bool, reason: &str) -> bool {
+        let response = ApprovalResponse {
+            job_id: job_id.to_string(),
+            approved,
+            remember: false,
+            reason: reason.to_string(),
+        };
+        self.approval_mgr.resolve(&response).await.is_some()
     }
 
     pub async fn create_sandbox_session(&self, config: SandboxSessionConfig) -> SandboxResult<()> {
@@ -414,6 +501,8 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     let approval_mgr = Arc::new(ApprovalManager::new(config.approval_timeout.as_secs()));
     let registry = Arc::new(JobRegistry::new(config.max_concurrent_jobs));
     let (approval_broadcast_tx, _) = broadcast::channel(64);
+    let approval_mgr_for_handle = Arc::clone(&approval_mgr);
+    let approval_broadcast_tx_for_handle = approval_broadcast_tx.clone();
     let browser_mgr = Arc::new(BrowserManager::new(BrowserConfig {
         enabled: Some(config.browser_enabled),
         ..BrowserConfig::default()
@@ -476,6 +565,9 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         join,
         status_rx,
         device_id,
+        approval_mgr: approval_mgr_for_handle,
+        approval_broadcast_tx: approval_broadcast_tx_for_handle,
+        app_tools: Arc::new(AsyncMutex::new(BTreeMap::new())),
         sandbox_registry: Arc::new(AsyncMutex::new(SandboxRegistry::default())),
     })
 }
