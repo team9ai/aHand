@@ -250,12 +250,7 @@ fn canonicalize_or_parent(path: &Path) -> io::Result<PathBuf> {
 fn canonicalize_no_follow(path: &Path) -> io::Result<PathBuf> {
     let file_name = path
         .file_name()
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "path has no final component",
-            )
-        })?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no final component"))?
         .to_os_string();
     let parent = path.parent().unwrap_or_else(|| Path::new("/"));
     let canonical_parent = canonicalize_or_parent(parent)?;
@@ -364,7 +359,9 @@ mod tests {
         let link = root.join("escape_link");
         std::os::unix::fs::symlink("/etc/hosts", &link).unwrap();
         let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &[], &[]));
-        let err = checker.check_path(&link.to_string_lossy(), false, false).unwrap_err();
+        let err = checker
+            .check_path(&link.to_string_lossy(), false, false)
+            .unwrap_err();
         assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
     }
 
@@ -378,7 +375,9 @@ mod tests {
         std::fs::write(&key, "fake").unwrap();
         let denylist = vec![format!("{}/.ssh/**", root.display())];
         let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &denylist, &[]));
-        let err = checker.check_path(&key.to_string_lossy(), false, false).unwrap_err();
+        let err = checker
+            .check_path(&key.to_string_lossy(), false, false)
+            .unwrap_err();
         assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
     }
 
@@ -390,7 +389,9 @@ mod tests {
         std::fs::write(&bashrc, "x").unwrap();
         let dangerous = vec![format!("{}/.bashrc", root.display())];
         let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &[], &dangerous));
-        let result = checker.check_path(&bashrc.to_string_lossy(), false, false).unwrap();
+        let result = checker
+            .check_path(&bashrc.to_string_lossy(), false, false)
+            .unwrap();
         assert!(result.needs_approval);
     }
 
@@ -402,7 +403,9 @@ mod tests {
         std::fs::write(&docs, "x").unwrap();
         let dangerous = vec![format!("{}/.bashrc", root.display())];
         let checker = FilePolicyChecker::new(&cfg_for_tempdir(&root, &[], &[], &dangerous));
-        let result = checker.check_path(&docs.to_string_lossy(), false, false).unwrap();
+        let result = checker
+            .check_path(&docs.to_string_lossy(), false, false)
+            .unwrap();
         assert!(!result.needs_approval);
     }
 
@@ -421,7 +424,9 @@ mod tests {
             max_write_bytes: 100_000_000,
             dangerous_paths: Vec::new(),
         });
-        let err = checker.check_path(&file.to_string_lossy(), false, false).unwrap_err();
+        let err = checker
+            .check_path(&file.to_string_lossy(), false, false)
+            .unwrap_err();
         assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
     }
 
@@ -443,7 +448,9 @@ mod tests {
         let checker = FilePolicyChecker::new(&config);
         let file = root.join("foo.txt");
         std::fs::write(&file, "x").unwrap();
-        let err = checker.check_path(&file.to_string_lossy(), false, false).unwrap_err();
+        let err = checker
+            .check_path(&file.to_string_lossy(), false, false)
+            .unwrap_err();
         assert_eq!(err.code, FileErrorCode::PolicyDenied as i32);
     }
 

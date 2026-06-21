@@ -9,9 +9,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use ahand_protocol::{
-    file_edit, file_write, full_write, ByteRangeReplace, FileAppend, FileEdit, FileEditResult,
-    FileError, FileErrorCode, FileWrite, FileWriteResult, FullWrite, LineRangeReplace,
-    StringReplace, WriteAction,
+    ByteRangeReplace, FileAppend, FileEdit, FileEditResult, FileError, FileErrorCode, FileWrite,
+    FileWriteResult, FullWrite, LineRangeReplace, StringReplace, WriteAction, file_edit,
+    file_write, full_write,
 };
 
 use super::file_error;
@@ -23,8 +23,7 @@ pub async fn handle_write(
     max_write_bytes: u64,
 ) -> Result<FileWriteResult, FileError> {
     ensure_encoding_supported(req.encoding.as_deref(), &req.path)?;
-    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink)
-        .await?;
+    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink).await?;
 
     let Some(method) = &req.method else {
         return Err(file_error(
@@ -68,12 +67,15 @@ pub async fn handle_edit(
     max_write_bytes: u64,
 ) -> Result<FileEditResult, FileError> {
     ensure_encoding_supported(req.encoding.as_deref(), &req.path)?;
-    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink)
-        .await?;
+    super::reject_if_final_component_is_symlink(resolved, &req.path, req.no_follow_symlink).await?;
 
     // Require existing file for edit.
     if !tokio::fs::try_exists(resolved).await.unwrap_or(false) {
-        return Err(file_error(FileErrorCode::NotFound, &req.path, "file not found"));
+        return Err(file_error(
+            FileErrorCode::NotFound,
+            &req.path,
+            "file not found",
+        ));
     }
     let metadata = tokio::fs::metadata(resolved)
         .await
@@ -485,10 +487,7 @@ async fn apply_byte_range_replace(
 
 /// Reject non-UTF-8 encoding parameters. V1 only supports UTF-8 writes;
 /// anything else returns FILE_ERROR_CODE_ENCODING with a clear message.
-fn ensure_encoding_supported(
-    encoding: Option<&str>,
-    req_path: &str,
-) -> Result<(), FileError> {
+fn ensure_encoding_supported(encoding: Option<&str>, req_path: &str) -> Result<(), FileError> {
     match encoding {
         None => Ok(()),
         Some(e)
