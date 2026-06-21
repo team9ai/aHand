@@ -3,8 +3,8 @@ use std::{collections::HashMap, path::PathBuf, time::Duration};
 use ahandd::{
     AppToolDef, AppToolHandler, DaemonConfig,
     sandbox::{
-        NetworkPolicy, RuntimeExecuteRequest, RuntimeProviderConfig, SandboxPermissionMode,
-        SandboxSessionConfig,
+        HostFileRef, NetworkPolicy, RegisterVersionRequest, RuntimeExecuteRequest,
+        RuntimeProviderConfig, SandboxPermissionMode, SandboxSessionConfig,
     },
 };
 
@@ -101,6 +101,139 @@ async fn daemon_handle_exposes_approval_subscription_and_response() {
             .respond_approval("missing-job", false, "not approved")
             .await
     );
+
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_handle_persists_and_user_commits_candidate_versions() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    let sandbox_root = temp.path().join("sandbox");
+    let source = temp.path().join("source.txt");
+    std::fs::create_dir_all(sandbox_root.join("workspace")).unwrap();
+    std::fs::write(&source, "original").unwrap();
+
+    let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+        .heartbeat_interval(Duration::from_millis(50))
+        .build();
+    let handle = ahandd::spawn(cfg).await.unwrap();
+    handle
+        .create_sandbox_session(SandboxSessionConfig {
+            session_id: "session-1".to_string(),
+            permission_mode: SandboxPermissionMode::Readonly,
+            workspace_root: sandbox_root.clone(),
+            network: NetworkPolicy::Enabled,
+        })
+        .await
+        .unwrap();
+    handle
+        .import_sandbox_file(
+            "session-1",
+            HostFileRef {
+                file_ref_id: "file-ref-1".to_string(),
+                source_path: source.clone(),
+                display_name: "source.txt".to_string(),
+                size: 8,
+                mtime_ms: None,
+                conversation_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    std::fs::write(sandbox_root.join("workspace/out.txt"), "updated").unwrap();
+
+    let version = handle
+        .register_sandbox_file_version(
+            "session-1",
+            RegisterVersionRequest {
+                sandbox_path: PathBuf::from("workspace/out.txt"),
+                source_file_ref_id: Some("file-ref-1".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let versions = handle
+        .list_sandbox_file_versions("session-1")
+        .await
+        .unwrap();
+    let agent_err = handle
+        .commit_sandbox_file_version("session-1", &version.version_id)
+        .await
+        .unwrap_err();
+
+    assert_eq!(versions, vec![version.clone()]);
+    assert_eq!(agent_err.code, "PERMISSION_DENIED");
+
+    let result = handle
+        .confirm_sandbox_file_version_overwrite("session-1", &version.version_id)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), "updated");
+    assert_eq!(result.version_id, version.version_id);
+    assert_eq!(result.source_file_ref_id, "file-ref-1");
+    assert!(result.backup_id.is_some());
+    assert_eq!(result.bytes_written, 7);
+    assert_eq!(result.permission_mode, SandboxPermissionMode::Readonly);
+
+    let versions = handle
+        .list_sandbox_file_versions("session-1")
+        .await
+        .unwrap();
+    assert_eq!(
+        versions[0].status,
+        ahandd::sandbox::FileVersionStatus::Committed
+    );
+
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn daemon_handle_saves_candidate_version_as_user_selected_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    let sandbox_root = temp.path().join("sandbox");
+    let target = temp.path().join("exports").join("out.txt");
+    std::fs::create_dir_all(sandbox_root.join("workspace")).unwrap();
+    std::fs::write(sandbox_root.join("workspace/out.txt"), "copy").unwrap();
+
+    let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+        .heartbeat_interval(Duration::from_millis(50))
+        .build();
+    let handle = ahandd::spawn(cfg).await.unwrap();
+    handle
+        .create_sandbox_session(SandboxSessionConfig {
+            session_id: "session-1".to_string(),
+            permission_mode: SandboxPermissionMode::Copy,
+            workspace_root: sandbox_root,
+            network: NetworkPolicy::Enabled,
+        })
+        .await
+        .unwrap();
+    let version = handle
+        .register_sandbox_file_version(
+            "session-1",
+            RegisterVersionRequest {
+                sandbox_path: PathBuf::from("workspace/out.txt"),
+                source_file_ref_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = handle
+        .save_sandbox_file_version_as("session-1", &version.version_id, &target)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "copy");
+    assert_eq!(result.version_id, version.version_id);
+    assert_eq!(result.source_file_ref_id, target.to_string_lossy());
+    assert_eq!(result.backup_id, None);
+    assert_eq!(result.old_hash, None);
+    assert_eq!(result.bytes_written, 4);
+    assert_eq!(result.permission_mode, SandboxPermissionMode::Copy);
 
     handle.shutdown().await.unwrap();
 }

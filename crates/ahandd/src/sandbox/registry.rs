@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use super::types::{
-    NetworkPolicy, PermissionSnapshot, RuntimeProviderConfig, SandboxError, SandboxFile,
-    SandboxPermissionMode, SandboxResult, SandboxSessionConfig,
+    FileVersion, HostFileRef, NetworkPolicy, PermissionSnapshot, RuntimeProviderConfig,
+    SandboxError, SandboxFile, SandboxPermissionMode, SandboxResult, SandboxSessionConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -12,7 +12,9 @@ pub struct SandboxSessionState {
     pub workspace_root: PathBuf,
     pub network: NetworkPolicy,
     pub runtimes: BTreeMap<String, RuntimeProviderConfig>,
+    pub host_file_refs: BTreeMap<String, HostFileRef>,
     pub imported_files: BTreeMap<String, SandboxFile>,
+    pub file_versions: BTreeMap<String, FileVersion>,
     permission: PermissionSnapshot,
 }
 
@@ -23,7 +25,9 @@ impl SandboxSessionState {
             workspace_root: config.workspace_root,
             network: config.network,
             runtimes: BTreeMap::new(),
+            host_file_refs: BTreeMap::new(),
             imported_files: BTreeMap::new(),
+            file_versions: BTreeMap::new(),
             permission: PermissionSnapshot {
                 mode: config.permission_mode,
                 version: 1,

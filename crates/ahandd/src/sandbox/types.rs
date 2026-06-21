@@ -153,6 +153,14 @@ impl SandboxError {
     pub fn runtime_not_registered(message: impl Into<String>) -> Self {
         Self::new(CODE_RUNTIME_NOT_REGISTERED, message)
     }
+
+    pub fn unknown_file_ref(message: impl Into<String>) -> Self {
+        Self::new(CODE_UNKNOWN_FILE_REF, message)
+    }
+
+    pub fn unknown_version(message: impl Into<String>) -> Self {
+        Self::new(CODE_UNKNOWN_VERSION, message)
+    }
 }
 
 #[cfg(test)]

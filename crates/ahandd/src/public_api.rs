@@ -459,6 +459,14 @@ impl DaemonHandle {
         file_lifecycle::register_file_version(&mut registry, session_id, request)
     }
 
+    pub async fn list_sandbox_file_versions(
+        &self,
+        session_id: &str,
+    ) -> SandboxResult<Vec<FileVersion>> {
+        let registry = self.sandbox_registry.lock().await;
+        file_lifecycle::list_file_versions(&registry, session_id)
+    }
+
     pub async fn commit_sandbox_file_version(
         &self,
         session_id: &str,
@@ -466,6 +474,30 @@ impl DaemonHandle {
     ) -> SandboxResult<CommitResult> {
         let mut registry = self.sandbox_registry.lock().await;
         file_lifecycle::commit_file_version(&mut registry, session_id, version_id)
+    }
+
+    pub async fn confirm_sandbox_file_version_overwrite(
+        &self,
+        session_id: &str,
+        version_id: &str,
+    ) -> SandboxResult<CommitResult> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::confirm_file_version_overwrite(&mut registry, session_id, version_id)
+    }
+
+    pub async fn save_sandbox_file_version_as(
+        &self,
+        session_id: &str,
+        version_id: &str,
+        target_path: &Path,
+    ) -> SandboxResult<CommitResult> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::save_file_version_as(
+            &mut registry,
+            session_id,
+            version_id,
+            target_path.to_path_buf(),
+        )
     }
 }
 
