@@ -8,6 +8,7 @@ pub mod executor;
 pub mod file_manager;
 pub mod outbox;
 pub mod registry;
+pub mod sandbox;
 pub mod session;
 pub mod store;
 pub mod updater;
