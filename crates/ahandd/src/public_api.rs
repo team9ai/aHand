@@ -11,7 +11,7 @@
 //! Only the `ahand-cloud` connection mode is supported here — the
 //! `openclaw-gateway` path remains CLI-only for now.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -32,8 +32,9 @@ use crate::config::{BrowserConfig, Config, FilePolicyConfig, HubConfig};
 use crate::device_identity::DeviceIdentity;
 use crate::registry::JobRegistry;
 use crate::sandbox::{
-    CommitResult, FileVersion, HostFileRef, PermissionSnapshot, RegisterVersionRequest,
-    RuntimeExecuteRequest, RuntimeExecuteResult, RuntimeProviderConfig, SandboxFile,
+    CommitResult, FileVersion, HostFileRef, NetworkPolicy, PermissionSnapshot,
+    RegisterVersionRequest, RegisteredExecEnvironment, RuntimeExecuteRequest, RuntimeExecuteResult,
+    RuntimeProviderConfig, SandboxExecRequest, SandboxExecResult, SandboxFile,
     SandboxPermissionMode, SandboxResult, SandboxSessionConfig, file_lifecycle, path_policy,
     registry::SandboxRegistry,
     runner::{self, PlatformExecuteRequest, RuntimeSandboxPolicy},
@@ -398,33 +399,40 @@ impl DaemonHandle {
         file_lifecycle::import_file(&mut registry, session_id, file_ref)
     }
 
-    pub async fn execute_sandbox_runtime(
+    pub async fn execute_sandbox_command(
         &self,
         session_id: &str,
-        request: RuntimeExecuteRequest,
-    ) -> SandboxResult<RuntimeExecuteResult> {
-        let (workspace_root, network, provider) = {
+        request: SandboxExecRequest,
+    ) -> SandboxResult<SandboxExecResult> {
+        let (workspace_root, network, exec_env): (
+            PathBuf,
+            NetworkPolicy,
+            RegisteredExecEnvironment,
+        ) = {
             let registry = self.sandbox_registry.lock().await;
             let session = registry.session(session_id)?;
-            let provider = session
-                .runtimes
-                .get(&request.runtime)
-                .cloned()
-                .ok_or_else(|| {
-                    crate::sandbox::SandboxError::runtime_not_registered(format!(
-                        "sandbox runtime '{}' is not registered",
-                        request.runtime
-                    ))
-                })?;
-            (session.workspace_root.clone(), session.network, provider)
+            (
+                session.workspace_root.clone(),
+                session.network,
+                session.exec_environment(),
+            )
         };
+        let SandboxExecRequest {
+            command,
+            cwd,
+            env: request_env,
+            timeout: request_timeout,
+        } = request;
+        let (program, args) = command.split_first().ok_or_else(|| {
+            crate::sandbox::SandboxError::invalid_command("sandbox command must not be empty")
+        })?;
 
         std::fs::create_dir_all(&workspace_root).map_err(|e| {
             crate::sandbox::SandboxError::unavailable(format!(
                 "failed to create sandbox workspace root: {e}"
             ))
         })?;
-        let cwd = match request.cwd {
+        let cwd = match cwd {
             Some(cwd) => {
                 path_policy::resolve_existing_sandbox_path(&workspace_root, &cwd.to_string_lossy())?
             }
@@ -434,20 +442,63 @@ impl DaemonHandle {
                 ))
             })?,
         };
-        let mut env = provider.env.clone();
-        env.extend(request.env);
-        let timeout = request.timeout.unwrap_or(provider.default_timeout);
-        let executable = provider.executable.clone();
-        let policy = RuntimeSandboxPolicy::new(workspace_root, provider, network);
+        let executable = runner::resolve_executable(program, &exec_env.path_entries)?;
+        let mut env = exec_env.env;
+        merge_path_entries(&mut env, &exec_env.path_entries);
+        env.extend(request_env);
+        let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
+        let policy = RuntimeSandboxPolicy {
+            writable_root: workspace_root,
+            readonly_roots: exec_env.readonly_roots,
+            network,
+        };
 
         runner::execute(PlatformExecuteRequest {
             executable,
-            args: request.args,
+            args: args.to_vec(),
             cwd,
             env,
             timeout,
             policy,
         })
+        .await
+    }
+
+    pub async fn execute_sandbox_runtime(
+        &self,
+        session_id: &str,
+        request: RuntimeExecuteRequest,
+    ) -> SandboxResult<RuntimeExecuteResult> {
+        let provider = {
+            let registry = self.sandbox_registry.lock().await;
+            let session = registry.session(session_id)?;
+            session
+                .runtimes
+                .get(&request.runtime)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::sandbox::SandboxError::runtime_not_registered(format!(
+                        "sandbox runtime '{}' is not registered",
+                        request.runtime
+                    ))
+                })?
+        };
+
+        let mut env = provider.env.clone();
+        env.extend(request.env);
+        let command = std::iter::once(provider.executable.to_string_lossy().to_string())
+            .chain(request.args.into_iter())
+            .collect::<Vec<_>>();
+
+        self.execute_sandbox_command(
+            session_id,
+            SandboxExecRequest {
+                command,
+                cwd: request.cwd,
+                env,
+                timeout: request.timeout.or(Some(provider.default_timeout)),
+            },
+        )
         .await
     }
 
@@ -526,6 +577,23 @@ fn canonicalize_runtime_provider(
     provider.readonly_roots.sort();
     provider.readonly_roots.dedup();
     Ok(provider)
+}
+
+fn merge_path_entries(env: &mut HashMap<String, String>, path_entries: &[PathBuf]) {
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let prefix = path_entries
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(separator);
+    if prefix.is_empty() {
+        return;
+    }
+    let path = match env.get("PATH") {
+        Some(existing) if !existing.is_empty() => format!("{prefix}{separator}{existing}"),
+        _ => prefix,
+    };
+    env.insert("PATH".to_string(), path);
 }
 
 /// Spawn an `ahandd` instance wired against the cloud hub described by `config`.
@@ -1026,6 +1094,43 @@ mod tests {
         let err = spawn(cfg).await.unwrap_err();
         // Just assert an error was produced — the exact message varies by OS.
         assert!(!err.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_sandbox_command_rejects_empty_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity_dir = temp.path().join("identity");
+        let workspace_root = temp.path().join("sandbox");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+            .heartbeat_interval(Duration::from_millis(50))
+            .build();
+        let handle = spawn(cfg).await.unwrap();
+        handle
+            .create_sandbox_session(SandboxSessionConfig {
+                session_id: "session-1".to_string(),
+                permission_mode: SandboxPermissionMode::Readonly,
+                workspace_root,
+                network: NetworkPolicy::Enabled,
+            })
+            .await
+            .unwrap();
+
+        let err = handle
+            .execute_sandbox_command(
+                "session-1",
+                SandboxExecRequest {
+                    command: vec![],
+                    cwd: None,
+                    env: HashMap::new(),
+                    timeout: Some(Duration::from_secs(1)),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, "INVALID_COMMAND");
+        handle.shutdown().await.unwrap();
     }
 
     #[test]
