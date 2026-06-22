@@ -10,6 +10,7 @@ pub mod file_manager;
 pub mod outbox;
 pub mod plugin_runtime;
 pub mod registry;
+pub mod sandbox;
 pub mod session;
 pub mod store;
 pub mod updater;
