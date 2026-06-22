@@ -13,6 +13,7 @@ async fn daemon_handle_exposes_sandbox_permission_updates() {
     let temp = tempfile::tempdir().unwrap();
     let identity_dir = temp.path().join("identity");
     let sandbox_root = temp.path().join("sandbox");
+    std::fs::create_dir_all(&sandbox_root).unwrap();
 
     let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
         .heartbeat_interval(Duration::from_millis(50))

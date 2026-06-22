@@ -382,6 +382,7 @@ impl DaemonHandle {
         session_id: &str,
         provider: RuntimeProviderConfig,
     ) -> SandboxResult<()> {
+        let provider = canonicalize_runtime_provider(provider)?;
         let mut registry = self.sandbox_registry.lock().await;
         let session = registry.session_mut(session_id)?;
         session.runtimes.insert(provider.name.clone(), provider);
@@ -499,6 +500,32 @@ impl DaemonHandle {
             target_path.to_path_buf(),
         )
     }
+}
+
+fn canonicalize_runtime_provider(
+    mut provider: RuntimeProviderConfig,
+) -> SandboxResult<RuntimeProviderConfig> {
+    provider.executable = provider.executable.canonicalize().map_err(|e| {
+        crate::sandbox::SandboxError::unavailable(format!(
+            "failed to resolve sandbox runtime executable '{}': {e}",
+            provider.executable.display()
+        ))
+    })?;
+    provider.readonly_roots = provider
+        .readonly_roots
+        .into_iter()
+        .map(|root| {
+            root.canonicalize().map_err(|e| {
+                crate::sandbox::SandboxError::unavailable(format!(
+                    "failed to resolve sandbox runtime readonly root '{}': {e}",
+                    root.display()
+                ))
+            })
+        })
+        .collect::<SandboxResult<Vec<_>>>()?;
+    provider.readonly_roots.sort();
+    provider.readonly_roots.dedup();
+    Ok(provider)
 }
 
 /// Spawn an `ahandd` instance wired against the cloud hub described by `config`.

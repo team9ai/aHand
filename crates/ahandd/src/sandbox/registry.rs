@@ -57,7 +57,14 @@ pub struct SandboxRegistry {
 
 impl SandboxRegistry {
     pub fn create_session(&mut self, config: SandboxSessionConfig) -> SandboxResult<()> {
+        let workspace_root = config.workspace_root.canonicalize().map_err(|e| {
+            SandboxError::unavailable(format!("failed to resolve sandbox workspace root: {e}"))
+        })?;
         let session_id = config.session_id.clone();
+        let config = SandboxSessionConfig {
+            workspace_root,
+            ..config
+        };
         self.sessions
             .insert(session_id, SandboxSessionState::from_config(config));
         Ok(())
@@ -92,22 +99,24 @@ impl SandboxRegistry {
 mod tests {
     use super::*;
     use crate::sandbox::types::{NetworkPolicy, SandboxPermissionMode, SandboxSessionConfig};
+    use std::fs;
     use std::path::PathBuf;
 
-    fn config() -> SandboxSessionConfig {
+    fn config(workspace_root: PathBuf) -> SandboxSessionConfig {
         SandboxSessionConfig {
             session_id: "session-1".to_string(),
             permission_mode: SandboxPermissionMode::Readonly,
-            workspace_root: PathBuf::from("/tmp/coffice/session-1"),
+            workspace_root,
             network: NetworkPolicy::Enabled,
         }
     }
 
     #[test]
     fn create_session_initializes_permission_version() {
+        let temp = tempfile::tempdir().unwrap();
         let mut registry = SandboxRegistry::default();
 
-        registry.create_session(config()).unwrap();
+        registry.create_session(config(temp.path().into())).unwrap();
         let snapshot = registry.permission_snapshot("session-1").unwrap();
 
         assert_eq!(snapshot.mode, SandboxPermissionMode::Readonly);
@@ -115,9 +124,28 @@ mod tests {
     }
 
     #[test]
-    fn permission_update_increments_only_on_change() {
+    fn create_session_canonicalizes_workspace_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let root_with_parent_component = workspace_root.join("..").join("workspace");
         let mut registry = SandboxRegistry::default();
-        registry.create_session(config()).unwrap();
+
+        registry
+            .create_session(config(root_with_parent_component))
+            .unwrap();
+
+        assert_eq!(
+            registry.session("session-1").unwrap().workspace_root,
+            workspace_root.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn permission_update_increments_only_on_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry.create_session(config(temp.path().into())).unwrap();
 
         let same = registry
             .update_permission("session-1", SandboxPermissionMode::Readonly)

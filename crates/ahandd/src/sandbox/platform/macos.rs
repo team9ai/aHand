@@ -110,9 +110,7 @@ pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
     sbpl.push_str("(allow process-info* (target same-sandbox))\n");
     sbpl.push_str("(allow file-read-metadata)\n");
     sbpl.push_str("(allow file-read* (literal \"/\"))\n");
-    sbpl.push_str(
-        "(allow sysctl-read\n  (sysctl-name \"security.mac.lockdown_mode_state\")\n  (sysctl-name \"kern.bootargs\"))\n",
-    );
+    sbpl.push_str("(allow sysctl-read)\n");
     for root in SYSTEM_READONLY_ROOTS {
         sbpl.push_str(&format!("(allow file-read* (subpath \"{root}\"))\n"));
     }
@@ -169,7 +167,7 @@ mod tests {
         assert!(sbpl.contains("(allow file-write*"));
         assert!(sbpl.contains("/sessions/s1"));
         assert!(sbpl.contains("(allow network*"));
-        assert!(sbpl.contains("security.mac.lockdown_mode_state"));
+        assert!(sbpl.contains("(allow sysctl-read)"));
         assert!(sbpl.contains("(allow file-read* (literal \"/\"))"));
         assert!(!sbpl.contains("(subpath \"/etc\")"));
     }

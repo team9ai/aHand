@@ -400,7 +400,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(file.sandbox_path.starts_with(root.join("input")));
+        assert!(
+            file.sandbox_path
+                .starts_with(root.canonicalize().unwrap().join("input"))
+        );
         assert_eq!(fs::read_to_string(file.sandbox_path).unwrap(), "hello");
     }
 
@@ -427,7 +430,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(file.sandbox_path.starts_with(root.join("input")));
+        assert!(
+            file.sandbox_path
+                .starts_with(root.canonicalize().unwrap().join("input"))
+        );
         assert_eq!(file.sandbox_path.file_name().unwrap(), "source.txt");
     }
 
