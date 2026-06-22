@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -6,8 +8,8 @@ use std::time::Duration;
 use ahandd::{
     DaemonConfig,
     sandbox::{
-        HostFileRef, NetworkPolicy, RegisterVersionRequest, RuntimeExecuteRequest,
-        RuntimeProviderConfig, SandboxPermissionMode, SandboxSessionConfig,
+        HostFileRef, NetworkPolicy, RegisterVersionRequest, RuntimeProviderConfig,
+        SandboxExecRequest, SandboxPermissionMode, SandboxSessionConfig,
     },
 };
 
@@ -46,11 +48,21 @@ fn runtime_root(executable: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+#[cfg(target_os = "macos")]
+fn executable_shim(bin: &Path, command_name: &str, target: &Path) -> PathBuf {
+    std::fs::create_dir_all(bin).unwrap();
+    let shim = bin.join(command_name);
+    symlink(target, &shim).unwrap();
+    shim
+}
+
+#[cfg(target_os = "macos")]
 #[tokio::test]
 async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
     let temp = tempfile::tempdir().unwrap();
     let identity_dir = temp.path().join("identity");
     let sandbox_root = temp.path().join("sandbox");
+    let python_runtime_bin = temp.path().join("runtime").join("python").join("bin");
     let source = temp.path().join("source.txt");
     std::fs::create_dir_all(sandbox_root.join("workspace")).unwrap();
     std::fs::write(&source, "original").unwrap();
@@ -69,7 +81,8 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
         .await
         .unwrap();
 
-    let python = python_executable();
+    let system_python = python_executable();
+    let python = executable_shim(&python_runtime_bin, "python", &system_python);
     let node = node_executable();
     let mut python_env = HashMap::new();
     python_env.insert("PYTHONNOUSERSITE".to_string(), "1".to_string());
@@ -79,7 +92,7 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
             RuntimeProviderConfig {
                 name: "python".to_string(),
                 executable: python.clone(),
-                readonly_roots: vec![runtime_root(&python)],
+                readonly_roots: vec![runtime_root(&python), runtime_root(&system_python)],
                 env: python_env,
                 default_timeout: Duration::from_secs(10),
             },
@@ -116,11 +129,11 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
         .unwrap();
 
     let read_imported = handle
-        .execute_sandbox_runtime(
+        .execute_sandbox_command(
             "session-1",
-            RuntimeExecuteRequest {
-                runtime: "python".to_string(),
-                args: vec![
+            SandboxExecRequest {
+                command: vec![
+                    "python".to_string(),
                     "-c".to_string(),
                     format!(
                         "from pathlib import Path; print(Path({:?}).read_text())",
@@ -138,11 +151,11 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
     assert_eq!(read_imported.stdout.trim(), "original");
 
     let write_output = handle
-        .execute_sandbox_runtime(
+        .execute_sandbox_command(
             "session-1",
-            RuntimeExecuteRequest {
-                runtime: "node".to_string(),
-                args: vec![
+            SandboxExecRequest {
+                command: vec![
+                    "node".to_string(),
                     "-e".to_string(),
                     "require('fs').writeFileSync('workspace/out.txt', 'changed')".to_string(),
                 ],
