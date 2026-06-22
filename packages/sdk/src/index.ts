@@ -17,6 +17,8 @@ export type {
   FileParams,
   FileResult,
   FileErrorPayload,
+  FileUploadUrlParams,
+  FileUploadUrlResult,
   ReadFileMode,
   ReadPdfMode,
   ReadFileImageFormat,
@@ -33,4 +35,8 @@ export type {
   ReadPdfPageText,
   ReadFilePdfResult,
   ReadFileResult,
+  AppToolInfo,
+  AppToolCatalog,
+  ListAppToolsOptions,
+  InvokeAppToolOptions,
 } from "./cloud-client.ts";

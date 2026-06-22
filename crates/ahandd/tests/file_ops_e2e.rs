@@ -9,19 +9,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ahand_protocol::{
-    ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy, FileCreateSymlink, FileDelete,
-    FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary,
-    FileReadImage, FileReadText, FileRequest, FileResponse, FileStat, FileType, FileWrite,
-    FullWrite, ImageFormat, LineRangeReplace, StringReplace, UnixPermission, file_chmod, file_edit,
-    file_position, file_request, file_response, file_write, full_write,
+    ByteRangeReplace, DeleteMode, FileAppend, FileCopy, FileDelete, FileEdit, FileErrorCode,
+    FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary, FileReadImage,
+    FileReadText, FileRequest, FileResponse, FileStat, FileType, FileWrite, FullWrite, ImageFormat,
+    LineRangeReplace, StringReplace, file_edit, file_position, file_request, file_response,
+    file_write, full_write,
 };
+#[cfg(unix)]
+use ahand_protocol::{FileChmod, FileCreateSymlink, UnixPermission, file_chmod};
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
 use prost::Message;
 use tempfile::TempDir;
 
 fn test_manager(tmp: &TempDir) -> (FileManager, PathBuf) {
-    let root = tmp.path().canonicalize().unwrap();
+    // canonicalize_simplified strips the Windows verbatim prefix (\\?\) so
+    // the allowlist patterns match what FilePolicyChecker returns internally.
+    let root = ahand_platform::paths::canonicalize_simplified(tmp.path()).unwrap();
     let pattern = format!("{}/**", root.to_string_lossy().trim_end_matches('/'));
     let self_pat = root.to_string_lossy().into_owned();
     let mgr = FileManager::new(&FilePolicyConfig {
@@ -417,10 +421,18 @@ async fn e2e_policy_rejection_returns_policy_denied_error() {
     let dir = TempDir::new().unwrap();
     let (mgr, _root) = test_manager(&dir);
 
+    // OS-appropriate absolute path outside the temp-dir-scoped allowlist; on
+    // Windows `/etc/passwd` has no drive letter and fails as InvalidPath
+    // before the allowlist check is reached.
+    #[cfg(unix)]
+    let outside_path = "/etc/passwd";
+    #[cfg(windows)]
+    let outside_path = r"C:\Windows\System32\drivers\etc\hosts";
+
     let req = FileRequest {
         request_id: "denied".into(),
         operation: Some(file_request::Operation::Stat(FileStat {
-            path: "/etc/passwd".into(),
+            path: outside_path.into(),
             no_follow_symlink: false,
         })),
     };

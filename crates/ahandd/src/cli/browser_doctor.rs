@@ -98,15 +98,140 @@ fn print_check(report: &CheckReport) {
 }
 
 fn print_fix_hint(label: &str, hint: &FixHint) {
+    print!("{}", format_fix_hint(label, hint));
+}
+
+/// Display label of the host platform, matching the exact vocabulary used by
+/// `PlatformCommand::platform` (`"macOS"` / `"Linux"` / `"Windows"`).
+///
+/// Uses `cfg!(target_os = ...)` rather than `std::env::consts::OS` on purpose:
+/// the latter yields lowercase (`"macos"`/`"linux"`/`"windows"`) which would
+/// match NONE of the capitalized labels and silently hide every hint. Returns
+/// `None` on an OS without a known label so callers can fall back to showing
+/// all platforms.
+fn host_platform_label() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        Some("macOS")
+    } else if cfg!(target_os = "linux") {
+        Some("Linux")
+    } else if cfg!(target_os = "windows") {
+        Some("Windows")
+    } else {
+        None
+    }
+}
+
+/// Render a fix hint for the human-facing CLI.
+///
+/// For `ManualCommand`, only the host platform's command line is shown (a Linux
+/// user has no use for the macOS `brew` command). If the host platform has no
+/// matching entry — an unknown OS, or a label that isn't in the list — all
+/// entries are printed so the user is never left with no remediation at all.
+///
+/// This filters ONLY the printed text; the serialized `FixHint` (consumed by
+/// `/api/status` and the admin surfaces) still carries every platform.
+fn format_fix_hint(label: &str, hint: &FixHint) -> String {
     match hint {
         FixHint::RunStep { command } => {
-            println!("  {label}  \u{2192}  {command}");
+            format!("  {label}  \u{2192}  {command}\n")
         }
         FixHint::ManualCommand { platform_commands } => {
-            println!("  {label}:");
+            let host = host_platform_label();
+            // Show only the host platform's line when it has a matching entry;
+            // otherwise fall back to all entries so we never print nothing.
+            let host_matched =
+                host.is_some_and(|h| platform_commands.iter().any(|pc| pc.platform == h));
+
+            let mut out = format!("  {label}:\n");
             for PlatformCommand { platform, command } in platform_commands {
-                println!("    {platform:<8}  {command}");
+                if host_matched && Some(*platform) != host {
+                    continue;
+                }
+                out.push_str(&format!("    {platform:<8}  {command}\n"));
+            }
+            out
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_command_shows_only_host_platform() {
+        let hint = FixHint::ManualCommand {
+            platform_commands: vec![
+                PlatformCommand {
+                    platform: "macOS",
+                    command: "brew install --cask google-chrome".into(),
+                },
+                PlatformCommand {
+                    platform: "Linux",
+                    command: "sudo apt install chromium-browser".into(),
+                },
+                PlatformCommand {
+                    platform: "Windows",
+                    command: "Edge should be preinstalled".into(),
+                },
+            ],
+        };
+
+        let rendered = format_fix_hint("System Browser", &hint);
+
+        // The host label resolves via the same cfg! helper the renderer uses,
+        // so this assertion holds on macOS, Linux, and Windows CI alike.
+        let host = host_platform_label().expect("test target should have a known host label");
+
+        // Exactly one command line (lines indented with four spaces).
+        let command_lines: Vec<&str> = rendered.lines().filter(|l| l.starts_with("    ")).collect();
+        assert_eq!(
+            command_lines.len(),
+            1,
+            "exactly one command line expected, got: {rendered:?}"
+        );
+        assert!(
+            command_lines[0].contains(host),
+            "the sole command line should be the host platform `{host}`: {rendered:?}"
+        );
+
+        // The two other-OS commands must be absent.
+        for (other_label, marker) in [
+            ("macOS", "brew install"),
+            ("Linux", "apt install"),
+            ("Windows", "preinstalled"),
+        ] {
+            if other_label != host {
+                assert!(
+                    !rendered.contains(marker),
+                    "other-OS hint `{marker}` ({other_label}) should be filtered out: {rendered:?}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn manual_command_falls_back_to_all_when_host_unmatched() {
+        // No entry matches the host label -> print everything, never nothing.
+        let hint = FixHint::ManualCommand {
+            platform_commands: vec![PlatformCommand {
+                platform: "Plan9",
+                command: "pkg_add chrome".into(),
+            }],
+        };
+        let rendered = format_fix_hint("System Browser", &hint);
+        assert!(
+            rendered.contains("Plan9") && rendered.contains("pkg_add chrome"),
+            "unmatched host must fall back to all entries: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn run_step_hint_renders_command() {
+        let hint = FixHint::RunStep {
+            command: "ahandd browser-init --step node".into(),
+        };
+        let rendered = format_fix_hint("Node.js", &hint);
+        assert!(rendered.contains("ahandd browser-init --step node"));
     }
 }

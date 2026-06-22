@@ -79,7 +79,7 @@ resource "aws_ecs_task_definition" "stub" {
   task_role_arn            = aws_iam_role.task.arn
 
   # Placeholder only — deploy-hub.yml registers fresh revisions on every
-  # push to main/dev with the real image + secrets + Traefik labels.
+  # push to main/dev/staging with the real image + secrets + Traefik labels.
   container_definitions = jsonencode([
     {
       name         = "ahand-hub"

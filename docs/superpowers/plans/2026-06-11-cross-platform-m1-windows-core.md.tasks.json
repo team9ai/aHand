@@ -4,72 +4,96 @@
     {
       "id": 1,
       "subject": "Task 1: Scaffold ahand-platform crate, paths module, .gitattributes",
-      "status": "pending",
+      "status": "completed",
       "description": "**Goal:** Workspace builds with new crate; exe_name/simplify/canonicalize_simplified tested; CRLF-safe repo.\n\n**Verify:** cargo test -p ahand-platform && cargo check --workspace && cargo check --target x86_64-pc-windows-msvc -p ahand-platform\n\n```json:metadata\n{\"files\": [\"Cargo.toml\", \".gitattributes\", \"crates/ahand-platform/Cargo.toml\", \"crates/ahand-platform/src/lib.rs\", \"crates/ahand-platform/src/paths.rs\"], \"verifyCommand\": \"cargo test -p ahand-platform && cargo check --workspace && cargo check --target x86_64-pc-windows-msvc -p ahand-platform\", \"acceptanceCriteria\": [\"crate in workspace\", \"paths helpers tested\", \"msvc check green\", \"gitattributes forces LF\"]}\n```"
     },
     {
       "id": 2,
       "subject": "Task 2: platform::process + adopt in ahandctl daemon lifecycle",
-      "status": "pending",
-      "blockedBy": [1],
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
       "description": "**Goal:** configure_detached/terminate/is_process_running in platform crate; daemon.rs cfg-free.\n\n**Verify:** cargo test -p ahand-platform -p ahandctl && cargo check --target x86_64-pc-windows-msvc -p ahandctl\n\n```json:metadata\n{\"files\": [\"crates/ahand-platform/src/process.rs\", \"crates/ahandctl/Cargo.toml\", \"crates/ahandctl/src/daemon.rs\"], \"verifyCommand\": \"cargo test -p ahand-platform -p ahandctl && cargo check --target x86_64-pc-windows-msvc -p ahandctl\", \"acceptanceCriteria\": [\"no cfg in daemon.rs\", \"libc kill on unix, taskkill on windows\", \"exe_name used for binary lookup\"]}\n```"
     },
     {
       "id": 3,
       "subject": "Task 3: platform::signals + adopt in ahandd main",
-      "status": "pending",
-      "blockedBy": [1],
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
       "description": "**Goal:** shutdown_signal() unified; main.rs loses tokio::signal::unix.\n\n**Verify:** cargo test -p ahand-platform && cargo build -p ahandd && cargo check --target x86_64-pc-windows-msvc -p ahandd (later-task files may still error; record)\n\n```json:metadata\n{\"files\": [\"crates/ahand-platform/src/signals.rs\", \"crates/ahandd/Cargo.toml\", \"crates/ahandd/src/main.rs\"], \"verifyCommand\": \"cargo test -p ahand-platform && cargo build -p ahandd\", \"acceptanceCriteria\": [\"no signal::unix in ahandd\", \"select! uses shutdown future\"]}\n```"
     },
     {
       "id": 4,
       "subject": "Task 4: platform::shell + adopt in executor and openclaw handler",
-      "status": "pending",
-      "blockedBy": [1],
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
       "description": "**Goal:** SHELL//bin/sh vs COMSPEC/cmd.exe via default_shell/env_shell/shell_c_flag; call sites adopted; tool_resolution_tests cfg-aware.\n\n**Verify:** cargo test -p ahandd && cargo test -p ahand-platform shell\n\n```json:metadata\n{\"files\": [\"crates/ahand-platform/src/shell.rs\", \"crates/ahandd/src/executor.rs\", \"crates/ahandd/src/openclaw/handler.rs\"], \"verifyCommand\": \"cargo test -p ahandd && cargo test -p ahand-platform shell\", \"acceptanceCriteria\": [\"no hardcoded /bin/sh in production code\", \"existing unix behavior unchanged\"]}\n```"
     },
     {
       "id": 5,
       "subject": "Task 5: Policy verbatim-prefix fix (\\\\?\\)",
-      "status": "pending",
-      "blockedBy": [1],
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
       "description": "**Goal:** canonicalize results simplified before glob matching; regression test pinning allowlisted tempdir passes check_path.\n\n**Verify:** cargo test -p ahandd file_manager && cargo test -p ahandd --test file_ops\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/file_manager/policy.rs\"], \"verifyCommand\": \"cargo test -p ahandd file_manager && cargo test -p ahandd --test file_ops\", \"acceptanceCriteria\": [\"simplify applied in canonicalize_or_parent both branches\", \"regression test added\"]}\n```"
     },
     {
       "id": 6,
       "subject": "Task 6: platform::secure_file + route all three secret writers",
-      "status": "pending",
-      "blockedBy": [1],
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
       "description": "**Goal:** write_secure_file (0o600 unix / icacls owner-only windows, temp+rename); device_identity x2 + pairing routed; no 0o600 left in ahandd.\n\n**Verify:** cargo test -p ahand-platform secure_file && cargo test -p ahandd && grep -rn 0o600 crates/ahandd/src/ returns nothing\n\n```json:metadata\n{\"files\": [\"crates/ahand-platform/src/secure_file.rs\", \"crates/ahandd/src/device_identity.rs\", \"crates/ahandd/src/openclaw/device_identity.rs\", \"crates/ahandd/src/openclaw/pairing.rs\"], \"verifyCommand\": \"cargo test -p ahand-platform secure_file && cargo test -p ahandd\", \"acceptanceCriteria\": [\"mode set before write on unix\", \"icacls hard-errors\", \"hello_signature golden test still green\"]}\n```"
     },
     {
       "id": 7,
       "subject": "Task 7: platform::ipc module (transport only, loopback tests)",
-      "status": "pending",
-      "blockedBy": [1],
+      "status": "completed",
+      "blockedBy": [
+        1
+      ],
       "description": "**Goal:** IpcEndpoint/IpcListener/ipc_connect with unix socket / named pipe; loopback roundtrip test.\n\n**Verify:** cargo test -p ahand-platform ipc && cargo check --target x86_64-pc-windows-msvc -p ahand-platform && clippy -D warnings\n\n```json:metadata\n{\"files\": [\"crates/ahand-platform/src/ipc.rs\"], \"verifyCommand\": \"cargo test -p ahand-platform ipc && cargo check --target x86_64-pc-windows-msvc -p ahand-platform\", \"acceptanceCriteria\": [\"default endpoint per-user\", \"pipe instance pre-created before accept returns\", \"ERROR_PIPE_BUSY retry on connect\"]}\n```"
     },
     {
       "id": 8,
       "subject": "Task 8: Adopt platform::ipc in ahandd server + ahandctl client",
-      "status": "pending",
-      "blockedBy": [7],
+      "status": "completed",
+      "blockedBy": [
+        7
+      ],
       "description": "**Goal:** serve_ipc on IpcListener; handle_ipc_conn generic; config returns IpcEndpoint (no /tmp); 5 ahandctl ipc_* connect sites use ipc_connect; manual IPC smoke on macOS.\n\n**Verify:** cargo test -p ahandd -p ahandctl && cargo check --target x86_64-pc-windows-msvc -p ahandd -p ahandctl (errors only in Task9/M3 files)\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/ipc.rs\", \"crates/ahandd/src/config.rs\", \"crates/ahandd/src/main.rs\", \"crates/ahandctl/src/main.rs\"], \"verifyCommand\": \"cargo test -p ahandd -p ahandctl\", \"acceptanceCriteria\": [\"no UnixListener/UnixStream/PermissionsExt in ahandd ipc.rs\", \"into_split replaced by tokio::io::split\", \"smoke test passes\"]}\n```"
     },
     {
       "id": 9,
       "subject": "Task 9: Updater + remaining /tmp fallbacks + save_atomic",
-      "status": "pending",
-      "blockedBy": [2],
+      "status": "completed",
+      "blockedBy": [
+        2
+      ],
       "description": "**Goal:** install_binary_into with .exe + rename-aside + cleanup_old_binary startup hook; windows restart via detached spawn + exit; browser.rs /tmp -> temp_dir; save_atomic overwrite test.\n\n**Verify:** cargo test -p ahandd updater && cargo test -p ahandd config && no /tmp literals outside tests\n\n```json:metadata\n{\"files\": [\"crates/ahandd/src/updater.rs\", \"crates/ahandd/src/main.rs\", \"crates/ahandd/src/browser.rs\", \"crates/ahandd/src/config.rs\"], \"verifyCommand\": \"cargo test -p ahandd updater && cargo test -p ahandd config\", \"acceptanceCriteria\": [\"rename-aside on windows\", \"startup cleanup hook wired\", \"no /tmp in client production code\"]}\n```"
     },
     {
       "id": 10,
       "subject": "Task 10: CI — 3-OS client test lane + Windows release artifacts",
-      "status": "pending",
-      "blockedBy": [2, 3, 4, 5, 6, 8, 9],
+      "status": "completed",
+      "blockedBy": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        9
+      ],
       "description": "**Goal:** client-ci.yml (ubuntu/macos/windows: fmt/clippy/test); release-rust.yml windows-x64 + protoc + .exe artifacts; iterate until Windows lane green — this is the M1 gate.\n\n**Verify:** gh run watch both workflows green on branch\n\n```json:metadata\n{\"files\": [\".github/workflows/client-ci.yml\", \".github/workflows/release-rust.yml\"], \"verifyCommand\": \"gh run list --branch feat/cross-platform-support\", \"acceptanceCriteria\": [\"windows test job green incl. policy regression test\", \"release dry-run builds ahandd-windows-x64.exe\"]}\n```"
     }
   ],
-  "lastUpdated": "2026-06-11"
+  "lastUpdated": "2026-06-11T00:00:00Z"
 }

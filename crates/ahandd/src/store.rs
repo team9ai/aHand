@@ -157,6 +157,9 @@ fn describe_payload(envelope: &Envelope) -> &'static str {
         Some(Payload::FileRequest(_)) => "FileRequest",
         Some(Payload::FileResponse(_)) => "FileResponse",
         Some(Payload::Heartbeat(_)) => "Heartbeat",
+        Some(Payload::AppToolsUpdate(_)) => "AppToolsUpdate",
+        Some(Payload::AppToolRequest(_)) => "AppToolRequest",
+        Some(Payload::AppToolResponse(_)) => "AppToolResponse",
         None => "none",
     }
 }
@@ -263,6 +266,18 @@ mod tests {
             "FileResponse",
         );
         check(Payload::Heartbeat(Heartbeat::default()), "Heartbeat");
+        check(
+            Payload::AppToolsUpdate(AppToolsUpdate::default()),
+            "AppToolsUpdate",
+        );
+        check(
+            Payload::AppToolRequest(AppToolRequest::default()),
+            "AppToolRequest",
+        );
+        check(
+            Payload::AppToolResponse(AppToolResponse::default()),
+            "AppToolResponse",
+        );
     }
 
     #[test]

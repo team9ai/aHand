@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 
 use ahand_hub_core::HubError;
 use ahand_hub_core::traits::{DeviceStore, OutboxStore};
+use ahand_hub_store::app_tool_store::{StoredAppTool, StoredAppToolCatalog, should_accept_update};
 use axum::extract::State;
 use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -643,6 +644,21 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         let last_inbound_at = Arc::new(AsyncMutex::new(tokio::time::Instant::now()));
         active_connection = Some((device_id.clone(), connection_id));
         state.devices.mark_online(&device_id, "ws").await?;
+        // New connection = continuity broken; the daemon re-advertises its snapshot right after
+        // Hello, and a stale catalog accepts any revision — this self-heals revision resets and
+        // survives hub crashes. The disconnect-time mark_stale is also retained (see below) but
+        // it is connection-id-guarded: unregister() only fires for the exact connection_id that
+        // was registered, so a superseded socket's unregister() cannot stale a catalog that was
+        // already accepted by the new connection. The hello-time mark_stale covers the case where
+        // the hub crashed (cleanup never ran) and the daemon's revision counter reset after
+        // restart, which would otherwise be silently ignored as a lower-revision fresh catalog.
+        if let Err(err) = state.app_tools.mark_stale(&device_id).await {
+            tracing::warn!(
+                device_id = %device_id,
+                error = %err,
+                "failed to mark app tool catalog stale at hello time",
+            );
+        }
         state.jobs.handle_device_connected(&device_id).await?;
         if let Err(err) = state.events.emit_device_online(&device_id, &hostname).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.online audit");
@@ -854,7 +870,158 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
                         }
                         state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
                         queue_ack_only(&control_tx, &device_id, envelope.seq)?;
-                    } else if dispatch_control_plane_event(&state, &envelope) {
+                    } else if let Some(ahand_protocol::envelope::Payload::AppToolResponse(ref resp)) = envelope.payload {
+                        // Resolve the pending oneshot for POST /api/control/app-tool.
+                        // Mirrors the BrowserResponse arm above exactly.
+                        if let Some((_, sender)) = state.app_tool_pending.remove(&resp.tool_call_id) {
+                            let _ = sender.send(resp.clone());
+                        } else {
+                            tracing::warn!(
+                                tool_call_id = %resp.tool_call_id,
+                                "received AppToolResponse with no pending request"
+                            );
+                        }
+                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
+                    } else if let Some(ahand_protocol::envelope::Payload::AppToolsUpdate(ref update)) = envelope.payload {
+                        state.connections.observe_inbound(&device_id, envelope.seq, envelope.ack).await?;
+                        queue_ack_only(&control_tx, &device_id, envelope.seq)?;
+                        // Connection-currency guard: a zombie socket (one that was superseded
+                        // by a new connection before this arm ran) must not overwrite the
+                        // catalog that the new connection's snapshot already installed.
+                        // The loop-level is_current check at loop entry is not sufficient
+                        // because observe_inbound is async — a reconnect could race between
+                        // the loop-level check and this write.
+                        // TODO(behavioral): this residual window is narrow (sub-ms) because
+                        // the old connection is closed before a new one is accepted, but it
+                        // is not zero; a stricter fix would stamp the catalog with the
+                        // accepting connection_id and reject lower-stamp writes.
+                        if !state.connections.is_current(&device_id, connection_id) {
+                            tracing::debug!(
+                                device_id = %device_id,
+                                %connection_id,
+                                "ignoring AppToolsUpdate from superseded (zombie) connection",
+                            );
+                            continue;
+                        }
+                        // 256 KiB hard cap — untrusted daemon payload; storing huge catalogs
+                        // wastes Redis memory and can exhaust downstream readers. Logged at
+                        // warn so operators notice misbehaving daemons without crashing them.
+                        let catalog_bytes: usize = update.tools.iter()
+                            .map(|t| t.name.len() + t.description.len() + t.input_schema_json.len())
+                            .sum();
+                        const CATALOG_MAX_BYTES: usize = 256 * 1024;
+                        if catalog_bytes > CATALOG_MAX_BYTES {
+                            tracing::warn!(
+                                device_id = %device_id,
+                                catalog_bytes,
+                                limit_bytes = CATALOG_MAX_BYTES,
+                                "app tool catalog exceeds size limit; ignoring update",
+                            );
+                        } else {
+                            let existing = match state.app_tools.get_catalog(&device_id).await {
+                                Ok(v) => v,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        device_id = %device_id,
+                                        error = %err,
+                                        "failed to read app tool catalog; accepting update fail-open",
+                                    );
+                                    None
+                                }
+                            };
+                            if should_accept_update(existing.as_ref(), update.revision) {
+                                let catalog = StoredAppToolCatalog {
+                                    revision: update.revision,
+                                    stale: false,
+                                    tools: update.tools.iter().map(|t| StoredAppTool {
+                                        name: t.name.clone(),
+                                        description: t.description.clone(),
+                                        input_schema_json: t.input_schema_json.clone(),
+                                        requires_approval: t.requires_approval,
+                                    }).collect(),
+                                    updated_at_ms: now_ms(),
+                                };
+                                let tool_count = catalog.tools.len();
+                                let revision = update.revision;
+                                if let Err(err) = state.app_tools.put_catalog(&device_id, catalog).await {
+                                    tracing::warn!(
+                                        device_id = %device_id,
+                                        error = %err,
+                                        "failed to store app tool catalog",
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        device_id = %device_id,
+                                        revision,
+                                        tool_count,
+                                        catalog_bytes,
+                                        "app tool catalog updated",
+                                    );
+                                    // Suppress audit + webhook when the incoming catalog is
+                                    // empty and the previous catalog was also empty-or-absent.
+                                    // A tool-less daemon reconnect would otherwise generate
+                                    // webhook noise on every hello without any meaningful
+                                    // state change. The catalog is still stored and `stale`
+                                    // is still cleared — only the noisy signals are suppressed.
+                                    // A real empty-after-nonempty transition (tool_count == 0
+                                    // but existing had tools) STILL fires so operators see
+                                    // intentional unregistrations.
+                                    let prev_tool_count = existing.as_ref().map(|c| c.tools.len()).unwrap_or(0);
+                                    let suppress_signals = tool_count == 0 && prev_tool_count == 0;
+                                    if suppress_signals {
+                                        tracing::debug!(
+                                            device_id = %device_id,
+                                            revision,
+                                            "empty-catalog reconnect: catalog stored, audit/webhook suppressed",
+                                        );
+                                    } else {
+                                    state.append_audit_entry(
+                                        "device.app_tools.updated",
+                                        "device",
+                                        &device_id,
+                                        &device_id,
+                                        serde_json::json!({
+                                            "revision": update.revision,
+                                            "toolCount": tool_count,
+                                        }),
+                                    ).await;
+                                    // Enqueue webhook: guard on is_enabled()
+                                    // and use the cached online_external_user_id
+                                    // (same approach as enqueue_heartbeat above).
+                                    if state.webhook.is_enabled()
+                                        && let Err(err) = state
+                                            .webhook
+                                            .enqueue_app_tools_updated(
+                                                &device_id,
+                                                online_external_user_id.as_deref(),
+                                                revision,
+                                                tool_count,
+                                            )
+                                            .await
+                                    {
+                                        tracing::warn!(
+                                            device_id = %device_id,
+                                            error = %err,
+                                            "failed to enqueue device.app_tools.updated webhook",
+                                        );
+                                    }
+                                    } // end !suppress_signals
+                                }
+                            } else {
+                                let incoming_revision = update.revision;
+                                let existing_revision = existing.as_ref().map(|c| c.revision).unwrap_or(0);
+                                let existing_stale = existing.as_ref().map(|c| c.stale).unwrap_or(false);
+                                tracing::debug!(
+                                    device_id = %device_id,
+                                    incoming_revision,
+                                    existing_revision,
+                                    existing_stale,
+                                    "ignoring app tool update (not newer than fresh catalog)",
+                                );
+                            }
+                        }
+                    } else if dispatch_control_plane_event(&state, &envelope).await {
                         // The control-plane tracker handled the frame, or
                         // the job id is a stale non-dashboard id that must
                         // not fall into JobRuntime's UUID-backed store.
@@ -934,6 +1101,19 @@ async fn run_device_socket(socket: WebSocket, state: AppState) -> anyhow::Result
         };
         state.devices.mark_offline(&device_id).await?;
         state.jobs.handle_device_disconnected(&device_id).await?;
+        // Disconnect-time mark_stale: only runs when unregister() succeeded for
+        // *this* connection_id — a superseded (replaced) connection always returns
+        // false from unregister(), so a late-running cleanup from an old socket
+        // cannot stale a catalog that was already accepted by the new connection.
+        // The hello-time mark_stale (above, at accept time) covers hub-crash and
+        // fast-reconnect scenarios where this cleanup might never run.
+        if let Err(err) = state.app_tools.mark_stale(&device_id).await {
+            tracing::warn!(
+                device_id = %device_id,
+                error = %err,
+                "failed to mark app tool catalog stale on disconnect",
+            );
+        }
         if let Err(err) = state.events.emit_device_offline(&device_id).await {
             tracing::warn!(device_id = %device_id, error = %err, "failed to write device.offline audit");
         }
@@ -982,6 +1162,9 @@ fn envelope_payload_variant_name(p: &Option<ahand_protocol::envelope::Payload>) 
         Some(Heartbeat(_)) => "Heartbeat",
         Some(FileRequest(_)) => "FileRequest",
         Some(FileResponse(_)) => "FileResponse",
+        Some(AppToolsUpdate(_)) => "AppToolsUpdate",
+        Some(AppToolRequest(_)) => "AppToolRequest",
+        Some(AppToolResponse(_)) => "AppToolResponse",
     }
 }
 
@@ -1015,7 +1198,10 @@ fn queue_ack_only(
 /// UUID-backed runtime trying to parse a control-plane ULID. Returns `false`
 /// otherwise (not job-related, or a dashboard / JobRuntime job id the caller
 /// still needs to process).
-fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Envelope) -> bool {
+async fn dispatch_control_plane_event(
+    state: &AppState,
+    envelope: &ahand_protocol::Envelope,
+) -> bool {
     let Some(payload) = envelope.payload.as_ref() else {
         return false;
     };
@@ -1047,6 +1233,35 @@ fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Env
                     }
                 }
             };
+            match kind {
+                ahand_protocol::job_event::Event::StdoutChunk(chunk) => {
+                    if let Err(err) = state
+                        .output_stream
+                        .push_stdout(&event.job_id, chunk.clone())
+                        .await
+                    {
+                        tracing::warn!(job_id = %event.job_id, error = %err, "failed recording control job stdout");
+                    }
+                }
+                ahand_protocol::job_event::Event::StderrChunk(chunk) => {
+                    if let Err(err) = state
+                        .output_stream
+                        .push_stderr(&event.job_id, chunk.clone())
+                        .await
+                    {
+                        tracing::warn!(job_id = %event.job_id, error = %err, "failed recording control job stderr");
+                    }
+                }
+                ahand_protocol::job_event::Event::Progress(percent) => {
+                    if let Err(err) = state
+                        .output_stream
+                        .push_progress(&event.job_id, (*percent).min(100))
+                        .await
+                    {
+                        tracing::warn!(job_id = %event.job_id, error = %err, "failed recording control job progress");
+                    }
+                }
+            }
             state.control_jobs.publish(&event.job_id, control_event);
             true
         }
@@ -1082,12 +1297,26 @@ fn dispatch_control_plane_event(state: &AppState, envelope: &ahand_protocol::Env
                     },
                 }
             };
+            if let Err(err) = state
+                .output_stream
+                .push_finished(&finished.job_id, finished.exit_code, &finished.error)
+                .await
+            {
+                tracing::warn!(job_id = %finished.job_id, error = %err, "failed recording control job finish");
+            }
             state.control_jobs.finalize(&finished.job_id, event);
             true
         }
         ahand_protocol::envelope::Payload::JobRejected(rejected) => {
             if state.control_jobs.get(&rejected.job_id).is_none() {
                 return consume_unknown_non_dashboard_job_id(&rejected.job_id, "JobRejected");
+            }
+            if let Err(err) = state
+                .output_stream
+                .push_finished(&rejected.job_id, 1, &rejected.reason)
+                .await
+            {
+                tracing::warn!(job_id = %rejected.job_id, error = %err, "failed recording control job rejection");
             }
             state.control_jobs.finalize(
                 &rejected.job_id,

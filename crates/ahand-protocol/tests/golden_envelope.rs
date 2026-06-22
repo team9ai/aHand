@@ -27,12 +27,13 @@
 //! satisfied by adding an arm without writing the matching golden.
 
 use ahand_protocol::{
+    AppToolDescriptor, AppToolError, AppToolRequest, AppToolResponse, AppToolsUpdate,
     ApprovalRequest, ApprovalResponse, BootstrapAuth, BrowserRequest, BrowserResponse, CancelJob,
     Ed25519Auth, Envelope, FileRequest, FileResponse, Heartbeat, Hello, HelloAccepted,
     HelloChallenge, JobEvent, JobFinished, JobRejected, JobRequest, PolicyQuery, PolicyState,
     PolicyUpdate, RefusalContext, SessionMode, SessionQuery, SessionState, SetSessionMode,
     StdinChunk, TerminalResize, UpdateCommand, UpdateState, UpdateStatus, UpdateSuggestion,
-    envelope, hello, job_event,
+    app_tool_response, envelope, hello, job_event,
 };
 use prost::Message;
 use std::path::{Path, PathBuf};
@@ -470,6 +471,54 @@ fn golden_file_response() {
     assert_golden("file_response", &env);
 }
 
+#[test]
+fn golden_app_tools_update() {
+    let env = base_envelope(envelope::Payload::AppToolsUpdate(AppToolsUpdate {
+        revision: 1,
+        tools: vec![AppToolDescriptor {
+            name: "list_documents".into(),
+            description: "List open documents".into(),
+            input_schema_json: r#"{"type":"object","properties":{}}"#.into(),
+            requires_approval: false,
+        }],
+    }));
+    assert_golden("app_tools_update", &env);
+}
+
+#[test]
+fn golden_app_tool_request() {
+    let env = base_envelope(envelope::Payload::AppToolRequest(AppToolRequest {
+        tool_call_id: "call-golden".into(),
+        name: "list_documents".into(),
+        args_json: r#"{"limit":10}"#.into(),
+        timeout_ms: 60_000,
+    }));
+    assert_golden("app_tool_request", &env);
+}
+
+#[test]
+fn golden_app_tool_response() {
+    let env = base_envelope(envelope::Payload::AppToolResponse(AppToolResponse {
+        tool_call_id: "call-golden".into(),
+        result: Some(app_tool_response::Result::Error(AppToolError {
+            code: "TOOL_NOT_FOUND".into(),
+            message: "no such tool".into(),
+        })),
+    }));
+    assert_golden("app_tool_response", &env);
+}
+
+#[test]
+fn golden_app_tool_response_result_json() {
+    let env = base_envelope(envelope::Payload::AppToolResponse(AppToolResponse {
+        tool_call_id: "call-golden".into(),
+        result: Some(app_tool_response::Result::ResultJson(
+            r#"{"documents":["a.txt","b.txt"]}"#.into(),
+        )),
+    }));
+    assert_golden("app_tool_response_result_json", &env);
+}
+
 // ── Exhaustiveness lock ─────────────────────────────────────────────────
 //
 // Every arm of `envelope::Payload` must map to a fixture name AND that
@@ -514,6 +563,9 @@ fn payload_fixture_name(p: &envelope::Payload) -> &'static str {
         FileRequest(_) => "file_request",
         FileResponse(_) => "file_response",
         Heartbeat(_) => "heartbeat",
+        AppToolsUpdate(_) => "app_tools_update",
+        AppToolRequest(_) => "app_tool_request",
+        AppToolResponse(_) => "app_tool_response",
     }
 }
 
@@ -556,6 +608,9 @@ fn every_payload_variant_has_a_fixture_file() {
         envelope::Payload::FileRequest(FileRequest::default()),
         envelope::Payload::FileResponse(FileResponse::default()),
         envelope::Payload::Heartbeat(Heartbeat::default()),
+        envelope::Payload::AppToolsUpdate(AppToolsUpdate::default()),
+        envelope::Payload::AppToolRequest(AppToolRequest::default()),
+        envelope::Payload::AppToolResponse(AppToolResponse::default()),
     ];
 
     let mut missing: Vec<String> = Vec::new();

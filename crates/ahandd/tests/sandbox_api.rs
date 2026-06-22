@@ -82,7 +82,7 @@ async fn daemon_handle_registers_app_tool_handlers() {
         .await
         .unwrap_err();
 
-    assert!(err.to_string().contains("app tool name cannot be empty"));
+    assert!(err.to_string().contains("invalid tool name"));
 
     handle.shutdown().await.unwrap();
 }

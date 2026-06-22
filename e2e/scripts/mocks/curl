@@ -1,6 +1,7 @@
 #!/bin/bash
 # Mock curl — routes URLs to fixture files.
-# Env: MOCK_CURL_FIXTURE_DIR, MOCK_CURL_LOG, MOCK_CURL_FAIL_PATTERN
+# Env: MOCK_CURL_FIXTURE_DIR, MOCK_CURL_LOG, MOCK_CURL_FAIL_PATTERN,
+#      MOCK_CURL_CHECKSUM_NOMATCH
 
 OUTPUT_FILE=""
 URL=""
@@ -27,6 +28,19 @@ if [ -n "$MOCK_CURL_FAIL_PATTERN" ]; then
   fi
 fi
 
+# Optional: serve a VALID-FORMAT checksum body whose filename does not match
+# the requested artifact, exercising verify_checksum's "no entry" fail-closed
+# branch (file present + readable, but no matching line).
+if [ -n "$MOCK_CURL_CHECKSUM_NOMATCH" ] && echo "$URL" | grep -q 'checksums-rust.txt'; then
+  body="deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  ahandd-OTHER"
+  if [ -n "$OUTPUT_FILE" ]; then
+    printf '%s\n' "$body" > "$OUTPUT_FILE"
+  else
+    printf '%s\n' "$body"
+  fi
+  exit 0
+fi
+
 # Map URL to fixture.
 resolve_fixture() {
   local url="$1"
@@ -35,6 +49,8 @@ resolve_fixture() {
       echo "$FIXTURE_DIR/github-releases.json" ;;
     *checksums-rust.txt)
       echo "$FIXTURE_DIR/checksums-rust.txt" ;;
+    *checksums-admin.txt)
+      echo "$FIXTURE_DIR/checksums-admin.txt" ;;
     *checksums-browser.txt)
       echo "$FIXTURE_DIR/checksums-browser.txt" ;;
     *admin-spa.tar.gz)

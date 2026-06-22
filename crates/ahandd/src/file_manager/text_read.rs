@@ -180,13 +180,13 @@ pub async fn handle_read_text(
         // avoids an underflow/reversed slice when the effective start has
         // been clamped forward (e.g. a LineCol.col that landed exactly on
         // the start-of-next-line boundary).
-        if !cut_short && display_end_raw > effective_start {
-            if raw.get(display_end_raw - 1) == Some(&b'\n') {
+        if !cut_short
+            && display_end_raw > effective_start
+            && raw.get(display_end_raw - 1) == Some(&b'\n')
+        {
+            display_end_raw -= 1;
+            if display_end_raw > effective_start && raw.get(display_end_raw - 1) == Some(&b'\r') {
                 display_end_raw -= 1;
-                if display_end_raw > effective_start && raw.get(display_end_raw - 1) == Some(&b'\r')
-                {
-                    display_end_raw -= 1;
-                }
             }
         }
 
@@ -263,21 +263,21 @@ fn resolve_encoding(
     encoding_hint: Option<&str>,
     req_path: &str,
 ) -> Result<&'static encoding_rs::Encoding, FileError> {
-    if let Some(name) = encoding_hint {
-        if !name.is_empty() {
-            if name.eq_ignore_ascii_case("utf-8") || name.eq_ignore_ascii_case("utf8") {
-                return Ok(encoding_rs::UTF_8);
-            }
-            return encoding_rs::Encoding::for_label(name.as_bytes()).ok_or_else(|| {
-                file_error(
-                    FileErrorCode::Encoding,
-                    req_path,
-                    format!("unknown encoding: {name}"),
-                )
-            });
+    if let Some(name) = encoding_hint
+        && !name.is_empty()
+    {
+        if name.eq_ignore_ascii_case("utf-8") || name.eq_ignore_ascii_case("utf8") {
+            return Ok(encoding_rs::UTF_8);
         }
-        // Empty string → fall through to auto-detect path below.
+        return encoding_rs::Encoding::for_label(name.as_bytes()).ok_or_else(|| {
+            file_error(
+                FileErrorCode::Encoding,
+                req_path,
+                format!("unknown encoding: {name}"),
+            )
+        });
     }
+    // Empty string → fall through to auto-detect path below.
 
     // Auto-detect. UTF-8 validation fast path.
     if std::str::from_utf8(raw).is_ok() {

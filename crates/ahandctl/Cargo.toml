@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 ahand-protocol = { path = "../ahand-protocol" }
+ahand-platform = { path = "../ahand-platform" }
+ahandd = { path = "../ahandd" }
 tokio.workspace = true
 prost.workspace = true
 anyhow.workspace = true
@@ -24,3 +26,12 @@ open = "5"
 toml = "0.8"
 rand = "0.8"
 dirs = "5"
+reqwest = { version = "0.12", features = ["json"] }
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+axum.workspace = true

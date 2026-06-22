@@ -246,6 +246,29 @@ impl Webhook {
         .await
     }
 
+    /// Enqueue a `device.app_tools.updated` event. Emitted when a daemon's
+    /// `AppToolsUpdate` is accepted and stored. `revision` is the new catalog
+    /// revision; `tool_count` is the number of tools in the snapshot.
+    /// Noops when disabled.
+    pub async fn enqueue_app_tools_updated(
+        &self,
+        device_id: &str,
+        external_user_id: Option<&str>,
+        revision: u64,
+        tool_count: usize,
+    ) -> anyhow::Result<()> {
+        self.enqueue_typed(
+            "device.app_tools.updated",
+            device_id,
+            external_user_id,
+            serde_json::json!({
+                "revision": revision,
+                "toolCount": tool_count,
+            }),
+        )
+        .await
+    }
+
     /// Enqueue a `device.revoked` event. Admin DELETE calls this
     /// after removing the row; `external_user_id` is best-effort
     /// (None if the row was anonymous). Noops when disabled.

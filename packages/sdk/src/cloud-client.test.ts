@@ -120,6 +120,29 @@ describe("CloudClient.spawn", () => {
     expect(calls[1].init?.headers).toMatchObject({ Authorization: "Bearer test-token" });
   });
 
+  it("notifies callers of the hub job id before streaming output", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ jobId: "job-001" }, 201),
+      () =>
+        sseResponse([
+          sseEvent("stdout", { chunk: "hello" }),
+          sseEvent("finished", { exitCode: 0, durationMs: 123 }),
+        ]),
+    ]);
+
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const events: string[] = [];
+
+    await client.spawn({
+      deviceId: "dev-1",
+      tool: "bash",
+      onJobStarted: ({ jobId }) => events.push(`started:${jobId}`),
+      onStdout: (chunk) => events.push(`stdout:${chunk}`),
+    });
+
+    expect(events).toEqual(["started:job-001", "stdout:hello"]);
+  });
+
   it("sends optional fields (env, cwd, timeoutMs, correlationId, interactive)", async () => {
     const { fn, calls } = mockFetch([
       () => jsonResponse({ jobId: "job-x" }, 201),
@@ -1107,6 +1130,144 @@ describe("CloudClient.browser", () => {
 });
 
 describe("CloudClient.files", () => {
+  it("happy: POSTs /api/control/files/upload-url with snake_case body + Bearer auth", async () => {
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            object_key: "uploads/dev-1/file.bin",
+            upload_url: "https://storage.test/upload",
+            expires_at_ms: 1_789_000_000_000,
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    const r = await client.createFileUploadUrl({ deviceId: "dev-1" });
+
+    expect(calls[0].url).toBe("https://hub.test/api/control/files/upload-url");
+    expect(calls[0].init?.method).toBe("POST");
+    expect(calls[0].init?.headers).toMatchObject({
+      Authorization: "Bearer test-token",
+      "Content-Type": "application/json",
+    });
+    expect(JSON.parse(calls[0].init?.body as string)).toEqual({
+      device_id: "dev-1",
+    });
+    expect(r).toEqual({
+      objectKey: "uploads/dev-1/file.bin",
+      uploadUrl: "https://storage.test/upload",
+      expiresAtMs: 1_789_000_000_000,
+    });
+  });
+
+  it("bad: upload-url malformed payload → CloudClientError(server_error)", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          {
+            object_key: "uploads/dev-1/file.bin",
+            upload_url: "https://storage.test/upload",
+          },
+          200,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1" }),
+    ).rejects.toMatchObject({ code: "server_error" });
+  });
+
+  it("bad: upload-url HTTP 401 → CloudClientError(unauthorized)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ error: { code: "UNAUTHORIZED", message: "no token" } }, 401),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1" }),
+    ).rejects.toMatchObject({ code: "unauthorized", httpStatus: 401 });
+  });
+
+  it("bad: upload-url HTTP 503 S3_DISABLED → CloudClientError(s3_disabled)", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          { error: { code: "S3_DISABLED", message: "S3 uploads are not configured" } },
+          503,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1" }),
+    ).rejects.toMatchObject({
+      code: "s3_disabled",
+      httpStatus: 503,
+      message: "S3 uploads are not configured",
+    });
+  });
+
+  it("bad: upload-url error body read rejection with aborted signal reason → CloudClientError(abort)", async () => {
+    const ctrl = new AbortController();
+    const abortReason = new Error("custom abort reason");
+    const fn = vi.fn(async () => {
+      const res = new Response("{}", {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      });
+      return Object.assign(res, {
+        json: async () => {
+          ctrl.abort(abortReason);
+          throw ctrl.signal.reason;
+        },
+      });
+    }) as unknown as typeof fetch;
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1", signal: ctrl.signal }),
+    ).rejects.toMatchObject({ code: "abort" });
+  });
+
+  it("bad: upload-url fetch rejection with aborted signal reason → CloudClientError(abort)", async () => {
+    const ctrl = new AbortController();
+    const abortReason = new Error("custom abort reason");
+    const fn = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      ctrl.abort(abortReason);
+      throw (init?.signal as AbortSignal).reason;
+    }) as unknown as typeof fetch;
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1", signal: ctrl.signal }),
+    ).rejects.toMatchObject({ code: "abort" });
+  });
+
+  it("bad: upload-url body read rejection with aborted signal reason → CloudClientError(abort)", async () => {
+    const ctrl = new AbortController();
+    const abortReason = new Error("custom abort reason");
+    const fn = vi.fn(async () => {
+      const res = new Response("{}", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+      return Object.assign(res, {
+        json: async () => {
+          ctrl.abort(abortReason);
+          throw ctrl.signal.reason;
+        },
+      });
+    }) as unknown as typeof fetch;
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+
+    await expect(
+      client.createFileUploadUrl({ deviceId: "dev-1", signal: ctrl.signal }),
+    ).rejects.toMatchObject({ code: "abort" });
+  });
+
   it("happy: POSTs /api/control/files with snake_case body + Bearer auth", async () => {
     const { fn, calls } = mockFetch([
       () =>
@@ -1798,5 +1959,294 @@ describe("CloudClientError", () => {
     expect(err.jobErrorMessage).toBe("access denied");
     expect(err.cause).toBeInstanceOf(Error);
     expect(err).toBeInstanceOf(Error);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CloudClient.listAppTools
+// ---------------------------------------------------------------------------
+
+describe("CloudClient.listAppTools", () => {
+  const catalog = {
+    revision: 3,
+    stale: false,
+    updatedAtMs: 1718000000000,
+    tools: [
+      {
+        name: "screenshot",
+        description: "Take a screenshot",
+        inputSchemaJson: "{}",
+        requiresApproval: false,
+      },
+    ],
+  };
+
+  it("happy path: GET correct URL, sends auth header, returns parsed catalog", async () => {
+    const { fn, calls } = mockFetch([() => jsonResponse(catalog)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const result = await client.listAppTools("dev/123");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe(
+      "https://hub.test/api/devices/dev%2F123/app-tools",
+    );
+    expect(calls[0].init?.method).toBe("GET");
+    expect(calls[0].init?.headers).toMatchObject({
+      Authorization: "Bearer test-token",
+    });
+    expect(result).toEqual(catalog);
+  });
+
+  it("bad: 404 → CloudClientError(not_found)", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ error: { code: "NOT_FOUND", message: "device not found" } }, 404),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.listAppTools("missing-device").catch((e) => e);
+    expect(err).toBeInstanceOf(CloudClientError);
+    expect((err as CloudClientError).code).toBe("not_found");
+    expect((err as CloudClientError).httpStatus).toBe(404);
+  });
+
+  it("bad: 403 → CloudClientError(forbidden)", async () => {
+    const { fn } = mockFetch([() => jsonResponse({}, 403)]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.listAppTools("d").catch((e) => e);
+    expect((err as CloudClientError).code).toBe("forbidden");
+    expect((err as CloudClientError).httpStatus).toBe(403);
+  });
+
+  it("bad: abort before fetch → zero calls, CloudClientError(abort)", async () => {
+    const { fn, calls } = mockFetch([]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const err = await client
+      .listAppTools("d", { signal: ctrl.signal })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("abort");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("bad: getAuthToken throws → propagates", async () => {
+    const tokenErr = new Error("auth failure");
+    const client = new CloudClient({
+      hubUrl: "https://hub.test",
+      getAuthToken: async () => {
+        throw tokenErr;
+      },
+    });
+    const err = await client.listAppTools("d").catch((e) => e);
+    expect(err).toBe(tokenErr);
+  });
+
+  it("bad: 200 with non-JSON body → CloudClientError(server_error)", async () => {
+    const fakeFetch = async () =>
+      new Response("<html>gateway error</html>", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(client.listAppTools("d")).rejects.toMatchObject({
+      code: "server_error",
+    });
+  });
+
+  it("bad: response has revision but missing tools array → CloudClientError(server_error)", async () => {
+    // revision present and numeric but `tools` is missing — the shape check
+    // now also requires an array `tools` field.
+    const { fn } = mockFetch([
+      () => jsonResponse({ revision: 1, stale: false, updatedAtMs: 0 }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await expect(client.listAppTools("d")).rejects.toMatchObject({
+      code: "server_error",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CloudClient.invokeAppTool
+// ---------------------------------------------------------------------------
+
+describe("CloudClient.invokeAppTool", () => {
+  it("happy path: correct body shape, returns result", async () => {
+    const { fn, calls } = mockFetch([
+      () =>
+        jsonResponse({
+          toolCallId: "tc-001",
+          result: { screenshot: "base64data" },
+        }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const result = await client.invokeAppTool("dev-1", "screenshot", {
+      format: "png",
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://hub.test/api/control/app-tool");
+    expect(calls[0].init?.method).toBe("POST");
+    expect(calls[0].init?.headers).toMatchObject({
+      Authorization: "Bearer test-token",
+      "Content-Type": "application/json",
+    });
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body).toEqual({
+      deviceId: "dev-1",
+      name: "screenshot",
+      args: { format: "png" },
+    });
+    expect(result).toEqual({ screenshot: "base64data" });
+  });
+
+  it("happy path: args omitted when not provided", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ toolCallId: "tc-002", result: { ok: true } }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await client.invokeAppTool("dev-1", "ping");
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect("args" in body).toBe(false);
+    expect("timeoutMs" in body).toBe(false);
+  });
+
+  it("happy path: timeoutMs included when provided", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ toolCallId: "tc-003", result: null }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await client.invokeAppTool("d", "t", undefined, { timeoutMs: 10_000 });
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body.timeoutMs).toBe(10_000);
+    expect("args" in body).toBe(false);
+  });
+
+  it("happy path: returns null when result field is missing", async () => {
+    const { fn } = mockFetch([
+      () => jsonResponse({ toolCallId: "tc-004" }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const result = await client.invokeAppTool("d", "t");
+    expect(result).toBeNull();
+  });
+
+  it("bad: daemon error APPROVAL_DENIED → app_tool_error with jobErrorCode", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse({
+          toolCallId: "tc-005",
+          error: { code: "APPROVAL_DENIED", message: "user declined" },
+        }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.invokeAppTool("d", "dangerous").catch((e) => e);
+    expect(err).toBeInstanceOf(CloudClientError);
+    expect((err as CloudClientError).code).toBe("app_tool_error");
+    expect((err as CloudClientError).jobErrorCode).toBe("APPROVAL_DENIED");
+    expect((err as CloudClientError).jobErrorMessage).toBe("user declined");
+  });
+
+  it("bad: 409 DEVICE_OFFLINE → CloudClientError(device_offline)", async () => {
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse(
+          { error: { code: "DEVICE_OFFLINE", message: "device not connected" } },
+          409,
+        ),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.invokeAppTool("d", "t").catch((e) => e);
+    expect((err as CloudClientError).code).toBe("device_offline");
+    expect((err as CloudClientError).httpStatus).toBe(409);
+  });
+
+  it("bad: 504 → CloudClientError(timeout)", async () => {
+    const { fn } = mockFetch([() => new Response(null, { status: 504 })]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.invokeAppTool("d", "t").catch((e) => e);
+    expect((err as CloudClientError).code).toBe("timeout");
+    expect((err as CloudClientError).httpStatus).toBe(504);
+  });
+
+  it("bad: abort before fetch → zero calls, CloudClientError(abort)", async () => {
+    const { fn, calls } = mockFetch([]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const ctrl = new AbortController();
+    ctrl.abort();
+    const err = await client
+      .invokeAppTool("d", "t", undefined, { signal: ctrl.signal })
+      .catch((e) => e);
+    expect((err as CloudClientError).code).toBe("abort");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("bad: getAuthToken throws → propagates", async () => {
+    const tokenErr = new Error("refresh failed");
+    const client = new CloudClient({
+      hubUrl: "https://hub.test",
+      getAuthToken: async () => {
+        throw tokenErr;
+      },
+    });
+    const err = await client.invokeAppTool("d", "t").catch((e) => e);
+    expect(err).toBe(tokenErr);
+  });
+
+  it("bad: 200 with non-JSON body → CloudClientError(server_error)", async () => {
+    const fakeFetch = async () =>
+      new Response("<html>gateway error</html>", {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const client = new CloudClient({
+      ...BASE_OPTS,
+      fetch: fakeFetch as typeof fetch,
+    });
+    await expect(client.invokeAppTool("d", "t")).rejects.toMatchObject({
+      code: "server_error",
+    });
+  });
+
+  it.each([
+    ["null literal", "null"],
+    ["number primitive", "42"],
+    ["JSON array", "[]"],
+  ])(
+    "bad: 200 body is malformed root (%s) → CloudClientError(server_error)",
+    async (_label, bodyText) => {
+      const fakeFetch = async () =>
+        new Response(bodyText, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      const client = new CloudClient({
+        ...BASE_OPTS,
+        fetch: fakeFetch as typeof fetch,
+      });
+      await expect(client.invokeAppTool("d", "t")).rejects.toMatchObject({
+        code: "server_error",
+      });
+    },
+  );
+
+  it("bad: daemon error with missing message → 'app tool failed' fallback + jobErrorMessage undefined", async () => {
+    // Daemon returns an error object with only a `code`, no `message`.
+    // The error message should fall back to "app tool failed" and
+    // jobErrorMessage should be undefined (not set from undefined).
+    const { fn } = mockFetch([
+      () =>
+        jsonResponse({
+          toolCallId: "tc-err",
+          error: { code: "HANDLER_PANIC" },
+        }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    const err = await client.invokeAppTool("d", "t").catch((e) => e);
+    expect(err).toBeInstanceOf(CloudClientError);
+    expect((err as CloudClientError).code).toBe("app_tool_error");
+    expect((err as CloudClientError).message).toBe("app tool failed");
+    expect((err as CloudClientError).jobErrorCode).toBe("HANDLER_PANIC");
+    expect((err as CloudClientError).jobErrorMessage).toBeUndefined();
   });
 });

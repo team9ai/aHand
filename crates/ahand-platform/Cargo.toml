@@ -1,0 +1,27 @@
+[package]
+name = "ahand-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+dunce.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Used by ipc.rs to build an explicit owner-only SECURITY_ATTRIBUTES for the
+# named pipe from an SDDL string (ConvertStringSecurityDescriptorToSecurityDescriptorW)
+# and to free the resulting LocalAlloc'd descriptor (LocalFree).
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+
+[dev-dependencies]
+tempfile = "3"
