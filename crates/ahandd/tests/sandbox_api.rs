@@ -1,10 +1,14 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+#[cfg(target_os = "macos")]
+use std::collections::HashMap;
+use std::{path::PathBuf, time::Duration};
 
+#[cfg(target_os = "macos")]
+use ahandd::sandbox::{RuntimeExecuteRequest, RuntimeProviderConfig};
 use ahandd::{
     AppToolDef, AppToolHandler, DaemonConfig,
     sandbox::{
-        HostFileRef, NetworkPolicy, RegisterVersionRequest, RuntimeExecuteRequest,
-        RuntimeProviderConfig, SandboxPermissionMode, SandboxSessionConfig,
+        HostFileRef, NetworkPolicy, RegisterVersionRequest, SandboxPermissionMode,
+        SandboxSessionConfig,
     },
 };
 
