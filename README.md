@@ -11,6 +11,8 @@ Cloud (WS server)  ←──  WebSocket (protobuf)  ──→  Local daemon (WS 
   (control plane)                                  (job executor)
                                                    ├─ shell / tools
                                                    ├─ browser automation
+                                                   ├─ file operations
+                                                   ├─ app tool registry
                                                    └─ policy enforcement
 ```
 
@@ -39,15 +41,39 @@ The dashboard can be deployed independently first. The compose stack runs the hu
 
 ### 1. Install
 
+#### macOS
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.sh | bash
 ```
 
-This installs `ahandd`, `ahandctl`, the admin panel, and browser setup script to `~/.ahand/`.
+The installer verifies the SHA-256 checksum of the daemon, CLI, and admin-panel artifacts before installing (fail-closed: aborts if the checksum file is missing or mismatches). Gatekeeper quarantine (`com.apple.quarantine`) is removed automatically for the installed binaries. After installation the installer prints the exact shell profile line to add `~/.ahand/bin` to your `PATH` — paste and run it, then open a new terminal.
 
-Environment variables:
+#### Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.sh | bash
+```
+
+The installer verifies the SHA-256 checksum of the daemon, CLI, and admin-panel artifacts before installing (fail-closed). There is no Gatekeeper step. After installation the installer prints the exact shell profile line to add `~/.ahand/bin` to your `PATH` — paste and run it, then open a new terminal.
+
+> **Linux binary note:** Released Linux binaries are glibc builds for `x86_64` and `aarch64`. musl/Alpine and `armv7` builds are not provided.
+
+#### Windows
+
+```powershell
+irm https://raw.githubusercontent.com/team9ai/aHand/main/scripts/dist/install.ps1 | iex
+```
+
+Run in a regular (non-admin) PowerShell terminal. Requires Windows 10 1809 or later for full daemon PTY support (the installer itself requires Windows 10 1803+ for in-box `tar`). The installer verifies SHA-256 checksums when the checksum file is available, then automatically adds `%USERPROFILE%\.ahand\bin` to your user `PATH`. Open a **new terminal** after installation for the PATH change to take effect.
+
+#### All platforms
+
+This installs `ahandd`, `ahandctl`, and the admin panel to `~/.ahand/` (macOS/Linux) or `%USERPROFILE%\.ahand\` (Windows).
+
+Environment variables (honoured on all platforms):
 - `AHAND_VERSION` — install a specific version (default: latest)
-- `AHAND_DIR` — install directory (default: `~/.ahand`)
+- `AHAND_DIR` — install directory (default: `~/.ahand` / `%USERPROFILE%\.ahand`)
 
 ### 2. Configure
 
@@ -66,14 +92,20 @@ ahandctl stop               # stop the daemon
 ahandctl restart             # restart the daemon
 ```
 
-Logs are written to `~/.ahand/data/daemon.log`.
+Logs are written to `~/.ahand/data/daemon.log` (macOS/Linux) or `%USERPROFILE%\.ahand\data\daemon.log` (Windows).
 
 ### Upgrade
+
+`ahandctl upgrade` is implemented natively in Rust and works on all platforms (macOS, Linux, Windows) — no shell required.
 
 ```bash
 ahandctl upgrade            # upgrade to latest
 ahandctl upgrade --check    # check for updates without installing
 ```
+
+`--check` queries the latest release and prints current vs. available versions without downloading or installing anything.
+
+Note: `upgrade.sh` (in `scripts/dist/`) is deprecated and kept only for legacy installs that pre-date native upgrade support.
 
 ### Browser Automation Setup
 
@@ -81,7 +113,16 @@ ahandctl upgrade --check    # check for updates without installing
 ahandctl browser-init       # install browser automation dependencies
 ```
 
-This sets up [playwright-cli](https://github.com/microsoft/playwright-cli), a local Node.js runtime (if needed), and detects/installs Chrome/Chromium.
+This sets up [playwright-cli](https://github.com/microsoft/playwright-cli) and a local Node.js runtime on all three platforms — no shell or bash required.
+
+**Platform behaviour:**
+
+- **macOS / Linux** — downloads the `.tar.xz` Node.js distribution and extracts it to the managed runtime directory (`~/.cache/ahand-runtimes/ahand-primary-runtime/`).
+- **Windows** — downloads the official `.zip` Node.js distribution from nodejs.org, extracts it with traversal/symlink guards, and normalises the flat zip layout (`node.exe` at archive root) into the consistent `bin/node.exe` shape used on all platforms. npm and playwright-cli are invoked via `node.exe <js-entrypoint>` (the `npm-cli.js` path and the `@playwright/cli` package.json `"bin"` entry resolved at runtime) — no `.cmd` shim is spawned.
+
+**Browser requirement:** Chrome or Edge must be installed on the machine. Both are auto-detected from the standard install paths; no additional browser download is needed.
+
+`setup-browser.sh` is deprecated (kept for legacy installs only; no longer downloaded or installed during upgrade). Use `ahandctl browser-init` instead on all platforms.
 
 ## Session Modes
 
@@ -110,6 +151,50 @@ max_write_bytes = 10485760   # 10 MB
 
 `dangerous_paths` matches escalate to STRICT-mode approval. Allowlist patterns support `~` expansion (fail-loud if `HOME` is unavailable) and glob (`**`, `?`). The hub forwards via `POST /api/devices/{device_id}/files` with admission control. See `proto/ahand/v1/file_ops.proto` for the wire format.
 
+## App Tool Registry
+
+Host applications that embed `ahandd` can register application-defined tools at runtime. Cloud callers discover and invoke them through the hub without custom protocol work.
+
+```rust
+// in the host application that embeds ahandd
+use ahandd::{AppToolDef, AppToolError, AppToolHandler};
+use serde_json::{Value, json};
+use std::sync::Arc;
+
+let def = AppToolDef {
+    name: "run_analysis".to_string(),
+    description: "Run a data analysis job".to_string(),
+    input_schema: json!({
+        "type": "object",
+        "properties": { "dataset": { "type": "string" } }
+    }),
+    requires_approval: false,
+};
+let handler: AppToolHandler = Arc::new(|_args: Value| {
+    Box::pin(async move {
+        // ... handler logic ...
+        Ok(json!({"status": "done"}))
+    })
+});
+daemon_handle.register_app_tool(def, handler).await?;
+```
+
+```typescript
+// cloud caller via SDK
+const catalog = await client.listAppTools(deviceId);
+const result  = await client.invokeAppTool(deviceId, "run_analysis", { dataset: "q1" });
+```
+
+Session-mode gating applies to every invocation. `requires_approval: true` on a descriptor forces explicit approval regardless of the caller's session mode.
+
+> **Approval + timeout composition:** the approval wait on the daemon side is bounded by
+> `min(approval policy timeout, clamp(timeoutMs))` — the request's clamped `timeoutMs` caps
+> the user's time to answer the dialog. A late approval finds the request already expired and
+> nothing executes. Set `timeoutMs` ≥ expected approval latency (max 300 000 ms); the request
+> timeout is now the hard deadline for both approval and execution.
+
+See `proto/ahand/v1/app_tool.proto` and `docs/remote-control-roadmap.md` (Section 5) for the full capability description.
+
 ## Repository Structure
 
 ```
@@ -131,6 +216,7 @@ ahand/
 │  ├─ ahand-hub/               # Production control plane HTTP/WebSocket server
 │  ├─ ahand-hub-core/          # Hub domain logic
 │  ├─ ahand-hub-store/         # Hub persistence adapters
+│  ├─ ahand-platform/         # Cross-platform OS abstraction (paths/IPC/process/shell/signals/secure-file)
 │  ├─ ahandd/                  # Local daemon (bin)
 │  └─ ahandctl/                # CLI tool (bin)
 ├─ deploy/
@@ -138,7 +224,7 @@ ahand/
 ├─ scripts/
 │  └─ dist/                    # Distribution scripts (install, upgrade, setup-browser)
 ├─ e2e/scripts/                # E2E tests for distribution scripts (BATS)
-├─ .github/workflows/          # CI/CD (hub-ci, release-rust, release-admin, release-browser, release-hub)
+├─ .github/workflows/          # CI/CD (client-ci, hub-ci, release-rust, release-admin, release-browser, release-hub)
 ├─ turbo.json                  # Turborepo pipeline
 ├─ Cargo.toml                  # Rust workspace
 └─ pnpm-workspace.yaml         # pnpm monorepo

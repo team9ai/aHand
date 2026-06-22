@@ -27,8 +27,8 @@
 use std::path::Path;
 
 use ahand_protocol::{
-    file_position, FileError, FileErrorCode, FilePosition, FileReadText, FileReadTextResult,
-    PositionInfo, StopReason, TextLine,
+    FileError, FileErrorCode, FilePosition, FileReadText, FileReadTextResult, PositionInfo,
+    StopReason, TextLine, file_position,
 };
 
 use super::file_error;
@@ -91,7 +91,10 @@ pub async fn handle_read_text(
     let max_lines = req.max_lines.unwrap_or(DEFAULT_MAX_LINES) as usize;
     // Clamp against the policy-level read budget so callers can never
     // bypass `max_read_bytes` by requesting a larger per-call max_bytes.
-    let max_bytes = req.max_bytes.unwrap_or(DEFAULT_MAX_BYTES).min(max_read_bytes);
+    let max_bytes = req
+        .max_bytes
+        .unwrap_or(DEFAULT_MAX_BYTES)
+        .min(max_read_bytes);
     let max_line_width = req.max_line_width.unwrap_or(DEFAULT_MAX_LINE_WIDTH);
     let target_end_byte = req
         .target_end
@@ -177,14 +180,13 @@ pub async fn handle_read_text(
         // avoids an underflow/reversed slice when the effective start has
         // been clamped forward (e.g. a LineCol.col that landed exactly on
         // the start-of-next-line boundary).
-        if !cut_short && display_end_raw > effective_start {
-            if raw.get(display_end_raw - 1) == Some(&b'\n') {
+        if !cut_short
+            && display_end_raw > effective_start
+            && raw.get(display_end_raw - 1) == Some(&b'\n')
+        {
+            display_end_raw -= 1;
+            if display_end_raw > effective_start && raw.get(display_end_raw - 1) == Some(&b'\r') {
                 display_end_raw -= 1;
-                if display_end_raw > effective_start
-                    && raw.get(display_end_raw - 1) == Some(&b'\r')
-                {
-                    display_end_raw -= 1;
-                }
             }
         }
 
@@ -230,10 +232,7 @@ pub async fn handle_read_text(
     }
 
     // End position info — also in RAW bytes.
-    let end_line_start_raw = line_offsets
-        .get(end_line_idx)
-        .copied()
-        .unwrap_or(raw.len());
+    let end_line_start_raw = line_offsets.get(end_line_idx).copied().unwrap_or(raw.len());
     let end_pos = PositionInfo {
         line: end_line_idx as u64 + 1,
         byte_in_file: end_byte as u64,
@@ -264,21 +263,21 @@ fn resolve_encoding(
     encoding_hint: Option<&str>,
     req_path: &str,
 ) -> Result<&'static encoding_rs::Encoding, FileError> {
-    if let Some(name) = encoding_hint {
-        if !name.is_empty() {
-            if name.eq_ignore_ascii_case("utf-8") || name.eq_ignore_ascii_case("utf8") {
-                return Ok(encoding_rs::UTF_8);
-            }
-            return encoding_rs::Encoding::for_label(name.as_bytes()).ok_or_else(|| {
-                file_error(
-                    FileErrorCode::Encoding,
-                    req_path,
-                    format!("unknown encoding: {name}"),
-                )
-            });
+    if let Some(name) = encoding_hint
+        && !name.is_empty()
+    {
+        if name.eq_ignore_ascii_case("utf-8") || name.eq_ignore_ascii_case("utf8") {
+            return Ok(encoding_rs::UTF_8);
         }
-        // Empty string → fall through to auto-detect path below.
+        return encoding_rs::Encoding::for_label(name.as_bytes()).ok_or_else(|| {
+            file_error(
+                FileErrorCode::Encoding,
+                req_path,
+                format!("unknown encoding: {name}"),
+            )
+        });
     }
+    // Empty string → fall through to auto-detect path below.
 
     // Auto-detect. UTF-8 validation fast path.
     if std::str::from_utf8(raw).is_ok() {

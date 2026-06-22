@@ -6,6 +6,7 @@
 
 /* eslint-disable */
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
+import { AppToolRequest, AppToolResponse, AppToolsUpdate } from "./app_tool.js";
 import { BrowserRequest, BrowserResponse } from "./browser.js";
 import { FileRequest, FileResponse } from "./file_ops.js";
 
@@ -183,6 +184,9 @@ export interface Envelope {
    */
   fileRequest?: FileRequest | undefined;
   fileResponse?: FileResponse | undefined;
+  appToolsUpdate?: AppToolsUpdate | undefined;
+  appToolRequest?: AppToolRequest | undefined;
+  appToolResponse?: AppToolResponse | undefined;
 }
 
 /**
@@ -445,6 +449,9 @@ function createBaseEnvelope(): Envelope {
     heartbeat: undefined,
     fileRequest: undefined,
     fileResponse: undefined,
+    appToolsUpdate: undefined,
+    appToolRequest: undefined,
+    appToolResponse: undefined,
   };
 }
 
@@ -542,6 +549,15 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.fileResponse !== undefined) {
       FileResponse.encode(message.fileResponse, writer.uint32(274).fork()).join();
+    }
+    if (message.appToolsUpdate !== undefined) {
+      AppToolsUpdate.encode(message.appToolsUpdate, writer.uint32(282).fork()).join();
+    }
+    if (message.appToolRequest !== undefined) {
+      AppToolRequest.encode(message.appToolRequest, writer.uint32(290).fork()).join();
+    }
+    if (message.appToolResponse !== undefined) {
+      AppToolResponse.encode(message.appToolResponse, writer.uint32(298).fork()).join();
     }
     return writer;
   },
@@ -801,6 +817,30 @@ export const Envelope: MessageFns<Envelope> = {
           message.fileResponse = FileResponse.decode(reader, reader.uint32());
           continue;
         }
+        case 35: {
+          if (tag !== 282) {
+            break;
+          }
+
+          message.appToolsUpdate = AppToolsUpdate.decode(reader, reader.uint32());
+          continue;
+        }
+        case 36: {
+          if (tag !== 290) {
+            break;
+          }
+
+          message.appToolRequest = AppToolRequest.decode(reader, reader.uint32());
+          continue;
+        }
+        case 37: {
+          if (tag !== 298) {
+            break;
+          }
+
+          message.appToolResponse = AppToolResponse.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -951,6 +991,21 @@ export const Envelope: MessageFns<Envelope> = {
         : isSet(object.file_response)
         ? FileResponse.fromJSON(object.file_response)
         : undefined,
+      appToolsUpdate: isSet(object.appToolsUpdate)
+        ? AppToolsUpdate.fromJSON(object.appToolsUpdate)
+        : isSet(object.app_tools_update)
+        ? AppToolsUpdate.fromJSON(object.app_tools_update)
+        : undefined,
+      appToolRequest: isSet(object.appToolRequest)
+        ? AppToolRequest.fromJSON(object.appToolRequest)
+        : isSet(object.app_tool_request)
+        ? AppToolRequest.fromJSON(object.app_tool_request)
+        : undefined,
+      appToolResponse: isSet(object.appToolResponse)
+        ? AppToolResponse.fromJSON(object.appToolResponse)
+        : isSet(object.app_tool_response)
+        ? AppToolResponse.fromJSON(object.app_tool_response)
+        : undefined,
     };
   },
 
@@ -1049,6 +1104,15 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.fileResponse !== undefined) {
       obj.fileResponse = FileResponse.toJSON(message.fileResponse);
     }
+    if (message.appToolsUpdate !== undefined) {
+      obj.appToolsUpdate = AppToolsUpdate.toJSON(message.appToolsUpdate);
+    }
+    if (message.appToolRequest !== undefined) {
+      obj.appToolRequest = AppToolRequest.toJSON(message.appToolRequest);
+    }
+    if (message.appToolResponse !== undefined) {
+      obj.appToolResponse = AppToolResponse.toJSON(message.appToolResponse);
+    }
     return obj;
   },
 
@@ -1135,6 +1199,15 @@ export const Envelope: MessageFns<Envelope> = {
       : undefined;
     message.fileResponse = (object.fileResponse !== undefined && object.fileResponse !== null)
       ? FileResponse.fromPartial(object.fileResponse)
+      : undefined;
+    message.appToolsUpdate = (object.appToolsUpdate !== undefined && object.appToolsUpdate !== null)
+      ? AppToolsUpdate.fromPartial(object.appToolsUpdate)
+      : undefined;
+    message.appToolRequest = (object.appToolRequest !== undefined && object.appToolRequest !== null)
+      ? AppToolRequest.fromPartial(object.appToolRequest)
+      : undefined;
+    message.appToolResponse = (object.appToolResponse !== undefined && object.appToolResponse !== null)
+      ? AppToolResponse.fromPartial(object.appToolResponse)
       : undefined;
     return message;
   },

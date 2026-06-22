@@ -167,7 +167,35 @@ Detailed research and phased plan: [2026-04-12-remote-desktop-research.md](super
 - [ ] Hub: session recording to persistent storage (opt-in, audited)
 - [ ] Dashboard: clipboard UI, file drag-drop, recording playback
 
-### 5. Local MCP Execution
+### 5. App Tool Registry
+
+Host applications that embed `ahandd` can register application-defined tools (name, JSON Schema, async handler) at runtime. Cloud callers discover and invoke them through the hub without custom protocol work.
+
+| Actor | Interaction |
+|-------|-------------|
+| Host app | Calls `DaemonHandle::register_app_tool` / `unregister_app_tool` in-process |
+| Hub | Caches a per-device tool catalog (Redis); marks it stale on disconnect |
+| Cloud caller | `GET /api/devices/{id}/app-tools` to list; `POST /api/control/app-tool` to invoke |
+| SDK | `CloudClient.listAppTools()` / `CloudClient.invokeAppTool()` |
+
+Session-mode gating is enforced on every invocation (INACTIVE → `SESSION_INACTIVE`). `requires_approval = true` on a descriptor forces explicit approval even in TRUST/AUTO_ACCEPT modes (tighten-only — the session mode can only be made stricter, never relaxed).
+
+App tools are the natural carrier for a future **daemon MCP bridge**: each MCP tool would be registered as an app tool, giving it auth, approval, and audit automatically without new protocol surface.
+
+**Current status:**
+- [x] `app_tool.proto` — `AppToolDescriptor` / `AppToolsUpdate` / `AppToolRequest` / `AppToolResponse` (Envelope tags 35/36/37)
+- [x] `@ahandai/proto@0.3.0` TypeScript generation
+- [x] Daemon `app_tool_registry` module — name validation, revision-watch, fail-fast 4-permit semaphore, bounded completed-call cache
+- [x] `DaemonHandle::register_app_tool` / `unregister_app_tool` — snapshot pushed on change and re-sent after every `Hello`
+- [x] Daemon dispatch — idempotency, `TOOL_NOT_FOUND`, `INVALID_ARGS`, `EXECUTION_TIMEOUT`, `HANDLER_PANIC`, `CONCURRENCY_LIMIT`
+- [x] Session-mode gating + tighten-only `requires_approval` enforcement
+- [x] Hub catalog store (Redis-backed, explicit stale flag, revision ordering)
+- [x] `GET /api/devices/{id}/app-tools` — returns `revision`, `stale`, `tools[]`
+- [x] `device.app_tools.updated` webhook event
+- [x] `POST /api/control/app-tool` — oneshot pending-map invoke (browser pattern), offline fast-fail, full-outcome audit
+- [x] `@ahandai/sdk@0.3.0` `listAppTools()` / `invokeAppTool()`
+
+### 6. Local MCP Execution
 
 Execute MCP (Model Context Protocol) servers installed on the device, allowing cloud agents to use local tools.
 
@@ -179,7 +207,7 @@ Execute MCP (Model Context Protocol) servers installed on the device, allowing c
 
 **Current status:**
 - [ ] TODO: MCP proxy protocol (forward MCP tool calls through aHand tunnel)
-- [ ] TODO: Daemon MCP bridge
+- [ ] TODO: Daemon MCP bridge (app tools are the natural carrier — see Section 5)
 - [ ] TODO: MCP tool discovery and registration
 
 ## Architecture Principles

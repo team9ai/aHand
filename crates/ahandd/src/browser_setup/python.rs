@@ -91,17 +91,17 @@ pub async fn ensure(
     let dirs = Dirs::new()?;
     let local_python = dirs.local_python_bin();
 
-    if !force && local_python.exists() {
-        if let Some(version) = read_python_version(&local_python).await
-            && version.meets_minimum()
-        {
-            emit(
-                progress,
-                Phase::Done,
-                format!("{} already installed at {}", version, dirs.python.display()),
-            );
-            return Ok(inspect().await);
-        }
+    if !force
+        && local_python.exists()
+        && let Some(version) = read_python_version(&local_python).await
+        && version.meets_minimum()
+    {
+        emit(
+            progress,
+            Phase::Done,
+            format!("{} already installed at {}", version, dirs.python.display()),
+        );
+        return Ok(inspect().await);
     }
 
     if dirs.python.exists() {
@@ -343,9 +343,14 @@ mod tests {
             dirs.python,
             PathBuf::from("/tmp/ahand-primary-runtime/dependencies/python")
         );
+        let python_bin = if cfg!(windows) {
+            "python3.exe"
+        } else {
+            "python3"
+        };
         assert_eq!(
             dirs.local_python_bin(),
-            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/python/bin/python3")
+            PathBuf::from("/tmp/ahand-primary-runtime/dependencies/python/bin").join(python_bin)
         );
     }
 

@@ -3,10 +3,10 @@
 Terraform + AWS operations guide for the **ahand-hub** control-plane service.
 
 - **Design spec**: `../docs` (ahand) and `../team9/docs/superpowers/specs/2026-04-22-ahand-integration-design.md`
-- **AWS account**: `471112576951`
+- **AWS account**: `149614785083` (t9)
 - **Region**: `us-east-1`
-- **AWS profile (local)**: `ww`
-- **Environments**: prod (`ahand-hub.team9.ai`), dev (`ahand-hub.dev.team9.ai`)
+- **AWS profile (local)**: `t9`
+- **Environments**: prod (`ahand-hub.team9.ai`), staging (`ahand-hub.staging.team9.ai`), dev (`ahand-hub.dev.team9.ai`)
 
 ## Prerequisites
 
@@ -17,8 +17,8 @@ Terraform + AWS operations guide for the **ahand-hub** control-plane service.
 | Docker | ≥ 24 | Docker Desktop |
 | `psql` | any | `brew install libpq && brew link --force libpq` |
 
-`aws configure --profile ww` must be set up with credentials for the
-`ww-admin` IAM user (or any principal with equivalent IAM / SSM / ECS / RDS
+`aws configure --profile t9` must be set up with credentials for a principal
+with equivalent IAM / SSM / ECS / RDS
 access).
 
 ## Directory layout
@@ -28,13 +28,14 @@ infra/
 ├── shared/           # account-wide resources (ECR, OIDC deploy role, log group)
 ├── envs/
 │   ├── prod/         # prod stack — module "ahand_hub" { env = "prod" }
+│   ├── staging/      # staging stack — module "ahand_hub" { env = "staging" }
 │   └── dev/          # dev stack  — module "ahand_hub" { env = "dev" }
 └── modules/
     └── ahand-hub/    # per-env IAM, SSM, Redis, ECS resources
 ```
 
-Each of `shared/`, `envs/prod/`, `envs/dev/` is an independent Terraform
-stack with its own `backend.tf` key inside `s3://weightwave-tfstate`.
+Each of `shared/`, `envs/prod/`, `envs/staging/`, and `envs/dev/` is an
+independent Terraform stack with its own `backend.tf` key.
 
 ## First-time apply
 
@@ -51,7 +52,13 @@ terraform init
 terraform plan
 terraform apply
 
-# 3. Prod
+# 3. Staging
+cd ../staging
+terraform init
+terraform plan
+terraform apply
+
+# 4. Prod
 cd ../prod
 terraform init
 terraform plan
@@ -69,6 +76,7 @@ name is known:
 | Host | Type | Target | Cloudflare mode |
 |---|---|---|---|
 | `ahand-hub.team9.ai` | CNAME | `traefik-nlb-9d708d124f9805ad.elb.us-east-1.amazonaws.com` | DNS-only (gray cloud) |
+| `ahand-hub.staging.team9.ai` | CNAME | `traefik-dev-nlb-8cda97ce6b37e5e1.elb.us-east-1.amazonaws.com` | DNS-only (gray cloud) |
 | `ahand-hub.dev.team9.ai` | CNAME | `traefik-dev-nlb-8cda97ce6b37e5e1.elb.us-east-1.amazonaws.com` | DNS-only (gray cloud) |
 
 Always DNS-only — Traefik's LetsEncrypt HTTP-01 challenge fails through the
@@ -85,7 +93,7 @@ ahand-hub runs on the shared `openclaw-hive-{prod,dev}` RDS instances. The
 real value is seeded by hand:
 
 ```bash
-ENV=prod                                # or dev
+ENV=prod                                # or staging or dev
 RDS_HOST=openclaw-hive-$ENV.chq8i2se49qd.us-east-1.rds.amazonaws.com
 DB_ADMIN=openclaw                       # RDS master user
 DB_ADMIN_PASSWORD=...                   # operator-held password
@@ -109,7 +117,7 @@ SQL
 # 3. Build the postgres:// URL and publish to SSM
 DATABASE_URL="postgres://ahand_hub_${ENV}:${AHAND_PW}@${RDS_HOST}:5432/ahand_hub_${ENV}?sslmode=require"
 aws ssm put-parameter --name /ahand-hub/$ENV/DATABASE_URL \
-  --type SecureString --value "$DATABASE_URL" --overwrite --profile ww
+  --type SecureString --value "$DATABASE_URL" --overwrite --profile t9
 ```
 
 Rotate by repeating with a new password and `ALTER ROLE ... WITH PASSWORD`.
@@ -122,9 +130,9 @@ Sentry project is provisioned:
 ```bash
 aws ssm put-parameter --name /ahand-hub/prod/SENTRY_DSN \
   --type SecureString --value "https://<key>@o<org>.ingest.sentry.io/<project>" \
-  --overwrite --profile ww
+  --overwrite --profile t9
 aws ecs update-service --cluster openclaw-hive --service ahand-hub-prod \
-  --force-new-deployment --profile ww
+  --force-new-deployment --profile t9
 ```
 
 Other secrets (`JWT_SECRET`, `SERVICE_TOKEN`, `WEBHOOK_SECRET`,
@@ -136,34 +144,35 @@ Other secrets (`JWT_SECRET`, `SERVICE_TOKEN`, `WEBHOOK_SECRET`,
 
 ```bash
 # Push to dev branch → deploy-hub.yml auto-deploys to dev
+# Push to staging branch → deploy-hub.yml auto-deploys to staging
 # Push to main branch → deploy-hub.yml auto-deploys to prod
-git push origin dev   # or main
+git push origin dev   # or staging or main
 
 # Manual deploy from a developer laptop
-aws ecr get-login-password --profile ww --region us-east-1 \
-  | docker login --username AWS --password-stdin 471112576951.dkr.ecr.us-east-1.amazonaws.com
+aws ecr get-login-password --profile t9 --region us-east-1 \
+  | docker login --username AWS --password-stdin 149614785083.dkr.ecr.us-east-1.amazonaws.com
 docker build --platform linux/amd64 \
-  -t 471112576951.dkr.ecr.us-east-1.amazonaws.com/ahand-hub:dev .
-docker push 471112576951.dkr.ecr.us-east-1.amazonaws.com/ahand-hub:dev
-AWS_PROFILE=ww ./deploy/hub/deploy.sh dev
+  -t 149614785083.dkr.ecr.us-east-1.amazonaws.com/ahand-hub:dev .
+docker push 149614785083.dkr.ecr.us-east-1.amazonaws.com/ahand-hub:dev
+AWS_PROFILE=t9 ./deploy/hub/deploy.sh dev
 ```
 
 ## View logs
 
 ```bash
-aws logs tail /ecs/ahand-hub --profile ww --region us-east-1 --since 1h --follow
-aws logs tail /ecs/ahand-hub --profile ww --region us-east-1 --since 1h \
+aws logs tail /ecs/ahand-hub --profile t9 --region us-east-1 --since 1h --follow
+aws logs tail /ecs/ahand-hub --profile t9 --region us-east-1 --since 1h \
   --filter-pattern '{$.level = "error"}'
 ```
 
-Log streams are prefixed `ahand-hub-prod-*` and `ahand-hub-dev-*`, so the
-single log group serves both environments.
+Log streams are prefixed `ahand-hub-prod-*`, `ahand-hub-staging-*`, and
+`ahand-hub-dev-*`, so the single log group serves all hub environments.
 
 ## Rollback
 
 ```bash
-aws ecs list-task-definitions --profile ww --family-prefix ahand-hub-prod --sort DESC | head -10
-aws ecs update-service --profile ww --cluster openclaw-hive \
+aws ecs list-task-definitions --profile t9 --family-prefix ahand-hub-prod --sort DESC | head -10
+aws ecs update-service --profile t9 --cluster openclaw-hive \
   --service ahand-hub-prod --task-definition ahand-hub-prod:42 --force-new-deployment
 ```
 
@@ -180,10 +189,10 @@ aws ecs update-service --profile ww --cluster openclaw-hive \
 
 ### ECS task crashes on startup
 
-1. Logs: `aws logs tail /ecs/ahand-hub --profile ww --since 30m`.
+1. Logs: `aws logs tail /ecs/ahand-hub --profile t9 --since 30m`.
 2. Likely causes:
    - `DATABASE_URL` or `REDIS_URL` missing — verify
-     `aws ssm get-parameters-by-path --path /ahand-hub/<env>/ --with-decryption --profile ww`.
+     `aws ssm get-parameters-by-path --path /ahand-hub/<env>/ --with-decryption --profile t9`.
    - Migration failure — connect as `ahand_hub_<env>` and inspect the
      `schema_migrations` table (or Drizzle/SQLx equivalent).
    - Redis unreachable — confirm the task SG has egress to the Redis SG on 6379.
@@ -196,8 +205,8 @@ DNS-only.
 
 ### High RDS connections
 
-`openclaw-hive-{prod,dev}` is shared with other services (folder9, control-plane).
-Hub caps its pool in code; confirm by querying `pg_stat_activity`.
+`openclaw-hive-dev` is shared by dev and staging. Hub caps its pool in code;
+confirm by querying `pg_stat_activity`.
 
 ## Terraform
 
@@ -205,9 +214,10 @@ Hub caps its pool in code; confirm by querying `pg_stat_activity`.
 |---|---|---|
 | shared | `infra/shared/` | `ahand-hub/shared/terraform.tfstate` |
 | prod | `infra/envs/prod/` | `ahand-hub/envs/prod/terraform.tfstate` |
+| staging | `infra/envs/staging/` | `ahand-hub/envs/staging/terraform.tfstate` |
 | dev | `infra/envs/dev/` | `ahand-hub/envs/dev/terraform.tfstate` |
 
-State bucket `weightwave-tfstate`, lock table `terraform-state-lock` — both
+State bucket `team9-tfstate`, lock table `terraform-state-lock` — both
 pre-existing and shared with folder9 / other team9 services.
 
 ## Preflight audit

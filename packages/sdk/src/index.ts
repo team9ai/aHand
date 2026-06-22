@@ -35,4 +35,8 @@ export type {
   ReadPdfPageText,
   ReadFilePdfResult,
   ReadFileResult,
+  AppToolInfo,
+  AppToolCatalog,
+  ListAppToolsOptions,
+  InvokeAppToolOptions,
 } from "./cloud-client.ts";

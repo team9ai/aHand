@@ -34,6 +34,9 @@ pub struct InstalledPluginResource {
     pub help_prompt: Option<String>,
 }
 
+// Directory/Env/Config variants are part of the host-resource wire contract;
+// constructed by later plugin stages.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HostResourceValue {

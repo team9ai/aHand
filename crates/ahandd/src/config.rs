@@ -12,6 +12,7 @@ pub enum ConnectionMode {
 }
 
 impl ConnectionMode {
+    #[allow(clippy::should_implement_trait)] // simple value constructor; no FromStr err type needed
     pub fn from_str(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "openclaw-gateway" | "openclaw" => Self::OpenClawGateway,
@@ -39,11 +40,12 @@ pub struct Config {
     /// Directory for trace logs and run artifacts. Defaults to ~/.ahand/data.
     pub data_dir: Option<String>,
 
-    /// Enable debug IPC server (Unix socket).
+    /// Enable debug IPC server.
     #[serde(default)]
     pub debug_ipc: Option<bool>,
 
-    /// Custom path for the IPC Unix socket. Defaults to ~/.ahand/ahandd.sock.
+    /// Custom IPC endpoint. Unix: socket path (default ~/.ahand/ahandd.sock);
+    /// Windows: named pipe name (default \\.\pipe\ahandd-<USERNAME>).
     pub ipc_socket_path: Option<String>,
 
     /// Unix permission mode for the IPC socket (e.g. 0o660 for group access).
@@ -336,13 +338,14 @@ fn expand_tilde(pattern: &str) -> anyhow::Result<String> {
 
 /// Apply [`expand_tilde`] to every entry in a mutable string list in place.
 /// Stops on the first failure so the caller sees the offending pattern.
-fn expand_tildes_in_place(list: &mut Vec<String>) -> anyhow::Result<()> {
+fn expand_tildes_in_place(list: &mut [String]) -> anyhow::Result<()> {
     for item in list.iter_mut() {
         *item = expand_tilde(item)?;
     }
     Ok(())
 }
 
+#[allow(dead_code)] // public API surface used by future CLI sub-commands
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -436,9 +439,10 @@ impl Config {
                 .map_err(|e| anyhow::anyhow!("failed to fsync {}: {e}", tmp_path.display()))?;
         }
 
-        // Rename (atomic on POSIX; on Windows `rename` fails if target exists,
-        // so on Windows we'd need a different strategy — but ahandd is
-        // Unix-only for now, so this is sufficient).
+        // Rename (atomic on POSIX; on Windows std::fs::rename replaces an
+        // existing target via MoveFileExW(MOVEFILE_REPLACE_EXISTING), which
+        // can still fail if another process holds the file open — the
+        // overwrite test pins the replace behavior on all platforms).
         if let Err(e) = std::fs::rename(&tmp_path, path) {
             // Best-effort cleanup of the tmp file
             let _ = std::fs::remove_file(&tmp_path);
@@ -455,14 +459,12 @@ impl Config {
         self.device_id.clone().unwrap_or_else(uuid_v4)
     }
 
-    /// Resolve the IPC socket path. Default: ~/.ahand/ahandd.sock.
-    pub fn ipc_socket_path(&self) -> PathBuf {
+    /// Resolve the IPC endpoint. Default: per-user platform endpoint
+    /// (`~/.ahand/ahandd.sock` on Unix, `\\.\pipe\ahandd-<user>` on Windows).
+    pub fn ipc_socket_path(&self) -> ahand_platform::ipc::IpcEndpoint {
         match &self.ipc_socket_path {
-            Some(p) => PathBuf::from(p),
-            None => dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(".ahand")
-                .join("ahandd.sock"),
+            Some(p) => ahand_platform::ipc::IpcEndpoint::from_path(PathBuf::from(p)),
+            None => ahand_platform::ipc::IpcEndpoint::default_for_user(),
         }
     }
 
@@ -501,9 +503,12 @@ mod tilde_tests {
     #[test]
     fn expand_tilde_for_home_rooted_patterns() {
         let home = dirs::home_dir().expect("home dir required for this test");
+        // Use Path::join to produce the platform-native separator (backslash on
+        // Windows, forward slash on Unix) so the assertion matches what
+        // expand_tilde_with returns via `home.join(rest).to_string_lossy()`.
         assert_eq!(
             expand_tilde("~/.ssh/**").unwrap(),
-            format!("{}/.ssh/**", home.display())
+            home.join(".ssh/**").to_string_lossy().to_string()
         );
         assert_eq!(
             expand_tilde("~").unwrap(),
@@ -561,6 +566,23 @@ mod tilde_tests {
             "/tmp/~backup"
         );
     }
+
+    /// #17 — `~\rest` (backslash variant) is expanded the same way as `~/rest`.
+    ///
+    /// `expand_tilde_with` strips the `~\` prefix via `strip_prefix("~\\")` and
+    /// calls `home.join(rest)`.  On Unix `Path::join("rest")` produces
+    /// `<home>/rest` (forward slash); on Windows it produces `<home>\rest`.
+    /// We assert against `home.join("rest")` so the test is platform-neutral.
+    #[test]
+    fn expand_tilde_with_backslash_separator_expands_to_home_join_rest() {
+        let home = std::path::Path::new("/fake/home");
+        let result = expand_tilde_with(r"~\rest", Some(home)).unwrap();
+        let expected = home.join("rest").to_string_lossy().into_owned();
+        assert_eq!(
+            result, expected,
+            "backslash tilde should expand like forward-slash tilde"
+        );
+    }
 }
 
 /// End-to-end tests that exercise `Config::load` through a real TOML
@@ -610,10 +632,20 @@ dangerous_paths = ["~/.ssh/**"]
         let path = write_config(&dir, body);
         let cfg = Config::load(&path).expect("config should load");
         let fp = cfg.file_policy.expect("file_policy should be present");
-        let home_str = home.to_string_lossy();
-        assert_eq!(fp.path_allowlist, vec![format!("{home_str}/projects/**")]);
-        assert_eq!(fp.path_denylist, vec![format!("{home_str}/private/**")]);
-        assert_eq!(fp.dangerous_paths, vec![format!("{home_str}/.ssh/**")]);
+        // Use Path::join to produce the expected pattern with the native
+        // path separator so the assertion is correct on all platforms.
+        assert_eq!(
+            fp.path_allowlist,
+            vec![home.join("projects/**").to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            fp.path_denylist,
+            vec![home.join("private/**").to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            fp.dangerous_paths,
+            vec![home.join(".ssh/**").to_string_lossy().into_owned()]
+        );
     }
 
     #[test]
@@ -693,8 +725,12 @@ path_allowlist = ["/etc/passwd", "/var/log/**"]
         let path = dir.path().join("definitely_does_not_exist.toml");
         let err = Config::load(&path).unwrap_err();
         let msg = err.to_string();
+        // Accept both Unix ("No such file") and Windows ("cannot find the file")
+        // phrasing for OS-level "file not found" errors.
         assert!(
-            msg.to_lowercase().contains("no such file") || msg.to_lowercase().contains("not found"),
+            msg.to_lowercase().contains("no such file")
+                || msg.to_lowercase().contains("not found")
+                || msg.to_lowercase().contains("cannot find"),
             "expected NotFound IO error, got: {msg}"
         );
     }
@@ -703,6 +739,82 @@ path_allowlist = ["/etc/passwd", "/var/log/**"]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ipc_socket_path (#18) ─────────────────────────────────────────────────
+
+    #[test]
+    fn ipc_socket_path_custom_path_is_used() {
+        let cfg = Config {
+            ipc_socket_path: Some("/tmp/custom-ahandd.sock".to_string()),
+            ..minimal_config()
+        };
+        let ep = cfg.ipc_socket_path();
+        let s = ep.as_path().to_string_lossy().into_owned();
+        assert_eq!(s, "/tmp/custom-ahandd.sock");
+    }
+
+    #[test]
+    fn ipc_socket_path_none_uses_platform_default() {
+        let cfg = Config {
+            ipc_socket_path: None,
+            ..minimal_config()
+        };
+        let ep = cfg.ipc_socket_path();
+        let s = ep.as_path().to_string_lossy().into_owned();
+        // Platform default should not be the literal "None".
+        assert!(!s.is_empty(), "default IPC path should not be empty");
+        // Rough shape check — either a socket path or a pipe.
+        #[cfg(unix)]
+        assert!(
+            s.contains("ahandd"),
+            "unix default IPC path should contain 'ahandd': {s}"
+        );
+        #[cfg(windows)]
+        assert!(
+            s.starts_with(r"\\.\pipe\"),
+            "windows default IPC path should be a named pipe: {s}"
+        );
+    }
+
+    // ── ipc_socket_mode (#19) ─────────────────────────────────────────────────
+
+    #[test]
+    fn ipc_socket_mode_default_is_0o660() {
+        let cfg = Config {
+            ipc_socket_mode: None,
+            ..minimal_config()
+        };
+        assert_eq!(cfg.ipc_socket_mode(), 0o660);
+    }
+
+    #[test]
+    fn ipc_socket_mode_override_is_used() {
+        let cfg = Config {
+            ipc_socket_mode: Some(0o600),
+            ..minimal_config()
+        };
+        assert_eq!(cfg.ipc_socket_mode(), 0o600);
+    }
+
+    fn minimal_config() -> Config {
+        Config {
+            mode: None,
+            server_url: "ws://localhost:3000/ws".to_string(),
+            device_id: None,
+            max_concurrent_jobs: None,
+            data_dir: None,
+            debug_ipc: None,
+            ipc_socket_path: None,
+            ipc_socket_mode: None,
+            trust_timeout_mins: None,
+            default_session_mode: None,
+            policy: PolicyConfig::default(),
+            openclaw: None,
+            browser: None,
+            hub: None,
+            file_policy: None,
+        }
+    }
 
     #[test]
     fn set_browser_enabled_true_then_false_round_trips() {
@@ -825,5 +937,21 @@ allowed_domains = ["example.com", "example.org"]
             !tmp_path.exists(),
             "tmp file should not be left behind after successful write"
         );
+    }
+
+    #[test]
+    fn save_atomic_replaces_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Build a minimal Config the same way other tests do.
+        std::fs::write(&path, "[browser]\nenabled = true\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        // First save creates the file.
+        cfg.save_atomic(&path).unwrap();
+        // Second save must not error (replace semantics).
+        cfg.save_atomic(&path).unwrap();
+        assert!(path.exists());
+        // No stale .tmp left behind.
+        assert!(!path.with_extension("toml.tmp").exists());
     }
 }

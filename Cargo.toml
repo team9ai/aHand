@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/ahand-platform",
     "crates/ahand-protocol", "crates/ahandctl",
     "crates/ahandd",
     "crates/ahand-hub-core",
@@ -25,6 +26,7 @@ dashmap = "6"
 jsonwebtoken = "9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sentry = { version = "0.46.2", default-features = false, features = ["backtrace", "contexts", "debug-images", "panic", "reqwest", "rustls", "tracing"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 anyhow = "1"
@@ -36,3 +38,4 @@ testcontainers = "0.24"
 axum = { version = "0.8", features = ["macros", "ws"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["trace", "cors", "fs"] }
+dunce = "1"

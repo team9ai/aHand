@@ -67,6 +67,11 @@ export interface SpawnParams {
   /** Callback for progress events. Thrown errors are swallowed. */
   onProgress?: (p: { percent: number; message?: string }) => void;
   /**
+   * Callback fired after the hub accepts the job and returns its id,
+   * before the SDK opens the SSE stream. Thrown errors are swallowed.
+   */
+  onJobStarted?: (job: { jobId: string }) => void;
+  /**
    * AbortSignal — aborting triggers best-effort
    * `POST /cancel` + closes SSE + rejects with an `abort` error.
    */
@@ -412,6 +417,58 @@ export interface BrowserResult {
   durationMs: number;
 }
 
+// ---------------------------------------------------------------------------
+// App-tool types
+// ---------------------------------------------------------------------------
+
+/**
+ * Metadata for a single app-defined tool registered by a host app embedding
+ * `ahandd`. The `inputSchemaJson` field is a JSON-encoded JSON Schema
+ * (string, not an object) matching the shape the tool expects as `args`.
+ */
+export interface AppToolInfo {
+  name: string;
+  description: string;
+  inputSchemaJson: string;
+  requiresApproval: boolean;
+}
+
+/**
+ * The full catalog of app-defined tools registered by a device. `revision`
+ * is a monotonically-increasing counter bumped by the daemon each time the
+ * catalog changes. `stale` is set to `true` on device disconnect or new
+ * connection (and when presence shows the device is offline); it is cleared
+ * by the next accepted AppToolsUpdate snapshot from the daemon.
+ */
+export interface AppToolCatalog {
+  revision: number;
+  stale: boolean;
+  updatedAtMs: number;
+  tools: AppToolInfo[];
+}
+
+/** Options for `listAppTools()`. */
+export interface ListAppToolsOptions {
+  signal?: AbortSignal;
+}
+
+/** Options for `invokeAppTool()`. */
+export interface InvokeAppToolOptions {
+  /**
+   * Per-request timeout in milliseconds. Defaults to `60_000` (60 s)
+   * when omitted. The hub clamps the value to `[1_000, 300_000]`
+   * (1 s – 5 min).
+   *
+   * For approval-gated tools, set this to at least the expected approval
+   * latency (max `300_000`). The approval wait on the daemon is bounded by
+   * `min(approval policy timeout, clamp(timeoutMs))` — a late approval finds
+   * the request already expired and nothing executes. This value is the hard
+   * deadline for both the approval dialog and execution.
+   */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
 /** Discriminated error codes surfaced by `CloudClient`. */
 export type CloudClientErrorCode =
   | "unauthorized"
@@ -427,7 +484,8 @@ export type CloudClientErrorCode =
   | "timeout"
   | "device_offline"
   | "policy_denied"
-  | "s3_disabled";
+  | "s3_disabled"
+  | "app_tool_error";
 
 /**
  * Typed error raised by `CloudClient`. Use `.code` to discriminate,
@@ -437,9 +495,17 @@ export type CloudClientErrorCode =
 export class CloudClientError extends Error {
   readonly code: CloudClientErrorCode;
   readonly httpStatus?: number;
-  /** Hub's `code` field for `job_error` (SSE error events). */
+  /**
+   * Daemon error code forwarded by the hub. Carried for SSE `job_error`
+   * events (`spawn()`), file-op daemon errors (`files()`), and
+   * app-tool daemon errors (`invokeAppTool()`).
+   */
   readonly jobErrorCode?: string;
-  /** Hub's `message` field for `job_error`. */
+  /**
+   * Daemon error message forwarded by the hub. Carried for SSE
+   * `job_error` events, file-op daemon errors, and app-tool daemon
+   * errors. May be `undefined` when the daemon omits a message.
+   */
   readonly jobErrorMessage?: string;
   /** Original error, if this wraps one (e.g. `network`). */
   readonly cause?: unknown;
@@ -1207,6 +1273,13 @@ export class CloudClient {
         { httpStatus: postRes.status },
       );
     }
+    if (p.onJobStarted) {
+      try {
+        p.onJobStarted({ jobId });
+      } catch {
+        // Swallow — user callback's problem.
+      }
+    }
 
     // Subscribe to the SSE stream. From here on, an abort triggers a
     // best-effort cancel before we surface the AbortError.
@@ -1769,6 +1842,202 @@ export class CloudClient {
       throw this.normalizeFetchError(err);
     }
     if (!res.ok) throw await toTypedHttpError(res);
+  }
+
+  /**
+   * `GET /api/devices/{deviceId}/app-tools`. Returns the catalog of
+   * application-defined tools registered by the host app embedding
+   * `ahandd` on the target device. Hub-level failures (auth, not found,
+   * timeout) throw `CloudClientError`; use the code to discriminate.
+   *
+   * The hub returns camelCase JSON matching `AppToolCatalog` directly.
+   * A minimal shape check (root must be an object with a numeric
+   * `revision` and an `Array` `tools`) is applied defensively to catch
+   * wire-contract drift early.
+   */
+  async listAppTools(
+    deviceId: string,
+    opts?: ListAppToolsOptions,
+  ): Promise<AppToolCatalog> {
+    if (opts?.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted before request");
+    }
+
+    const fetchImpl = this.fetchImpl();
+    const token = await this.opts.getAuthToken();
+    if (opts?.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
+
+    let res: Response;
+    try {
+      res = await fetchImpl(
+        `${this.opts.hubUrl}/api/devices/${encodeURIComponent(deviceId)}/app-tools`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+          signal: opts?.signal,
+        },
+      );
+    } catch (err) {
+      throw this.normalizeFetchError(err, opts?.signal);
+    }
+    if (!res.ok) throw await toTypedHttpError(res, opts?.signal);
+
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch (e: unknown) {
+      if (isAbortError(e)) {
+        throw new CloudClientError(
+          "abort",
+          "listAppTools request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw new CloudClientError("network", String(e), { cause: e });
+    }
+
+    // Defensive shape check: root must be an object with a numeric `revision`
+    // and an array `tools`. Same coercion-masks-regression rationale as files().
+    if (
+      json === null ||
+      typeof json !== "object" ||
+      Array.isArray(json) ||
+      typeof (json as { revision?: unknown }).revision !== "number" ||
+      !Array.isArray((json as { tools?: unknown }).tools)
+    ) {
+      throw new CloudClientError(
+        "server_error",
+        "Hub response malformed: expected AppToolCatalog with numeric revision and tools array",
+      );
+    }
+
+    return json as AppToolCatalog;
+  }
+
+  /**
+   * `POST /api/control/app-tool`. Invokes an application-defined tool on
+   * the target device and waits for the result. The hub forwards the call
+   * to the daemon and blocks until the tool completes or the timeout
+   * fires.
+   *
+   * Hub-level errors (auth, offline, timeout) throw `CloudClientError`.
+   * Daemon-level failures surface as `CloudClientError("app_tool_error")`
+   * with the daemon error code in `jobErrorCode`. The well-known daemon
+   * error codes are: `TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE |
+   * APPROVAL_DENIED | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT |
+   * HANDLER_PANIC | CONCURRENCY_LIMIT`. Handler-supplied codes pass
+   * through verbatim; `HANDLER_ERROR` is only the empty-code fallback.
+   * Do not treat this set as closed — future daemon versions may add
+   * codes. See `proto/ahand/v1/app_tool.proto` comments for details.
+   *
+   * For approval-gated tools, set `opts.timeoutMs` ≥ expected approval
+   * latency (max `300_000`). The approval wait is bounded by
+   * `min(approval policy timeout, clamp(timeoutMs))` — a late approval finds
+   * the request already expired and nothing executes.
+   *
+   * Returns `body.result` on success. When the daemon returns a
+   * successful response but omits the `result` field, `null` is returned
+   * for a stable contract (callers can always do `result ?? default`).
+   */
+  async invokeAppTool(
+    deviceId: string,
+    name: string,
+    args?: Record<string, unknown>,
+    opts?: InvokeAppToolOptions,
+  ): Promise<unknown> {
+    if (opts?.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted before request");
+    }
+
+    const fetchImpl = this.fetchImpl();
+    const token = await this.opts.getAuthToken();
+    if (opts?.signal?.aborted) {
+      throw new CloudClientError("abort", "Aborted after token fetch");
+    }
+
+    // camelCase body; omit undefined optional fields
+    const requestBody: Record<string, unknown> = { deviceId, name };
+    if (args !== undefined) requestBody.args = args;
+    if (opts?.timeoutMs !== undefined) requestBody.timeoutMs = opts.timeoutMs;
+
+    let res: Response;
+    try {
+      res = await fetchImpl(`${this.opts.hubUrl}/api/control/app-tool`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(requestBody),
+        signal: opts?.signal,
+      });
+    } catch (err) {
+      throw this.normalizeFetchError(err, opts?.signal);
+    }
+    if (!res.ok) throw await toTypedHttpError(res, opts?.signal);
+
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch (e: unknown) {
+      if (isAbortError(e)) {
+        throw new CloudClientError(
+          "abort",
+          "invokeAppTool request aborted during response read",
+          { cause: e },
+        );
+      }
+      if (e instanceof SyntaxError) {
+        throw new CloudClientError(
+          "server_error",
+          "Hub returned non-JSON response",
+          { cause: e },
+        );
+      }
+      throw new CloudClientError("network", String(e), { cause: e });
+    }
+
+    // Strict shape check — same rationale as `files()`. A non-object root
+    // (null, array, primitive) means the hub's wire contract has drifted;
+    // coercing would silently mask the regression.
+    if (json === null || typeof json !== "object" || Array.isArray(json)) {
+      throw new CloudClientError(
+        "server_error",
+        "Hub response malformed: expected invokeAppTool object response",
+      );
+    }
+
+    const typedJson = json as {
+      toolCallId?: string;
+      result?: unknown;
+      error?: { code?: string; message?: string } | null;
+    };
+
+    // A 200 with an `error` field is a daemon-level failure.
+    if (typedJson.error != null) {
+      throw new CloudClientError(
+        "app_tool_error",
+        typedJson.error.message ?? "app tool failed",
+        {
+          jobErrorCode: typedJson.error.code,
+          jobErrorMessage: typedJson.error.message,
+        },
+      );
+    }
+
+    // Return `null` when `result` is missing for a stable contract.
+    return typedJson.result !== undefined ? typedJson.result : null;
   }
 
   /**

@@ -2,6 +2,11 @@
 //!
 //! Framed messages for communication with OpenClaw Gateway.
 
+// Protocol structs are Deserialize targets — their fields are populated by serde
+// from inbound JSON, not by direct Rust construction. Dead-code warnings for
+// fields/variants/structs that are populated but not yet read are expected here.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

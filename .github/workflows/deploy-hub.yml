@@ -1,7 +1,7 @@
 name: Deploy Hub
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, staging]
     paths:
       - "crates/ahand-hub/**"
       - "crates/ahand-hub-core/**"
@@ -10,6 +10,8 @@ on:
       - "proto/**"
       - "Cargo.lock"
       - "deploy/hub/Dockerfile"
+      - "deploy/hub/deploy.sh"
+      - "deploy/hub/task-definition.template.json"
       - ".github/workflows/deploy-hub.yml"
 
 permissions:
@@ -32,6 +34,10 @@ jobs:
             echo "ENV=prod" >> "$GITHUB_ENV"
             echo "ECS_CLUSTER=openclaw-hive" >> "$GITHUB_ENV"
             echo "SERVICE_NAME=ahand-hub-prod" >> "$GITHUB_ENV"
+          elif [ "${{ github.ref }}" = "refs/heads/staging" ]; then
+            echo "ENV=staging" >> "$GITHUB_ENV"
+            echo "ECS_CLUSTER=openclaw-hive-dev" >> "$GITHUB_ENV"
+            echo "SERVICE_NAME=ahand-hub-staging" >> "$GITHUB_ENV"
           else
             echo "ENV=dev" >> "$GITHUB_ENV"
             echo "ECS_CLUSTER=openclaw-hive-dev" >> "$GITHUB_ENV"

@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use ahand_platform::ipc::{IpcEndpoint, IpcListener};
 use ahand_protocol::{BrowserResponse, Envelope, JobFinished, JobRejected, SessionMode, envelope};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
@@ -17,10 +16,10 @@ use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::RunStore;
 
-/// Start the IPC server on the given Unix socket path.
+/// Start the IPC server on the given endpoint.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_ipc(
-    socket_path: PathBuf,
+    endpoint: IpcEndpoint,
     socket_mode: u32,
     registry: Arc<JobRegistry>,
     store: Option<Arc<RunStore>>,
@@ -31,33 +30,12 @@ pub async fn serve_ipc(
     browser_mgr: Arc<BrowserManager>,
     file_mgr: Arc<FileManager>,
 ) -> anyhow::Result<()> {
-    // Remove stale socket file if it exists.
-    let _ = std::fs::remove_file(&socket_path);
-
-    // Ensure parent directory exists.
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let listener = UnixListener::bind(&socket_path)?;
-
-    // Set socket permissions.
-    set_permissions(&socket_path, socket_mode)?;
-
-    info!(path = %socket_path.display(), mode = format!("{:04o}", socket_mode), "IPC server listening");
+    let mut listener = IpcListener::bind(&endpoint, socket_mode)?;
+    info!(endpoint = %endpoint.as_path().display(), "IPC server listening");
 
     loop {
         match listener.accept().await {
-            Ok((stream, _addr)) => {
-                // Get peer credentials before splitting the stream.
-                let caller_uid = match stream.peer_cred() {
-                    Ok(cred) => format!("uid:{}", cred.uid()),
-                    Err(e) => {
-                        warn!(error = %e, "IPC: failed to get peer credentials");
-                        "uid:unknown".to_string()
-                    }
-                };
-
+            Ok((stream, caller_id)) => {
                 let reg = Arc::clone(&registry);
                 let st = store.clone();
                 let smgr = Arc::clone(&session_mgr);
@@ -68,7 +46,7 @@ pub async fn serve_ipc(
                 let fmgr = Arc::clone(&file_mgr);
                 tokio::spawn(async move {
                     if let Err(e) = handle_ipc_conn(
-                        stream, reg, st, smgr, amgr, bcast, did, caller_uid, bmgr, fmgr,
+                        stream, reg, st, smgr, amgr, bcast, did, caller_id, bmgr, fmgr,
                     )
                     .await
                     {
@@ -84,25 +62,28 @@ pub async fn serve_ipc(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_ipc_conn(
-    stream: UnixStream,
+async fn handle_ipc_conn<S>(
+    stream: S,
     registry: Arc<JobRegistry>,
     store: Option<Arc<RunStore>>,
     session_mgr: Arc<SessionManager>,
     approval_mgr: Arc<ApprovalManager>,
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     device_id: String,
-    caller_uid: String,
+    caller_id: String,
     browser_mgr: Arc<BrowserManager>,
     file_mgr: Arc<FileManager>,
-) -> anyhow::Result<()> {
-    let (reader, writer) = stream.into_split();
+) -> anyhow::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (reader, writer) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(reader);
 
-    info!(caller_uid = %caller_uid, "IPC: new connection");
+    info!(caller_id = %caller_id, "IPC: new connection");
 
     // Register the IPC caller so session queries return it.
-    session_mgr.register_caller(&caller_uid).await;
+    session_mgr.register_caller(&caller_id).await;
 
     // Channel for sending responses back through the IPC stream.
     let (tx, mut rx) = mpsc::unbounded_channel::<Envelope>();
@@ -243,7 +224,7 @@ async fn handle_ipc_conn(
                 }
 
                 // Session mode check.
-                match session_mgr.check(&req, &caller_uid).await {
+                match session_mgr.check(&req, &caller_id).await {
                     SessionDecision::Deny(reason) => {
                         warn!(job_id = %req.job_id, reason = %reason, "IPC: job rejected by session mode");
                         let reject_env = Envelope {
@@ -288,7 +269,7 @@ async fn handle_ipc_conn(
                         info!(job_id = %req.job_id, reason = %reason, "IPC: job needs approval (strict mode)");
 
                         let (approval_req, approval_rx) = approval_mgr
-                            .submit(req.clone(), &caller_uid, reason, previous_refusals)
+                            .submit(req.clone(), &caller_id, reason, previous_refusals)
                             .await;
 
                         // Send ApprovalRequest to this IPC client.
@@ -313,7 +294,7 @@ async fn handle_ipc_conn(
                         let smgr = Arc::clone(&session_mgr);
                         let timeout = amgr.default_timeout();
                         let job_id = req.job_id.clone();
-                        let cuid = caller_uid.clone();
+                        let cuid = caller_id.clone();
                         let provider = job_provider.clone();
 
                         tokio::spawn(async move {
@@ -383,15 +364,13 @@ async fn handle_ipc_conn(
             }
             Some(envelope::Payload::ApprovalResponse(resp)) => {
                 info!(job_id = %resp.job_id, approved = resp.approved, "IPC: received approval response");
-                if !resp.approved && !resp.reason.is_empty() {
-                    if let Some((req, _)) = approval_mgr.resolve(&resp).await {
-                        session_mgr
-                            .record_refusal(&caller_uid, &req.tool, &resp.reason)
-                            .await;
-                    }
-                } else {
-                    approval_mgr.resolve(&resp).await;
-                }
+                crate::approval::apply_approval_response(
+                    &approval_mgr,
+                    &session_mgr,
+                    &resp,
+                    &caller_id,
+                )
+                .await;
             }
             Some(envelope::Payload::SetSessionMode(msg)) => {
                 let mode = SessionMode::try_from(msg.mode).unwrap_or(SessionMode::Inactive);
@@ -625,12 +604,6 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> s
     Ok(())
 }
 
-fn set_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(mode);
-    std::fs::set_permissions(path, perms)
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -726,5 +699,36 @@ mod tests {
             }
             other => panic!("expected JobRejected envelope, got {other:?}"),
         }
+    }
+
+    // ── read_frame / write_frame (#15) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn read_frame_rejects_oversized_length_prefix() {
+        use tokio::io::AsyncWriteExt;
+        // 16 MB + 1 byte exceeds the cap.
+        let too_large: u32 = 16 * 1024 * 1024 + 1;
+        let (mut client, mut server) = tokio::io::duplex(64);
+        // Write the length-prefix only (no body needed — rejection is on length).
+        client.write_u32(too_large).await.unwrap();
+        drop(client);
+        let err = read_frame(&mut server).await.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "oversized frame should be InvalidData, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_frame_write_frame_small_valid_roundtrip() {
+        use tokio::io::BufReader;
+        let payload = b"hello ipc frame";
+        let (mut writer_half, reader_half) = tokio::io::duplex(1024);
+        write_frame(&mut writer_half, payload).await.unwrap();
+        drop(writer_half);
+        let mut buf_reader = BufReader::new(reader_half);
+        let got = read_frame(&mut buf_reader).await.unwrap();
+        assert_eq!(got, payload);
     }
 }

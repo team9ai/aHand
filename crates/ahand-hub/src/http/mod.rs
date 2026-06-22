@@ -23,6 +23,7 @@ pub fn router(state: AppState) -> Router {
         .merge(admin::router(state.clone()))
         .merge(control_plane::router(state.clone()))
         .route("/api/health", get(system::health))
+        .route("/api/system/sentry-smoke", post(system::sentry_smoke))
         .route("/api/stats", get(system::stats))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/verify", get(auth::verify))

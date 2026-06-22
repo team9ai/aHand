@@ -34,6 +34,7 @@ pub enum CheckStatus {
 /// Where a detected component comes from.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Preinstalled will be used for Windows Edge detection (M4)
 pub enum CheckSource {
     /// Installed by ahandd under ~/.ahand/...
     Managed,
@@ -95,7 +96,13 @@ pub enum Phase {
     Extracting,
     Installing,
     Verifying,
+    /// Step completed successfully. Rendered with a `✓` prefix by formatters.
     Done,
+    /// Step completed with a failure. Emitted by `wrap_failure` instead of
+    /// `Phase::Done` so formatters can distinguish success from failure
+    /// without inspecting the `Result` from `run_all`/`run_step`.
+    /// Rendered with a `✗` prefix by formatters.
+    Failed,
     /// A raw log line from the running step. Check `ProgressEvent.stream`
     /// to disambiguate stdout / stderr / synthesized info messages.
     /// `message` carries the line content (no trailing newline);
@@ -147,6 +154,9 @@ pub struct DetectedBrowser {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
+// Chromium is not available as a pre-installed browser on Windows, so the
+// variant is constructed only in mac/linux cfg blocks; allow it on Windows.
+#[allow(dead_code)]
 pub enum BrowserKind {
     Chrome,
     Chromium,

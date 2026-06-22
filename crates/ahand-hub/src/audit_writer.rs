@@ -359,14 +359,18 @@ mod tests {
             .unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let mut last_body = String::new();
         loop {
-            if tokio::fs::metadata(&fallback_path).await.is_ok() {
-                let body = tokio::fs::read_to_string(&fallback_path).await.unwrap();
-                assert!(body.contains("\"action\":\"job.created\""));
-                break;
+            match tokio::fs::read_to_string(&fallback_path).await {
+                Ok(body) if body.contains("\"action\":\"job.created\"") => break,
+                Ok(body) => {
+                    last_body = body;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => panic!("failed to read fallback file: {err}"),
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("fallback file was not written");
+                panic!("fallback file did not contain expected audit entry: {last_body:?}");
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

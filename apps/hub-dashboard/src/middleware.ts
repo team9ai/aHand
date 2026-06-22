@@ -7,6 +7,10 @@ export function middleware(request: NextRequest) {
     return rewriteDashboardWebSocket(request);
   }
 
+  if (request.nextUrl.pathname === "/api/sentry-smoke") {
+    return NextResponse.next();
+  }
+
   const session = request.cookies.get("ahand_hub_session");
 
   if (!session && request.nextUrl.pathname.startsWith("/api/proxy/")) {

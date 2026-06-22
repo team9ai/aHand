@@ -321,8 +321,10 @@ impl OutputStream {
         match &self.backend {
             OutputBackend::Memory(memory) => memory.subscribe_terminal(job_id).await,
             OutputBackend::Persistent(store) => {
-                let store = store.clone();
-                let history = store.read_history(&job_id).await?;
+                // Dedicated reader connection established once before returning and
+                // reused for history + every live XREAD poll (see open_reader docs).
+                let mut reader = store.open_reader().await?;
+                let history = reader.read_history(&job_id).await?;
                 let live_job_id = job_id.clone();
 
                 Ok(Box::pin(stream! {
@@ -344,7 +346,7 @@ impl OutputStream {
                     }
 
                     loop {
-                        match store.read_live(&live_job_id, &last_stream_id, 5_000).await {
+                        match reader.read_live(&live_job_id, &last_stream_id, 5_000).await {
                             Ok(items) if items.is_empty() => continue,
                             Ok(items) => {
                                 for item in items {
@@ -385,8 +387,13 @@ impl OutputStream {
         match &self.backend {
             OutputBackend::Memory(memory) => memory.subscribe_from(job_id, last_event_id).await,
             OutputBackend::Persistent(store) => {
-                let store = store.clone();
-                let history = store.read_history(&job_id).await?;
+                // A single dedicated reader connection is established here, before
+                // subscribe() returns, and reused for the history read and every
+                // live XREAD poll. This keeps the blocking XREAD loop off the
+                // per-poll connection-setup path and stops one subscriber's
+                // blocking read from starving others (see open_reader docs).
+                let mut reader = store.open_reader().await?;
+                let history = reader.read_history(&job_id).await?;
                 let live_job_id = job_id.clone();
                 let needs_resync = persistent_history_needs_resync(
                     history.first().map(|item| item.seq),
@@ -419,7 +426,7 @@ impl OutputStream {
                     }
 
                     loop {
-                        match store.read_live(&live_job_id, &last_stream_id, 5_000).await {
+                        match reader.read_live(&live_job_id, &last_stream_id, 5_000).await {
                             Ok(items) if items.is_empty() => continue,
                             Ok(items) => {
                                 for item in items {
@@ -729,5 +736,59 @@ mod tests {
         let body = render_event(event).await;
 
         assert!(body.contains("event: finished"));
+    }
+
+    #[tokio::test]
+    async fn persistent_subscribe_reader_survives_multiple_live_polls() {
+        // Regression for the dedicated-reader connection: the subscribe path now
+        // reuses a single connection across every blocking XREAD poll instead of
+        // re-establishing one per poll. A second event appended after the first
+        // live event must still be delivered over the same reused connection.
+        let stack = ahand_hub_store::test_support::TestStack::start()
+            .await
+            .unwrap();
+        let store = ahand_hub_store::job_output_store::RedisJobOutputStore::new(
+            stack.redis_url(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        let stream = OutputStream::persistent(store.clone());
+        let mut subscriber = stream.subscribe("job-persist-multi".into()).await.unwrap();
+
+        store
+            .append(
+                "job-persist-multi",
+                ahand_hub_store::job_output_store::JobOutputRecord::Stdout("first\n".into()),
+            )
+            .await
+            .unwrap();
+
+        let first = tokio::time::timeout(Duration::from_millis(250), subscriber.next())
+            .await
+            .expect("first live event must arrive over the reused reader")
+            .expect("subscriber should emit the first event")
+            .unwrap();
+        assert!(render_event(first).await.contains("data: first"));
+
+        // Append a second event AFTER the first XREAD poll completed, forcing the
+        // loop to issue another XREAD on the same connection.
+        store
+            .append(
+                "job-persist-multi",
+                ahand_hub_store::job_output_store::JobOutputRecord::Finished {
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let second = tokio::time::timeout(Duration::from_millis(250), subscriber.next())
+            .await
+            .expect("second live event must arrive over the same reused reader")
+            .expect("subscriber should emit the second event")
+            .unwrap();
+        assert!(render_event(second).await.contains("event: finished"));
     }
 }
