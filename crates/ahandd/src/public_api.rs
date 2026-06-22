@@ -556,12 +556,24 @@ impl DaemonHandle {
 fn canonicalize_runtime_provider(
     mut provider: RuntimeProviderConfig,
 ) -> SandboxResult<RuntimeProviderConfig> {
-    provider.executable = provider.executable.canonicalize().map_err(|e| {
+    let executable_entry = if provider.executable.is_absolute() {
+        provider.executable.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                crate::sandbox::SandboxError::unavailable(format!(
+                    "failed to resolve current directory for sandbox runtime executable: {e}"
+                ))
+            })?
+            .join(&provider.executable)
+    };
+    executable_entry.canonicalize().map_err(|e| {
         crate::sandbox::SandboxError::unavailable(format!(
             "failed to resolve sandbox runtime executable '{}': {e}",
-            provider.executable.display()
+            executable_entry.display()
         ))
     })?;
+    provider.executable = executable_entry;
     provider.readonly_roots = provider
         .readonly_roots
         .into_iter()
@@ -1131,6 +1143,34 @@ mod tests {
 
         assert_eq!(err.code, "INVALID_COMMAND");
         handle.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_runtime_provider_preserves_executable_entry_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("runtime").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let alias = bin.join("python");
+        symlink("/bin/echo", &alias).unwrap();
+
+        let provider = canonicalize_runtime_provider(RuntimeProviderConfig {
+            name: "python".to_string(),
+            executable: alias.clone(),
+            readonly_roots: vec![bin.clone(), PathBuf::from("/bin")],
+            env: HashMap::new(),
+            default_timeout: Duration::from_secs(10),
+        })
+        .unwrap();
+
+        assert_eq!(provider.executable, alias);
+        assert!(
+            provider
+                .readonly_roots
+                .contains(&bin.canonicalize().unwrap())
+        );
     }
 
     #[test]

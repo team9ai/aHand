@@ -51,13 +51,17 @@ pub fn resolve_executable(program: &str, path_entries: &[PathBuf]) -> SandboxRes
 
     let program_path = PathBuf::from(program);
     if program_path.is_absolute() {
+        let is_registered_entry_path = path_entries
+            .iter()
+            .any(|entry| program_path.starts_with(entry));
         let resolved = program_path.canonicalize().map_err(|e| {
             SandboxError::command_not_found(format!(
                 "failed to resolve sandbox command '{}': {e}",
                 program
             ))
         })?;
-        if path_entries.iter().any(|entry| resolved.starts_with(entry)) {
+        if is_registered_entry_path || path_entries.iter().any(|entry| resolved.starts_with(entry))
+        {
             return Ok(resolved);
         }
         return Err(SandboxError::invalid_command(format!(
@@ -161,6 +165,26 @@ mod tests {
         let err = resolve_executable(&denied_program.to_string_lossy(), &[allowed]).unwrap_err();
 
         assert_eq!(err.code, "INVALID_COMMAND");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_executable_allows_absolute_alias_under_registered_path_entry() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        let target_dir = temp.path().join("target");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target_program = target_dir.join("python3");
+        std::fs::write(&target_program, "").unwrap();
+        let alias = bin.join("python");
+        symlink(&target_program, &alias).unwrap();
+
+        let resolved = resolve_executable(&alias.to_string_lossy(), &[bin]).unwrap();
+
+        assert_eq!(resolved, target_program.canonicalize().unwrap());
     }
 
     #[tokio::test]
