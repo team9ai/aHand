@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::symlink;
