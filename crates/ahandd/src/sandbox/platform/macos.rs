@@ -1,3 +1,5 @@
+use std::ffi::OsString;
+use std::path::Path;
 use std::process::Stdio;
 
 use tokio::io::AsyncReadExt;
@@ -42,12 +44,10 @@ const SYSTEM_EXECUTABLE_ROOTS: &[&str] = &[
 
 pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
     let policy = render_policy(&request.policy);
+    let args = sandbox_exec_args(policy, &request.executable, &request.args);
     let mut command = Command::new(SANDBOX_EXEC);
     command
-        .arg("-p")
-        .arg(policy)
-        .arg(&request.executable)
-        .args(&request.args)
+        .args(args)
         .current_dir(&request.cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -100,6 +100,17 @@ pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeEx
         exit_code,
         timed_out,
     })
+}
+
+fn sandbox_exec_args(policy: String, executable: &Path, args: &[String]) -> Vec<OsString> {
+    let mut argv = vec![
+        OsString::from("-p"),
+        OsString::from(policy),
+        OsString::from("--"),
+        executable.as_os_str().to_os_string(),
+    ];
+    argv.extend(args.iter().map(OsString::from));
+    argv
 }
 
 pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
@@ -170,6 +181,43 @@ mod tests {
         assert!(sbpl.contains("(allow sysctl-read)"));
         assert!(sbpl.contains("(allow file-read* (literal \"/\"))"));
         assert!(!sbpl.contains("(subpath \"/etc\")"));
+    }
+
+    #[test]
+    fn rendered_policy_allows_runtime_path_and_workspace_only_for_writes() {
+        let policy = RuntimeSandboxPolicy {
+            writable_root: PathBuf::from("/sessions/s1"),
+            readonly_roots: vec![PathBuf::from("/runtime/python")],
+            network: NetworkPolicy::Enabled,
+        };
+
+        let sbpl = render_policy(&policy);
+
+        assert!(sbpl.contains("(allow file-read* (subpath \"/runtime/python\"))"));
+        assert!(sbpl.contains("(allow file-read* (subpath \"/sessions/s1\"))"));
+        assert!(sbpl.contains("(allow file-write* (subpath \"/sessions/s1\"))"));
+        assert!(!sbpl.contains("(allow file-write* (subpath \"/runtime/python\"))"));
+        assert!(sbpl.contains("(allow network*"));
+    }
+
+    #[test]
+    fn sandbox_exec_argv_separates_policy_from_sandboxed_command() {
+        let argv = sandbox_exec_args(
+            "(version 1)".to_string(),
+            &PathBuf::from("/runtime/python/bin/python"),
+            &["-c".to_string(), "print('ok')".to_string()],
+        );
+        let argv = argv
+            .iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(argv[0], "-p");
+        assert_eq!(argv[1], "(version 1)");
+        assert_eq!(argv[2], "--");
+        assert_eq!(argv[3], "/runtime/python/bin/python");
+        assert_eq!(argv[4], "-c");
+        assert_eq!(argv[5], "print('ok')");
     }
 
     #[tokio::test]
