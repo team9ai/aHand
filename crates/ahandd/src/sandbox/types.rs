@@ -10,6 +10,8 @@ pub const CODE_INVALID_SANDBOX_PATH: &str = "INVALID_SANDBOX_PATH";
 pub const CODE_UNKNOWN_FILE_REF: &str = "UNKNOWN_FILE_REF";
 pub const CODE_UNKNOWN_VERSION: &str = "UNKNOWN_VERSION";
 pub const CODE_RUNTIME_NOT_REGISTERED: &str = "RUNTIME_NOT_REGISTERED";
+pub const CODE_INVALID_COMMAND: &str = "INVALID_COMMAND";
+pub const CODE_COMMAND_NOT_FOUND: &str = "COMMAND_NOT_FOUND";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -77,12 +79,30 @@ pub struct RuntimeExecuteRequest {
     pub timeout: Option<Duration>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxExecRequest {
+    pub command: Vec<String>,
+    pub cwd: Option<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub timeout: Option<Duration>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeExecuteResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+}
+
+pub type SandboxExecResult = RuntimeExecuteResult;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredExecEnvironment {
+    pub path_entries: Vec<PathBuf>,
+    pub readonly_roots: Vec<PathBuf>,
+    pub env: HashMap<String, String>,
+    pub default_timeout: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +170,14 @@ impl SandboxError {
         Self::new(CODE_INVALID_SANDBOX_PATH, message)
     }
 
+    pub fn invalid_command(message: impl Into<String>) -> Self {
+        Self::new(CODE_INVALID_COMMAND, message)
+    }
+
+    pub fn command_not_found(message: impl Into<String>) -> Self {
+        Self::new(CODE_COMMAND_NOT_FOUND, message)
+    }
+
     pub fn runtime_not_registered(message: impl Into<String>) -> Self {
         Self::new(CODE_RUNTIME_NOT_REGISTERED, message)
     }
@@ -215,6 +243,49 @@ mod tests {
         );
         assert_eq!(provider.env["PYTHONPATH"], "/opt/coffice/python/lib");
         assert_eq!(provider.default_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn sandbox_exec_request_keeps_command_cwd_env_and_timeout() {
+        let request = SandboxExecRequest {
+            command: vec![
+                "python".to_string(),
+                "-c".to_string(),
+                "print('ok')".to_string(),
+            ],
+            cwd: Some(PathBuf::from("workspace")),
+            env: HashMap::from([("EXAMPLE".to_string(), "1".to_string())]),
+            timeout: Some(Duration::from_secs(7)),
+        };
+
+        assert_eq!(request.command[0], "python");
+        assert_eq!(request.cwd, Some(PathBuf::from("workspace")));
+        assert_eq!(request.env["EXAMPLE"], "1");
+        assert_eq!(request.timeout, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn registered_exec_environment_preserves_path_roots_env_and_timeout() {
+        let env = RegisteredExecEnvironment {
+            path_entries: vec![PathBuf::from("/runtime/python/bin")],
+            readonly_roots: vec![PathBuf::from("/runtime/python")],
+            env: HashMap::from([("PYTHONNOUSERSITE".to_string(), "1".to_string())]),
+            default_timeout: Duration::from_secs(30),
+        };
+
+        assert_eq!(env.path_entries, vec![PathBuf::from("/runtime/python/bin")]);
+        assert_eq!(env.readonly_roots, vec![PathBuf::from("/runtime/python")]);
+        assert_eq!(env.env["PYTHONNOUSERSITE"], "1");
+        assert_eq!(env.default_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn command_error_constructors_preserve_codes() {
+        let invalid = SandboxError::invalid_command("command must not be empty");
+        let missing = SandboxError::command_not_found("python was not found");
+
+        assert_eq!(invalid.code, "INVALID_COMMAND");
+        assert_eq!(missing.code, "COMMAND_NOT_FOUND");
     }
 
     #[test]
