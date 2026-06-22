@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use super::types::{
-    FileVersion, HostFileRef, NetworkPolicy, PermissionSnapshot, RuntimeProviderConfig,
-    SandboxError, SandboxFile, SandboxPermissionMode, SandboxResult, SandboxSessionConfig,
+    FileVersion, HostFileRef, NetworkPolicy, PermissionSnapshot, RegisteredExecEnvironment,
+    RuntimeProviderConfig, SandboxError, SandboxFile, SandboxPermissionMode, SandboxResult,
+    SandboxSessionConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -47,6 +49,40 @@ impl SandboxSessionState {
             };
         }
         self.permission.clone()
+    }
+
+    pub fn exec_environment(&self) -> RegisteredExecEnvironment {
+        let mut path_entries = Vec::new();
+        let mut readonly_roots = Vec::new();
+        let mut env = HashMap::new();
+
+        for provider in self.runtimes.values() {
+            if let Some(parent) = provider.executable.parent() {
+                push_unique_path(&mut path_entries, parent.to_path_buf());
+            }
+            for root in &provider.readonly_roots {
+                push_unique_path(&mut readonly_roots, root.clone());
+            }
+            for (key, value) in &provider.env {
+                env.insert(key.clone(), value.clone());
+            }
+        }
+
+        path_entries.sort();
+        readonly_roots.sort();
+
+        RegisteredExecEnvironment {
+            path_entries,
+            readonly_roots,
+            env,
+            default_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
     }
 }
 
@@ -157,5 +193,98 @@ mod tests {
         assert_eq!(same.version, 1);
         assert_eq!(changed.version, 2);
         assert_eq!(changed.mode, SandboxPermissionMode::Full);
+    }
+
+    #[test]
+    fn exec_environment_aggregates_provider_paths_roots_and_env() {
+        let temp = tempfile::tempdir().unwrap();
+        let python_root = temp.path().join("python");
+        let node_root = temp.path().join("node");
+        let python_bin = python_root.join("bin");
+        let node_bin = node_root.join("bin");
+        fs::create_dir_all(&python_bin).unwrap();
+        fs::create_dir_all(&node_bin).unwrap();
+        fs::write(python_bin.join("python"), "").unwrap();
+        fs::write(node_bin.join("node"), "").unwrap();
+
+        let mut session = SandboxSessionState::from_config(config(temp.path().into()));
+        session.runtimes.insert(
+            "python".to_string(),
+            RuntimeProviderConfig {
+                name: "python".to_string(),
+                executable: python_bin.join("python").canonicalize().unwrap(),
+                readonly_roots: vec![python_root.canonicalize().unwrap()],
+                env: std::collections::HashMap::from([(
+                    "PYTHONNOUSERSITE".to_string(),
+                    "1".to_string(),
+                )]),
+                default_timeout: std::time::Duration::from_secs(11),
+            },
+        );
+        session.runtimes.insert(
+            "node".to_string(),
+            RuntimeProviderConfig {
+                name: "node".to_string(),
+                executable: node_bin.join("node").canonicalize().unwrap(),
+                readonly_roots: vec![node_root.canonicalize().unwrap()],
+                env: std::collections::HashMap::from([(
+                    "NODE_PATH".to_string(),
+                    node_root.join("node_modules").to_string_lossy().to_string(),
+                )]),
+                default_timeout: std::time::Duration::from_secs(17),
+            },
+        );
+
+        let env = session.exec_environment();
+
+        assert_eq!(
+            env.path_entries,
+            vec![
+                node_bin.canonicalize().unwrap(),
+                python_bin.canonicalize().unwrap()
+            ]
+        );
+        assert_eq!(
+            env.readonly_roots,
+            vec![
+                node_root.canonicalize().unwrap(),
+                python_root.canonicalize().unwrap()
+            ]
+        );
+        assert_eq!(env.env["PYTHONNOUSERSITE"], "1");
+        assert!(env.env["NODE_PATH"].contains("node_modules"));
+        assert_eq!(env.default_timeout, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn exec_environment_deduplicates_provider_paths_and_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_root = temp.path().join("runtime");
+        let runtime_bin = runtime_root.join("bin");
+        fs::create_dir_all(&runtime_bin).unwrap();
+        fs::write(runtime_bin.join("python"), "").unwrap();
+        fs::write(runtime_bin.join("node"), "").unwrap();
+
+        let mut session = SandboxSessionState::from_config(config(temp.path().into()));
+        for name in ["python", "node"] {
+            session.runtimes.insert(
+                name.to_string(),
+                RuntimeProviderConfig {
+                    name: name.to_string(),
+                    executable: runtime_bin.join(name).canonicalize().unwrap(),
+                    readonly_roots: vec![runtime_root.canonicalize().unwrap()],
+                    env: std::collections::HashMap::new(),
+                    default_timeout: std::time::Duration::from_secs(30),
+                },
+            );
+        }
+
+        let env = session.exec_environment();
+
+        assert_eq!(env.path_entries, vec![runtime_bin.canonicalize().unwrap()]);
+        assert_eq!(
+            env.readonly_roots,
+            vec![runtime_root.canonicalize().unwrap()]
+        );
     }
 }
