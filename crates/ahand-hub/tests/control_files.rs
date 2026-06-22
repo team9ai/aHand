@@ -88,6 +88,116 @@ fn mint_cp_jwt_with_scope(external_user_id: &str, scope: &str) -> String {
     token
 }
 
+fn mint_cp_jwt_with_device_ids(external_user_id: &str, device_ids: Option<Vec<String>>) -> String {
+    use ahand_hub_core::auth::mint_control_plane_jwt;
+    let (token, _) = mint_control_plane_jwt(
+        JWT_SECRET.as_bytes(),
+        external_user_id,
+        "jobs:execute",
+        device_ids,
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    token
+}
+
+#[tokio::test]
+async fn control_files_upload_url_requires_auth() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{}/api/control/files/upload-url",
+            server.http_base_url()
+        ))
+        .json(&serde_json::json!({ "device_id": "device-2" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_files_upload_url_rejects_wrong_owner() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let device = attach_owned_device(&server, "cf-upload-owner", "owner-a").await;
+    let token = mint_cp_jwt("owner-b");
+
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{}/api/control/files/upload-url",
+            server.http_base_url()
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "device_id": "cf-upload-owner" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::FORBIDDEN);
+    drop(device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_files_upload_url_returns_s3_disabled_without_s3() {
+    let server = spawn_server_with_state(support::test_state().await).await;
+    let device = attach_owned_device(&server, "cf-upload-s3", "owner-a").await;
+    let token = mint_cp_jwt("owner-a");
+
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{}/api/control/files/upload-url",
+            server.http_base_url()
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "device_id": "cf-upload-s3" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "S3_DISABLED");
+    drop(device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_files_write_rejects_upload_key_for_unscoped_device() {
+    let server = spawn_server_with_state(support::test_state_with_s3().await).await;
+    let device = attach_owned_device(&server, "cf-upload-scope-b", "owner-scope").await;
+    let token =
+        mint_cp_jwt_with_device_ids("owner-scope", Some(vec!["cf-upload-scope-b".to_string()]));
+
+    let res = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .post(format!("{}/api/control/files", server.http_base_url()))
+        .bearer_auth(token)
+        .json(&serde_json::json!({
+            "device_id": "cf-upload-scope-b",
+            "operation": "write",
+            "params": {
+                "path": "/tmp/out.txt",
+                "full_write": {
+                    "s3_object_key": "file-ops/cf-upload-scope-a/staged.bin"
+                }
+            },
+            "timeout_ms": 1_000,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_S3_OBJECT_KEY");
+    drop(device);
+    server.shutdown().await;
+}
+
 #[tokio::test]
 async fn control_files_401_without_auth_header() {
     let server = spawn_server_with_state(support::test_state().await).await;

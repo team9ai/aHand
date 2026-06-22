@@ -1484,6 +1484,71 @@ async fn cancelled_finish_reports_cancelled_error_code() {
 }
 
 #[tokio::test]
+async fn create_job_timeout_streams_error_and_sends_cancel() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-dev-timeout", "user-cp").await;
+    let token = mint_cp_jwt(&server, "user-cp");
+
+    let resp = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "cp-dev-timeout",
+            "tool": "sleep",
+            "args": ["10"],
+            "timeoutMs": 500,
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let job_id = body["jobId"].as_str().unwrap().to_string();
+
+    // Subscribe before waiting on daemon delivery so slow CI cannot let the
+    // timeout finalize and remove the job before the stream endpoint is opened.
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/stream",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let stream_task = tokio::spawn(async move {
+        let mut stream = resp.bytes_stream();
+        let mut body = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            body.push_str(&String::from_utf8_lossy(&chunk));
+            if body.contains("event: error") {
+                break;
+            }
+        }
+        body
+    });
+
+    let received = recv_job_request(&mut device).await;
+    assert_eq!(received.job_id, job_id);
+
+    let cancel = tokio::time::timeout(Duration::from_secs(5), recv_cancel(&mut device))
+        .await
+        .expect("expected timeout cancel envelope");
+    assert_eq!(cancel.job_id, job_id);
+
+    let body = tokio::time::timeout(Duration::from_secs(5), stream_task)
+        .await
+        .expect("expected timeout SSE event")
+        .unwrap();
+    assert!(body.contains("event: error"));
+    assert!(body.contains(r#""code":"timeout""#));
+    assert!(server.state().control_jobs.get(&job_id).is_none());
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn stderr_and_progress_with_message_render_correctly() {
     // Covers the stderr + progress SSE render branches explicitly.
     // (Progress-with-message is reserved for future use but we
@@ -1656,6 +1721,103 @@ async fn sse_late_joiner_after_terminal_event_gets_empty_stream() {
         "late-joiner should get 404 (job entry cleaned up after finalize), got {}",
         resp.status()
     );
+
+    drop(device);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_job_output_stream_replays_after_terminal_event() {
+    let server = spawn_server_with_state(test_state().await).await;
+    let mut device = attach_owned_device(&server, "cp-output", "user-output").await;
+    let token = mint_cp_jwt(&server, "user-output");
+
+    let job_id = post_create_job(
+        &server,
+        &token,
+        serde_json::json!({ "deviceId": "cp-output", "tool": "echo" }),
+    )
+    .await
+    .json::<serde_json::Value>()
+    .await
+    .unwrap()["jobId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = recv_job_request(&mut device).await;
+
+    send_envelope(
+        &mut device,
+        ahand_protocol::Envelope {
+            device_id: "cp-output".into(),
+            msg_id: "output-1".into(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::JobEvent(ahand_protocol::JobEvent {
+                job_id: job_id.clone(),
+                event: Some(ahand_protocol::job_event::Event::StdoutChunk(
+                    b"streamed line\n".to_vec(),
+                )),
+            })),
+            ..Default::default()
+        },
+    )
+    .await;
+    send_envelope(
+        &mut device,
+        ahand_protocol::Envelope {
+            device_id: "cp-output".into(),
+            msg_id: "output-finished".into(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::JobFinished(
+                ahand_protocol::JobFinished {
+                    job_id: job_id.clone(),
+                    exit_code: 0,
+                    error: String::new(),
+                },
+            )),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if server.state().control_jobs.get(&job_id).is_none() {
+            break;
+        }
+    }
+    assert!(
+        server.state().control_jobs.get(&job_id).is_none(),
+        "control job tracker should be finalized before late output subscribe"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{}/api/control/jobs/{job_id}/output",
+            server.http_base_url()
+        ))
+        .bearer_auth(&token)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut stream = resp.bytes_stream();
+    let mut body = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        body.push_str(&String::from_utf8_lossy(&chunk));
+        if body.contains("event: finished") {
+            break;
+        }
+    }
+
+    assert!(body.contains("id: 1"), "body was: {body}");
+    assert!(body.contains("event: stdout"), "body was: {body}");
+    assert!(body.contains("data: streamed line"), "body was: {body}");
+    assert!(body.contains("event: finished"), "body was: {body}");
+    assert!(body.contains(r#""exit_code":0"#), "body was: {body}");
 
     drop(device);
     server.shutdown().await;

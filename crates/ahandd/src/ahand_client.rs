@@ -9,10 +9,11 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tokio::sync::watch;
 
+use crate::app_tool_registry::AppToolRegistry;
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::config::Config;
@@ -20,6 +21,7 @@ use crate::device_identity::DeviceIdentity;
 use crate::executor::{self, EnvelopeSink as _};
 use crate::file_manager::FileManager;
 use crate::outbox::{Outbox, prepare_outbound};
+use crate::plugin_runtime::{CapabilityKind, CapabilityUnavailable, JobProvider};
 use crate::registry::{IsKnown, JobRegistry};
 use crate::session::{SessionDecision, SessionManager};
 use crate::store::{Direction, RunStore};
@@ -62,9 +64,17 @@ struct QueuedEnvelope {
 /// replied by tungstenite per RFC 6455) before its watchdog timeout
 /// fires — that's how we detect zombie TCP connections that survived
 /// macOS sleep/wake or NAT timeout without any visible socket error.
+///
+/// `DirectEnvelope` bypasses outbox SEQUENCING/replay (the snapshot is
+/// idempotent and re-generated fresh at the start of every new connection),
+/// but is still trace-logged to RunStore so the operator can observe it.
+/// Encoding happens inside the send task so the unencoded `Envelope` is
+/// available for store logging.
+#[allow(clippy::large_enum_variant)] // Envelope is the hot path; boxing adds indirection cost
 enum OutboundFrame {
     Envelope(QueuedEnvelope),
     WsPing(Vec<u8>),
+    DirectEnvelope(Envelope),
 }
 
 impl BufferedEnvelopeSender {
@@ -76,6 +86,22 @@ impl BufferedEnvelopeSender {
     /// already exited (session tearing down).
     fn send_ping(&self, payload: Vec<u8>) -> Result<(), ()> {
         self.tx.send(OutboundFrame::WsPing(payload)).map_err(|_| ())
+    }
+
+    /// Send an envelope WITHOUT going through the outbox sequencing/replay
+    /// pipeline. Used for idempotent push messages (e.g. `AppToolsUpdate`
+    /// snapshots) that must not be replayed on reconnect because a fresh
+    /// snapshot is generated at the start of every new connection. The
+    /// envelope is still trace-logged to RunStore; encoding happens in the
+    /// send task.
+    ///
+    /// do NOT use for traffic requiring at-least-once delivery — anything
+    /// that must survive reconnect goes through send(); direct frames carry
+    /// seq=0 and sit outside the ack/dedup window.
+    fn send_direct(&self, envelope: Envelope) -> Result<(), ()> {
+        self.tx
+            .send(OutboundFrame::DirectEnvelope(envelope))
+            .map_err(|_| ())
     }
 }
 
@@ -94,6 +120,7 @@ impl crate::executor::EnvelopeSink for BufferedEnvelopeSender {
 /// Coarse outcome of a single `connect()` attempt, used by library callers
 /// that want to observe handshake success/failure without scraping logs.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // variant fields carried for future observers / SDK consumers
 pub enum ConnectOutcome {
     /// The Hello handshake was accepted.
     HandshakeAccepted,
@@ -136,6 +163,7 @@ pub async fn run(
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
     file_mgr: Arc<FileManager>,
+    app_tools: Arc<AppToolRegistry>,
 ) -> anyhow::Result<()> {
     run_with_reporter(
         config,
@@ -147,6 +175,7 @@ pub async fn run(
         approval_broadcast_tx,
         browser_mgr,
         file_mgr,
+        app_tools,
         Arc::new(NoopReporter),
     )
     .await
@@ -167,6 +196,7 @@ pub async fn run_with_reporter(
     approval_broadcast_tx: broadcast::Sender<Envelope>,
     browser_mgr: Arc<BrowserManager>,
     file_mgr: Arc<FileManager>,
+    app_tools: Arc<AppToolRegistry>,
     reporter: Arc<dyn ClientReporter>,
 ) -> anyhow::Result<()> {
     let hub_config = config.hub_config();
@@ -207,6 +237,7 @@ pub async fn run_with_reporter(
             &approval_broadcast_tx,
             &browser_mgr,
             &file_mgr,
+            &app_tools,
             reporter.as_ref(),
         )
         .await;
@@ -244,6 +275,7 @@ async fn connect_reporting(
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
     file_mgr: &Arc<FileManager>,
+    app_tools: &Arc<AppToolRegistry>,
     reporter: &dyn ClientReporter,
 ) -> anyhow::Result<()> {
     let auth_modes = hello_auth_modes(bearer_token.as_deref());
@@ -264,6 +296,7 @@ async fn connect_reporting(
             approval_broadcast_tx,
             browser_mgr,
             file_mgr,
+            app_tools,
             reporter,
         )
         .await;
@@ -300,6 +333,7 @@ async fn connect_with_auth(
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
     browser_mgr: &Arc<BrowserManager>,
     file_mgr: &Arc<FileManager>,
+    app_tools: &Arc<AppToolRegistry>,
     reporter: &dyn ClientReporter,
 ) -> Result<(), ConnectError> {
     // OS-level TCP keepalive is the lower-tier twin of the WS Ping/Pong
@@ -321,12 +355,18 @@ async fn connect_with_auth(
     info!(last_ack, "connected, sending Hello");
 
     // Send Hello envelope — Hello is NOT stamped (seq=0), it's a connection signal.
-    let hello = build_hello_envelope(
+    let capability_router = crate::plugin_runtime::build_router(browser_mgr, file_mgr)
+        .await
+        .map_err(ConnectError::Session)?;
+    let hello = build_hello_envelope_with_capabilities(
         device_id,
         identity,
         last_ack,
-        browser_mgr.is_enabled(),
-        file_mgr.is_enabled(),
+        capability_router
+            .active_wire_capabilities()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         &challenge.nonce,
         match auth_mode {
             HelloAuthMode::Ed25519 => None,
@@ -382,6 +422,72 @@ async fn connect_with_auth(
         crate::updater::spawn_update(params, device_id.to_string(), tx.clone());
     }
 
+    // AppToolsUpdate advertising:
+    //
+    // Subscribe to revision changes BEFORE sending the initial snapshot so
+    // that any registration that races the post-handshake window (i.e. a
+    // revision bump between subscribe and the initial send) is captured by
+    // the watcher task and not silently dropped.
+    //
+    // Ordering:
+    //   1. subscribe_revision()          → get a Receiver
+    //   2. borrow_and_update()           → mark current revision as "seen"
+    //   3. send initial snapshot         → covers any tools registered before connect
+    //   4. spawn watcher task            → fires on every subsequent bump
+    //
+    // Any revision bump after step 2 wakes the watcher (step 4) and
+    // triggers a fresh snapshot — no duplicate and no missed update.
+    {
+        let mut revision_rx = app_tools.subscribe_revision();
+        // Mark current revision as seen so the watcher doesn't re-send the
+        // initial snapshot.
+        revision_rx.borrow_and_update();
+
+        // Send the initial snapshot (covers all tools registered before or
+        // during the handshake window). Use send_direct so this envelope is
+        // NOT added to the outbox — snapshots are idempotent and must not be
+        // replayed on reconnect (a fresh snapshot is generated each time).
+        let initial_snap = app_tools.snapshot().await;
+        debug!(
+            revision = initial_snap.revision,
+            tool_count = initial_snap.tools.len(),
+            "advertising app tools snapshot"
+        );
+        let _ = tx.send_direct(app_tools_snapshot_envelope(device_id, initial_snap));
+
+        // Spawn a connection-scoped watcher that re-sends the snapshot on
+        // every registry mutation.  Exits when `close_tx` fires (connection
+        // teardown) or when `tx` is dropped (mpsc closes).
+        let watcher_tx = tx.clone();
+        let watcher_app_tools = Arc::clone(app_tools);
+        let watcher_device_id = device_id.to_string();
+        let mut watcher_close_rx = close_rx.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = watcher_close_rx.changed() => {
+                        debug!("app-tools watcher exiting");
+                        break;
+                    }
+                    changed = revision_rx.changed() => {
+                        if changed.is_err() {
+                            debug!("app-tools watcher exiting");
+                            break;
+                        }
+                        let snap = watcher_app_tools.snapshot().await;
+                        debug!(revision = snap.revision, tool_count = snap.tools.len(), "advertising app tools snapshot");
+                        // send_direct: snapshots are idempotent, must not be
+                        // added to the outbox for replay on reconnect.
+                        if watcher_tx.send_direct(app_tools_snapshot_envelope(&watcher_device_id, snap)).is_err() {
+                            debug!("app-tools watcher exiting");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Task: receive OutboundFrame from executors + ws-ping task, stamp + encode
     // + send over WS. Multiplexed so the sink stays single-owner.
     let send_handle = tokio::spawn(async move {
@@ -395,6 +501,14 @@ async fn connect_with_auth(
                     tungstenite::Message::Binary(queued.frame)
                 }
                 OutboundFrame::WsPing(payload) => tungstenite::Message::Ping(payload),
+                // Direct envelopes (e.g. AppToolsUpdate snapshots) bypass
+                // outbox sequencing/replay but are still trace-logged.
+                OutboundFrame::DirectEnvelope(envelope) => {
+                    if let Some(s) = &store_send {
+                        s.log_envelope(&envelope, Direction::Outbound).await;
+                    }
+                    tungstenite::Message::Binary(envelope.encode_to_vec())
+                }
             };
             if sink.send(msg).await.is_err() {
                 break;
@@ -523,6 +637,8 @@ async fn connect_with_auth(
                     store,
                     approval_mgr,
                     approval_broadcast_tx,
+                    browser_mgr,
+                    file_mgr,
                 )
                 .await;
             }
@@ -532,16 +648,13 @@ async fn connect_with_auth(
             }
             Some(envelope::Payload::ApprovalResponse(resp)) => {
                 info!(job_id = %resp.job_id, approved = resp.approved, "received approval response from cloud");
-                // Record refusal if reason is provided.
-                if !resp.approved && !resp.reason.is_empty() {
-                    if let Some((req, _)) = approval_mgr.resolve(&resp).await {
-                        session_mgr
-                            .record_refusal(caller_uid, &req.tool, &resp.reason)
-                            .await;
-                    }
-                } else {
-                    approval_mgr.resolve(&resp).await;
-                }
+                crate::approval::apply_approval_response(
+                    approval_mgr,
+                    session_mgr,
+                    &resp,
+                    caller_uid,
+                )
+                .await;
             }
             Some(envelope::Payload::SetSessionMode(msg)) => {
                 handle_set_session_mode(device_id, session_mgr, &msg, &tx).await;
@@ -550,8 +663,16 @@ async fn connect_with_auth(
                 handle_session_query(device_id, session_mgr, &query, &tx).await;
             }
             Some(envelope::Payload::BrowserRequest(req)) => {
-                handle_browser_request(device_id, caller_uid, &req, &tx, session_mgr, browser_mgr)
-                    .await;
+                handle_browser_request(
+                    device_id,
+                    caller_uid,
+                    &req,
+                    &tx,
+                    session_mgr,
+                    browser_mgr,
+                    file_mgr,
+                )
+                .await;
             }
             Some(envelope::Payload::FileRequest(req)) => {
                 handle_file_request(
@@ -560,10 +681,24 @@ async fn connect_with_auth(
                     req,
                     &tx,
                     session_mgr,
+                    browser_mgr,
                     file_mgr,
                     approval_mgr,
                     approval_broadcast_tx,
                     &close_rx,
+                )
+                .await;
+            }
+            Some(envelope::Payload::AppToolRequest(req)) => {
+                handle_app_tool_request(
+                    device_id,
+                    caller_uid,
+                    req,
+                    &tx,
+                    session_mgr,
+                    approval_mgr,
+                    approval_broadcast_tx,
+                    app_tools,
                 )
                 .await;
             }
@@ -611,7 +746,7 @@ async fn connect_with_auth(
         }
     }
 
-    // Teardown order matters here. Three independent things still hold
+    // Teardown order matters here. Four independent things still hold
     // sender clones and could wedge `send_handle.await`:
     //
     // 1. Detached file-approval tasks spawned by handle_file_request hold
@@ -626,6 +761,11 @@ async fn connect_with_auth(
     //    `rx.recv()` indefinitely until the WS broke naturally. Aborting
     //    the task drops its clone.
     // 3. Same logic for `ws_ping_task`.
+    // 4. The app-tools watcher task holds `watcher_tx` (a clone of `tx`)
+    //    and exits via `watcher_close_rx.changed()`. Dropping `_close_guard`
+    //    fires `close_tx`, which wakes the watcher so it releases its clone
+    //    before `send_handle.await` is reached. The guard drop MUST precede
+    //    `send_handle.await` for this reason.
     drop(_close_guard);
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
@@ -756,6 +896,22 @@ fn set_tcp_keepcnt_macos(stream: &tokio::net::TcpStream, count: u32) -> std::io:
     Ok(())
 }
 
+fn app_tools_snapshot_envelope(
+    device_id: &str,
+    snapshot: ahand_protocol::AppToolsUpdate,
+) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolsUpdate(snapshot)),
+        ..Default::default()
+    }
+}
+
+// Bin target never calls this directly; exercised via lib integration tests
+// (hub_handshake) and external SDK consumers.
+#[allow(dead_code)]
 pub fn build_hello_envelope(
     device_id: &str,
     identity: &DeviceIdentity,
@@ -765,7 +921,6 @@ pub fn build_hello_envelope(
     challenge_nonce: &[u8],
     bearer_token: Option<String>,
 ) -> Envelope {
-    let signed_at_ms = identity.next_hello_signed_at_ms();
     let mut capabilities = vec!["exec".to_string()];
     if browser_enabled {
         // Device-reported capability name binds to the concrete
@@ -780,11 +935,30 @@ pub fn build_hello_envelope(
         capabilities.push("file".to_string());
     }
 
+    build_hello_envelope_with_capabilities(
+        device_id,
+        identity,
+        last_ack,
+        capabilities,
+        challenge_nonce,
+        bearer_token,
+    )
+}
+
+pub fn build_hello_envelope_with_capabilities(
+    device_id: &str,
+    identity: &DeviceIdentity,
+    last_ack: u64,
+    capabilities: Vec<String>,
+    challenge_nonce: &[u8],
+    bearer_token: Option<String>,
+) -> Envelope {
+    let signed_at_ms = identity.next_hello_signed_at_ms();
     let mut hello = Hello {
         version: env!("CARGO_PKG_VERSION").to_string(),
         hostname: gethostname::gethostname().to_string_lossy().to_string(),
         os: std::env::consts::OS.to_string(),
-        capabilities,
+        capabilities: hello_capabilities_from_wire_names(capabilities),
         last_ack,
         auth: None,
     };
@@ -814,12 +988,88 @@ pub fn build_hello_envelope(
     }
 }
 
+fn hello_capabilities_from_wire_names(capabilities: Vec<String>) -> Vec<String> {
+    capabilities
+}
+
 pub fn hello_auth_modes(bootstrap_token: Option<&str>) -> Vec<HelloAuthMode> {
     let mut modes = vec![HelloAuthMode::Ed25519];
     if let Some(token) = bootstrap_token {
         modes.push(HelloAuthMode::Bootstrap(token.to_owned()));
     }
     modes
+}
+
+fn reject_job_for_capability_error<T>(
+    device_id: &str,
+    req: &ahand_protocol::JobRequest,
+    tx: &T,
+    reason: String,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    warn!(
+        job_id = %req.job_id,
+        tool = %req.tool,
+        reason = %reason,
+        "job rejected by capability router"
+    );
+    let reject_env = Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::JobRejected(JobRejected {
+            job_id: req.job_id.clone(),
+            reason,
+        })),
+        ..Default::default()
+    };
+    let _ = tx.send(reject_env);
+}
+
+fn browser_unavailable_response(
+    req: &ahand_protocol::BrowserRequest,
+    unavailable: &CapabilityUnavailable,
+) -> BrowserResponse {
+    BrowserResponse {
+        request_id: req.request_id.clone(),
+        session_id: req.session_id.clone(),
+        success: false,
+        error: unavailable.to_protocol_message(),
+        ..Default::default()
+    }
+}
+
+fn file_unavailable_response(
+    req: &ahand_protocol::FileRequest,
+    path: &str,
+    unavailable: &CapabilityUnavailable,
+) -> ahand_protocol::FileResponse {
+    crate::file_manager::error_response(
+        req.request_id.clone(),
+        ahand_protocol::FileErrorCode::PolicyDenied,
+        path,
+        &unavailable.to_protocol_message(),
+    )
+}
+
+fn managed_runtime_interactive_rejection(
+    device_id: &str,
+    req: &ahand_protocol::JobRequest,
+) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::JobRejected(JobRejected {
+            job_id: req.job_id.clone(),
+            reason: format!(
+                "managed runtime tool {} does not support interactive PTY jobs",
+                req.tool
+            ),
+        })),
+        ..Default::default()
+    }
 }
 
 /// Handle an incoming JobRequest with idempotency + session mode check.
@@ -834,9 +1084,36 @@ async fn handle_job_request<T>(
     store: &Option<Arc<RunStore>>,
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
+    browser_mgr: &Arc<BrowserManager>,
+    file_mgr: &Arc<FileManager>,
 ) where
     T: crate::executor::EnvelopeSink,
 {
+    let provider_registry =
+        match crate::plugin_runtime::build_provider_registry(browser_mgr, file_mgr).await {
+            Ok(registry) => registry,
+            Err(err) => {
+                reject_job_for_capability_error(
+                    device_id,
+                    &req,
+                    tx,
+                    format!("exec capability unavailable: failed to inspect host resources: {err}"),
+                );
+                return;
+            }
+        };
+    let job_provider = match provider_registry.resolve_job_provider(&req.tool) {
+        Ok(provider) => provider,
+        Err(err) => {
+            reject_job_for_capability_error(device_id, &req, tx, err.to_protocol_message());
+            return;
+        }
+    };
+    if req.interactive && matches!(job_provider, JobProvider::ManagedRuntime { .. }) {
+        let _ = tx.send(managed_runtime_interactive_rejection(device_id, &req));
+        return;
+    }
+
     // Idempotency check.
     match registry.is_known(&req.job_id).await {
         IsKnown::Running => {
@@ -879,7 +1156,7 @@ async fn handle_job_request<T>(
             let _ = tx.send(reject_env);
         }
         SessionDecision::Allow => {
-            spawn_job(device_id, req, tx, registry, store).await;
+            spawn_job(device_id, req, job_provider, tx, registry, store).await;
         }
         SessionDecision::NeedsApproval {
             reason,
@@ -914,13 +1191,14 @@ async fn handle_job_request<T>(
             let timeout = amgr.default_timeout();
             let job_id = req.job_id.clone();
             let cuid = caller_uid.to_string();
+            let job_provider = job_provider.clone();
 
             tokio::spawn(async move {
                 let result = tokio::time::timeout(timeout, approval_rx).await;
                 match result {
                     Ok(Ok(resp)) if resp.approved => {
                         info!(job_id = %job_id, "approval granted");
-                        spawn_job(&did, req, &tx_clone, &reg, &st).await;
+                        spawn_job(&did, req, job_provider, &tx_clone, &reg, &st).await;
                     }
                     Ok(Ok(resp)) => {
                         // Denied — record refusal if reason provided.
@@ -970,6 +1248,7 @@ async fn handle_job_request<T>(
 async fn spawn_job<T>(
     device_id: &str,
     req: ahand_protocol::JobRequest,
+    provider: JobProvider,
     tx: &T,
     registry: &Arc<JobRegistry>,
     store: &Option<Arc<RunStore>>,
@@ -986,6 +1265,11 @@ async fn spawn_job<T>(
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
 
     if interactive {
+        if matches!(provider, JobProvider::ManagedRuntime { .. }) {
+            let _ = tx.send(managed_runtime_interactive_rejection(device_id, &req));
+            return;
+        }
+
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<executor::StdinInput>();
         reg.register_interactive(job_id.clone(), cancel_tx, stdin_tx)
             .await;
@@ -1008,7 +1292,14 @@ async fn spawn_job<T>(
 
         tokio::spawn(async move {
             let _permit = reg.acquire_permit().await;
-            let (exit_code, error) = executor::run_job(did, req, tx_clone, cancel_rx, st).await;
+            let (exit_code, error) = match provider {
+                JobProvider::DefaultExec => {
+                    executor::run_job(did, req, tx_clone, cancel_rx, st).await
+                }
+                JobProvider::ManagedRuntime { target, .. } => {
+                    executor::run_job_with_target(did, req, target, tx_clone, cancel_rx, st).await
+                }
+            };
             reg.remove(&job_id).await;
             reg.mark_completed(job_id, exit_code, error).await;
         });
@@ -1068,6 +1359,7 @@ async fn handle_browser_request<T>(
     tx: &T,
     session_mgr: &Arc<SessionManager>,
     browser_mgr: &Arc<BrowserManager>,
+    file_mgr: &Arc<FileManager>,
 ) where
     T: crate::executor::EnvelopeSink,
 {
@@ -1078,18 +1370,41 @@ async fn handle_browser_request<T>(
         "received browser request"
     );
 
-    if !browser_mgr.is_enabled() {
+    let provider_registry = match crate::plugin_runtime::build_provider_registry(
+        browser_mgr,
+        file_mgr,
+    )
+    .await
+    {
+        Ok(registry) => registry,
+        Err(err) => {
+            let resp_env = Envelope {
+                device_id: device_id.to_string(),
+                msg_id: new_msg_id(),
+                ts_ms: now_ms(),
+                payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
+                    request_id: req.request_id.clone(),
+                    session_id: req.session_id.clone(),
+                    success: false,
+                    error: format!(
+                        "browser capability unavailable: failed to inspect host resources: {err}"
+                    ),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let _ = tx.send(resp_env);
+            return;
+        }
+    };
+    if let Err(unavailable) = provider_registry.ensure(CapabilityKind::Browser) {
         let resp_env = Envelope {
             device_id: device_id.to_string(),
             msg_id: new_msg_id(),
             ts_ms: now_ms(),
-            payload: Some(envelope::Payload::BrowserResponse(BrowserResponse {
-                request_id: req.request_id.clone(),
-                session_id: req.session_id.clone(),
-                success: false,
-                error: "browser capabilities not enabled".to_string(),
-                ..Default::default()
-            })),
+            payload: Some(envelope::Payload::BrowserResponse(
+                browser_unavailable_response(req, &unavailable),
+            )),
             ..Default::default()
         };
         let _ = tx.send(resp_env);
@@ -1202,6 +1517,7 @@ async fn handle_file_request<T>(
     req: ahand_protocol::FileRequest,
     tx: &T,
     session_mgr: &Arc<SessionManager>,
+    browser_mgr: &Arc<BrowserManager>,
     file_mgr: &Arc<FileManager>,
     approval_mgr: &Arc<ApprovalManager>,
     approval_broadcast_tx: &broadcast::Sender<Envelope>,
@@ -1235,12 +1551,26 @@ async fn handle_file_request<T>(
     // field hiding behind a generic "PolicyDenied" message.
     let req_paths_joined = file_mgr.request_paths(&req).join(", ");
 
-    if !file_mgr.is_enabled() {
-        send_file_response(crate::file_manager::error_response(
-            req.request_id.clone(),
-            ahand_protocol::FileErrorCode::PolicyDenied,
+    let provider_registry =
+        match crate::plugin_runtime::build_provider_registry(browser_mgr, file_mgr).await {
+            Ok(registry) => registry,
+            Err(err) => {
+                send_file_response(crate::file_manager::error_response(
+                    req.request_id.clone(),
+                    ahand_protocol::FileErrorCode::PolicyDenied,
+                    &req_paths_joined,
+                    &format!(
+                        "file capability unavailable: failed to inspect host resources: {err}"
+                    ),
+                ));
+                return;
+            }
+        };
+    if let Err(unavailable) = provider_registry.ensure(CapabilityKind::File) {
+        send_file_response(file_unavailable_response(
+            &req,
             &req_paths_joined,
-            "file operations are not enabled on this daemon",
+            &unavailable,
         ));
         return;
     }
@@ -1472,12 +1802,699 @@ async fn handle_file_request<T>(
     });
 }
 
+// ── AppTool envelope helpers ──────────────────────────────────────────────────
+
+fn app_tool_error_envelope(
+    device_id: &str,
+    tool_call_id: &str,
+    code: &str,
+    message: String,
+) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolResponse(
+            ahand_protocol::AppToolResponse {
+                tool_call_id: tool_call_id.to_string(),
+                result: Some(ahand_protocol::app_tool_response::Result::Error(
+                    ahand_protocol::AppToolError {
+                        code: code.to_string(),
+                        message,
+                    },
+                )),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: String) -> Envelope {
+    Envelope {
+        device_id: device_id.to_string(),
+        msg_id: new_msg_id(),
+        ts_ms: now_ms(),
+        payload: Some(envelope::Payload::AppToolResponse(
+            ahand_protocol::AppToolResponse {
+                tool_call_id: tool_call_id.to_string(),
+                result: Some(ahand_protocol::app_tool_response::Result::ResultJson(
+                    result_json,
+                )),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+// ── AppTool handler ───────────────────────────────────────────────────────────
+
+/// Handle an incoming AppToolRequest.
+///
+/// Revised step order (Task 6):
+///   1. Idempotency check — early-exit if already Running (silent) or Completed
+///      (replay cached response).
+///   2. Lookup — TOOL_NOT_FOUND if not registered. Lookup must happen before the
+///      gate so TOOL_NOT_FOUND is always returned for unknown tools regardless of
+///      session mode (no information leak about mode from the error code).
+///   3. Session-mode gate — uses a synthetic JobRequest keyed on a namespaced
+///      `"app-tool:{tool_call_id}"` job_id (see approval_job_id below) so the
+///      existing approval machinery (ApprovalManager, spawned-wait pattern)
+///      is reused without modification.
+///      * Inactive / expired trust → SESSION_INACTIVE error, return.
+///      * Allow (Trust/AutoAccept) + requires_approval=false → fall through.
+///      * Allow + requires_approval=true OR Strict → NeedsApproval path:
+///        mark_running first (idempotency), send ApprovalRequest, spawn waiter.
+///   4. Parse args — INVALID_ARGS on bad JSON or non-object.
+///   5. Concurrency permit — CONCURRENCY_LIMIT if all slots taken.
+///   6. Execute (spawned).
+///
+/// mark_running is called BEFORE sending the ApprovalRequest (NeedsApproval path)
+/// or before spawning execution (Allow path). This closes the idempotency window:
+/// a duplicate request arriving while approval is pending or while execution is
+/// running sees Running and is silently ignored. Every terminal outcome
+/// (denied / timed out / handler result) calls mark_completed so that a
+/// post-completion replay of the same tool_call_id returns the cached result.
+///
+/// Note: the handler captured at step 2 is the one registered at request time.
+/// If the app re-registers the same tool mid-wait (between step 3 NeedsApproval
+/// and waiter resolution), the captured handler still executes — we approve
+/// what was requested, not what happens to be registered at approval time.
+///
+/// Contrast with handle_file_request (which also spawns its approval-wait leg):
+/// file requests front-load a quick policy check inline and only spawn the
+/// approval waiter; here the entire execution is spawned because handler
+/// duration is unbounded (up to MAX_TIMEOUT_MS = 300s).
+///
+/// Timeout semantics: `timeout_ms` bounds the WHOLE invocation (approval +
+/// execution). Approval wait = min(approval_timeout, clamp_timeout(timeout_ms));
+/// execution gets the remaining budget (floored at MIN_TIMEOUT_MS). This ensures
+/// the hub's `clamped_timeout + 2s` window always covers the daemon-side outcome
+/// and eliminates ghost execution (where a late approval would run a handler
+/// whose result nobody can receive because the hub has already moved on).
+///
+/// The approval waiter intentionally does NOT watch `close_rx` (unlike file-request
+/// waiters): the response rides the stamped outbox so a result produced across a
+/// reconnect is replayed to the hub; the cost is an orphaned waiter for at most
+/// `min(approval_timeout, 300 s)` for app tools — not watching `close_rx` is
+/// therefore cheap, because the waiter self-cancels within the invocation deadline.
+#[allow(clippy::too_many_arguments)]
+async fn handle_app_tool_request<T>(
+    device_id: &str,
+    caller_uid: &str,
+    req: ahand_protocol::AppToolRequest,
+    tx: &T,
+    session_mgr: &Arc<SessionManager>,
+    approval_mgr: &Arc<ApprovalManager>,
+    approval_broadcast_tx: &broadcast::Sender<Envelope>,
+    app_tools: &Arc<AppToolRegistry>,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    info!(
+        tool_call_id = %req.tool_call_id,
+        name = %req.name,
+        "received AppToolRequest"
+    );
+
+    // ── Step 1: idempotency check ─────────────────────────────────────────
+    match app_tools.call_state(&req.tool_call_id).await {
+        crate::app_tool_registry::CallState::Running => {
+            warn!(
+                tool_call_id = %req.tool_call_id,
+                "duplicate tool_call_id while running — ignoring"
+            );
+            return;
+        }
+        crate::app_tool_registry::CallState::Completed(cached) => {
+            debug!(
+                tool_call_id = %req.tool_call_id,
+                "duplicate tool_call_id after completion — replaying cached response"
+            );
+            // Replay the cached response (error or result).
+            let envelope = match (cached.result_json, cached.error) {
+                (Some(json), _) => app_tool_result_envelope(device_id, &req.tool_call_id, json),
+                (None, Some(err)) => {
+                    app_tool_error_envelope(device_id, &req.tool_call_id, &err.code, err.message)
+                }
+                (None, None) => {
+                    // Shouldn't happen in practice but treat as HANDLER_ERROR.
+                    app_tool_error_envelope(
+                        device_id,
+                        &req.tool_call_id,
+                        "HANDLER_ERROR",
+                        "cached result had no outcome".to_string(),
+                    )
+                }
+            };
+            let _ = tx.send(envelope);
+            return;
+        }
+        crate::app_tool_registry::CallState::Unknown => {}
+    }
+
+    // ── Step 2: lookup ────────────────────────────────────────────────────
+    // Lookup happens BEFORE the session gate so that TOOL_NOT_FOUND is always
+    // returned for unknown tools regardless of session mode (no information
+    // leak about mode). The gate needs descriptor.requires_approval, so we
+    // look up once and reuse both descriptor and handler.
+    let (descriptor, handler) = match app_tools.lookup(&req.name).await {
+        Some(pair) => pair,
+        None => {
+            warn!(
+                tool_call_id = %req.tool_call_id,
+                name = %req.name,
+                "app tool not found"
+            );
+            let _ = tx.send(app_tool_error_envelope(
+                device_id,
+                &req.tool_call_id,
+                "TOOL_NOT_FOUND",
+                format!(
+                    "no app tool named {:?} is registered on this device",
+                    req.name
+                ),
+            ));
+            return;
+        }
+    };
+
+    // ── Step 3: session-mode gate ─────────────────────────────────────────
+    // Build a synthetic JobRequest so the existing SessionManager and
+    // ApprovalManager work unchanged. The job_id is namespaced "app-tool:"
+    // so a cloud-chosen tool_call_id can never accidentally evict a real
+    // job's pending approval in ApprovalManager's shared HashMap — mirroring
+    // the "file-req:" namespace used by handle_file_request (~line 1615).
+    // ApprovalResponse echoes ApprovalRequest.job_id, so resolve() still
+    // works: we send "app-tool:{tool_call_id}" and receive it back unchanged.
+    let approval_job_id = format!("app-tool:{}", req.tool_call_id);
+    let args_preview: String = req.args_json.chars().take(512).collect();
+    let synthetic = ahand_protocol::JobRequest {
+        job_id: approval_job_id.clone(),
+        tool: format!("app:{}", req.name),
+        args: vec![args_preview],
+        ..Default::default()
+    };
+
+    let decision = match session_mgr.check(&synthetic, caller_uid).await {
+        SessionDecision::Deny(reason) => {
+            warn!(
+                tool_call_id = %req.tool_call_id,
+                name = %req.name,
+                reason = %reason,
+                "app tool rejected by session mode"
+            );
+            let _ = tx.send(app_tool_error_envelope(
+                device_id,
+                &req.tool_call_id,
+                "SESSION_INACTIVE",
+                format!("session mode rejects app tool calls: {reason}"),
+            ));
+            return;
+        }
+        // Allow but requires_approval=true: upgrade to NeedsApproval.
+        SessionDecision::Allow if descriptor.requires_approval => {
+            let previous_refusals = session_mgr.get_refusals(&synthetic.tool).await;
+            SessionDecision::NeedsApproval {
+                reason: format!(
+                    "app tool {:?} is registered with requires_approval",
+                    req.name
+                ),
+                previous_refusals,
+            }
+        }
+        other => other,
+    };
+
+    if let SessionDecision::NeedsApproval {
+        reason,
+        previous_refusals,
+    } = decision
+    {
+        info!(
+            tool_call_id = %req.tool_call_id,
+            name = %req.name,
+            reason = %reason,
+            "app tool requires approval"
+        );
+
+        // Compute the bounded approval-wait timeout BEFORE submitting so the
+        // advertised expires_ms in the ApprovalRequest matches the window the
+        // waiter actually uses (dial + dialog UI both show this value).
+        let timeout_ms_req = req.timeout_ms;
+        // The call's clamped timeout is the TOTAL deadline for approval +
+        // execution. Bounding the approval wait by it guarantees the hub's
+        // `clamped + 2s` wait always covers the daemon-side outcome — no ghost
+        // execution after the caller's window closed (the hub mints a fresh
+        // tool_call_id per POST, so a late result would be unreachable anyway).
+        // The operator's approval_timeout remains an upper bound — a caller's
+        // timeout_ms can shrink the window but never extend it beyond what the
+        // approval policy permits.
+        let total_deadline_ms = AppToolRegistry::clamp_timeout(timeout_ms_req);
+        let timeout = approval_mgr
+            .default_timeout()
+            .min(Duration::from_millis(total_deadline_ms as u64));
+
+        // Mark running BEFORE sending the ApprovalRequest so that a
+        // duplicate request arriving while approval is pending sees Running
+        // and is silently ignored (idempotency window is closed now).
+        // Every terminal outcome (deny/timeout/execute) calls mark_completed.
+        app_tools.mark_running(&req.tool_call_id).await;
+
+        let (approval_req, approval_rx) = approval_mgr
+            .submit_with_timeout(
+                synthetic.clone(),
+                caller_uid,
+                reason,
+                previous_refusals,
+                timeout,
+            )
+            .await;
+
+        // Send ApprovalRequest to cloud via WS.
+        let approval_env = Envelope {
+            device_id: device_id.to_string(),
+            msg_id: new_msg_id(),
+            ts_ms: now_ms(),
+            payload: Some(envelope::Payload::ApprovalRequest(approval_req.clone())),
+            ..Default::default()
+        };
+        let _ = tx.send(approval_env.clone());
+
+        // Broadcast to all IPC clients.
+        let _ = approval_broadcast_tx.send(approval_env);
+
+        // Spawn a task to wait for approval without blocking the WS read loop.
+        let tx_clone = (*tx).clone();
+        let did = device_id.to_string();
+        let amgr = Arc::clone(approval_mgr);
+        let app_tools_clone = Arc::clone(app_tools);
+        let tool_call_id = req.tool_call_id.clone();
+        let tool_name = req.name.clone();
+        let args_json = req.args_json.clone();
+        let approval_job_id_clone = approval_job_id.clone();
+
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(timeout, approval_rx).await;
+            match result {
+                Ok(Ok(resp)) if resp.approved => {
+                    let approval_wait_ms = started.elapsed().as_millis() as u64;
+                    // Execution gets what's left of the total deadline
+                    // (clamp_timeout inside validate_and_execute floors this
+                    // at MIN_TIMEOUT_MS).
+                    let remaining_ms = (total_deadline_ms as u64)
+                        .saturating_sub(approval_wait_ms)
+                        .max(crate::app_tool_registry::MIN_TIMEOUT_MS as u64)
+                        as u32;
+                    info!(
+                        tool_call_id = %tool_call_id,
+                        tool_name = %tool_name,
+                        approval_wait_ms,
+                        remaining_ms,
+                        "app tool approval granted"
+                    );
+                    // Proceed to args parse → permit → execute inside this task.
+                    validate_and_execute_app_tool(
+                        &did,
+                        tool_call_id,
+                        tool_name,
+                        args_json,
+                        remaining_ms,
+                        handler,
+                        &tx_clone,
+                        &app_tools_clone,
+                    )
+                    .await;
+                }
+                Ok(Ok(resp)) => {
+                    // Denied.
+                    // refusal is recorded at the ApprovalResponse resolve site
+                    // (see ~line 650); recording here would duplicate it.
+                    let approval_wait_ms = started.elapsed().as_millis() as u64;
+                    info!(
+                        tool_call_id = %tool_call_id,
+                        tool_name = %tool_name,
+                        approval_wait_ms,
+                        reason = %resp.reason,
+                        "app tool approval denied"
+                    );
+                    // resolve() already removed the entry from ApprovalManager;
+                    // calling expire here would be a no-op — skip it.
+                    let denied_reason = if resp.reason.is_empty() {
+                        "the user declined this call".to_string()
+                    } else {
+                        format!("the user declined this call: {}", resp.reason)
+                    };
+                    fail_app_tool_call(
+                        &app_tools_clone,
+                        &tx_clone,
+                        &did,
+                        &tool_call_id,
+                        "APPROVAL_DENIED",
+                        denied_reason,
+                    )
+                    .await;
+                }
+                _ => {
+                    // Timeout (or channel closed).
+                    let approval_wait_ms = started.elapsed().as_millis() as u64;
+                    warn!(
+                        tool_call_id = %tool_call_id,
+                        tool_name = %tool_name,
+                        approval_wait_ms,
+                        "app tool approval timed out"
+                    );
+                    // expire() is needed here: resolve() was never called (no
+                    // response arrived), so the entry is still in the HashMap.
+                    amgr.expire(&approval_job_id_clone).await;
+                    fail_app_tool_call(
+                        &app_tools_clone,
+                        &tx_clone,
+                        &did,
+                        &tool_call_id,
+                        "APPROVAL_TIMEOUT",
+                        "approval request expired without a user response".to_string(),
+                    )
+                    .await;
+                }
+            }
+        });
+
+        return; // spawned task owns the rest; read loop continues
+    }
+
+    // ── Allow path: fall through to args parse → permit → execute ────────
+    validate_and_execute_app_tool(
+        device_id,
+        req.tool_call_id,
+        req.name,
+        req.args_json,
+        req.timeout_ms,
+        handler,
+        tx,
+        app_tools,
+    )
+    .await;
+}
+
+/// Record a failed app-tool call in the idempotency cache and send the error
+/// envelope to the WS. Used at all five fail paths (deny, timeout, bad-JSON,
+/// non-object args, concurrency limit) to keep them DRY and avoid the
+/// double-construction drift risk where code and message diverge between
+/// mark_completed and the envelope.
+async fn fail_app_tool_call<T: crate::executor::EnvelopeSink>(
+    app_tools: &Arc<AppToolRegistry>,
+    tx: &T,
+    device_id: &str,
+    tool_call_id: &str,
+    code: &str,
+    message: String,
+) {
+    app_tools
+        .mark_completed(
+            tool_call_id.to_string(),
+            crate::app_tool_registry::CompletedAppToolCall {
+                result_json: None,
+                error: Some(crate::app_tool_registry::AppToolError {
+                    code: code.to_string(),
+                    message: message.clone(),
+                }),
+            },
+        )
+        .await;
+    let _ = tx.send(app_tool_error_envelope(
+        device_id,
+        tool_call_id,
+        code,
+        message,
+    ));
+}
+
+/// Post-gate tail: parse args, acquire permit, mark_running, spawn execute.
+///
+/// Called from two sites:
+///   1. Inline Allow path in handle_app_tool_request.
+///   2. Inside the approval-wait task after approval is granted.
+///
+/// The caller must NOT have called mark_running yet on the Allow path (it is
+/// called here). On the approval path, mark_running was called before the
+/// ApprovalRequest was sent (to close the idempotency window during the wait),
+/// so this function's mark_running call is a no-op duplicate — the registry
+/// treats a second mark_running as idempotent (still Running).
+#[allow(clippy::too_many_arguments)]
+async fn validate_and_execute_app_tool<T>(
+    device_id: &str,
+    tool_call_id: String,
+    tool_name: String,
+    args_json: String,
+    timeout_ms_req: u32,
+    handler: crate::app_tool_registry::AppToolHandler,
+    tx: &T,
+    app_tools: &Arc<AppToolRegistry>,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    // ── Parse args ────────────────────────────────────────────────────────
+    let args: serde_json::Value = match serde_json::from_str(&args_json) {
+        Ok(v) => v,
+        Err(err) => {
+            warn!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                error = %err,
+                "invalid app tool args"
+            );
+            // On the approval path mark_running was already called; record
+            // completion so the idempotency cache is consistent.
+            fail_app_tool_call(
+                app_tools,
+                tx,
+                device_id,
+                &tool_call_id,
+                "INVALID_ARGS",
+                format!("args_json is not valid JSON: {err}"),
+            )
+            .await;
+            return;
+        }
+    };
+    if !args.is_object() {
+        warn!(
+            tool_call_id = %tool_call_id,
+            tool_name = %tool_name,
+            "invalid app tool args: not a JSON object"
+        );
+        fail_app_tool_call(
+            app_tools,
+            tx,
+            device_id,
+            &tool_call_id,
+            "INVALID_ARGS",
+            "args_json must be a JSON object".to_string(),
+        )
+        .await;
+        return;
+    }
+
+    // ── Concurrency permit (fail-fast) ────────────────────────────────────
+    let permit = match app_tools.try_acquire_permit() {
+        Some(p) => p,
+        None => {
+            warn!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                "app tool concurrency limit hit"
+            );
+            fail_app_tool_call(
+                app_tools,
+                tx,
+                device_id,
+                &tool_call_id,
+                "CONCURRENCY_LIMIT",
+                "too many app tool calls in flight on this device; retry after in-flight calls finish".to_string(),
+            )
+            .await;
+            return;
+        }
+    };
+
+    // ── Execute (spawned so the read loop / approval task stays unblocked) ─
+    // mark_running BEFORE spawning so any duplicate that arrives before the
+    // task starts still sees Running (idempotency window is closed here).
+    // On the approval path this is already Running — mark_running is
+    // idempotent; calling it again is safe.
+    app_tools.mark_running(&tool_call_id).await;
+
+    let tx_clone = (*tx).clone();
+    let did = device_id.to_string();
+    let app_tools_clone = Arc::clone(app_tools);
+    let timeout_ms = AppToolRegistry::clamp_timeout(timeout_ms_req);
+
+    tokio::spawn(async move {
+        execute_app_tool(
+            &did,
+            tool_call_id,
+            tool_name,
+            args,
+            handler,
+            permit,
+            timeout_ms,
+            &tx_clone,
+            &app_tools_clone,
+        )
+        .await;
+    });
+}
+
+/// Execute an app tool handler with panic isolation, timeout, and idempotency
+/// recording. Called from a spawned task (not the read loop).
+///
+/// The permit is moved into the spawned handler task (not held by this fn).
+/// If timeout fires before the handler completes, we do NOT abort the spawned
+/// handler task — it may hold app-owned locks or resources. The permit releases
+/// naturally when the handler task eventually finishes (or drops).
+#[allow(clippy::too_many_arguments)]
+async fn execute_app_tool<T>(
+    device_id: &str,
+    tool_call_id: String,
+    tool_name: String,
+    args: serde_json::Value,
+    handler: crate::app_tool_registry::AppToolHandler,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    timeout_ms: u32,
+    tx: &T,
+    app_tools: &Arc<AppToolRegistry>,
+) where
+    T: crate::executor::EnvelopeSink,
+{
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+
+    // Spawn the handler inside its own task for panic isolation.
+    // The permit is moved into the task so it is released when the task
+    // finishes (or is eventually garbage-collected after a timeout — we do NOT
+    // abort() the task because the handler may hold app-owned locks).
+    let handler_task = tokio::spawn(async move {
+        let _permit = permit; // keep permit alive until handler completes
+        handler(args).await
+    });
+
+    let (code, message, result_json) = match tokio::time::timeout(timeout, handler_task).await {
+        // Handler completed successfully.
+        Ok(Ok(Ok(value))) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            info!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                duration_ms,
+                outcome = "success",
+                "app tool call completed"
+            );
+            (None, None, Some(value.to_string()))
+        }
+        // Handler returned an error.
+        Ok(Ok(Err(app_err))) => {
+            let code = if app_err.code.is_empty() {
+                "HANDLER_ERROR".to_string()
+            } else {
+                app_err.code.clone()
+            };
+            let duration_ms = started.elapsed().as_millis() as u64;
+            info!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                duration_ms,
+                outcome = %code,
+                "app tool call returned handler error"
+            );
+            (Some(code), Some(app_err.message), None)
+        }
+        // Handler task panicked.
+        Ok(Err(join_err)) if join_err.is_panic() => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            warn!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                duration_ms,
+                "app tool handler panicked; the app may be in a bad state"
+            );
+            (
+                Some("HANDLER_PANIC".to_string()),
+                Some("app tool handler panicked; the app may be in a bad state".to_string()),
+                None,
+            )
+        }
+        // Handler task was cancelled (should not happen with our spawn pattern).
+        Ok(Err(_)) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            warn!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                duration_ms,
+                "app tool task was cancelled"
+            );
+            (
+                Some("HANDLER_ERROR".to_string()),
+                Some("app tool task was cancelled".to_string()),
+                None,
+            )
+        }
+        // Timeout — handler task is still running but we stop waiting.
+        // We do NOT abort the spawned task: it may hold app-owned locks.
+        // The permit releases when the handler task eventually finishes.
+        Err(_) => {
+            let duration_ms = started.elapsed().as_millis() as u64;
+            warn!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                duration_ms,
+                timeout_ms,
+                "app tool timed out"
+            );
+            (
+                Some("EXECUTION_TIMEOUT".to_string()),
+                Some(format!("app tool did not finish within {timeout_ms}ms")),
+                None,
+            )
+        }
+    };
+
+    // Record outcome in the idempotency cache (required on every path).
+    let completed = crate::app_tool_registry::CompletedAppToolCall {
+        result_json: result_json.clone(),
+        error: match (&code, &message) {
+            (Some(c), Some(m)) => Some(crate::app_tool_registry::AppToolError {
+                code: c.clone(),
+                message: m.clone(),
+            }),
+            _ => None,
+        },
+    };
+    app_tools
+        .mark_completed(tool_call_id.clone(), completed)
+        .await;
+
+    // Send wire response.
+    let envelope = match (result_json, code, message) {
+        (Some(json), _, _) => app_tool_result_envelope(device_id, &tool_call_id, json),
+        (None, Some(c), Some(m)) => app_tool_error_envelope(device_id, &tool_call_id, &c, m),
+        _ => app_tool_error_envelope(
+            device_id,
+            &tool_call_id,
+            "HANDLER_ERROR",
+            "internal: no outcome recorded".to_string(),
+        ),
+    };
+    let _ = tx.send(envelope);
+}
+
 fn file_op_name(op: &ahand_protocol::file_request::Operation) -> &'static str {
     use ahand_protocol::file_request::Operation;
     match op {
         Operation::ReadText(_) => "read_text",
         Operation::ReadBinary(_) => "read_binary",
         Operation::ReadImage(_) => "read_image",
+        Operation::ReadPdf(_) => "read_pdf",
         Operation::Write(_) => "write",
         Operation::Edit(_) => "edit",
         Operation::Delete(_) => "delete",
@@ -1618,9 +2635,105 @@ mod tests {
     use crate::outbox::Outbox;
 
     use super::{
-        BufferedEnvelopeSender, ConnectError, OutboundFrame, QueuedEnvelope,
-        classify_hello_accepted_message, connect_tcp_with_keepalive,
+        BufferedEnvelopeSender, ConnectError, OutboundFrame, classify_hello_accepted_message,
+        connect_tcp_with_keepalive, hello_capabilities_from_wire_names,
     };
+
+    #[test]
+    fn hello_capabilities_preserve_router_order_and_names() {
+        let capabilities = hello_capabilities_from_wire_names(vec![
+            "exec".to_string(),
+            "file".to_string(),
+            "browser-playwright-cli".to_string(),
+        ]);
+
+        assert_eq!(capabilities, vec!["exec", "file", "browser-playwright-cli"]);
+    }
+
+    #[test]
+    fn browser_unavailable_response_preserves_ids_and_install_hint() {
+        let req = ahand_protocol::BrowserRequest {
+            request_id: "browser-req-1".to_string(),
+            session_id: "browser-session-1".to_string(),
+            action: "navigate".to_string(),
+            ..Default::default()
+        };
+        let unavailable = crate::plugin_runtime::CapabilityUnavailable {
+            capability: crate::plugin_runtime::CapabilityKind::Browser,
+            plugin_id: "browser-playwright-cli".to_string(),
+            status: crate::plugin_runtime::PluginStatus::Blocked,
+            reason: "dependency node is missing".to_string(),
+            remediation: crate::plugin_runtime::CapabilityRemediation::InstallPlugin {
+                plugin_id: "browser-playwright-cli".to_string(),
+            },
+        };
+
+        let resp = super::browser_unavailable_response(&req, &unavailable);
+
+        assert_eq!(resp.request_id, "browser-req-1");
+        assert_eq!(resp.session_id, "browser-session-1");
+        assert!(!resp.success);
+        assert!(resp.error.contains("browser capability unavailable"));
+        assert!(
+            resp.error.contains(
+                "install plugin browser-playwright-cli through the host plugin installer"
+            )
+        );
+    }
+
+    #[test]
+    fn file_unavailable_response_preserves_request_id_and_path() {
+        let req = ahand_protocol::FileRequest {
+            request_id: "file-req-1".to_string(),
+            ..Default::default()
+        };
+        let unavailable = crate::plugin_runtime::CapabilityUnavailable {
+            capability: crate::plugin_runtime::CapabilityKind::File,
+            plugin_id: "file".to_string(),
+            status: crate::plugin_runtime::PluginStatus::Blocked,
+            reason: "host configuration disabled file operations".to_string(),
+            remediation: crate::plugin_runtime::CapabilityRemediation::HostConfiguration {
+                message: "enable file operations in host configuration".to_string(),
+            },
+        };
+
+        let resp = super::file_unavailable_response(&req, "notes.txt", &unavailable);
+
+        assert_eq!(resp.request_id, "file-req-1");
+        match resp.result {
+            Some(ahand_protocol::file_response::Result::Error(err)) => {
+                assert_eq!(err.code, ahand_protocol::FileErrorCode::PolicyDenied as i32);
+                assert_eq!(err.path, "notes.txt");
+                assert!(
+                    err.message
+                        .contains("file capability unavailable: host configuration disabled")
+                );
+            }
+            other => panic!("expected file error response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn managed_runtime_interactive_rejection_preserves_job_id() {
+        let req = ahand_protocol::JobRequest {
+            job_id: "node-interactive-1".to_string(),
+            tool: "plugin:node".to_string(),
+            interactive: true,
+            ..Default::default()
+        };
+
+        let env = super::managed_runtime_interactive_rejection("device-1", &req);
+
+        assert_eq!(env.device_id, "device-1");
+        match env.payload {
+            Some(envelope::Payload::JobRejected(rejected)) => {
+                assert_eq!(rejected.job_id, "node-interactive-1");
+                assert!(rejected.reason.contains("plugin:node"));
+                assert!(rejected.reason.contains("interactive"));
+            }
+            other => panic!("expected JobRejected, got {other:?}"),
+        }
+    }
 
     /// Spinning up a real `spawn(...)` daemon and reaching into its private
     /// TcpStream just to read getsockopt would mean exposing the socket
@@ -1657,22 +2770,24 @@ mod tests {
             "SO_KEEPALIVE must be on after connect_tcp_with_keepalive",
         );
 
-        // Linux/BSDs path: socket2 exposes typed getters.
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        // Linux/BSDs path: socket2 0.6 exposes typed getters with `tcp_` prefix.
+        // Windows and macOS are excluded here (Windows: no typed getters;
+        // macOS: uses raw getsockopt below).
+        #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
         {
             assert_eq!(
-                sock.keepalive_time().expect("read keepalive idle time"),
+                sock.tcp_keepalive_time().expect("read keepalive idle time"),
                 std::time::Duration::from_secs(30),
                 "TCP_KEEPIDLE must be 30s",
             );
             assert_eq!(
-                sock.keepalive_interval()
+                sock.tcp_keepalive_interval()
                     .expect("read keepalive probe interval"),
                 std::time::Duration::from_secs(10),
                 "TCP_KEEPINTVL must be 10s",
             );
             assert_eq!(
-                sock.keepalive_retries()
+                sock.tcp_keepalive_retries()
                     .expect("read keepalive retry count"),
                 3,
                 "TCP_KEEPCNT must be 3",

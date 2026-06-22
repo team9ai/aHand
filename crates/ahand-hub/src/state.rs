@@ -9,6 +9,7 @@ use ahand_hub_core::services::device_manager::DeviceManager;
 use ahand_hub_core::services::job_dispatcher::JobDispatcher;
 use ahand_hub_core::traits::{AuditStore, DeviceAdminStore, DeviceStore, JobStore};
 use ahand_hub_core::{HubError, Result};
+use ahand_hub_store::app_tool_store::{RedisAppToolStore, StoredAppToolCatalog};
 use ahand_hub_store::audit_store::PgAuditStore;
 use ahand_hub_store::bootstrap_store::RedisBootstrapStore;
 use ahand_hub_store::device_store::PgDeviceStore;
@@ -57,6 +58,11 @@ pub struct AppState {
     pub connections: Arc<crate::ws::device_gateway::ConnectionRegistry>,
     pub browser_pending:
         Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::BrowserResponse>>>,
+    /// Pending `POST /api/control/app-tool` oneshots keyed by `tool_call_id`
+    /// (UUID). The WS gateway resolves these when an `AppToolResponse` arrives
+    /// from the device. Mirrors `browser_pending` exactly.
+    pub app_tool_pending:
+        Arc<DashMap<String, tokio::sync::oneshot::Sender<ahand_protocol::AppToolResponse>>>,
     pub events: Arc<crate::events::EventBus>,
     pub output_stream: Arc<crate::output_stream::OutputStream>,
     pub bootstrap_tokens: Arc<crate::bootstrap::BootstrapCredentials>,
@@ -90,6 +96,9 @@ pub struct AppState {
     /// so call sites can always invoke `state.webhook.enqueue_*` without
     /// branching.
     pub webhook: Arc<crate::webhook::Webhook>,
+    /// Per-device app tool catalog cache. Uses an in-memory store in test/memory
+    /// configurations and Redis-backed storage in persistent configurations.
+    pub app_tools: Arc<AppToolStore>,
 }
 
 impl AppState {
@@ -191,7 +200,12 @@ impl AppState {
         ));
 
         let browser_pending = Arc::new(DashMap::new());
-        let control_jobs = Arc::new(crate::control_jobs::ControlJobTracker::new());
+        let app_tool_pending = Arc::new(DashMap::new());
+        let control_jobs = Arc::new(
+            crate::control_jobs::ControlJobTracker::new_with_completed_access_retention(
+                finished_retention,
+            ),
+        );
         let control_rate_limiter = Arc::new(default_control_plane_rate_limiter());
 
         // Webhook dispatcher — always present. When the URL/secret are
@@ -218,6 +232,15 @@ impl AppState {
             _ => crate::webhook::Webhook::disabled(),
         };
 
+        // App tool catalog store — Redis-backed in persistent mode, in-memory in memory mode.
+        let app_tools = Arc::new(match &config.store {
+            crate::config::StoreConfig::Memory => AppToolStore::memory(),
+            crate::config::StoreConfig::Persistent { redis_url, .. } => {
+                let app_tools_redis = ahand_hub_store::redis::connect_redis(redis_url).await?;
+                AppToolStore::redis(RedisAppToolStore::new(app_tools_redis))
+            }
+        });
+
         let state = Self {
             auth: Arc::new(AuthService::new(&config.jwt_secret)),
             device_manager,
@@ -231,6 +254,7 @@ impl AppState {
             control_rate_limiter,
             connections,
             browser_pending,
+            app_tool_pending,
             events,
             output_stream,
             bootstrap_tokens: Arc::new(bootstrap_tokens),
@@ -249,6 +273,7 @@ impl AppState {
             file_request_timeout: Duration::from_millis(config.file_request_timeout_ms),
             s3_client,
             webhook,
+            app_tools,
         };
         state
             .preregister_bootstrap_device(state.device_bootstrap_device_id.as_str())
@@ -794,4 +819,65 @@ async fn prune_audit_entries(audit_store: &dyn AuditStore, retention_days: u64) 
     let retention_days = std::cmp::min(retention_days, i64::MAX as u64) as i64;
     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
     audit_store.prune_before(cutoff).await
+}
+
+/// App tool catalog store — wraps either a Redis-backed store (production)
+/// or an in-memory DashMap (tests / memory mode). The same async API is
+/// exposed regardless of which variant is active.
+#[derive(Clone)]
+pub enum AppToolStore {
+    Redis(RedisAppToolStore),
+    Memory(Arc<DashMap<String, StoredAppToolCatalog>>),
+}
+
+impl AppToolStore {
+    pub fn memory() -> Self {
+        AppToolStore::Memory(Arc::new(DashMap::new()))
+    }
+
+    pub fn redis(store: RedisAppToolStore) -> Self {
+        AppToolStore::Redis(store)
+    }
+
+    pub async fn put_catalog(&self, device_id: &str, catalog: StoredAppToolCatalog) -> Result<()> {
+        match self {
+            AppToolStore::Redis(s) => s.put_catalog(device_id, catalog).await,
+            AppToolStore::Memory(m) => {
+                m.insert(device_id.to_string(), catalog);
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn get_catalog(&self, device_id: &str) -> Result<Option<StoredAppToolCatalog>> {
+        match self {
+            AppToolStore::Redis(s) => s.get_catalog(device_id).await,
+            AppToolStore::Memory(m) => Ok(m.get(device_id).map(|v| v.clone())),
+        }
+    }
+
+    /// Mark the catalog stale. Returns `true` if a catalog was found and
+    /// updated; `false` if no catalog exists (no-op).
+    pub async fn mark_stale(&self, device_id: &str) -> Result<bool> {
+        match self {
+            AppToolStore::Redis(s) => s.mark_stale(device_id).await,
+            AppToolStore::Memory(m) => {
+                if let Some(mut entry) = m.get_mut(device_id) {
+                    entry.stale = true;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// Delete the catalog entry entirely. Returns `Ok(true)` if a key was
+    /// removed, `Ok(false)` if no catalog existed (no-op).
+    pub async fn delete_catalog(&self, device_id: &str) -> Result<bool> {
+        match self {
+            AppToolStore::Redis(s) => s.delete_catalog(device_id).await,
+            AppToolStore::Memory(m) => Ok(m.remove(device_id).is_some()),
+        }
+    }
 }

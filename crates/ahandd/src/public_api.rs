@@ -11,23 +11,35 @@
 //! Only the `ahand-cloud` connection mode is supported here — the
 //! `openclaw-gateway` path remains CLI-only for now.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 
-pub use ahand_protocol::SessionMode;
+pub use ahand_protocol::{ApprovalRequest, SessionMode};
+use ahand_protocol::{Envelope, envelope};
 
 use crate::ahand_client::{self, ClientReporter, ConnectOutcome};
+use crate::app_tool_registry::AppToolRegistry;
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::config::{BrowserConfig, Config, FilePolicyConfig, HubConfig};
 use crate::device_identity::DeviceIdentity;
 use crate::registry::JobRegistry;
+use crate::sandbox::{
+    CommitResult, FileVersion, HostFileRef, NetworkPolicy, PermissionSnapshot,
+    RegisterVersionRequest, RegisteredExecEnvironment, RuntimeExecuteRequest, RuntimeExecuteResult,
+    RuntimeProviderConfig, SandboxExecRequest, SandboxExecResult, SandboxFile,
+    SandboxPermissionMode, SandboxResult, SandboxSessionConfig, file_lifecycle, path_policy,
+    registry::SandboxRegistry,
+    runner::{self, PlatformExecuteRequest, RuntimeSandboxPolicy},
+};
 use crate::session::SessionManager;
+
+pub use crate::app_tool_registry::{AppToolDef, AppToolError, AppToolHandler};
 
 use crate::device_identity::IDENTITY_FILE as IDENTITY_FILE_NAME;
 
@@ -196,15 +208,52 @@ impl PartialEq for DaemonStatus {
     }
 }
 
+/// Cursor over daemon approval requests for embedding UIs.
+pub struct ApprovalSubscription {
+    rx: broadcast::Receiver<Envelope>,
+}
+
+impl ApprovalSubscription {
+    fn new(rx: broadcast::Receiver<Envelope>) -> Self {
+        Self { rx }
+    }
+
+    pub async fn recv(&mut self) -> Option<ApprovalRequest> {
+        loop {
+            match self.rx.recv().await {
+                Ok(envelope) => match envelope.payload {
+                    Some(envelope::Payload::ApprovalRequest(req)) => return Some(req),
+                    _ => continue,
+                },
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
 /// Handle returned by [`spawn`]. Drop-safe — `shutdown()` is the preferred
 /// cleanup path, but dropping the handle also cancels the inner task via
 /// the embedded `oneshot` sender going out of scope.
-#[derive(Debug)]
 pub struct DaemonHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
     join: JoinHandle<anyhow::Result<()>>,
     status_rx: watch::Receiver<DaemonStatus>,
     device_id: String,
+    app_tools: Arc<AppToolRegistry>,
+    approval_broadcast_tx: broadcast::Sender<Envelope>,
+    approval_mgr: Arc<ApprovalManager>,
+    session_mgr: Arc<SessionManager>,
+    sandbox_registry: Arc<AsyncMutex<SandboxRegistry>>,
+}
+
+impl std::fmt::Debug for DaemonHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonHandle")
+            .field("device_id", &self.device_id)
+            .field("status", &self.status())
+            .finish_non_exhaustive()
+    }
 }
 
 static ACTIVE_DAEMONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -265,6 +314,365 @@ impl DaemonHandle {
     pub fn device_id(&self) -> &str {
         &self.device_id
     }
+
+    /// Register an app-defined tool. The daemon will advertise an updated
+    /// snapshot to the hub immediately (if connected) and after every
+    /// subsequent reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - `def.name` does not match `^[a-z0-9_-]{1,64}$`
+    /// - `def.input_schema` is not a JSON object
+    /// - a tool with the same name is already registered
+    ///
+    /// A failed registration does not change the advertised catalog; the hub
+    /// sees no new snapshot and the revision is not incremented.
+    ///
+    /// # Handler contract
+    ///
+    /// Handlers should complete promptly or honor cancellation by finishing.
+    /// A handler that never returns permanently consumes one of the 4
+    /// per-device concurrency slots: a timeout response is sent to the caller
+    /// when the configured `timeout_ms` elapses, but the slot is only released
+    /// when the handler task actually finishes (or is dropped). Four stuck
+    /// handlers will disable app tools on the device until daemon restart.
+    pub async fn register_app_tool(
+        &self,
+        def: AppToolDef,
+        handler: AppToolHandler,
+    ) -> anyhow::Result<()> {
+        self.app_tools.register(def, handler).await
+    }
+
+    /// Unregister an app-defined tool by name. Returns `true` if the tool
+    /// existed. The daemon pushes a new snapshot (without the tool) to the
+    /// hub immediately if connected.
+    pub async fn unregister_app_tool(&self, name: &str) -> bool {
+        self.app_tools.unregister(name).await
+    }
+
+    /// Subscribe to in-process approval requests.
+    ///
+    /// Job, file, and app-tool paths all broadcast here. Each subscriber
+    /// receives every request independently (broadcast semantics). Lagged
+    /// subscribers automatically skip missed messages rather than blocking.
+    ///
+    /// # When requests appear
+    ///
+    /// Under the builder default [`SessionMode::AutoAccept`], approval requests
+    /// fire **only** for app tools registered with `requires_approval: true`
+    /// (and for policy-escalated file operations). Under
+    /// [`SessionMode::Strict`] every job, file, and app-tool call goes through
+    /// approval. An embedder subscribing under the default configuration may
+    /// therefore never receive a request unless it registers tools with
+    /// `requires_approval: true` or explicitly switches to `Strict` mode.
+    ///
+    /// ## `job_id` namespaces
+    ///
+    /// The `job_id` field on each [`ApprovalRequest`] is already namespaced:
+    ///
+    /// 1. **Real jobs** - raw `job_id` from the cloud `JobRequest`; tool is
+    ///    whatever the cloud sent (e.g. `"bash"`, `"computer"`).
+    /// 2. **File requests** - `"file-req:{request_id}"`; tool is `"file"`.
+    ///    The prefix prevents a `request_id` from evicting a same-named real
+    ///    job entry.
+    /// 3. **App-tool calls** - `"app-tool:{tool_call_id}"`; tool is
+    ///    `"app:{name}"`. The prefix prevents a cloud-chosen `tool_call_id`
+    ///    from colliding with a real job's pending entry.
+    ///
+    /// Pass the `job_id` verbatim to [`DaemonHandle::respond_approval`].
+    ///
+    /// ## Expiry
+    ///
+    /// Each request carries an `expires_ms` timestamp derived from
+    /// [`DaemonConfig::approval_timeout`]. For app tools the effective window
+    /// is further bounded by the call's own `timeout_ms`: approval must arrive
+    /// within `min(approval_timeout, timeout_ms)` of the request being sent.
+    ///
+    /// ## Subscribe-before-traffic and multi-subscriber semantics
+    ///
+    /// This channel does **not** replay missed messages - subscribe before
+    /// sending traffic (or before spawning the task that will send traffic).
+    /// Every active subscriber independently receives every request.
+    pub fn subscribe_approvals(&self) -> ApprovalSubscription {
+        ApprovalSubscription::new(self.approval_broadcast_tx.subscribe())
+    }
+
+    /// Answer a pending approval from the embedding application.
+    ///
+    /// Mirrors the WS/IPC `ApprovalResponse` handling exactly:
+    /// - deny with non-empty `reason` -> `resolve` + `record_refusal`
+    /// - approve or deny without reason -> `resolve` only
+    ///
+    /// The refusal log is keyed by tool name today (`SessionManager::record_refusal`
+    /// ignores the caller principal). The `"local"` principal passed internally
+    /// is a forward-looking sentinel for when per-principal tracking is added.
+    ///
+    /// `job_id` is [`ApprovalRequest::job_id`] verbatim (already namespaced,
+    /// e.g. `"app-tool:{id}"`).
+    ///
+    /// Returns `false` when no matching pending approval exists (already
+    /// resolved or expired).
+    pub async fn respond_approval(&self, job_id: &str, approved: bool, reason: &str) -> bool {
+        let resp = ahand_protocol::ApprovalResponse {
+            job_id: job_id.to_string(),
+            approved,
+            reason: reason.to_string(),
+            remember: false,
+        };
+        crate::approval::apply_approval_response(
+            &self.approval_mgr,
+            &self.session_mgr,
+            &resp,
+            "local",
+        )
+        .await
+    }
+
+    pub async fn create_sandbox_session(&self, config: SandboxSessionConfig) -> SandboxResult<()> {
+        self.sandbox_registry.lock().await.create_session(config)
+    }
+
+    pub async fn update_sandbox_permission_mode(
+        &self,
+        session_id: &str,
+        mode: SandboxPermissionMode,
+    ) -> SandboxResult<PermissionSnapshot> {
+        self.sandbox_registry
+            .lock()
+            .await
+            .update_permission(session_id, mode)
+    }
+
+    pub async fn register_sandbox_runtime(
+        &self,
+        session_id: &str,
+        provider: RuntimeProviderConfig,
+    ) -> SandboxResult<()> {
+        let provider = canonicalize_runtime_provider(provider)?;
+        let mut registry = self.sandbox_registry.lock().await;
+        let session = registry.session_mut(session_id)?;
+        session.runtimes.insert(provider.name.clone(), provider);
+        Ok(())
+    }
+
+    pub async fn import_sandbox_file(
+        &self,
+        session_id: &str,
+        file_ref: HostFileRef,
+    ) -> SandboxResult<SandboxFile> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::import_file(&mut registry, session_id, file_ref)
+    }
+
+    pub async fn execute_sandbox_command(
+        &self,
+        session_id: &str,
+        request: SandboxExecRequest,
+    ) -> SandboxResult<SandboxExecResult> {
+        let (workspace_root, network, exec_env): (
+            PathBuf,
+            NetworkPolicy,
+            RegisteredExecEnvironment,
+        ) = {
+            let registry = self.sandbox_registry.lock().await;
+            let session = registry.session(session_id)?;
+            (
+                session.workspace_root.clone(),
+                session.network,
+                session.exec_environment(),
+            )
+        };
+        let SandboxExecRequest {
+            command,
+            cwd,
+            env: request_env,
+            timeout: request_timeout,
+        } = request;
+        let (program, args) = command.split_first().ok_or_else(|| {
+            crate::sandbox::SandboxError::invalid_command("sandbox command must not be empty")
+        })?;
+
+        std::fs::create_dir_all(&workspace_root).map_err(|e| {
+            crate::sandbox::SandboxError::unavailable(format!(
+                "failed to create sandbox workspace root: {e}"
+            ))
+        })?;
+        let cwd = match cwd {
+            Some(cwd) => {
+                path_policy::resolve_existing_sandbox_path(&workspace_root, &cwd.to_string_lossy())?
+            }
+            None => workspace_root.canonicalize().map_err(|e| {
+                crate::sandbox::SandboxError::invalid_sandbox_path(format!(
+                    "failed to resolve sandbox workspace root: {e}"
+                ))
+            })?,
+        };
+        let executable = runner::resolve_executable(program, &exec_env.path_entries)?;
+        let mut env = exec_env.env;
+        merge_path_entries(&mut env, &exec_env.path_entries);
+        env.extend(request_env);
+        let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
+        let policy = RuntimeSandboxPolicy {
+            writable_root: workspace_root,
+            readonly_roots: exec_env.readonly_roots,
+            network,
+        };
+
+        runner::execute(PlatformExecuteRequest {
+            executable,
+            args: args.to_vec(),
+            cwd,
+            env,
+            timeout,
+            policy,
+        })
+        .await
+    }
+
+    pub async fn execute_sandbox_runtime(
+        &self,
+        session_id: &str,
+        request: RuntimeExecuteRequest,
+    ) -> SandboxResult<RuntimeExecuteResult> {
+        let provider = {
+            let registry = self.sandbox_registry.lock().await;
+            let session = registry.session(session_id)?;
+            session
+                .runtimes
+                .get(&request.runtime)
+                .cloned()
+                .ok_or_else(|| {
+                    crate::sandbox::SandboxError::runtime_not_registered(format!(
+                        "sandbox runtime '{}' is not registered",
+                        request.runtime
+                    ))
+                })?
+        };
+
+        let mut env = provider.env.clone();
+        env.extend(request.env);
+        let command = std::iter::once(provider.executable.to_string_lossy().to_string())
+            .chain(request.args)
+            .collect::<Vec<_>>();
+
+        self.execute_sandbox_command(
+            session_id,
+            SandboxExecRequest {
+                command,
+                cwd: request.cwd,
+                env,
+                timeout: request.timeout.or(Some(provider.default_timeout)),
+            },
+        )
+        .await
+    }
+
+    pub async fn register_sandbox_file_version(
+        &self,
+        session_id: &str,
+        request: RegisterVersionRequest,
+    ) -> SandboxResult<FileVersion> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::register_file_version(&mut registry, session_id, request)
+    }
+
+    pub async fn list_sandbox_file_versions(
+        &self,
+        session_id: &str,
+    ) -> SandboxResult<Vec<FileVersion>> {
+        let registry = self.sandbox_registry.lock().await;
+        file_lifecycle::list_file_versions(&registry, session_id)
+    }
+
+    pub async fn commit_sandbox_file_version(
+        &self,
+        session_id: &str,
+        version_id: &str,
+    ) -> SandboxResult<CommitResult> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::commit_file_version(&mut registry, session_id, version_id)
+    }
+
+    pub async fn confirm_sandbox_file_version_overwrite(
+        &self,
+        session_id: &str,
+        version_id: &str,
+    ) -> SandboxResult<CommitResult> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::confirm_file_version_overwrite(&mut registry, session_id, version_id)
+    }
+
+    pub async fn save_sandbox_file_version_as(
+        &self,
+        session_id: &str,
+        version_id: &str,
+        target_path: &Path,
+    ) -> SandboxResult<CommitResult> {
+        let mut registry = self.sandbox_registry.lock().await;
+        file_lifecycle::save_file_version_as(
+            &mut registry,
+            session_id,
+            version_id,
+            target_path.to_path_buf(),
+        )
+    }
+}
+
+fn canonicalize_runtime_provider(
+    mut provider: RuntimeProviderConfig,
+) -> SandboxResult<RuntimeProviderConfig> {
+    let executable_entry = if provider.executable.is_absolute() {
+        provider.executable.clone()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                crate::sandbox::SandboxError::unavailable(format!(
+                    "failed to resolve current directory for sandbox runtime executable: {e}"
+                ))
+            })?
+            .join(&provider.executable)
+    };
+    executable_entry.canonicalize().map_err(|e| {
+        crate::sandbox::SandboxError::unavailable(format!(
+            "failed to resolve sandbox runtime executable '{}': {e}",
+            executable_entry.display()
+        ))
+    })?;
+    provider.executable = executable_entry;
+    provider.readonly_roots = provider
+        .readonly_roots
+        .into_iter()
+        .map(|root| {
+            root.canonicalize().map_err(|e| {
+                crate::sandbox::SandboxError::unavailable(format!(
+                    "failed to resolve sandbox runtime readonly root '{}': {e}",
+                    root.display()
+                ))
+            })
+        })
+        .collect::<SandboxResult<Vec<_>>>()?;
+    provider.readonly_roots.sort();
+    provider.readonly_roots.dedup();
+    Ok(provider)
+}
+
+fn merge_path_entries(env: &mut HashMap<String, String>, path_entries: &[PathBuf]) {
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let prefix = path_entries
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>()
+        .join(separator);
+    if prefix.is_empty() {
+        return;
+    }
+    let path = match env.get("PATH") {
+        Some(existing) if !existing.is_empty() => format!("{prefix}{separator}{existing}"),
+        _ => prefix,
+    };
+    env.insert("PATH".to_string(), path);
 }
 
 /// Spawn an `ahandd` instance wired against the cloud hub described by `config`.
@@ -311,6 +719,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     // (defaulted in `build_inner_config`).
     let file_policy_cfg = inner_config.file_policy.clone().unwrap_or_default();
     let file_mgr = Arc::new(crate::file_manager::FileManager::new(&file_policy_cfg));
+    let app_tools = Arc::new(AppToolRegistry::new());
 
     let status_tx_task = status_tx.clone();
     let device_id_for_task = device_id.clone();
@@ -319,6 +728,11 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     let reporter: Arc<dyn ClientReporter> =
         Arc::new(StatusReporter::new(reporter_status_tx, reporter_device_id));
 
+    let approval_broadcast_tx_for_handle = approval_broadcast_tx.clone();
+    let approval_mgr_for_handle = Arc::clone(&approval_mgr);
+    let session_mgr_for_handle = Arc::clone(&session_mgr);
+
+    let app_tools_for_task = Arc::clone(&app_tools);
     let join = tokio::spawn(async move {
         let _active_guard = active_guard;
         let run_fut = ahand_client::run_with_reporter(
@@ -331,6 +745,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
             approval_broadcast_tx,
             browser_mgr,
             file_mgr,
+            app_tools_for_task,
             reporter,
         );
 
@@ -362,6 +777,11 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         join,
         status_rx,
         device_id,
+        app_tools,
+        approval_broadcast_tx: approval_broadcast_tx_for_handle,
+        approval_mgr: approval_mgr_for_handle,
+        session_mgr: session_mgr_for_handle,
+        sandbox_registry: Arc::new(AsyncMutex::new(SandboxRegistry::default())),
     })
 }
 
@@ -458,7 +878,10 @@ fn build_inner_config(cfg: &DaemonConfig, identity_path: &Path) -> Config {
 fn permissive_embedded_file_policy() -> FilePolicyConfig {
     FilePolicyConfig {
         enabled: true,
-        path_allowlist: vec!["/**".to_string()],
+        // "/**" matches Unix absolute paths; "**" matches Windows
+        // drive-letter paths (glob components carry no leading separator on
+        // Windows, so "/**" alone would deny everything there).
+        path_allowlist: vec!["/**".to_string(), "**".to_string()],
         ..FilePolicyConfig::default()
     }
 }
@@ -761,6 +1184,71 @@ mod tests {
         assert!(!err.to_string().is_empty());
     }
 
+    #[tokio::test]
+    async fn execute_sandbox_command_rejects_empty_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity_dir = temp.path().join("identity");
+        let workspace_root = temp.path().join("sandbox");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+            .heartbeat_interval(Duration::from_millis(50))
+            .build();
+        let handle = spawn(cfg).await.unwrap();
+        handle
+            .create_sandbox_session(SandboxSessionConfig {
+                session_id: "session-1".to_string(),
+                permission_mode: SandboxPermissionMode::Readonly,
+                workspace_root,
+                network: NetworkPolicy::Enabled,
+            })
+            .await
+            .unwrap();
+
+        let err = handle
+            .execute_sandbox_command(
+                "session-1",
+                SandboxExecRequest {
+                    command: vec![],
+                    cwd: None,
+                    env: HashMap::new(),
+                    timeout: Some(Duration::from_secs(1)),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, "INVALID_COMMAND");
+        handle.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_runtime_provider_preserves_executable_entry_path() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("runtime").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let alias = bin.join("python");
+        symlink("/bin/echo", &alias).unwrap();
+
+        let provider = canonicalize_runtime_provider(RuntimeProviderConfig {
+            name: "python".to_string(),
+            executable: alias.clone(),
+            readonly_roots: vec![bin.clone(), PathBuf::from("/bin")],
+            env: HashMap::new(),
+            default_timeout: Duration::from_secs(10),
+        })
+        .unwrap();
+
+        assert_eq!(provider.executable, alias);
+        assert!(
+            provider
+                .readonly_roots
+                .contains(&bin.canonicalize().unwrap())
+        );
+    }
+
     #[test]
     fn load_or_create_identity_is_idempotent() {
         let dir = std::env::temp_dir().join(format!(
@@ -776,6 +1264,43 @@ mod tests {
         assert_eq!(a.public_key_bytes(), b.public_key_bytes());
         // Cleanup
         let _ = std::fs::remove_file(dir.join(IDENTITY_FILE_NAME));
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[tokio::test]
+    async fn permissive_embedded_policy_admits_native_paths() {
+        // Regression pin for the Windows port: the permissive allowlist used
+        // to be only "/**", which never matches drive-letter paths
+        // (C:\...), so every embedded-library file op was PolicyDenied on
+        // Windows. This must pass on all three CI platforms.
+        use ahand_protocol::{FileRequest, FileStat, file_request, file_response};
+        let dir = std::env::temp_dir().join(format!(
+            "ahandd-public-api-permissive-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = dir.join("probe.txt");
+        std::fs::write(&probe, "ok").unwrap();
+
+        let mgr = crate::file_manager::FileManager::new(&permissive_embedded_file_policy());
+        let req = FileRequest {
+            request_id: "permissive".into(),
+            operation: Some(file_request::Operation::Stat(FileStat {
+                path: probe.to_string_lossy().into_owned(),
+                no_follow_symlink: false,
+            })),
+        };
+        let resp = mgr.handle(&req).await;
+        assert!(
+            matches!(resp.result, Some(file_response::Result::Stat(_))),
+            "permissive policy denied a native path: {:?}",
+            resp.result
+        );
+        // Cleanup
+        let _ = std::fs::remove_file(&probe);
         let _ = std::fs::remove_dir(&dir);
     }
 }

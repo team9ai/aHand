@@ -17,18 +17,20 @@
 //! trackers filter by `job_id` so a control-plane job doesn't collide
 //! with a dashboard job.
 //!
-//! Cleanup semantics: an entry is removed as soon as a terminal event
-//! (`Finished` or `Error`) is published to it. Leaking subscribers
-//! don't matter — `tokio::broadcast` drops senders naturally when the
-//! entry goes out of scope, which in turn closes any SSE streams. If
-//! a daemon never emits a terminal event (crash without final frame),
-//! the entry stays until the hub is restarted — the dashboard job
-//! flow already relies on the WS disconnect path to finalize jobs, but
-//! control-plane jobs don't have that hook, so callers should set a
-//! sensible `timeout_ms` on the daemon side.
+//! Cleanup semantics: a live entry is removed as soon as a terminal
+//! event (`Finished` or `Error`) is published to it. We keep a small
+//! completed-access record for the same retention window as job output
+//! so late `/output` subscribers can still be authorized. Leaking
+//! subscribers don't matter — `tokio::broadcast` drops senders naturally
+//! when the live entry goes out of scope, which in turn closes any SSE
+//! streams. If a daemon never emits a terminal event (crash without
+//! final frame), the live entry stays until the hub is restarted — the
+//! dashboard job flow already relies on the WS disconnect path to
+//! finalize jobs, but control-plane jobs don't have that hook, so
+//! callers should set a sensible `timeout_ms` on the daemon side.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::broadcast;
@@ -39,6 +41,7 @@ use tokio::sync::broadcast;
 /// subscriber that falls behind simply sees `RecvError::Lagged` and
 /// the stream ends.
 const JOB_EVENT_CHANNEL_CAPACITY: usize = 1024;
+const DEFAULT_COMPLETED_ACCESS_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 /// Single control-plane job event delivered to SSE subscribers.
 ///
@@ -79,6 +82,18 @@ pub struct JobChannels {
     pub started_at: Instant,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ControlJobAccess {
+    pub device_id: String,
+    pub external_user_id: String,
+}
+
+#[derive(Clone)]
+struct CompletedControlJobAccess {
+    access: ControlJobAccess,
+    completed_at: Instant,
+}
+
 impl JobChannels {
     /// Subscribe for incoming events. The returned receiver lives
     /// independently of this channel handle and is dropped by the
@@ -103,15 +118,38 @@ impl JobChannels {
 ///   so POSTs with the same correlation id from the same user are
 ///   idempotent without leaking ids across users (a user could
 ///   legitimately reuse a correlation id another user also picked).
-#[derive(Default)]
 pub struct ControlJobTracker {
     jobs: DashMap<String, Arc<JobChannels>>,
+    completed_access: DashMap<String, CompletedControlJobAccess>,
     correlation_index: DashMap<String, String>,
+    completed_access_retention: Duration,
+}
+
+impl Default for ControlJobTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ControlJobTracker {
     pub fn new() -> Self {
-        Self::default()
+        Self::new_with_completed_access_retention(DEFAULT_COMPLETED_ACCESS_RETENTION)
+    }
+
+    pub fn new_with_completed_access_retention(completed_access_retention: Duration) -> Self {
+        Self {
+            jobs: DashMap::new(),
+            completed_access: DashMap::new(),
+            correlation_index: DashMap::new(),
+            completed_access_retention,
+        }
+    }
+
+    fn prune_completed_access(&self) {
+        let now = Instant::now();
+        self.completed_access.retain(|_, entry| {
+            now.duration_since(entry.completed_at) <= self.completed_access_retention
+        });
     }
 
     /// Register a new job and return a handle to it. Safe to call
@@ -136,12 +174,27 @@ impl ControlJobTracker {
             self.correlation_index
                 .insert(correlation_key(&external_user_id, &cid), job_id.clone());
         }
+        self.prune_completed_access();
+        self.completed_access.remove(&job_id);
         self.jobs.insert(job_id, channels.clone());
         channels
     }
 
     pub fn get(&self, job_id: &str) -> Option<Arc<JobChannels>> {
         self.jobs.get(job_id).map(|entry| entry.clone())
+    }
+
+    pub fn access(&self, job_id: &str) -> Option<ControlJobAccess> {
+        self.prune_completed_access();
+        if let Some(channels) = self.jobs.get(job_id) {
+            return Some(ControlJobAccess {
+                device_id: channels.device_id.clone(),
+                external_user_id: channels.external_user_id.clone(),
+            });
+        }
+        self.completed_access
+            .get(job_id)
+            .map(|entry| entry.access.clone())
     }
 
     /// Returns the existing `job_id` if the `(external_user_id,
@@ -185,6 +238,16 @@ impl ControlJobTracker {
             return;
         };
         channels.send(event);
+        self.completed_access.insert(
+            job_id.to_string(),
+            CompletedControlJobAccess {
+                access: ControlJobAccess {
+                    device_id: channels.device_id.clone(),
+                    external_user_id: channels.external_user_id.clone(),
+                },
+                completed_at: Instant::now(),
+            },
+        );
         if let Some(cid) = &channels.correlation_id {
             let key = correlation_key(&channels.external_user_id, cid);
             // Only remove if the correlation entry still points at
@@ -311,8 +374,29 @@ mod tests {
             }
         );
         assert!(t.get("job-1").is_none());
+        assert_eq!(
+            t.access("job-1"),
+            Some(ControlJobAccess {
+                device_id: "dev".into(),
+                external_user_id: "user".into(),
+            })
+        );
         assert_eq!(t.find_by_correlation("user", "corr"), None);
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn completed_access_expires_after_retention() {
+        let t = ControlJobTracker::new_with_completed_access_retention(Duration::ZERO);
+        t.register("job-1".into(), "dev".into(), "user".into(), None);
+        t.finalize(
+            "job-1",
+            ControlJobEvent::Finished {
+                exit_code: 0,
+                duration_ms: 5,
+            },
+        );
+        assert_eq!(t.access("job-1"), None);
     }
 
     #[test]

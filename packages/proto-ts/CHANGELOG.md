@@ -1,5 +1,22 @@
 # @ahandai/proto Changelog
 
+## 0.3.0 — 2026-06-11
+
+### Added
+
+- **`AppToolsUpdate` / `AppToolRequest` / `AppToolResponse`** wire types
+  (Envelope tags 35–37) for application-defined tools registered by host
+  apps embedding `ahandd`. Includes `AppToolDescriptor` (name, description,
+  JSON Schema, `requires_approval`) and `AppToolError`.
+
+## 0.2.1 — 2026-05-13
+
+### Added
+
+- Added `read_pdf` file-operation protobuf types, including PDF modes
+  (`auto`, `metadata`, `raw`, `imgs`, `text`), page ranges, metadata,
+  rendered page images, and page text payloads.
+
 ## 0.2.0 — 2026-04-30
 
 Released alongside `@ahandai/sdk@0.2.0`. Both packages are now published

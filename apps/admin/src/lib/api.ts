@@ -80,6 +80,41 @@ export interface StatusResponse {
   config_path: string;
   data_dir: string;
   data_dir_size: number;
+  home_dir: string;
+  bin_dir: string;
+}
+
+export type PluginStatus =
+  | "installed"
+  | "missing"
+  | "outdated"
+  | "failed"
+  | "blocked";
+
+export type HostPlatform = "darwin" | "linux" | "windows";
+export type HostArch = "arm64" | "x64";
+
+export type HostResourceValue =
+  | { kind: "executable"; name: string; path: string; version?: string }
+  | { kind: "directory"; name: string; path: string }
+  | { kind: "env"; name: string; value: string }
+  | { kind: "config"; name: string; value: unknown };
+
+export interface InstalledPluginResource {
+  id: string;
+  version: string;
+  status: PluginStatus;
+  dependencies: string[];
+  capabilities: string[];
+  resources: Record<string, HostResourceValue>;
+  helpPrompt?: string;
+}
+
+export interface HostResourceSnapshot {
+  runtimeVersion: string;
+  platform: HostPlatform;
+  arch: HostArch;
+  plugins: InstalledPluginResource[];
 }
 
 export interface LogEntry {
@@ -117,6 +152,10 @@ export interface RunDetail {
 export const api = {
   async getStatus(): Promise<StatusResponse> {
     return fetchAPI("/status");
+  },
+
+  async getHostResource(): Promise<HostResourceSnapshot> {
+    return fetchAPI("/host-resource");
   },
 
   async getConfig(): Promise<any> {

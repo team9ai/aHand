@@ -1,4 +1,5 @@
 mod ahand_client;
+mod app_tool_registry;
 mod approval;
 mod browser;
 mod browser_setup;
@@ -10,12 +11,14 @@ mod file_manager;
 mod ipc;
 mod openclaw;
 mod outbox;
+mod plugin_runtime;
 mod policy;
 mod registry;
 mod session;
 mod store;
 pub mod updater;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -23,7 +26,6 @@ use ahand_protocol::Envelope;
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 use config::ConnectionMode;
-use tokio::signal::unix::{SignalKind, signal};
 use tracing::info;
 
 #[derive(Parser)]
@@ -49,11 +51,11 @@ struct Args {
     #[arg(long, env = "AHAND_DATA_DIR")]
     data_dir: Option<String>,
 
-    /// Enable debug IPC server (Unix socket)
+    /// Enable debug IPC server
     #[arg(long, env = "AHAND_DEBUG_IPC")]
     debug_ipc: bool,
 
-    /// Custom path for the IPC Unix socket
+    /// Custom IPC endpoint (Unix socket path; named pipe name on Windows)
     #[arg(long, env = "AHAND_IPC_SOCKET")]
     ipc_socket: Option<String>,
 
@@ -97,12 +99,35 @@ enum Cmd {
         /// Force reinstall (clean existing installation first)
         #[arg(long)]
         force: bool,
-        /// Run only a single step: node or playwright
+        /// Run only a single step: node, python, or playwright
         #[arg(long)]
         step: Option<String>,
     },
     /// Diagnose browser automation setup and report missing components
     BrowserDoctor,
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCmd {
+    /// Inspect all plugins or a single plugin
+    Doctor { plugin: Option<String> },
+    /// Install a plugin and required dependencies
+    Install {
+        plugin: String,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Reinstall or repair a plugin
+    Repair { plugin: String },
+    /// Print getHostResource JSON
+    HostResource {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -119,6 +144,9 @@ async fn main() -> anyhow::Result<()> {
             }
             Cmd::BrowserDoctor => {
                 return cli::browser_doctor::run().await;
+            }
+            Cmd::Plugin { command } => {
+                return run_plugin_command(command).await;
             }
         }
     }
@@ -274,6 +302,9 @@ async fn main() -> anyhow::Result<()> {
         info!(pid = std::process::id(), path = %p.display(), "wrote PID file");
     }
 
+    // Clean up any stale binary left by a previous Windows self-update.
+    updater::cleanup_old_binary();
+
     let session_mgr = Arc::new(session::SessionManager::new(
         cfg.trust_timeout_mins.unwrap_or(60),
     ));
@@ -300,13 +331,16 @@ async fn main() -> anyhow::Result<()> {
 
     let file_policy_cfg = cfg.file_policy.clone().unwrap_or_default();
     let file_mgr = Arc::new(file_manager::FileManager::new(&file_policy_cfg));
+    // CLI daemon advertises an empty app-tool catalog; embedding apps
+    // populate this via DaemonHandle::register_app_tool instead.
+    let app_tools = Arc::new(app_tool_registry::AppToolRegistry::new());
 
     // Broadcast channel for pushing approval requests to all IPC clients.
     let (approval_broadcast_tx, _) = tokio::sync::broadcast::channel::<Envelope>(64);
 
-    // Set up signal handlers for graceful shutdown.
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
+    // Set up signal handlers for graceful shutdown (SIGTERM/SIGINT on Unix,
+    // Ctrl-C on Windows).
+    let shutdown = ahand_platform::signals::shutdown_signal()?;
 
     let main_future = async {
         match connection_mode {
@@ -340,10 +374,11 @@ async fn main() -> anyhow::Result<()> {
                         approval_broadcast_tx.clone(),
                         device_id.clone(),
                         Arc::clone(&browser_mgr),
+                        Arc::clone(&file_mgr),
                     ));
 
                     tokio::select! {
-                        r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx, Arc::clone(&browser_mgr), Arc::clone(&file_mgr)) => r,
+                        r = ahand_client::run(cfg, device_id, registry, store_opt, session_mgr, approval_mgr, approval_broadcast_tx, Arc::clone(&browser_mgr), Arc::clone(&file_mgr), Arc::clone(&app_tools)) => r,
                         r = ipc_handle => {
                             r??;
                             Ok(())
@@ -360,6 +395,7 @@ async fn main() -> anyhow::Result<()> {
                         approval_broadcast_tx,
                         browser_mgr,
                         file_mgr,
+                        app_tools,
                     )
                     .await
                 }
@@ -401,6 +437,7 @@ async fn main() -> anyhow::Result<()> {
                         approval_broadcast_tx.clone(),
                         device_id.clone(),
                         Arc::clone(&browser_mgr),
+                        Arc::clone(&file_mgr),
                     ));
 
                     tokio::select! {
@@ -420,12 +457,8 @@ async fn main() -> anyhow::Result<()> {
     // Race main event loop against shutdown signals.
     let result = tokio::select! {
         r = main_future => r,
-        _ = sigterm.recv() => {
-            info!("received SIGTERM, shutting down");
-            Ok(())
-        }
-        _ = sigint.recv() => {
-            info!("received SIGINT, shutting down");
+        sig = shutdown => {
+            info!(signal = sig, "received shutdown signal, shutting down");
             Ok(())
         }
     };
@@ -434,6 +467,85 @@ async fn main() -> anyhow::Result<()> {
     cleanup_pid_file(&pid_path);
 
     result
+}
+
+async fn run_plugin_command(command: &PluginCmd) -> anyhow::Result<()> {
+    match command {
+        PluginCmd::Doctor { plugin } => {
+            let snapshot = plugin_runtime::get_host_resource().await?;
+            let mut matched = false;
+            for item in snapshot.plugins {
+                if plugin.as_deref().is_some_and(|id| id != item.id) {
+                    continue;
+                }
+                matched = true;
+                println!("{}: {:?}", item.id, item.status);
+            }
+            if let Some(plugin) = plugin
+                && !matched
+            {
+                anyhow::bail!("unknown plugin `{plugin}`");
+            }
+            Ok(())
+        }
+        PluginCmd::Install { plugin, force } => run_plugin_install(plugin, *force).await,
+        PluginCmd::Repair { plugin } => run_plugin_install(plugin, true).await,
+        PluginCmd::HostResource { json } => {
+            let snapshot = plugin_runtime::get_host_resource().await?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&snapshot)?);
+            } else {
+                for plugin in snapshot.plugins {
+                    println!("{}: {:?}", plugin.id, plugin.status);
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_plugin_install(plugin: &str, force: bool) -> anyhow::Result<()> {
+    for step in install_steps_for(plugin)? {
+        cli::browser_init::run(force, Some(step)).await?;
+    }
+    Ok(())
+}
+
+fn install_steps_for(plugin: &str) -> anyhow::Result<Vec<String>> {
+    let registry = plugin_runtime::builtin::builtin_registry()?;
+    let activation_order = registry.activation_order()?;
+    let mut required = BTreeSet::new();
+    collect_plugin_and_dependencies(plugin, &registry, &mut required)?;
+
+    let steps = activation_order
+        .into_iter()
+        .filter(|id| required.contains(id) && has_install_step(id))
+        .collect::<Vec<_>>();
+
+    if steps.is_empty() {
+        anyhow::bail!("plugin `{plugin}` does not have an install step in this release");
+    }
+
+    Ok(steps)
+}
+
+fn collect_plugin_and_dependencies(
+    plugin: &str,
+    registry: &plugin_runtime::PluginRegistry,
+    required: &mut BTreeSet<String>,
+) -> anyhow::Result<()> {
+    let manifest = registry
+        .get(plugin)
+        .ok_or_else(|| anyhow::anyhow!("unknown plugin `{plugin}`"))?;
+    for dependency in &manifest.dependencies {
+        collect_plugin_and_dependencies(dependency, registry, required)?;
+    }
+    required.insert(plugin.to_string());
+    Ok(())
+}
+
+fn has_install_step(plugin: &str) -> bool {
+    matches!(plugin, "node" | "python" | "browser-playwright-cli")
 }
 
 fn write_pid_file(data_dir: &Option<PathBuf>) -> Option<PathBuf> {
@@ -457,5 +569,48 @@ fn cleanup_pid_file(pid_path: &Option<PathBuf>) {
         } else {
             tracing::info!(path = %path.display(), "removed PID file");
         }
+    }
+}
+
+#[cfg(test)]
+mod plugin_cli_tests {
+    use super::*;
+
+    #[test]
+    fn browser_plugin_install_steps_include_node_dependency_first() {
+        assert_eq!(
+            install_steps_for("browser-playwright-cli").unwrap(),
+            vec!["node".to_string(), "browser-playwright-cli".to_string()]
+        );
+    }
+
+    #[test]
+    fn node_plugin_install_steps_include_only_node() {
+        assert_eq!(install_steps_for("node").unwrap(), vec!["node".to_string()]);
+    }
+
+    #[test]
+    fn python_plugin_install_steps_include_only_python() {
+        assert_eq!(
+            install_steps_for("python").unwrap(),
+            vec!["python".to_string()]
+        );
+    }
+
+    #[test]
+    fn non_installable_plugin_reports_no_install_step() {
+        let err = install_steps_for("file").unwrap_err().to_string();
+        assert!(err.contains("does not have an install step"));
+    }
+
+    #[tokio::test]
+    async fn plugin_doctor_rejects_unknown_plugin() {
+        let err = run_plugin_command(&PluginCmd::Doctor {
+            plugin: Some("does-not-exist".to_string()),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown plugin `does-not-exist`"));
     }
 }

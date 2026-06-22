@@ -1,6 +1,6 @@
 {
   "name": "@ahand/daemon",
-  "version": "0.1.2",
+  "version": "0.1.14",
   "private": true,
   "description": "AHand local execution daemon",
   "scripts": {

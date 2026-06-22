@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ahand-platform = { path = "../ahand-platform" }
 ahand-protocol = { path = "../ahand-protocol" }
 tokio.workspace = true
 prost.workspace = true
@@ -48,6 +49,7 @@ semver = "1"
 hex = "0.4"
 portable-pty = "0.9.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+pdf_oxide = { version = "0.3.46", default-features = false, features = ["rendering"] }
 glob = "0.3"
 trash = "5"
 encoding_rs = "0.8"
@@ -61,6 +63,22 @@ chardetng = "0.1"
 # wrapper, and it is already present in the workspace lock as a
 # transitive dep so deduplicates cleanly.
 nix = { version = "0.28", features = ["fs", "dir"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Used by `file_manager::fs_ops` to perform a TRUE protected-DACL replacement
+# for Windows ACL chmod via the Win32 security API (SetNamedSecurityInfoW with
+# PROTECTED_DACL_SECURITY_INFORMATION), instead of icacls (which leaves
+# pre-existing explicit ACEs in place). Principal→SID resolution uses
+# LookupAccountNameW; the DACL is built from an SDDL string via
+# ConvertStringSecurityDescriptorToSecurityDescriptorW + GetSecurityDescriptorDacl.
+# Feature set mirrors ahand-platform/ipc.rs (T6) plus the Authorization module
+# for SetNamedSecurityInfoW / SE_FILE_OBJECT and SID stringification.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 [features]
 # Dev-only escape hatch for the manual TCP-keepalive smoke test in

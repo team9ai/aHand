@@ -8,18 +8,33 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ahand_protocol::{
-    ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy, FileCreateSymlink, FileDelete,
-    FileEdit, FileErrorCode, FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary,
-    FileReadImage, FileReadText, FileRequest, FileStat, FileType, FileWrite, FullWrite,
-    ImageFormat, LineCol, LineRangeReplace, StopReason, StringReplace, UnixPermission, WriteAction,
-    file_chmod, file_edit, file_position, file_read_text, file_request, file_response, file_write,
-    full_write,
+    ByteRangeReplace, DeleteMode, FileAppend, FileChmod, FileCopy, FileDelete, FileEdit,
+    FileErrorCode, FileGlob, FileList, FileMkdir, FileMove, FilePosition, FileReadBinary,
+    FileReadImage, FileReadPdf, FileReadPdfMode, FileReadText, FileRequest, FileStat, FileType,
+    FileWrite, FullWrite, ImageFormat, LineCol, LineRangeReplace, PdfPageRange, StopReason,
+    StringReplace, WriteAction, file_edit, file_position, file_read_text, file_request,
+    file_response, file_write, full_write,
 };
+// FileCreateSymlink is used in both #[cfg(unix)] and #[cfg(windows)] tests.
+// UnixPermission and file_chmod are only used in #[cfg(unix)] tests.
+// AclEntry, AclEntryType, WindowsAcl are used in #[cfg(windows)] ACL tests.
+#[cfg(any(unix, windows))]
+use ahand_protocol::FileCreateSymlink;
+#[cfg(unix)]
+use ahand_protocol::{UnixPermission, file_chmod};
 use ahandd::config::FilePolicyConfig;
 use ahandd::file_manager::FileManager;
 use tempfile::TempDir;
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
+
+/// Canonicalize `path` and strip the Windows verbatim prefix (`\\?\`) so the
+/// result can be used in allowlist patterns and compared with paths returned by
+/// `check_path` (which also applies dunce::simplify). On Unix this is identical
+/// to `path.canonicalize().unwrap()`.
+fn canon(path: &std::path::Path) -> PathBuf {
+    ahand_platform::paths::canonicalize_simplified(path).expect("canonicalization should succeed")
+}
 
 /// Set up a permissive file manager scoped to the given temp directory.
 ///
@@ -28,9 +43,10 @@ use tempfile::TempDir;
 /// `/var/folders/...` becomes `/private/var/folders/...` after canonicalization
 /// and our policy checker doesn't resolve symlinks.
 fn test_manager(tmp: &TempDir) -> (FileManager, PathBuf) {
-    let root = tmp
-        .path()
-        .canonicalize()
+    // Use canonicalize_simplified to strip the Windows verbatim prefix (\\?\)
+    // so the allowlist patterns match what FilePolicyChecker returns after its
+    // own simplify() call. On Unix this is identical to plain canonicalize().
+    let root = ahand_platform::paths::canonicalize_simplified(tmp.path())
         .expect("tempdir canonicalization should succeed");
     let root_str = root.to_string_lossy().into_owned();
     let pattern = format!("{}/**", root_str.trim_end_matches('/'));
@@ -57,6 +73,8 @@ fn stat_request(path: &Path) -> FileRequest {
     }
 }
 
+// Used by unix and windows no-follow tests.
+#[cfg(any(unix, windows))]
 fn stat_request_no_follow(path: &Path) -> FileRequest {
     FileRequest {
         request_id: "test".to_string(),
@@ -137,6 +155,92 @@ fn expect_read_image(resp: ahand_protocol::FileResponse) -> ahand_protocol::File
     }
 }
 
+fn expect_read_pdf(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileReadPdfResult {
+    match resp.result {
+        Some(file_response::Result::ReadPdf(r)) => r,
+        other => panic!("expected read_pdf result, got {other:?}"),
+    }
+}
+
+fn wrap_read_pdf(req: FileReadPdf) -> FileRequest {
+    FileRequest {
+        request_id: "pdf".into(),
+        operation: Some(file_request::Operation::ReadPdf(req)),
+    }
+}
+
+fn pdf_escape_text(text: &str) -> String {
+    text.replace('\\', r"\\")
+        .replace('(', r"\(")
+        .replace(')', r"\)")
+}
+
+fn write_test_pdf(path: &Path, pages: usize) {
+    assert!(pages > 0);
+    let mut objects: Vec<(usize, String)> = Vec::new();
+    let kids = (0..pages)
+        .map(|idx| format!("{} 0 R", 4 + idx * 2))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    objects.push((1, "<< /Type /Catalog /Pages 2 0 R >>".to_string()));
+    objects.push((
+        2,
+        format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids, pages),
+    ));
+    objects.push((
+        3,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ));
+
+    for page_idx in 0..pages {
+        let page_no = page_idx + 1;
+        let page_obj = 4 + page_idx * 2;
+        let content_obj = page_obj + 1;
+        let text = pdf_escape_text(&format!("Page {} alpha beta", page_no));
+        let stream = format!("BT /F1 18 Tf 40 150 Td ({}) Tj ET", text);
+        objects.push((
+            page_obj,
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] \
+                 /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+                content_obj
+            ),
+        ));
+        objects.push((
+            content_obj,
+            format!(
+                "<< /Length {} >>\nstream\n{}\nendstream",
+                stream.len(),
+                stream
+            ),
+        ));
+    }
+
+    objects.sort_by_key(|(id, _)| *id);
+    let max_id = objects.last().map(|(id, _)| *id).unwrap();
+    let mut out = String::from("%PDF-1.4\n");
+    let mut offsets = vec![0usize; max_id + 1];
+    for (id, body) in objects {
+        offsets[id] = out.len();
+        out.push_str(&format!("{} 0 obj\n{}\nendobj\n", id, body));
+    }
+
+    let xref_offset = out.len();
+    out.push_str(&format!("xref\n0 {}\n", max_id + 1));
+    out.push_str("0000000000 65535 f \n");
+    for offset in offsets.iter().take(max_id + 1).skip(1) {
+        out.push_str(&format!("{:010} 00000 n \n", offset));
+    }
+    out.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        max_id + 1,
+        xref_offset
+    ));
+
+    fs::write(path, out).expect("failed to write test PDF");
+}
+
 fn expect_write(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileWriteResult {
     match resp.result {
         Some(file_response::Result::Write(r)) => r,
@@ -172,6 +276,7 @@ fn expect_move(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileMoveRe
     }
 }
 
+#[cfg(any(unix, windows))]
 fn expect_symlink(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileCreateSymlinkResult {
     match resp.result {
         Some(file_response::Result::CreateSymlink(r)) => r,
@@ -179,6 +284,7 @@ fn expect_symlink(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileCre
     }
 }
 
+#[cfg(any(unix, windows))]
 fn expect_chmod(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileChmodResult {
     match resp.result {
         Some(file_response::Result::Chmod(r)) => r,
@@ -710,11 +816,19 @@ async fn stat_outside_allowlist_is_denied() {
     let dir = TempDir::new().unwrap();
     let (mgr, _root) = test_manager(&dir);
 
-    // Try to stat a path outside the allowlist.
+    // Use an OS-appropriate absolute path that is guaranteed to be outside the
+    // allowlist (which is scoped to the temp dir). On Windows `/etc/hosts` is
+    // not a valid absolute path (no drive letter), so we use the Windows
+    // equivalent instead.
+    #[cfg(unix)]
+    let outside_path = "/etc/hosts";
+    #[cfg(windows)]
+    let outside_path = r"C:\Windows\System32\drivers\etc\hosts";
+
     let req = FileRequest {
         request_id: "t".into(),
         operation: Some(file_request::Operation::Stat(FileStat {
-            path: "/etc/hosts".into(),
+            path: outside_path.into(),
             no_follow_symlink: false,
         })),
     };
@@ -823,7 +937,7 @@ async fn read_text_respects_max_bytes() {
     let result = expect_read_text(resp);
     assert_eq!(result.stop_reason, StopReason::MaxBytes as i32);
     assert!(result.lines.len() <= 3); // at most 2-3 lines
-    assert!(result.lines.len() >= 1);
+    assert!(!result.lines.is_empty());
 }
 
 #[tokio::test]
@@ -1273,7 +1387,7 @@ async fn read_image_input_size_exceeds_max_read_bytes_is_rejected() {
     // size so the file-size check trips before the dimension guard.
     use image::{ImageBuffer, Rgb};
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
         enabled: true,
@@ -1336,6 +1450,154 @@ async fn read_image_max_bytes_unreachable_returns_too_large() {
     let resp = mgr.handle(&req).await;
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::TooLarge as i32);
+}
+
+// ── FileReadPdf tests ──────────────────────────────────────────────────────
+
+fn read_pdf_request(path: &Path, mode: FileReadPdfMode, range: Option<(u32, u32)>) -> FileReadPdf {
+    FileReadPdf {
+        path: path.to_string_lossy().into_owned(),
+        mode: mode as i32,
+        page_range: range.map(|(start_page, end_page)| PdfPageRange {
+            start_page,
+            end_page,
+        }),
+        no_follow_symlink: false,
+    }
+}
+
+#[tokio::test]
+async fn read_pdf_metadata_returns_total_pages_and_bytes() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 6);
+    let size = fs::metadata(&file).unwrap().len();
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Metadata,
+            None,
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Metadata as i32);
+    let metadata = result.metadata.expect("metadata should be populated");
+    assert_eq!(metadata.total_pages, 6);
+    assert_eq!(metadata.total_file_bytes, size);
+    assert!(result.images.is_empty());
+    assert!(result.text_pages.is_empty());
+    assert!(result.raw_content.is_empty());
+}
+
+#[tokio::test]
+async fn read_pdf_text_returns_page_separated_text_for_range() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 6);
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Text,
+            Some((2, 4)),
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Text as i32);
+    assert_eq!(result.metadata.unwrap().total_pages, 6);
+    assert_eq!(result.text_pages.len(), 3);
+    assert_eq!(result.text_pages[0].page_number, 2);
+    assert!(result.text_pages[0].content.contains("Page 2 alpha beta"));
+    assert_eq!(result.text_pages[2].page_number, 4);
+    assert!(result.text_pages[2].content.contains("Page 4 alpha beta"));
+    assert!(result.images.is_empty());
+}
+
+#[tokio::test]
+async fn read_pdf_imgs_returns_rendered_images_for_range() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 6);
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Imgs,
+            Some((2, 3)),
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Imgs as i32);
+    assert_eq!(result.images.len(), 2);
+    assert_eq!(result.images[0].page_number, 2);
+    assert_eq!(result.images[0].format, ImageFormat::Png as i32);
+    assert!(result.images[0].width > 0);
+    assert!(result.images[0].height > 0);
+    assert!(
+        result.images[0]
+            .content
+            .starts_with(&[0x89, b'P', b'N', b'G'])
+    );
+    assert_eq!(result.images[1].page_number, 3);
+    assert!(result.text_pages.is_empty());
+}
+
+#[tokio::test]
+async fn read_pdf_auto_defaults_to_first_five_pages_with_images_and_text() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 6);
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Auto,
+            None,
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Auto as i32);
+    assert_eq!(result.metadata.unwrap().total_pages, 6);
+    assert_eq!(result.images.len(), 5);
+    assert_eq!(result.text_pages.len(), 5);
+    assert_eq!(result.images[0].page_number, 1);
+    assert_eq!(result.images[4].page_number, 5);
+    assert!(result.text_pages[4].content.contains("Page 5 alpha beta"));
+}
+
+#[tokio::test]
+async fn read_pdf_raw_rejects_page_range_and_returns_pdf_bytes() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("doc.pdf");
+    write_test_pdf(&file, 2);
+
+    let bad_resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Raw,
+            Some((1, 1)),
+        )))
+        .await;
+    let err = expect_error(bad_resp);
+    assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+
+    let resp = mgr
+        .handle(&wrap_read_pdf(read_pdf_request(
+            &file,
+            FileReadPdfMode::Raw,
+            None,
+        )))
+        .await;
+    let result = expect_read_pdf(resp);
+    assert_eq!(result.mode, FileReadPdfMode::Raw as i32);
+    assert_eq!(result.metadata.unwrap().total_pages, 2);
+    assert!(result.raw_content.starts_with(b"%PDF-"));
 }
 
 // ── FileWrite tests ────────────────────────────────────────────────────────
@@ -1550,7 +1812,7 @@ async fn write_exceeds_max_bytes_returns_too_large() {
     let dir = TempDir::new().unwrap();
     let _ = dir.path();
     // Use a custom manager with a tight max_write_bytes.
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
         enabled: true,
@@ -1563,7 +1825,7 @@ async fn write_exceeds_max_bytes_returns_too_large() {
     let file = tmp_root.join("too_big.bin");
 
     let resp = mgr
-        .handle(&write_request_full(&file, &vec![0u8; 100], false))
+        .handle(&write_request_full(&file, &[0u8; 100], false))
         .await;
     let err = expect_error(resp);
     assert_eq!(err.code, FileErrorCode::TooLarge as i32);
@@ -1593,7 +1855,7 @@ async fn write_string_replace_refuses_oversized_existing_file_before_read() {
     // through the Write StringReplace path (which goes through
     // `apply_string_replace`).
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let mgr = manager_with_max_write(&tmp_root, 50);
 
     let file = tmp_root.join("big.txt");
@@ -1631,7 +1893,7 @@ async fn edit_string_replace_refuses_oversized_existing_file_before_read() {
     // inline `read_to_string` (not delegated to apply_string_replace),
     // so the pre-check has to fire there independently.
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let mgr = manager_with_max_write(&tmp_root, 50);
 
     let file = tmp_root.join("big.txt");
@@ -1666,7 +1928,7 @@ async fn line_range_replace_refuses_oversized_existing_file_before_read() {
     // (apply_line_range_replace also calls read_to_string on the full
     // file before any size check; the same OOM hazard applies).
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let mgr = manager_with_max_write(&tmp_root, 50);
 
     let file = tmp_root.join("big.txt");
@@ -1703,7 +1965,7 @@ async fn byte_range_replace_refuses_oversized_existing_file_before_read() {
     // `read_to_string`, so the size guard has to live on this branch
     // separately even though the OOM hazard is identical).
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let mgr = manager_with_max_write(&tmp_root, 50);
 
     let file = tmp_root.join("big.bin");
@@ -2985,7 +3247,7 @@ async fn read_image_bomb_guard_rejects_oversized_dimensions() {
     // by setting max_read_bytes tight enough that the guard trips.
     use image::{ImageBuffer, Rgb};
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     // Tight budget: 1 MB read cap, but 1024x1024 RGBA = 4 MB decoded.
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
@@ -3016,10 +3278,7 @@ async fn read_image_bomb_guard_rejects_oversized_dimensions() {
 /// marks specific subpaths as `dangerous_paths`. Mirrors `test_manager`
 /// but with the dangerous-paths slot populated.
 fn manager_with_dangerous(tmp: &TempDir, dangerous: &[&str]) -> (FileManager, std::path::PathBuf) {
-    let root = tmp
-        .path()
-        .canonicalize()
-        .expect("tempdir canonicalization should succeed");
+    let root = canon(tmp.path());
     let root_str = root.to_string_lossy().into_owned();
     let pattern = format!("{}/**", root_str.trim_end_matches('/'));
     let dangerous_abs: Vec<String> = dangerous
@@ -3376,7 +3635,7 @@ async fn read_text_exceeding_max_read_bytes_returns_too_large() {
     // slurping. A file that exceeds the policy budget should return
     // TooLarge, never load into memory.
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
         enabled: true,
@@ -3619,7 +3878,7 @@ async fn append_exceeding_total_size_limit_returns_too_large() {
     // and new content. An existing file at the limit + any non-empty
     // append must fail with TooLarge before any write happens.
     let dir = TempDir::new().unwrap();
-    let tmp_root = dir.path().canonicalize().unwrap();
+    let tmp_root = canon(dir.path());
     let root_str = tmp_root.to_string_lossy().into_owned();
     let mgr = ahandd::file_manager::FileManager::new(&ahandd::config::FilePolicyConfig {
         enabled: true,
@@ -3726,13 +3985,13 @@ async fn verify_post_create_remove_file_or_dir_unlinks_a_rejected_file() {
     // rejects, the artifact at the rejected path is unlinked so the
     // caller's failure surface is "operation didn't happen".
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let policy = restrictive_policy(&allowed_root);
 
     // The artifact lives outside the allowlist — the post-check will
     // reject it and the cleanup must unlink.
     let outside = TempDir::new().unwrap();
-    let outside_root = outside.path().canonicalize().unwrap();
+    let outside_root = canon(outside.path());
     let leaked = outside_root.join("leaked.txt");
     fs::write(&leaked, "ghost").unwrap();
     assert!(leaked.exists());
@@ -3759,10 +4018,10 @@ async fn verify_post_create_remove_tree_all_purges_a_rejected_directory_tree() {
     // used the file-or-dir variant would leak the partial tree on
     // disk after returning PolicyDenied.
     let allowed = TempDir::new().unwrap();
-    let policy = restrictive_policy(&allowed.path().canonicalize().unwrap());
+    let policy = restrictive_policy(&canon(allowed.path()));
 
     let outside = TempDir::new().unwrap();
-    let outside_root = outside.path().canonicalize().unwrap();
+    let outside_root = canon(outside.path());
     let tree_root = outside_root.join("tree");
     fs::create_dir(&tree_root).unwrap();
     fs::create_dir(tree_root.join("nested")).unwrap();
@@ -3794,10 +4053,10 @@ async fn verify_post_create_leave_preserves_data_at_rejected_path() {
     // destination (deleted by us). `Leave` preserves the data so the
     // operator can recover by inspecting the rejected destination.
     let allowed = TempDir::new().unwrap();
-    let policy = restrictive_policy(&allowed.path().canonicalize().unwrap());
+    let policy = restrictive_policy(&canon(allowed.path()));
 
     let outside = TempDir::new().unwrap();
-    let outside_root = outside.path().canonicalize().unwrap();
+    let outside_root = canon(outside.path());
     let preserved = outside_root.join("user_data.txt");
     fs::write(&preserved, b"do not delete").unwrap();
 
@@ -3827,7 +4086,7 @@ async fn verify_post_create_returns_ok_when_path_is_inside_allowlist() {
     // new one — Remove* modes were already exercised by the existing
     // integration suite via Mkdir / Write / Copy / Symlink.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let policy = restrictive_policy(&allowed_root);
 
     let inside = allowed_root.join("ok.txt");
@@ -3860,6 +4119,7 @@ async fn verify_post_create_returns_ok_when_path_is_inside_allowlist() {
 //   3. **not** mutate either side of the would-be operation (no escape,
 //      no data loss).
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn mkdir_with_symlinked_parent_returns_policy_denied_and_does_not_escape() {
@@ -3873,9 +4133,9 @@ async fn mkdir_with_symlinked_parent_returns_policy_denied_and_does_not_escape()
     // parent walk fails with ELOOP (Linux) or ENOTDIR (macOS) and the
     // handler returns PolicyDenied without touching the attacker side.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
 
     let sentinel = attacker_root.join("sentinel.txt");
     fs::write(&sentinel, b"do_not_touch").unwrap();
@@ -3910,6 +4170,7 @@ async fn mkdir_with_symlinked_parent_returns_policy_denied_and_does_not_escape()
     );
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn move_with_symlinked_destination_parent_does_not_destroy_source() {
@@ -3922,12 +4183,12 @@ async fn move_with_symlinked_destination_parent_does_not_destroy_source() {
     // refactor must reject **before** the rename runs, so the source
     // survives intact.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let source = allowed_root.join("payload.txt");
     fs::write(&source, b"important_data").unwrap();
 
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
     let dest_parent_link = allowed_root.join("dest_parent_link");
     std::os::unix::fs::symlink(&attacker_root, &dest_parent_link).unwrap();
     let destination = dest_parent_link.join("moved.txt");
@@ -3960,6 +4221,7 @@ async fn move_with_symlinked_destination_parent_does_not_destroy_source() {
     );
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn copy_single_file_with_symlinked_destination_parent_returns_policy_denied() {
@@ -3968,12 +4230,12 @@ async fn copy_single_file_with_symlinked_destination_parent_returns_policy_denie
     // openat-based dest open with NOFOLLOW + safe parent walk rejects
     // before any write occurs.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let source = allowed_root.join("readable.txt");
     fs::write(&source, b"secret").unwrap();
 
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
     let dest_parent_link = allowed_root.join("dest_link");
     std::os::unix::fs::symlink(&attacker_root, &dest_parent_link).unwrap();
     let destination = dest_parent_link.join("copy.txt");
@@ -3998,6 +4260,7 @@ async fn copy_single_file_with_symlinked_destination_parent_returns_policy_denie
     assert!(!attacker_root.join("copy.txt").exists());
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn create_symlink_with_symlinked_parent_returns_policy_denied() {
@@ -4006,9 +4269,9 @@ async fn create_symlink_with_symlinked_parent_returns_policy_denied() {
     // implementation would follow it and place the link in the
     // attacker's directory. Our safe-open rejects before symlinkat runs.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
 
     let parent_link = allowed_root.join("parent_link");
     std::os::unix::fs::symlink(&attacker_root, &parent_link).unwrap();
@@ -4034,6 +4297,7 @@ async fn create_symlink_with_symlinked_parent_returns_policy_denied() {
     );
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(unix)]
 #[tokio::test]
 async fn chmod_with_symlinked_parent_does_not_modify_target_permissions() {
@@ -4042,9 +4306,9 @@ async fn chmod_with_symlinked_parent_does_not_modify_target_permissions() {
     // attacker's target. Pre-create a victim file with a known mode
     // and verify it stays exactly that mode after the handler rejects.
     let allowed = TempDir::new().unwrap();
-    let allowed_root = allowed.path().canonicalize().unwrap();
+    let allowed_root = canon(allowed.path());
     let attacker = TempDir::new().unwrap();
-    let attacker_root = attacker.path().canonicalize().unwrap();
+    let attacker_root = canon(attacker.path());
 
     let victim = attacker_root.join("victim.txt");
     fs::write(&victim, b"x").unwrap();
@@ -4084,6 +4348,7 @@ async fn chmod_with_symlinked_parent_does_not_modify_target_permissions() {
     );
 }
 
+// no Windows equivalent: openat2 TOCTOU — single-tenant assumption (spec M4)
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn linux_openat2_path_returns_policy_denied_for_symlinked_ancestor() {
@@ -4094,7 +4359,7 @@ async fn linux_openat2_path_returns_policy_denied_for_symlinked_ancestor() {
     // because operators must read this error as "policy refused to
     // traverse a symlink", not "your filesystem is missing files".
     let dir = TempDir::new().unwrap();
-    let root = dir.path().canonicalize().unwrap();
+    let root = canon(dir.path());
     let real = root.join("real_dir");
     fs::create_dir(&real).unwrap();
     let link = root.join("link_dir");
@@ -4119,5 +4384,1009 @@ async fn linux_openat2_path_returns_policy_denied_for_symlinked_ancestor() {
     assert!(
         !real.join("inner").exists(),
         "no inner dir must have been created at the symlink target",
+    );
+}
+
+// ── Windows symlink tests ───────────────────────────────────────────────────
+//
+// These tests exercise the Windows arm of handle_create_symlink which uses
+// std::os::windows::fs::{symlink_file, symlink_dir}.  They run only on Windows
+// (the syscalls are unavailable elsewhere), but map_symlink_error is tested
+// cross-platform further below.
+
+/// R2 Windows analogue: a CreateSymlink request whose target lies outside the
+/// allowlist is rejected at the policy preflight with PolicyDenied.
+///
+/// The R2 check lives in the dispatch layer (file_manager/mod.rs), not in the
+/// platform-specific syscall arm, so this test verifies the security property
+/// holds on Windows without actually invoking symlink creation.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_create_symlink_target_outside_allowlist_is_denied() {
+    // R2 regression (Windows parity): FileCreateSymlink with a target pointing
+    // outside the allowlist must be rejected at policy preflight (PolicyDenied).
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let link = root.join("escape");
+
+    // Build an outside-allowlist path that is robust on non-C: Windows installs.
+    // WINDIR is set by Windows itself (e.g. "C:\Windows" or "D:\Windows");
+    // fall back to the conventional path if somehow unset.
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_owned());
+    let outside_target = format!(r"{windir}\System32\drivers\etc\hosts");
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            // %WINDIR%\System32\drivers\etc\hosts is outside the temp-dir
+            // allowlist on any Windows installation regardless of drive letter.
+            target: outside_target,
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let err = mgr.check_request_approval(&req).await.unwrap_err();
+    assert_eq!(
+        err.code,
+        FileErrorCode::PolicyDenied as i32,
+        "target outside allowlist must yield PolicyDenied; got: {:?}",
+        err,
+    );
+}
+
+/// Happy-path: create a file symlink on Windows (target is an existing file).
+/// Verifies that symlink_file is chosen when the target is not a directory, that
+/// the link inode is a symlink, and that it resolves back to the target.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_create_file_symlink_creates_link() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    let link = root.join("link_to_file");
+    fs::write(&target, "hello").unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: target.to_string_lossy().into_owned(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_symlink(resp);
+
+    let link_meta = fs::symlink_metadata(&link).expect("symlink must exist");
+    assert!(
+        link_meta.file_type().is_symlink(),
+        "created path must be a symlink, not a regular file"
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        target,
+        "symlink must resolve to the original target"
+    );
+}
+
+/// Happy-path: create a directory symlink on Windows (target is an existing dir).
+/// Verifies that symlink_dir is chosen when the target is a directory and that
+/// the link resolves to the target directory.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_create_dir_symlink_creates_link() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target_dir = root.join("target_dir");
+    let link = root.join("link_to_dir");
+    fs::create_dir(&target_dir).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: target_dir.to_string_lossy().into_owned(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_symlink(resp);
+
+    let link_meta = fs::symlink_metadata(&link).expect("directory symlink must exist");
+    assert!(
+        link_meta.file_type().is_symlink(),
+        "created path must be a symlink, not a plain directory"
+    );
+    assert_eq!(
+        fs::read_link(&link).unwrap(),
+        target_dir,
+        "directory symlink must resolve to the target directory"
+    );
+}
+
+// Note: map_symlink_error unit tests live in the fs_ops.rs #[cfg(test)] block
+// (crates/ahandd/src/file_manager/fs_ops.rs) where the function is also compiled
+// under cfg(test) cross-platform.  See:
+//   map_symlink_error_privilege_not_held_maps_to_permission_denied_with_remediation
+//   map_symlink_error_generic_permission_denied_passes_through
+//   map_symlink_error_already_exists_passes_through
+//   map_symlink_error_not_found_passes_through
+
+// ── Windows ACL chmod integration tests ───────────────────────────────────
+//
+// These tests require a real Windows environment (they call into the Win32
+// security API via `SetNamedSecurityInfoW` and read ACLs back with icacls).
+// The pure SDDL builders (`build_dacl_sddl` / `acl_mask_to_sddl_rights` /
+// `sddl_principal_passthrough`) are unit-tested in fs_ops.rs#[cfg(test)] and run
+// cross-platform.
+
+#[cfg(windows)]
+mod windows_acl_chmod {
+    use super::*;
+    use ahand_protocol::{AclEntry, AclEntryType, WindowsAcl, file_chmod};
+
+    /// Apply a single grant-full-control ACE for the current user to a temp
+    /// file. Because the entry list is the COMPLETE effective DACL
+    /// (`/inheritance:r` strips inherited ACEs), readback must show the user
+    /// AND no surviving inherited grant (no `(I)` marker, and the broad
+    /// `BUILTIN\Users` / `Everyone` principals are gone — owner-only really is
+    /// owner-only).
+    #[tokio::test]
+    async fn chmod_windows_grant_full_control_to_current_user() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_test.txt");
+        fs::write(&file, "acl").unwrap();
+
+        let username = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+
+        let req = FileRequest {
+            request_id: "acl-grant".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![AclEntry {
+                        principal: username.clone(),
+                        access_mask: 0x001F_01FF, // FILE_ALL_ACCESS → "F"
+                        entry_type: AclEntryType::Allow as i32,
+                    }],
+                })),
+            })),
+        };
+
+        let resp = mgr.handle(&req).await;
+        let result = expect_chmod(resp);
+        assert_eq!(result.items_modified, 1);
+
+        // Read back via icacls and assert the user's entry appears.
+        let out = std::process::Command::new("icacls")
+            .arg(&file)
+            .output()
+            .expect("icacls must be available on Windows CI");
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        let username_lower = username.to_lowercase();
+        assert!(
+            text.contains(&username_lower),
+            "icacls output must contain the granted user '{username_lower}': {text}"
+        );
+        // C1+C2: inheritance was stripped, so the DACL is owner-only — no
+        // inherited ACE (`(I)`) and no broad principals survive.
+        assert!(
+            !text.contains("(i)"),
+            "inheritance must be stripped (no inherited ACE): {text}"
+        );
+        assert!(
+            !text.contains("builtin\\users"),
+            "owner-only DACL must not retain BUILTIN\\Users: {text}"
+        );
+        assert!(
+            !text.contains("everyone"),
+            "owner-only DACL must not retain Everyone: {text}"
+        );
+    }
+
+    /// Deny Everyone read on a file. With `/inheritance:r` the supplied entries
+    /// are the COMPLETE effective DACL, so this proves the actual denial:
+    ///   1. Every readback line mentioning "everyone" is a DENY line
+    ///      (Everyone appears ONLY in a deny context — no surviving ALLOW).
+    ///   2. There is at least one such Everyone DENY line.
+    ///   3. No inherited broad ALLOW survives (the inheritance marker `(I)`
+    ///      is absent — inheritance was stripped).
+    ///
+    /// icacls output-shape assumption: `icacls <file>` prints one principal per
+    /// line; a denied ACE renders the principal with a `(DENY)` token, e.g.
+    /// `Everyone:(DENY)(R)`, while an allowed ACE has no `(DENY)` token and an
+    /// inherited ACE carries an `(I)` token. We lowercase before matching.
+    #[tokio::test]
+    async fn chmod_windows_deny_everyone_read() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_deny.txt");
+        fs::write(&file, "deny").unwrap();
+
+        // First grant the current user full control so we retain access
+        // even after denying Everyone.
+        let username = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+
+        let req = FileRequest {
+            request_id: "acl-deny".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![
+                        AclEntry {
+                            principal: username.clone(),
+                            access_mask: 0x001F_01FF, // Full control
+                            entry_type: AclEntryType::Allow as i32,
+                        },
+                        AclEntry {
+                            principal: "Everyone".to_string(),
+                            access_mask: 0x0012_0089, // Read
+                            entry_type: AclEntryType::Deny as i32,
+                        },
+                    ],
+                })),
+            })),
+        };
+
+        let resp = mgr.handle(&req).await;
+        let result = expect_chmod(resp);
+        assert_eq!(result.items_modified, 1);
+
+        let out = std::process::Command::new("icacls")
+            .arg(&file)
+            .output()
+            .expect("icacls must be available on Windows CI");
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+
+        // Collect the lines that reference Everyone.
+        let everyone_lines: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("everyone"))
+            .collect();
+
+        // (2) Everyone must appear at all — the deny ACE was applied.
+        assert!(
+            !everyone_lines.is_empty(),
+            "icacls output must reference Everyone: {text}"
+        );
+        // (1) Every Everyone line must be a DENY — no surviving Everyone ALLOW.
+        for line in &everyone_lines {
+            assert!(
+                line.contains("(deny)"),
+                "Everyone must appear ONLY in a DENY context (no surviving ALLOW); \
+                 offending line: {line:?}; full output: {text}"
+            );
+        }
+        // (3) No inherited ACE survives — `/inheritance:r` stripped inheritance,
+        // so the `(I)` inherited marker must be absent from the DACL.
+        assert!(
+            !text.contains("(i)"),
+            "inheritance must be stripped — no inherited ACE may survive: {text}"
+        );
+    }
+
+    /// Recursive Windows ACL chmod (`/T /C`) must apply to a directory and its
+    /// children, and `items_modified` must reflect icacls's processed count
+    /// (more than 1 for a populated tree). Parity with the Unix recursive arm.
+    #[tokio::test]
+    async fn chmod_windows_recursive_applies_to_children() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let sub = root.join("acl_rec");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("a.txt"), "a").unwrap();
+        fs::write(sub.join("b.txt"), "b").unwrap();
+
+        let username = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+
+        let req = FileRequest {
+            request_id: "acl-rec".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: sub.to_string_lossy().into_owned(),
+                recursive: true,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![AclEntry {
+                        principal: username.clone(),
+                        access_mask: 0x001F_01FF, // Full control
+                        entry_type: AclEntryType::Allow as i32,
+                    }],
+                })),
+            })),
+        };
+
+        let resp = mgr.handle(&req).await;
+        let result = expect_chmod(resp);
+        // The dir + 2 children → at least 3 processed entries.
+        assert!(
+            result.items_modified >= 3,
+            "recursive chmod must process the dir and its children; got {}",
+            result.items_modified
+        );
+
+        // The child files must now carry the user's ACE.
+        for child in ["a.txt", "b.txt"] {
+            let out = std::process::Command::new("icacls")
+                .arg(sub.join(child))
+                .output()
+                .expect("icacls must be available on Windows CI");
+            let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            assert!(
+                text.contains(&username.to_lowercase()),
+                "recursive ACL must reach child {child}: {text}"
+            );
+        }
+    }
+
+    /// An invalid principal (a string that is not a resolvable account) must
+    /// produce a clear PermissionDenied FileError, not a generic Io.
+    #[tokio::test]
+    async fn chmod_windows_invalid_principal_returns_permission_denied() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_bad.txt");
+        fs::write(&file, "bad").unwrap();
+
+        let req = FileRequest {
+            request_id: "acl-invalid".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![AclEntry {
+                        principal: "THIS_ACCOUNT_DOES_NOT_EXIST_XYZ12345".to_string(),
+                        access_mask: 0x001F_01FF,
+                        entry_type: AclEntryType::Allow as i32,
+                    }],
+                })),
+            })),
+        };
+
+        let err = expect_error(mgr.handle(&req).await);
+        assert_eq!(
+            err.code,
+            FileErrorCode::PermissionDenied as i32,
+            "invalid principal must map to PermissionDenied; got: {:?}",
+            err
+        );
+        assert!(
+            err.message.contains("invalid principal") || err.message.contains("account"),
+            "error message must identify the cause; got: {}",
+            err.message
+        );
+    }
+
+    /// Empty entries list must be rejected with Unspecified before reaching icacls.
+    #[tokio::test]
+    async fn chmod_windows_empty_entries_returns_unspecified_error() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_empty.txt");
+        fs::write(&file, "empty").unwrap();
+
+        let req = FileRequest {
+            request_id: "acl-empty".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![],
+                })),
+            })),
+        };
+
+        let err = expect_error(mgr.handle(&req).await);
+        assert_eq!(err.code, FileErrorCode::Unspecified as i32);
+    }
+
+    /// I4: a malformed principal (one containing ':') must be rejected with
+    /// InvalidPath BEFORE any icacls subprocess launch (defense-in-depth).
+    #[tokio::test]
+    async fn chmod_windows_malformed_principal_rejected_before_icacls() {
+        let dir = TempDir::new().unwrap();
+        let (mgr, root) = test_manager(&dir);
+        let file = root.join("acl_malformed.txt");
+        fs::write(&file, "x").unwrap();
+
+        let req = FileRequest {
+            request_id: "acl-malformed".into(),
+            operation: Some(file_request::Operation::Chmod(FileChmod {
+                path: file.to_string_lossy().into_owned(),
+                recursive: false,
+                no_follow_symlink: false,
+                permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                    entries: vec![AclEntry {
+                        // ':' would smuggle a perm field into the principal.
+                        principal: "Everyone:F".to_string(),
+                        access_mask: 0x001F_01FF,
+                        entry_type: AclEntryType::Allow as i32,
+                    }],
+                })),
+            })),
+        };
+
+        let err = expect_error(mgr.handle(&req).await);
+        assert_eq!(err.code, FileErrorCode::InvalidPath as i32);
+        assert!(
+            err.message.contains("malformed principal"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    // Non-Windows arm: sending Windows ACL on a non-Windows platform returns
+    // Unspecified (no test needed here — the non-cfg(windows) arm in handle_chmod
+    // is exercised implicitly; this module is only compiled on Windows anyway).
+}
+
+// ── T7: Windows security regression suite ─────────────────────────────────
+//
+// Inventory classification (per plan Task 7):
+//
+// (a) HAS windows analogue already written (T1/T2/T4):
+//   - create_symlink_creates_link                         → T1: windows_create_file_symlink_creates_link
+//   - create_symlink with dir target                      → T1: windows_create_dir_symlink_creates_link
+//   - check_request_approval_denies_symlink_target_outside_allowlist → T1: windows_create_symlink_target_outside_allowlist_is_denied
+//   - chmod_sets_unix_mode                                → T2: windows_acl_chmod::chmod_windows_grant_full_control_to_current_user
+//   - chmod_recursive_applies_to_children                 → T2: windows_acl_chmod::chmod_windows_recursive_applies_to_children
+//   - chmod_chown_not_supported_returns_permission_denied → T2: windows_acl_chmod::chmod_windows_invalid_principal_returns_permission_denied
+//   - glob_match / denylist case                          → T4: policy.rs windows_glob_match_case_insensitive_allow,
+//                                                                       windows_denylist_case_variant_blocked,
+//                                                                       windows_denylist_case_bypass_blocked_through_check_path
+//   - chmod_refuses_symlink_when_no_follow_set            → T2: reject_if_final_component_is_symlink (cross-platform)
+//   - mkdir_with_mode_sets_permissions                    → no meaningful Windows chmod equivalent (Windows ACL, not mode bits)
+//
+// (b) NEEDS windows analogue → written in this section (T7):
+//   - stat_symlink_follow_returns_target_type
+//   - stat_symlink_no_follow_returns_symlink_type (lstat-not-metadata behavior)
+//   - list_does_not_follow_symlink_into_target_metadata
+//   - glob_skips_symlink_pointing_outside_allowlist       ← THE key junction/symlink-escape denial test
+//   - write_refuses_symlink_when_no_follow_set
+//   - edit_refuses_symlink_when_no_follow_set
+//   - delete_symlink_no_follow_removes_link_not_target
+//   - check_request_approval_escalates_relative_symlink_target_into_dangerous_path
+//
+// (c) NO Windows equivalent — openat2/O_NOFOLLOW TOCTOU (left unix-gated):
+//   The following tests use `openat2`/`O_NOFOLLOW` dirfd chains that have no
+//   Windows equivalent. Windows has no openat2 TOCTOU — single-tenant
+//   assumption (spec M4):
+//   - mkdir_with_symlinked_parent_returns_policy_denied_and_does_not_escape
+//   - move_with_symlinked_destination_parent_does_not_destroy_source
+//   - copy_single_file_with_symlinked_destination_parent_returns_policy_denied
+//   - create_symlink_with_symlinked_parent_returns_policy_denied
+//   - chmod_with_symlinked_parent_does_not_modify_target_permissions
+//   - linux_openat2_path_returns_policy_denied_for_symlinked_ancestor
+//
+// Junction vs symlink_dir choice:
+//   Directory symlinks on Windows require Developer Mode or elevation (they
+//   use CreateSymbolicLink with SYMBOLIC_LINK_FLAG_DIRECTORY). Junctions
+//   (reparse points) do NOT require elevated privileges and are supported via
+//   `std::os::windows::fs::symlink_dir` on Windows CI with Developer Mode, OR
+//   via the `junction::create` API. To avoid adding a new crate dependency,
+//   we use `std::os::windows::fs::symlink_dir` (the T1 tests already use this
+//   and pass on CI — CI runs with Developer Mode enabled on windows-latest).
+//   The escape-denial test uses symlink_dir to create a directory symlink
+//   pointing OUTSIDE the allowlist, then attempts a file op THROUGH it and
+//   asserts PolicyDenied — proving that canonicalize_simplified resolves the
+//   symlink/junction target and then the policy checker re-validates.
+//
+// IMPORTANT: all fixtures use `canon()` (→ canonicalize_simplified) to strip
+// the Windows verbatim prefix (\\?\), matching what FilePolicyChecker returns.
+// No raw `.canonicalize()` calls appear in any test added here.
+
+/// Windows analogue of stat_symlink_follow_returns_target_type.
+/// A file symlink whose target is a file: following the link reports the
+/// file's type and size, not the symlink's own metadata.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_stat_symlink_follow_returns_target_type() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "hi").unwrap();
+    let link = root.join("link_follow");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let resp = mgr.handle(&stat_request(&link)).await;
+    let stat = expect_stat(resp);
+
+    // follow: behaves like target
+    assert_eq!(stat.file_type, FileType::File as i32);
+    assert_eq!(stat.size, 2);
+}
+
+/// Windows analogue of stat_symlink_no_follow_returns_symlink_type.
+/// `no_follow_symlink=true` must use `symlink_metadata` (lstat semantics)
+/// and report the link itself as a Symlink, NOT the target file.
+/// This is the "lstat-not-metadata" behavior on Windows.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_stat_symlink_no_follow_returns_symlink_type() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "hi").unwrap();
+    let link = root.join("link_nofollow");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let resp = mgr.handle(&stat_request_no_follow(&link)).await;
+    let stat = expect_stat(resp);
+
+    assert_eq!(
+        stat.file_type,
+        FileType::Symlink as i32,
+        "no_follow_symlink=true must report the symlink itself, not the target"
+    );
+    assert!(
+        stat.symlink_target.is_some(),
+        "symlink_target must be populated for a symlink stat"
+    );
+}
+
+/// Windows analogue of list_does_not_follow_symlink_into_target_metadata.
+/// A symlink inside the listed directory must surface as `FileType::Symlink`
+/// and must NOT leak the target file's size/type/mtime via metadata following.
+/// Previously `handle_list` called `entry.metadata()` which follows symlinks.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_list_does_not_follow_symlink_into_target_metadata() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+
+    // Create a real file with a known size inside the sandbox.
+    let real_inside = root.join("real.txt");
+    fs::write(&real_inside, "1234567890").unwrap(); // 10 bytes
+
+    // Create an OUTSIDE directory with a large file to detect metadata leakage.
+    let outside = TempDir::new().unwrap();
+    let outside_root = canon(outside.path());
+    let big_outside = outside_root.join("big.bin");
+    fs::write(&big_outside, vec![0u8; 5000]).unwrap();
+
+    // Symlink inside root pointing to the outside directory.
+    // The link itself is inside the allowlist; the target is not.
+    let link = root.join("link-out");
+    std::os::windows::fs::symlink_dir(&outside_root, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::List(FileList {
+            path: root.to_string_lossy().into_owned(),
+            max_results: None,
+            offset: None,
+            include_hidden: false,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let list = expect_list(resp);
+    let link_entry = list
+        .entries
+        .iter()
+        .find(|e| e.name == "link-out")
+        .expect("link-out must appear in listing");
+    // The link must be reported as Symlink type, not Directory.
+    assert_eq!(
+        link_entry.file_type,
+        FileType::Symlink as i32,
+        "symlink must not be resolved to its target's file type"
+    );
+    // The target string must be populated so callers can see what it points at.
+    assert!(
+        link_entry.symlink_target.is_some(),
+        "symlink_target should be populated"
+    );
+    // And the real file must still be listed correctly alongside it.
+    let real_entry = list
+        .entries
+        .iter()
+        .find(|e| e.name == "real.txt")
+        .expect("real.txt must appear in listing");
+    assert_eq!(real_entry.file_type, FileType::File as i32);
+    assert_eq!(real_entry.size, 10);
+}
+
+/// THE key junction/symlink-escape DENIAL test (Windows security regression).
+///
+/// A directory symlink (created via `std::os::windows::fs::symlink_dir`) that
+/// points OUTSIDE the allowlist must be DENIED when a glob pattern traverses
+/// into it.  This proves that `glob_skips_symlink_pointing_outside_allowlist`
+/// security property holds on Windows: the daemon's glob re-checks policy per
+/// match and filters out any result whose canonicalized path escapes the
+/// allowlist, even when the entry appeared inside the allowed directory.
+///
+/// **Positive-control sub-assertion**: we also create a `FileManager` whose
+/// allowlist includes BOTH `root` AND `outside_root`, run the same glob, and
+/// assert it returns 3 matches (`inside.rs + escape.rs + witness.rs`).  This
+/// proves that the glob engine DOES traverse the symlinked directory — so the
+/// `total_matches==1` result in the restrictive-policy run is caused by the
+/// policy filter, not by the glob silently skipping the symlink.  Without
+/// this companion assertion a non-traversing glob would also yield 1 match,
+/// making the security assertion trivially vacuous.
+///
+/// **Junction vs symlink_dir choice**: `std::os::windows::fs::symlink_dir` is
+/// used here because the T1 tests already exercise it on `windows-latest` CI
+/// (which runs with Developer Mode enabled).  Junctions would avoid the
+/// privilege requirement, but adding the `junction` crate as a dev-dependency
+/// is not needed when `symlink_dir` is already proven to work.  If CI ever
+/// reports ERROR_PRIVILEGE_NOT_HELD here, switch to the junction approach.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_glob_skips_symlink_dir_pointing_outside_allowlist() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+
+    // A real file inside the allowlist.
+    fs::write(root.join("inside.rs"), "x").unwrap();
+
+    // An outside temp dir with TWO real files we DO NOT want accessible.
+    // Two files are required: if a non-traversing glob silently skips the
+    // symlinked dir it would still yield total_matches==1, indistinguishable
+    // from "policy filtered the outside files". With two outside candidates,
+    // a traversing-but-unfiltered glob returns 3 — the count distinguishes
+    // traversal-without-policy (3) from policy-filtered (1).
+    let outside = TempDir::new().unwrap();
+    let outside_root = canon(outside.path());
+    fs::write(outside_root.join("escape.rs"), "secret").unwrap();
+    fs::write(outside_root.join("witness.rs"), "also-secret").unwrap();
+
+    // Create a directory symlink inside root pointing at outside_root.
+    // The symlink itself is inside the allowlist; its canonical target is not.
+    let link_dir = root.join("subdir_link");
+    std::os::windows::fs::symlink_dir(&outside_root, &link_dir).unwrap();
+
+    let glob_req = |base: &std::path::Path| FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Glob(FileGlob {
+            pattern: "**/*.rs".into(),
+            base_path: Some(base.to_string_lossy().into_owned()),
+            max_results: None,
+        })),
+    };
+
+    // ── Positive-control: allowlist covers both root AND outside_root ──────
+    // This proves the glob DOES traverse the symlinked directory.
+    {
+        let outside_root_str = outside_root.to_string_lossy().into_owned();
+        let root_str = root.to_string_lossy().into_owned();
+        let permissive_mgr = FileManager::new(&FilePolicyConfig {
+            enabled: true,
+            path_allowlist: vec![
+                format!("{}/**", root_str.trim_end_matches('/')),
+                root_str.clone(),
+                format!("{}/**", outside_root_str.trim_end_matches('/')),
+                outside_root_str.clone(),
+            ],
+            path_denylist: vec![],
+            max_read_bytes: 100_000_000,
+            max_write_bytes: 100_000_000,
+            dangerous_paths: vec![],
+        });
+        let resp = permissive_mgr.handle(&glob_req(&root)).await;
+        let glob = expect_glob(resp);
+        assert_eq!(
+            glob.total_matches, 3,
+            "permissive policy must return all 3 .rs files (inside.rs + escape.rs + witness.rs), \
+             proving glob traverses the symlink; got {} matches: {:?}",
+            glob.total_matches, glob.entries
+        );
+    }
+
+    // ── Restrictive policy: only root is allowed ───────────────────────────
+    // With traversal confirmed above, total_matches==1 here proves that
+    // policy filtered the two outside matches — not that glob skipped the dir.
+    let resp = mgr.handle(&glob_req(&root)).await;
+    let glob = expect_glob(resp);
+
+    assert_eq!(
+        glob.total_matches, 1,
+        "symlink/junction-escape through glob must be filtered; got {} matches: {:?}",
+        glob.total_matches, glob.entries
+    );
+    // The single survivor must be inside.rs specifically.
+    assert_eq!(
+        glob.entries.len(),
+        1,
+        "exactly one entry must remain after filtering"
+    );
+    assert!(
+        glob.entries[0].name.ends_with("inside.rs"),
+        "the surviving entry must be inside.rs, got: {:?}",
+        glob.entries[0].name
+    );
+    assert!(
+        glob.entries.iter().all(|e| !e.name.contains("subdir_link")
+            && !e.name.ends_with("escape.rs")
+            && !e.name.ends_with("witness.rs")),
+        "escape.rs and witness.rs through the symlink must be filtered out"
+    );
+}
+
+/// Windows analogue of write_refuses_symlink_when_no_follow_set.
+/// `no_follow_symlink=true` on a file symlink must refuse to write through it.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_write_refuses_symlink_when_no_follow_set() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "original").unwrap();
+    let link = root.join("link.txt");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Write(FileWrite {
+            path: link.to_string_lossy().into_owned(),
+            create_parents: false,
+            encoding: None,
+            no_follow_symlink: true,
+            method: Some(file_write::Method::FullWrite(FullWrite {
+                source: Some(full_write::Source::Content(b"hijacked".to_vec())),
+                ..Default::default()
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(
+        err.code,
+        FileErrorCode::InvalidPath as i32,
+        "no_follow_symlink=true on a symlink must return InvalidPath"
+    );
+    // Target must be untouched.
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "original",
+        "target file content must be unchanged"
+    );
+}
+
+/// Windows analogue of edit_refuses_symlink_when_no_follow_set.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_edit_refuses_symlink_when_no_follow_set() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "foo").unwrap();
+    let link = root.join("link.txt");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Edit(FileEdit {
+            path: link.to_string_lossy().into_owned(),
+            encoding: None,
+            no_follow_symlink: true,
+            method: Some(file_edit::Method::StringReplace(StringReplace {
+                old_string: "foo".into(),
+                new_string: "bar".into(),
+                replace_all: false,
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(
+        err.code,
+        FileErrorCode::InvalidPath as i32,
+        "no_follow_symlink=true on a symlink must return InvalidPath"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "foo",
+        "target file content must be unchanged"
+    );
+}
+
+/// Windows analogue of delete_symlink_no_follow_removes_link_not_target.
+/// When `no_follow_symlink=true`, delete must remove the symlink itself,
+/// leaving the target intact.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_delete_symlink_no_follow_removes_link_not_target() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "x").unwrap();
+    let link = root.join("link.txt");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Delete(FileDelete {
+            path: link.to_string_lossy().into_owned(),
+            recursive: false,
+            mode: DeleteMode::Permanent as i32,
+            no_follow_symlink: true,
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    expect_delete(resp);
+    // Symlink gone, target survived.
+    assert!(!link.exists(), "the symlink itself must be removed");
+    assert!(target.exists(), "the symlink target must survive");
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "x",
+        "target content must be unchanged"
+    );
+}
+
+/// Windows analogue of chmod_refuses_symlink_when_no_follow_set.
+/// `no_follow_symlink=true` on a file symlink must be refused before any ACL
+/// operation is attempted — `reject_if_final_component_is_symlink` fires and
+/// returns `InvalidPath`, leaving the target's ACL untouched.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_chmod_refuses_symlink_when_no_follow_set() {
+    use ahand_protocol::{AclEntry, AclEntryType, WindowsAcl, file_chmod};
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let target = root.join("target.txt");
+    fs::write(&target, "x").unwrap();
+    let link = root.join("link.txt");
+    std::os::windows::fs::symlink_file(&target, &link).unwrap();
+
+    // Attempt a chmod through the symlink with no_follow_symlink=true.
+    // The ACL principal is irrelevant — the request must be rejected before
+    // any ACL operation is attempted.
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: link.to_string_lossy().into_owned(),
+            recursive: false,
+            no_follow_symlink: true,
+            permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                entries: vec![AclEntry {
+                    principal: "Everyone".into(),
+                    access_mask: 0x001F_01FF, // FILE_ALL_ACCESS
+                    entry_type: AclEntryType::Allow as i32,
+                }],
+            })),
+        })),
+    };
+    let resp = mgr.handle(&req).await;
+    let err = expect_error(resp);
+    assert_eq!(
+        err.code,
+        FileErrorCode::InvalidPath as i32,
+        "no_follow_symlink=true on a symlink must return InvalidPath"
+    );
+}
+
+/// SECURITY-HIGH#2 regression: a recursive Windows ACL chmod must NOT follow a
+/// directory reparse point (symlink/junction) planted inside the allowed
+/// directory and modify ACLs of files OUTSIDE the allowlist.
+///
+/// The original `icacls /T` recursion followed junctions, so a reparse point
+/// inside an allowed dir could redirect the recursive chmod to external files.
+/// The fix self-walks the tree and SKIPS reparse points (matching the Unix
+/// recursive arm). This test plants a directory symlink inside `root` pointing
+/// at an OUTSIDE dir, runs a recursive chmod on `root`, and asserts the outside
+/// file's DACL is byte-for-byte unchanged — proving the reparse point was
+/// skipped and the recursion never escaped the allowlist.
+///
+/// We capture the outside file's `icacls` output before and after; equality
+/// proves no ACL write reached it. A real file (`inside.txt`) inside `root`
+/// confirms the recursive chmod DID run and DID modify in-allowlist entries
+/// (positive control), so the unchanged-outside assertion is not vacuous.
+///
+/// Uses `symlink_dir` for the same CI reasons as the glob escape test above.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_recursive_chmod_does_not_follow_symlink_dir_outside_allowlist() {
+    use ahand_protocol::{AclEntry, AclEntryType, WindowsAcl, file_chmod};
+
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+
+    // A real file inside the allowlist — the recursive chmod MUST reach this.
+    let inside = root.join("inside.txt");
+    fs::write(&inside, "inside").unwrap();
+
+    // An OUTSIDE temp dir with a file whose ACL must remain untouched.
+    let outside = TempDir::new().unwrap();
+    let outside_root = canon(outside.path());
+    let outside_file = outside_root.join("victim.txt");
+    fs::write(&outside_file, "do-not-touch").unwrap();
+
+    // Snapshot the outside file's ACL BEFORE the operation.
+    let acl_before = std::process::Command::new("icacls")
+        .arg(&outside_file)
+        .output()
+        .expect("icacls must be available on Windows CI");
+    let acl_before = String::from_utf8_lossy(&acl_before.stdout).into_owned();
+
+    // Plant a directory symlink inside root pointing at outside_root. The link
+    // is inside the allowlist; its target is not.
+    let link_dir = root.join("subdir_link");
+    std::os::windows::fs::symlink_dir(&outside_root, &link_dir).unwrap();
+
+    let username = std::env::var("USERNAME").expect("USERNAME must be set on Windows");
+
+    let req = FileRequest {
+        request_id: "acl-rec-escape".into(),
+        operation: Some(file_request::Operation::Chmod(FileChmod {
+            path: root.to_string_lossy().into_owned(),
+            recursive: true,
+            no_follow_symlink: false,
+            permission: Some(file_chmod::Permission::Windows(WindowsAcl {
+                entries: vec![AclEntry {
+                    principal: username.clone(),
+                    access_mask: 0x001F_01FF, // Full control
+                    entry_type: AclEntryType::Allow as i32,
+                }],
+            })),
+        })),
+    };
+
+    let resp = mgr.handle(&req).await;
+    let result = expect_chmod(resp);
+    // Positive control: the in-allowlist file was modified (root + inside.txt,
+    // and the symlink itself must NOT be counted since it is skipped).
+    assert!(
+        result.items_modified >= 2,
+        "recursive chmod must process root and inside.txt; got {}",
+        result.items_modified
+    );
+
+    // The in-allowlist file must now carry the user's ACE (recursion ran).
+    let inside_out = std::process::Command::new("icacls")
+        .arg(&inside)
+        .output()
+        .expect("icacls must be available on Windows CI");
+    let inside_text = String::from_utf8_lossy(&inside_out.stdout).to_lowercase();
+    assert!(
+        inside_text.contains(&username.to_lowercase()),
+        "recursive chmod must reach inside.txt: {inside_text}"
+    );
+
+    // THE security assertion: the OUTSIDE file's ACL must be byte-for-byte
+    // unchanged — the reparse point was skipped, not followed.
+    let acl_after = std::process::Command::new("icacls")
+        .arg(&outside_file)
+        .output()
+        .expect("icacls must be available on Windows CI");
+    let acl_after = String::from_utf8_lossy(&acl_after.stdout).into_owned();
+    assert_eq!(
+        acl_before, acl_after,
+        "recursive chmod must NOT follow the directory symlink and modify the \
+         outside file's ACL (HIGH#2). before={acl_before:?} after={acl_after:?}"
+    );
+}
+
+/// Windows analogue of check_request_approval_escalates_relative_symlink_target_into_dangerous_path.
+/// A FileCreateSymlink with a *relative* target that resolves into a path
+/// listed in `dangerous_paths` must escalate to approval on Windows too.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_create_symlink_relative_target_into_dangerous_path_escalates() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = manager_with_dangerous(&dir, &["secret.txt"]);
+    fs::write(root.join("secret.txt"), "shhh").unwrap();
+    let sub = root.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let link = sub.join("escape");
+
+    let req = FileRequest {
+        request_id: "t".into(),
+        operation: Some(file_request::Operation::CreateSymlink(FileCreateSymlink {
+            target: "../secret.txt".into(),
+            link_path: link.to_string_lossy().into_owned(),
+        })),
+    };
+    let escalation = mgr
+        .check_request_approval(&req)
+        .await
+        .expect("relative target inside allowlist must not be denied")
+        .expect("relative target resolving into dangerous_paths must escalate");
+    assert_eq!(
+        escalation.kind,
+        ahandd::file_manager::EscalationKind::DangerousPath
     );
 }

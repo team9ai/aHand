@@ -47,6 +47,14 @@ EOF
   cat > "$TEST_INSTALL_DIR/node/bin/npm" <<'EOF'
 #!/bin/bash
 echo "local-npm $*"
+# Mirror the central npm mock: a global install must produce the
+# playwright-cli binary next to this stub, or the script's post-install
+# verification correctly fails.
+if [ "$1" = "install" ]; then
+  bin_dir="$(cd "$(dirname "$0")" && pwd)"
+  printf '#!/bin/bash\necho playwright-cli-stub\n' > "$bin_dir/playwright-cli"
+  chmod +x "$bin_dir/playwright-cli"
+fi
 EOF
   chmod +x "$TEST_INSTALL_DIR/node/bin/npm"
 

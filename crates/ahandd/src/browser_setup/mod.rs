@@ -2,7 +2,7 @@
 //!
 //! Public API:
 //! - `inspect_all()`, `inspect(name)` — read-only diagnostic
-//! - `run_all(force, progress)` — install everything (or refresh)
+//! - `run_all(force, progress)` — install browser automation dependencies
 //! - `run_step(name, force, progress)` — install a single component
 //! - `detect_browser(config_override)`, `detect_all_browsers()` — browser detection
 
@@ -11,11 +11,12 @@ use anyhow::{Result, bail};
 pub mod browser_detect;
 pub mod node;
 pub mod playwright;
+pub mod progress_format;
+pub mod python;
 pub mod types;
 
-pub use browser_detect::{
-    detect as detect_browser, detect_all as detect_all_browsers, tried_browsers,
-};
+pub use browser_detect::{detect as detect_browser, tried_browsers};
+pub use progress_format::{format_progress_line, format_summary};
 pub use types::*;
 
 /// Classify an `anyhow::Error` produced by an install step into a
@@ -82,10 +83,12 @@ pub async fn inspect_all() -> Vec<CheckReport> {
 }
 
 /// Inspect a single component by name.
+#[allow(dead_code)] // future CLI diagnostics sub-command
 pub async fn inspect(name: &str) -> Option<CheckReport> {
     match name {
         "node" => Some(node::inspect().await),
-        "playwright" => Some(playwright::inspect().await),
+        "python" => Some(python::inspect().await),
+        "playwright" | "browser-playwright-cli" => Some(playwright::inspect().await),
         "browser" => Some(inspect_browser()),
         _ => None,
     }
@@ -93,9 +96,8 @@ pub async fn inspect(name: &str) -> Option<CheckReport> {
 
 /// Run all install steps. `force` reinstalls even if already present.
 ///
-/// **Progress-callback note:** `Phase::Done` is emitted even on failure
-/// (see `wrap_failure`); use the `Result` return value, not the callback,
-/// to determine success.
+/// **Progress-callback note:** `Phase::Failed` (not `Phase::Done`) is emitted
+/// on failure (see `wrap_failure`); formatters can distinguish by phase.
 pub async fn run_all(
     force: bool,
     progress: impl Fn(ProgressEvent) + Send + Sync + 'static,
@@ -123,12 +125,13 @@ pub async fn run_all(
     Ok(vec![node_report, playwright_report, browser_report])
 }
 
-/// Run a single install step. Valid names: `node`, `playwright`.
-/// Returns an error for `playwright` if Node is not already installed.
+/// Run a single install step. Valid names: `node`, `python`, `playwright`,
+/// `browser-playwright-cli`, plus non-installable plugin ids for diagnostics.
+/// Returns an error for `playwright`/`browser-playwright-cli` if Node is not
+/// already installed.
 ///
-/// **Progress-callback note:** `Phase::Done` is emitted even on failure
-/// (see `wrap_failure`); use the `Result` return value, not the callback,
-/// to determine success.
+/// **Progress-callback note:** `Phase::Failed` (not `Phase::Done`) is emitted
+/// on failure (see `wrap_failure`); formatters can distinguish by phase.
 pub async fn run_step(
     name: &str,
     force: bool,
@@ -140,38 +143,46 @@ pub async fn run_step(
             Ok(r) => Ok(r),
             Err(e) => Err(wrap_failure(e, "node", "Node.js", progress_ref)),
         },
-        "playwright" => {
+        "python" => match python::ensure(force, progress_ref).await {
+            Ok(r) => Ok(r),
+            Err(e) => Err(wrap_failure(e, "python", "Python", progress_ref)),
+        },
+        "playwright" | "browser-playwright-cli" => {
             let node_status = node::inspect().await;
             if !matches!(node_status.status, CheckStatus::Ok { .. }) {
                 bail!(
-                    "playwright step requires node to be installed first. \
+                    "browser-playwright-cli requires node to be installed first. \
                      Run `ahandd browser-init --step node` first, or \
-                     `ahandd browser-init` for all steps."
+                     `ahandd plugin install browser-playwright-cli`."
                 );
             }
             match playwright::ensure(force, progress_ref).await {
                 Ok(r) => Ok(r),
                 Err(e) => Err(wrap_failure(
                     e,
-                    "playwright",
+                    "browser-playwright-cli",
                     "playwright-cli",
                     progress_ref,
                 )),
             }
         }
-        other => bail!("unknown step `{other}`. Valid steps: node, playwright"),
+        "shell" | "file" => {
+            bail!("plugin `{name}` does not have an install step in this release")
+        }
+        other => bail!(
+            "unknown step `{other}`. Valid install steps: node, python, playwright, browser-playwright-cli"
+        ),
     }
 }
 
-/// Build a `FailedStepReport`, emit a terminal `ProgressEvent::Done`, and
-/// attach the report to the error via `.context(...)`. Called by
-/// `run_all` / `run_step` on any `ensure()` failure.
+/// Build a `FailedStepReport`, emit a terminal `ProgressEvent` with
+/// `Phase::Failed`, and attach the report to the error via `.context(...)`.
+/// Called by `run_all` / `run_step` on any `ensure()` failure.
 ///
-/// `Phase::Done` is emitted here on the failure path as well as in
-/// `node::ensure` / `playwright::ensure` on success. Progress-callback
-/// consumers CANNOT infer success vs. failure from the `Done` event alone
-/// — they must inspect the `Result` from `run_all` / `run_step`. Use
-/// `err.downcast_ref::<FailedStepReport>()` to get the classified report.
+/// `Phase::Failed` (not `Phase::Done`) is emitted here so that presentation
+/// formatters can render a `✗` prefix without consulting the `Result` return
+/// value. Use `err.downcast_ref::<FailedStepReport>()` to get the classified
+/// report.
 fn wrap_failure(
     err: anyhow::Error,
     name: &'static str,
@@ -182,7 +193,7 @@ fn wrap_failure(
     let message = format!("{err:#}");
     progress(ProgressEvent {
         step: name,
-        phase: Phase::Done,
+        phase: Phase::Failed,
         message: message.clone(),
         percent: None,
         stream: None,
@@ -268,6 +279,24 @@ mod tests {
         assert!(inspect("playwright").await.is_some());
         assert!(inspect("browser").await.is_some());
         assert!(inspect("nothing").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inspect_accepts_plugin_id_aliases() {
+        assert!(inspect("node").await.is_some());
+        assert!(inspect("python").await.is_some());
+        assert!(inspect("playwright").await.is_some());
+        assert!(inspect("browser-playwright-cli").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn run_step_rejects_file_plugin_because_it_has_no_installer() {
+        let progress = |_: ProgressEvent| {};
+        let err = run_step("file", false, progress)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not have an install step"));
     }
 
     #[test]

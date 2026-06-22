@@ -8,6 +8,7 @@ pub mod binary_read;
 pub mod fs_ops;
 #[cfg(unix)]
 pub mod io_safe;
+pub mod pdf_read;
 pub mod policy;
 pub mod text_read;
 pub mod write_ops;
@@ -50,6 +51,7 @@ static GLOB_APPROVAL_SCAN_CAP: AtomicUsize = AtomicUsize::new(10_000);
 /// `#[doc(hidden)]` so it doesn't surface in rustdoc and the body of the
 /// docstring tells anyone reaching for it to stop.
 #[doc(hidden)]
+#[allow(dead_code)] // test back-door for cap tuning; intentionally hidden
 pub fn set_glob_approval_scan_cap(cap: usize) -> usize {
     GLOB_APPROVAL_SCAN_CAP.swap(cap, Ordering::Relaxed)
 }
@@ -58,6 +60,7 @@ pub fn set_glob_approval_scan_cap(cap: usize) -> usize {
 /// The `reason` string is what surfaces in the approval prompt UI; `path`
 /// is the specific path that triggered the escalation, when applicable.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // `path` is surfaced in approval prompt display (future UI)
 pub struct ApprovalEscalation {
     pub kind: EscalationKind,
     pub reason: String,
@@ -95,6 +98,7 @@ pub struct FileManager {
     enabled: bool,
 }
 
+#[allow(dead_code)] // policy() is a public accessor for future audit / SDK consumers
 impl FileManager {
     pub fn new(config: &FilePolicyConfig) -> Self {
         Self {
@@ -148,14 +152,15 @@ impl FileManager {
     ) -> Result<Option<ApprovalEscalation>, FileError> {
         // Recursive PERMANENT delete forces approval even if none of the
         // paths themselves are marked dangerous (design.md:635).
-        if let Some(file_request::Operation::Delete(d)) = &req.operation {
-            if d.mode == DeleteMode::Permanent as i32 && d.recursive {
-                return Ok(Some(ApprovalEscalation {
-                    kind: EscalationKind::RecursivePermanentDelete,
-                    reason: "recursive permanent delete requires explicit approval".to_string(),
-                    path: Some(d.path.clone()),
-                }));
-            }
+        if let Some(file_request::Operation::Delete(d)) = &req.operation
+            && d.mode == DeleteMode::Permanent as i32
+            && d.recursive
+        {
+            return Ok(Some(ApprovalEscalation {
+                kind: EscalationKind::RecursivePermanentDelete,
+                reason: "recursive permanent delete requires explicit approval".to_string(),
+                path: Some(d.path.clone()),
+            }));
         }
 
         // Walk the request's declared paths. collect_request_paths now
@@ -340,6 +345,18 @@ impl FileManager {
                 )
                 .await?;
                 Ok(file_response::Result::ReadImage(result))
+            }
+            file_request::Operation::ReadPdf(req) => {
+                let checked = self
+                    .policy
+                    .check_path(&req.path, false, req.no_follow_symlink)?;
+                let result = pdf_read::handle_read_pdf(
+                    req,
+                    checked.resolved_path.as_path(),
+                    self.policy.max_read_bytes(),
+                )
+                .await?;
+                Ok(file_response::Result::ReadPdf(result))
             }
             file_request::Operation::Write(req) => {
                 let checked = self
@@ -541,6 +558,7 @@ fn collect_request_paths(req: &FileRequest) -> Vec<(String, bool, bool)> {
         Operation::ReadText(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
         Operation::ReadBinary(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
         Operation::ReadImage(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
+        Operation::ReadPdf(r) => vec![(r.path.clone(), false, r.no_follow_symlink)],
         Operation::Write(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
         Operation::Edit(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
         Operation::Delete(r) => vec![(r.path.clone(), true, r.no_follow_symlink)],
@@ -817,24 +835,16 @@ pub(super) async fn reject_if_final_component_is_symlink(
     }
     // symlink_metadata never follows. If the file doesn't exist at all, we
     // let the downstream handler produce its own NotFound error.
-    if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await {
-        if metadata.file_type().is_symlink() {
-            return Err(file_error(
-                FileErrorCode::InvalidPath,
-                req_path,
-                "no_follow_symlink is set but the final component is a symlink",
-            ));
-        }
+    if let Ok(metadata) = tokio::fs::symlink_metadata(resolved).await
+        && metadata.file_type().is_symlink()
+    {
+        return Err(file_error(
+            FileErrorCode::InvalidPath,
+            req_path,
+            "no_follow_symlink is set but the final component is a symlink",
+        ));
     }
     Ok(())
-}
-
-fn unimplemented_error(path: &str) -> FileError {
-    file_error(
-        FileErrorCode::Unspecified,
-        path,
-        "operation not yet implemented",
-    )
 }
 
 #[cfg(test)]

@@ -39,6 +39,7 @@ setup_isolated_env() {
   unset MOCK_NODE_ABSENT
   unset MOCK_NODE_VERSION
   unset MOCK_CURL_FAIL_PATTERN
+  unset MOCK_CURL_CHECKSUM_NOMATCH
 
   # Per-test kill log.
   export MOCK_KILL_LOG="$TEST_HOME/kill-calls.log"

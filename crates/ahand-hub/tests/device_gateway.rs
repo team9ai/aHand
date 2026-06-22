@@ -39,6 +39,62 @@ async fn device_ws_accepts_signed_hello_and_registers_presence() {
 }
 
 #[tokio::test]
+async fn stale_control_plane_job_finished_is_acked_without_closing_socket() {
+    let server = spawn_test_server().await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(server.ws_url("/ws"))
+        .await
+        .unwrap();
+
+    let challenge = read_hello_challenge(&mut socket).await;
+    let hello = signed_hello("device-1", &challenge.nonce);
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            hello.encode_to_vec().into(),
+        ))
+        .await
+        .unwrap();
+    let _ = read_hello_accepted(&mut socket).await;
+
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            ahand_protocol::Envelope {
+                device_id: "device-1".into(),
+                msg_id: "stale-control-job-finished".into(),
+                seq: 1,
+                ts_ms: now_ms(),
+                payload: Some(ahand_protocol::envelope::Payload::JobFinished(
+                    ahand_protocol::JobFinished {
+                        job_id: "01KRDSZ20BRER8PT5SMK9CYC9N".into(),
+                        exit_code: 0,
+                        error: String::new(),
+                    },
+                )),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let message = tokio::time::timeout(std::time::Duration::from_millis(250), socket.next())
+        .await
+        .expect("expected ack-only frame before timeout")
+        .expect("device socket should remain open")
+        .expect("device socket should not close with an error");
+    let tokio_tungstenite::tungstenite::Message::Binary(data) = message else {
+        panic!("expected binary ack-only frame, got {message:?}");
+    };
+    let ack = ahand_protocol::Envelope::decode(data.as_ref()).unwrap();
+    assert_eq!(ack.device_id, "device-1");
+    assert_eq!(ack.seq, 0);
+    assert_eq!(ack.ack, 1);
+    assert!(ack.payload.is_none());
+
+    let _ = socket.close(None).await;
+}
+
+#[tokio::test]
 async fn idle_device_connection_times_out_and_marks_presence_offline() {
     let mut config = test_config();
     config.device_staleness_probe_interval_ms = 20;

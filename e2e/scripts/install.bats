@@ -109,16 +109,29 @@ teardown() {
   export MOCK_CURL_FIXTURE_DIR="$TEST_HOME/empty-fixtures"
   mkdir -p "$MOCK_CURL_FIXTURE_DIR"
   echo '[]' > "$MOCK_CURL_FIXTURE_DIR/github-releases.json"
-  # Copy other fixtures so the script doesn't fail for other reasons.
+  # The version check fires before any downloads, so missing download fixtures
+  # are never reached — no need to copy them here.
   run bash "$DIST_DIR/install.sh"
   assert_failure
   assert_output --partial "Could not determine Rust release version"
 }
 
-@test "install: cleans up temp tar file" {
-  run bash "$DIST_DIR/install.sh"
+@test "install: cleans up temp files (no leftover temp dir)" {
+  # Point install.sh's mktemp at an isolated, per-test TMPDIR so this is
+  # parallel-safe (no shared global /tmp path). After a successful install
+  # the EXIT trap must have removed the per-invocation temp dir, leaving
+  # this dir empty.
+  #
+  # NOTE: `VAR=val run cmd` does NOT pass the env-prefix into bats `run`
+  # (run is a shell function, not an external command). Use `run env VAR=val`
+  # so TMPDIR is actually forwarded to install.sh's mktemp.
+  local isolated_tmp="$TEST_HOME/temp"
+  mkdir -p "$isolated_tmp"
+  run env TMPDIR="$isolated_tmp" bash "$DIST_DIR/install.sh"
   assert_success
-  [ ! -f "/tmp/ahand-admin-spa.tar.gz" ]
+  # After a successful install the EXIT trap must have removed the
+  # per-invocation temp dir, leaving isolated_tmp empty.
+  [ -z "$(ls -A "$isolated_tmp")" ]
 }
 
 @test "install: outputs success message with PATH instructions" {
@@ -135,4 +148,49 @@ teardown() {
   assert_success
   assert_executable "$TEST_INSTALL_DIR/bin/ahandd"
   [ "$(cat "$TEST_INSTALL_DIR/version")" = "0.3.0" ]
+}
+
+# ── SHA-256 verification (cross-platform parity with install.ps1) ─
+
+@test "install: verifies checksums on happy path" {
+  run bash "$DIST_DIR/install.sh"
+  assert_success
+  assert_output --partial "Verifying checksums"
+  assert_output --partial "Checksum OK: ahandd-darwin-arm64"
+  assert_output --partial "Checksum OK: ahandctl-darwin-arm64"
+  assert_output --partial "Checksum OK: admin-spa.tar.gz"
+  assert_executable "$TEST_INSTALL_DIR/bin/ahandd"
+}
+
+@test "install: aborts on tampered artifact (checksum mismatch)" {
+  # Force the local digest to differ from the published checksum: the
+  # mock shasum returns a bogus hash, simulating a tampered/corrupt binary.
+  export MOCK_SHASUM_FAIL=true
+  run bash "$DIST_DIR/install.sh"
+  assert_failure
+  assert_output --partial "Checksum mismatch"
+  # Fail-closed: the unverified binary must NOT be installed.
+  [ ! -f "$TEST_INSTALL_DIR/bin/ahandd" ]
+}
+
+@test "install: fails closed when checksum file is missing" {
+  # The .sha256/checksum download 404s; install must abort, not skip.
+  export MOCK_CURL_FAIL_PATTERN="checksums-rust.txt"
+  run bash "$DIST_DIR/install.sh"
+  assert_failure
+  assert_output --partial "Checksum file not available"
+  # Fail-closed: nothing installed without integrity verification.
+  [ ! -f "$TEST_INSTALL_DIR/bin/ahandd" ]
+}
+
+@test "install: fails closed when checksum entry is missing for artifact" {
+  # The checksum file downloads fine (present + readable, valid format) but
+  # contains NO line for the requested artifact — verify_checksum must still
+  # abort (the "no entry" fail-closed branch), not silently skip verification.
+  export MOCK_CURL_CHECKSUM_NOMATCH=1
+  run bash "$DIST_DIR/install.sh"
+  assert_failure
+  assert_output --partial "No checksum entry"
+  # Fail-closed: the unverified binary must NOT be installed.
+  [ ! -f "$TEST_INSTALL_DIR/bin/ahandd" ]
 }

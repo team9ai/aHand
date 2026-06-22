@@ -6,7 +6,9 @@
 
 /* eslint-disable */
 import { BinaryReader, BinaryWriter } from "@bufbuild/protobuf/wire";
+import { AppToolRequest, AppToolResponse, AppToolsUpdate } from "./app_tool.js";
 import { BrowserRequest, BrowserResponse } from "./browser.js";
+import { FileRequest, FileResponse } from "./file_ops.js";
 
 export const protobufPackage = "ahand.v1";
 
@@ -170,7 +172,21 @@ export interface Envelope {
   updateStatus?: UpdateStatus | undefined;
   stdinChunk?: StdinChunk | undefined;
   terminalResize?: TerminalResize | undefined;
-  heartbeat?: Heartbeat | undefined;
+  heartbeat?:
+    | Heartbeat
+    | undefined;
+  /**
+   * Tag 32 is intentionally skipped: PR #1 (c9b8a4d, 2026-04-28)
+   * briefly assigned `FileResponse = 32` on `dev` and shifted
+   * Heartbeat to 33, breaking wire compat with deployed daemons.
+   * Don't reuse 32 even though no client ever decoded it correctly —
+   * a hub built between c9b8a4d and the fix will emit/parse it.
+   */
+  fileRequest?: FileRequest | undefined;
+  fileResponse?: FileResponse | undefined;
+  appToolsUpdate?: AppToolsUpdate | undefined;
+  appToolRequest?: AppToolRequest | undefined;
+  appToolResponse?: AppToolResponse | undefined;
 }
 
 /**
@@ -431,6 +447,11 @@ function createBaseEnvelope(): Envelope {
     stdinChunk: undefined,
     terminalResize: undefined,
     heartbeat: undefined,
+    fileRequest: undefined,
+    fileResponse: undefined,
+    appToolsUpdate: undefined,
+    appToolRequest: undefined,
+    appToolResponse: undefined,
   };
 }
 
@@ -522,6 +543,21 @@ export const Envelope: MessageFns<Envelope> = {
     }
     if (message.heartbeat !== undefined) {
       Heartbeat.encode(message.heartbeat, writer.uint32(250).fork()).join();
+    }
+    if (message.fileRequest !== undefined) {
+      FileRequest.encode(message.fileRequest, writer.uint32(266).fork()).join();
+    }
+    if (message.fileResponse !== undefined) {
+      FileResponse.encode(message.fileResponse, writer.uint32(274).fork()).join();
+    }
+    if (message.appToolsUpdate !== undefined) {
+      AppToolsUpdate.encode(message.appToolsUpdate, writer.uint32(282).fork()).join();
+    }
+    if (message.appToolRequest !== undefined) {
+      AppToolRequest.encode(message.appToolRequest, writer.uint32(290).fork()).join();
+    }
+    if (message.appToolResponse !== undefined) {
+      AppToolResponse.encode(message.appToolResponse, writer.uint32(298).fork()).join();
     }
     return writer;
   },
@@ -765,6 +801,46 @@ export const Envelope: MessageFns<Envelope> = {
           message.heartbeat = Heartbeat.decode(reader, reader.uint32());
           continue;
         }
+        case 33: {
+          if (tag !== 266) {
+            break;
+          }
+
+          message.fileRequest = FileRequest.decode(reader, reader.uint32());
+          continue;
+        }
+        case 34: {
+          if (tag !== 274) {
+            break;
+          }
+
+          message.fileResponse = FileResponse.decode(reader, reader.uint32());
+          continue;
+        }
+        case 35: {
+          if (tag !== 282) {
+            break;
+          }
+
+          message.appToolsUpdate = AppToolsUpdate.decode(reader, reader.uint32());
+          continue;
+        }
+        case 36: {
+          if (tag !== 290) {
+            break;
+          }
+
+          message.appToolRequest = AppToolRequest.decode(reader, reader.uint32());
+          continue;
+        }
+        case 37: {
+          if (tag !== 298) {
+            break;
+          }
+
+          message.appToolResponse = AppToolResponse.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -905,6 +981,31 @@ export const Envelope: MessageFns<Envelope> = {
         ? TerminalResize.fromJSON(object.terminal_resize)
         : undefined,
       heartbeat: isSet(object.heartbeat) ? Heartbeat.fromJSON(object.heartbeat) : undefined,
+      fileRequest: isSet(object.fileRequest)
+        ? FileRequest.fromJSON(object.fileRequest)
+        : isSet(object.file_request)
+        ? FileRequest.fromJSON(object.file_request)
+        : undefined,
+      fileResponse: isSet(object.fileResponse)
+        ? FileResponse.fromJSON(object.fileResponse)
+        : isSet(object.file_response)
+        ? FileResponse.fromJSON(object.file_response)
+        : undefined,
+      appToolsUpdate: isSet(object.appToolsUpdate)
+        ? AppToolsUpdate.fromJSON(object.appToolsUpdate)
+        : isSet(object.app_tools_update)
+        ? AppToolsUpdate.fromJSON(object.app_tools_update)
+        : undefined,
+      appToolRequest: isSet(object.appToolRequest)
+        ? AppToolRequest.fromJSON(object.appToolRequest)
+        : isSet(object.app_tool_request)
+        ? AppToolRequest.fromJSON(object.app_tool_request)
+        : undefined,
+      appToolResponse: isSet(object.appToolResponse)
+        ? AppToolResponse.fromJSON(object.appToolResponse)
+        : isSet(object.app_tool_response)
+        ? AppToolResponse.fromJSON(object.app_tool_response)
+        : undefined,
     };
   },
 
@@ -997,6 +1098,21 @@ export const Envelope: MessageFns<Envelope> = {
     if (message.heartbeat !== undefined) {
       obj.heartbeat = Heartbeat.toJSON(message.heartbeat);
     }
+    if (message.fileRequest !== undefined) {
+      obj.fileRequest = FileRequest.toJSON(message.fileRequest);
+    }
+    if (message.fileResponse !== undefined) {
+      obj.fileResponse = FileResponse.toJSON(message.fileResponse);
+    }
+    if (message.appToolsUpdate !== undefined) {
+      obj.appToolsUpdate = AppToolsUpdate.toJSON(message.appToolsUpdate);
+    }
+    if (message.appToolRequest !== undefined) {
+      obj.appToolRequest = AppToolRequest.toJSON(message.appToolRequest);
+    }
+    if (message.appToolResponse !== undefined) {
+      obj.appToolResponse = AppToolResponse.toJSON(message.appToolResponse);
+    }
     return obj;
   },
 
@@ -1077,6 +1193,21 @@ export const Envelope: MessageFns<Envelope> = {
       : undefined;
     message.heartbeat = (object.heartbeat !== undefined && object.heartbeat !== null)
       ? Heartbeat.fromPartial(object.heartbeat)
+      : undefined;
+    message.fileRequest = (object.fileRequest !== undefined && object.fileRequest !== null)
+      ? FileRequest.fromPartial(object.fileRequest)
+      : undefined;
+    message.fileResponse = (object.fileResponse !== undefined && object.fileResponse !== null)
+      ? FileResponse.fromPartial(object.fileResponse)
+      : undefined;
+    message.appToolsUpdate = (object.appToolsUpdate !== undefined && object.appToolsUpdate !== null)
+      ? AppToolsUpdate.fromPartial(object.appToolsUpdate)
+      : undefined;
+    message.appToolRequest = (object.appToolRequest !== undefined && object.appToolRequest !== null)
+      ? AppToolRequest.fromPartial(object.appToolRequest)
+      : undefined;
+    message.appToolResponse = (object.appToolResponse !== undefined && object.appToolResponse !== null)
+      ? AppToolResponse.fromPartial(object.appToolResponse)
       : undefined;
     return message;
   },

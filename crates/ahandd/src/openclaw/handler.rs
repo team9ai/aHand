@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,6 +55,7 @@ pub(crate) struct ExecEvent {
 }
 
 /// Handler for OpenClaw node invocations
+#[allow(dead_code)] // registry + store consumed via Arc; fields read in future methods
 pub struct OpenClawHandler {
     node_id: String,
     registry: Arc<JobRegistry>,
@@ -66,6 +67,7 @@ pub struct OpenClawHandler {
     browser_mgr: Arc<BrowserManager>,
 }
 
+#[allow(clippy::too_many_arguments)] // constructor mirrors the struct fields 1:1; grouping would obscure intent
 impl OpenClawHandler {
     pub fn new(
         node_id: String,
@@ -235,44 +237,66 @@ impl OpenClawHandler {
         (invoke_result, Some(event))
     }
 
-    /// Execute a command and collect output
+    /// Execute a command and collect output.
+    ///
+    /// Two execution paths exist:
+    ///
+    /// **Shell path** (`raw_command` set, or `command` has exactly 1 element):
+    /// The string is passed to the platform shell via `shell -c <string>`, which
+    /// supports shell builtins, pipes, redirections, etc.
+    ///
+    /// **Direct path** (`command` has 2+ elements):
+    /// `Command::new(cmd[0]).args(cmd[1..])` — argv boundaries are preserved
+    /// exactly as the caller specified them.  The shell is never involved, so
+    /// special characters in arguments (`&`, `|`, `>`, `^`, `%`, etc.) are
+    /// passed through to the child process verbatim and cannot smuggle additional
+    /// shell commands regardless of platform.  Shell builtins are not available
+    /// in this form (they were unreliable before too — POSIX escaping only
+    /// approximated safety on Windows cmd.exe).
     async fn run_command(&self, params: &SystemRunParams) -> RunResult {
         let cwd = params.cwd.as_deref().filter(|s| !s.is_empty());
         let env_overrides = params.env.as_ref();
         let timeout_ms = params.timeout_ms.or(Some(120_000)); // default 2 minutes
 
-        // Use raw_command with shell, or command array
-        // If command array has 1 element, it's likely a full shell command string - use directly
-        // If multiple elements, it's argv-style - escape and join
-        let shell_cmd = params
-            .raw_command
-            .clone()
-            .or_else(|| {
-                if params.command.len() == 1 {
-                    // Single element = full shell command, use directly
-                    Some(params.command[0].clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| shell_escape_join(&params.command));
+        let command_env = env_overrides
+            .map(sanitize_env)
+            .unwrap_or_else(|| env::vars().collect());
+        let path_val = crate::plugin_runtime::path_env::child_process_path(&command_env).await;
 
-        debug!(shell_cmd = %shell_cmd, command_len = params.command.len(), "executing command via shell");
+        // Decide between direct spawn (array with 2+ elements) and shell spawn.
+        let use_direct = params.raw_command.is_none() && params.command.len() >= 2;
 
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(&shell_cmd);
+        let mut cmd: Command = if use_direct {
+            // Direct spawn: argv boundaries are preserved — no shell, no injection risk.
+            let exe = &params.command[0];
+            debug!(exe = %exe, args = ?&params.command[1..], "executing command directly (no shell)");
+            let mut c = Command::new(exe);
+            c.args(&params.command[1..]);
+            c
+        } else {
+            // Shell spawn: raw_command or single-element command string.
+            let shell_cmd = params
+                .raw_command
+                .clone()
+                .unwrap_or_else(|| params.command.first().cloned().unwrap_or_default());
+            debug!(shell_cmd = %shell_cmd, "executing command via shell");
+            let shell = ahand_platform::shell::env_shell()
+                .unwrap_or_else(|| ahand_platform::shell::default_shell().path);
+            let mut c = Command::new(shell);
+            c.arg(ahand_platform::shell::shell_c_flag()).arg(&shell_cmd);
+            c
+        };
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
 
-        // Apply environment overrides with sanitization
-        if let Some(overrides) = env_overrides {
-            let sanitized = sanitize_env(overrides);
-            for (key, value) in sanitized {
+        for (key, value) in &command_env {
+            if !crate::plugin_runtime::path_env::is_path_env_key(key) {
                 cmd.env(key, value);
             }
         }
+        cmd.env("PATH", path_val);
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -326,7 +350,7 @@ impl OpenClawHandler {
         });
 
         // Wait with timeout
-        let timeout = timeout_ms.map(|ms| Duration::from_millis(ms));
+        let timeout = timeout_ms.map(Duration::from_millis);
         let (exit_code, timed_out) = if let Some(dur) = timeout {
             match tokio::time::timeout(dur, child.wait()).await {
                 Ok(Ok(status)) => (status.code(), false),
@@ -441,8 +465,11 @@ impl OpenClawHandler {
         };
 
         let mut found: HashMap<String, String> = HashMap::new();
-        let path_env = env::var("PATH").unwrap_or_default();
-        let path_dirs: Vec<&str> = path_env.split(':').collect();
+        let base_path = env::var("PATH").unwrap_or_default();
+        let path_env =
+            crate::plugin_runtime::path_env::path_with_installed_runtime_bins_or_base(&base_path)
+                .await;
+        let path_dirs: Vec<PathBuf> = std::env::split_paths(&path_env).collect();
 
         for bin in &params.bins {
             let bin = bin.trim();
@@ -450,11 +477,10 @@ impl OpenClawHandler {
                 continue;
             }
 
-            for dir in &path_dirs {
-                let candidate = Path::new(dir).join(bin);
-                if candidate.exists() && candidate.is_file() {
-                    found.insert(bin.to_string(), candidate.to_string_lossy().to_string());
-                    break;
+            'dirs: for dir in &path_dirs {
+                if let Some(p) = which_in_dir(dir, bin) {
+                    found.insert(bin.to_string(), p.to_string_lossy().to_string());
+                    break 'dirs;
                 }
             }
         }
@@ -645,21 +671,15 @@ impl OpenClawHandler {
                     .browser_mgr
                     .execute(&session_id, &action, &action_params_json, timeout_ms)
                     .await;
-                if submit {
-                    if let Ok(ref r) = result {
-                        if r.success {
-                            let press_params = serde_json::json!({ "key": "Enter" });
-                            let _ = self
-                                .browser_mgr
-                                .execute(
-                                    &session_id,
-                                    "press",
-                                    &press_params.to_string(),
-                                    timeout_ms,
-                                )
-                                .await;
-                        }
-                    }
+                if submit
+                    && let Ok(ref r) = result
+                    && r.success
+                {
+                    let press_params = serde_json::json!({ "key": "Enter" });
+                    let _ = self
+                        .browser_mgr
+                        .execute(&session_id, "press", &press_params.to_string(), timeout_ms)
+                        .await;
                 }
                 result
             }
@@ -1187,13 +1207,13 @@ fn translate_act_kind(kind: &str, body: &serde_json::Value) -> Result<(String, S
             // OpenClaw sends { fields: [{ref, type, value}, ...] }.
             // Use the first field for playwright-cli `fill <ref> <text>`.
             let fields = body.get("fields").and_then(|v| v.as_array());
-            if let Some(fields) = fields {
-                if let Some(first) = fields.first() {
-                    let ref_val = first.get("ref").and_then(|v| v.as_str()).unwrap_or("");
-                    let value = first.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                    let params = serde_json::json!({ "ref": ref_val, "text": value });
-                    return Ok(("fill".to_string(), params.to_string()));
-                }
+            if let Some(fields) = fields
+                && let Some(first) = fields.first()
+            {
+                let ref_val = first.get("ref").and_then(|v| v.as_str()).unwrap_or("");
+                let value = first.get("value").and_then(|v| v.as_str()).unwrap_or("");
+                let params = serde_json::json!({ "ref": ref_val, "text": value });
+                return Ok(("fill".to_string(), params.to_string()));
             }
             Ok(("fill".to_string(), "{}".to_string()))
         }
@@ -1236,6 +1256,43 @@ fn translate_act_kind(kind: &str, body: &serde_json::Value) -> Result<(String, S
     }
 }
 
+/// Probe one directory for `bin`, considering PATHEXT on Windows.
+///
+/// On Unix: checks `dir/bin` existence only.
+///
+/// On Windows: first probes `dir/bin` as-is (handles the case where the
+/// binary already has an extension); if that fails and `bin` has no
+/// extension, probes `dir/bin{ext}` for each extension in the `PATHEXT`
+/// environment variable (falling back to `.COM;.EXE;.BAT;.CMD`).
+fn which_in_dir(dir: &std::path::Path, bin: &str) -> Option<std::path::PathBuf> {
+    let candidate = dir.join(bin);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+
+    #[cfg(windows)]
+    {
+        // Only probe PATHEXT suffixes when the binary name has no extension.
+        use std::path::Path;
+        if Path::new(bin).extension().is_none() {
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            for ext in pathext.split(';') {
+                let ext = ext.trim();
+                if ext.is_empty() {
+                    continue;
+                }
+                let with_ext = dir.join(format!("{bin}{ext}"));
+                if with_ext.is_file() {
+                    return Some(with_ext);
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Decode params from JSON string
 fn decode_params<T: serde::de::DeserializeOwned>(
     params_json: &Option<String>,
@@ -1265,49 +1322,6 @@ fn format_command(argv: &[String]) -> String {
         .join(" ")
 }
 
-/// Join command array into shell-safe string
-fn shell_escape_join(argv: &[String]) -> String {
-    argv.iter()
-        .map(|arg| {
-            // If arg contains shell special chars, quote it
-            if arg.chars().any(|c| {
-                matches!(
-                    c,
-                    ' ' | '"'
-                        | '\''
-                        | '\\'
-                        | '$'
-                        | '`'
-                        | '!'
-                        | '*'
-                        | '?'
-                        | '['
-                        | ']'
-                        | '('
-                        | ')'
-                        | '{'
-                        | '}'
-                        | '|'
-                        | '&'
-                        | ';'
-                        | '<'
-                        | '>'
-                        | '\n'
-                        | '\t'
-                )
-            }) {
-                // Use single quotes and escape any single quotes inside
-                format!("'{}'", arg.replace('\'', "'\\''"))
-            } else if arg.is_empty() {
-                "''".to_string()
-            } else {
-                arg.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// Truncate output to max characters
 fn truncate_output(raw: &str, max_chars: usize) -> String {
     if raw.len() <= max_chars {
@@ -1315,6 +1329,52 @@ fn truncate_output(raw: &str, max_chars: usize) -> String {
     } else {
         format!("... (truncated) {}", &raw[raw.len() - max_chars..])
     }
+}
+
+/// Returns `true` iff `override_val` is a strict PATH-prepend of `base`:
+/// the entries of `base` must appear as a contiguous suffix of the entries
+/// in `override_val`.  Uses `std::env::split_paths` so the separator is
+/// platform-correct (`;` on Windows, `:` on Unix).
+///
+/// Note: `std::env::split_paths("")` yields a single empty-string entry on
+/// some platforms; we filter those out so that an empty-string input is
+/// treated as "no entries".
+///
+/// Decision for empty `base`: a non-empty `override_val` is accepted as
+/// "all entries are prepended to an empty base", mirroring the common case
+/// where the daemon starts with `PATH=""` (e.g. in a stripped sandbox).
+/// An empty `override_val` is rejected (nothing meaningful was prepended).
+///
+/// Windows note: case-variant base entries (e.g. `C:\Windows` vs `c:\windows`)
+/// fail the suffix equality check and the override is dropped, so the daemon's
+/// own PATH is used unchanged.  This is intentional fail-closed behaviour.
+fn path_override_is_prepend_only(override_val: &str, base: &str) -> bool {
+    // Filter out empty path entries produced by split_paths("").
+    let non_empty = |p: &std::path::PathBuf| !p.as_os_str().is_empty();
+    let override_entries: Vec<_> = std::env::split_paths(override_val)
+        .filter(non_empty)
+        .collect();
+    let base_entries: Vec<_> = std::env::split_paths(base).filter(non_empty).collect();
+
+    if override_entries.is_empty() {
+        // An empty override adds nothing; reject.
+        return false;
+    }
+
+    if base_entries.is_empty() {
+        // Empty base: any non-empty override is acceptable — all entries are
+        // "prepended" to an empty base.
+        return true;
+    }
+
+    // The base entries must form a contiguous suffix of the override entries.
+    let base_len = base_entries.len();
+    let over_len = override_entries.len();
+    if base_len > over_len {
+        return false;
+    }
+    let suffix_start = over_len - base_len;
+    override_entries[suffix_start..] == base_entries[..]
 }
 
 /// Sanitize environment variables
@@ -1326,6 +1386,29 @@ fn sanitize_env(overrides: &HashMap<String, String>) -> HashMap<String, String> 
         "PERL5LIB",
         "PERL5OPT",
         "RUBYOPT",
+        // Redirects the Python interpreter binary; a plugin could use it to
+        // run an attacker-controlled python executable when the daemon spawns
+        // python for a managed runtime.
+        "PYTHONEXECUTABLE",
+        // Auto-executes a script every time the Python interpreter starts;
+        // allows arbitrary code injection into any python subprocess the
+        // daemon spawns.
+        "PYTHONSTARTUP",
+        // Injects module-resolution directories into Node.js require(); a
+        // plugin could use it to preload attacker-controlled code when the
+        // daemon spawns node for a managed runtime.
+        "NODE_PATH",
+        // Auto-sourced by bash when invoked non-interactively (e.g. via $SHELL);
+        // allows arbitrary code injection into any bash subprocess the daemon spawns.
+        "BASH_ENV",
+        // On Windows, cmd.exe consults PATHEXT to resolve the extension of a bare
+        // command name; a cloud JobRequest could override it to make an approved bare
+        // command resolve to an attacker-controlled script extension instead of .EXE.
+        "PATHEXT",
+        // On Windows, %COMSPEC% names the command interpreter; a child-env override
+        // redirects shell spawns to an attacker-controlled binary when the daemon
+        // invokes the shell by that variable rather than a hard-coded path.
+        "COMSPEC",
     ];
 
     const BLOCKED_PREFIXES: &[&str] = &["DYLD_", "LD_"];
@@ -1342,9 +1425,15 @@ fn sanitize_env(overrides: &HashMap<String, String>) -> HashMap<String, String> 
             if trimmed.is_empty() {
                 continue;
             }
-            // Only allow PATH if it prepends to current PATH
-            if trimmed == base_path || trimmed.ends_with(&format!(":{}", base_path)) {
-                result.insert(key.clone(), value.clone());
+            // Only allow PATH overrides that strictly prepend to the current
+            // PATH (platform-correct: split_paths uses `;` on Windows, `:` on
+            // Unix).  Overrides that replace or reorder existing entries are
+            // rejected to prevent DLL/binary hijacking.
+            if path_override_is_prepend_only(trimmed, &base_path) {
+                result.retain(|existing_key, _| {
+                    !crate::plugin_runtime::path_env::is_path_env_key(existing_key)
+                });
+                result.insert("PATH".to_string(), value.clone());
             }
             continue;
         }
@@ -1403,7 +1492,40 @@ mod tests {
     }
 
     fn unique_output_path() -> PathBuf {
-        PathBuf::from(format!("/tmp/ahand-openclaw-{}", uuid::Uuid::new_v4()))
+        std::env::temp_dir().join(format!("ahand-openclaw-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Returns a shell command string that creates a marker file at `path`.
+    ///
+    /// Unix:    `printf X > '<path>'` via sh  — single-quotes the path so names
+    ///          with spaces are handled correctly.
+    /// Windows: `echo X><path>` via COMSPEC (typically cmd.exe) — UNQUOTED path.
+    ///          The whole command is passed to `cmd.exe /C` as a SINGLE arg by
+    ///          `tokio::process::Command`, which serialises it with MSVC-CRT
+    ///          quoting (`"` → `\"`).  cmd.exe does not understand `\"`, so a
+    ///          quoted path would be mangled and the redirect would write to the
+    ///          wrong target (see the M4 backlog note in the cross-platform spec).
+    ///          `unique_output_path` builds the path under `temp_dir()`, which is
+    ///          space-free on the CI runner (`C:\Users\runneradmin\AppData\Local\
+    ///          Temp`), so an unquoted path is safe here.  No space before `>` so
+    ///          cmd.exe doesn't include a trailing space in the redirect token.
+    ///          Tests assert only `path.exists()`, not exact content, so the
+    ///          trailing CRLF cmd adds is irrelevant.
+    fn write_marker_command(path: &std::path::Path) -> String {
+        #[cfg(unix)]
+        {
+            format!("printf X > '{}'", path.display())
+        }
+        #[cfg(windows)]
+        {
+            // Unquoted, no space before `>`.  See the doc comment above for why
+            // quotes must NOT be used through `cmd.exe /C` from Rust's Command.
+            format!("echo X>{}", path.display())
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            format!("printf X > '{}'", path.display())
+        }
     }
 
     fn system_run_invoke(
@@ -1413,7 +1535,10 @@ mod tests {
         approval_decision: Option<&str>,
     ) -> super::NodeInvokeRequest {
         let mut params = serde_json::Map::new();
-        params.insert("command".into(), json!(["sh"]));
+        // rawCommand is set so use_direct=false; the shell drives execution and the
+        // "command" array is ignored.  A non-empty placeholder is required because
+        // handle_invoke rejects an empty command array before reaching the run path.
+        params.insert("command".into(), json!(["<rawCommand>"]));
         params.insert("rawCommand".into(), json!(raw_command));
         params.insert("sessionKey".into(), json!(session_key));
         params.insert("runId".into(), json!("run-1"));
@@ -1442,7 +1567,9 @@ mod tests {
     async fn inactive_session_denies_system_run_without_execution() {
         let (handler, _session_mgr, _approval_mgr, _broadcast_tx) = test_handler(1);
         let output_path = unique_output_path();
-        let command = format!("printf denied > {}", output_path.display());
+        // Command never executes (session inactive); write_marker_command keeps
+        // the helper cross-platform-portable for consistency.
+        let command = write_marker_command(&output_path);
 
         let (result, event) = handler
             .handle_invoke(system_run_invoke("session-1", command, None, None))
@@ -1463,6 +1590,10 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
+    // Executes a real shell job (sh -c on Unix; cmd /C on Windows) and asserts
+    // the output file was created.  The command is built by `write_marker_command`
+    // which selects the right syntax per platform.  `unique_output_path` uses
+    // `std::env::temp_dir()` so the path is writable on both platforms.
     #[tokio::test]
     async fn strict_mode_preapproved_request_executes_without_local_wait() {
         let (handler, session_mgr, _approval_mgr, approval_broadcast_tx) = test_handler(1);
@@ -1471,7 +1602,7 @@ mod tests {
             .await;
         let mut approval_rx = approval_broadcast_tx.subscribe();
         let output_path = unique_output_path();
-        let command = format!("printf approved > {}", output_path.display());
+        let command = write_marker_command(&output_path);
 
         let (result, event) = handler
             .handle_invoke(system_run_invoke("session-1", command, Some(true), None))
@@ -1492,6 +1623,9 @@ mod tests {
         let _ = std::fs::remove_file(output_path);
     }
 
+    // Executes a real shell job (sh -c on Unix; cmd /C on Windows) and asserts
+    // the output file was created after approval.  The command is built by
+    // `write_marker_command` which selects the right syntax per platform.
     #[tokio::test]
     async fn strict_mode_waits_for_local_approval_before_running() {
         let (handler, session_mgr, approval_mgr, approval_broadcast_tx) = test_handler(1);
@@ -1500,7 +1634,7 @@ mod tests {
             .await;
         let mut approval_rx = approval_broadcast_tx.subscribe();
         let output_path = unique_output_path();
-        let command = format!("printf locally-approved > {}", output_path.display());
+        let command = write_marker_command(&output_path);
 
         let resolver = tokio::spawn(async move {
             let envelope = approval_rx.recv().await.unwrap();
@@ -1539,7 +1673,9 @@ mod tests {
             .await;
         let mut approval_rx = approval_broadcast_tx.subscribe();
         let output_path = unique_output_path();
-        let command = format!("printf should-not-run > {}", output_path.display());
+        // Command is denied before execution; write_marker_command keeps the
+        // helper cross-platform-portable and consistent with sibling tests.
+        let command = write_marker_command(&output_path);
 
         let resolver = tokio::spawn(async move {
             let envelope = approval_rx.recv().await.unwrap();
@@ -1584,7 +1720,9 @@ mod tests {
             .await;
         let mut approval_rx = approval_broadcast_tx.subscribe();
         let output_path = unique_output_path();
-        let command = format!("printf should-not-run > {}", output_path.display());
+        // Command times out before execution; write_marker_command keeps the
+        // helper cross-platform-portable and consistent with sibling tests.
+        let command = write_marker_command(&output_path);
 
         let (result, event) = handler
             .handle_invoke(system_run_invoke("session-1", command, None, None))
@@ -1628,5 +1766,572 @@ mod tests {
         assert_eq!(payload["success"], false);
         assert_eq!(payload["exitCode"], 7);
         assert_eq!(event.unwrap().kind, ExecEventKind::Finished);
+    }
+
+    /// Build an invoke request that uses a true argv array (no rawCommand).
+    /// Used to test the direct-spawn path. Its only caller is the
+    /// unix-gated ampersand test, so gate it the same way.
+    #[cfg(unix)]
+    fn array_command_invoke(
+        session_key: &str,
+        argv: Vec<&str>,
+        approved: Option<bool>,
+    ) -> super::NodeInvokeRequest {
+        let mut params = serde_json::Map::new();
+        let cmd_json: serde_json::Value = argv.iter().map(|s| json!(s)).collect();
+        params.insert("command".into(), cmd_json);
+        params.insert("sessionKey".into(), json!(session_key));
+        params.insert("runId".into(), json!("run-arr-1"));
+        if let Some(approved) = approved {
+            params.insert("approved".into(), json!(approved));
+        }
+        super::NodeInvokeRequest {
+            id: "invoke-arr-1".to_string(),
+            node_id: "node-1".to_string(),
+            command: "system.run".to_string(),
+            params_json: Some(serde_json::Value::Object(params).to_string()),
+            timeout_ms: Some(5_000),
+            idempotency_key: None,
+        }
+    }
+
+    // ── which_in_dir tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn which_in_dir_finds_exact_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_path = tmp.path().join("mybinary");
+        std::fs::write(&bin_path, b"").unwrap();
+        let result = super::which_in_dir(tmp.path(), "mybinary");
+        assert_eq!(result, Some(bin_path));
+    }
+
+    #[test]
+    fn which_in_dir_returns_none_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = super::which_in_dir(tmp.path(), "doesnotexist");
+        assert!(result.is_none());
+    }
+
+    /// On Windows, a binary without an extension should be found when probing
+    /// PATHEXT extensions. Gate to cfg(windows) since we need actual .exe files
+    /// to exist and PATHEXT semantics are Windows-specific.
+    #[cfg(windows)]
+    #[test]
+    fn which_in_dir_finds_pathext_extension_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create "mybinary.exe" — PATHEXT typically contains .EXE
+        let bin_path = tmp.path().join("mybinary.exe");
+        std::fs::write(&bin_path, b"").unwrap();
+        // Query without extension. PATHEXT entries are typically upper-case
+        // (".EXE") and NTFS is case-insensitive, so the returned path may
+        // carry the PATHEXT casing — compare case-insensitively.
+        let result = super::which_in_dir(tmp.path(), "mybinary");
+        let found = result.expect("should find mybinary.exe via PATHEXT");
+        assert_eq!(
+            found.to_string_lossy().to_lowercase(),
+            bin_path.to_string_lossy().to_lowercase(),
+            "should find mybinary.exe via PATHEXT (case-insensitive)"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn which_in_dir_already_has_extension_does_not_double_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_path = tmp.path().join("mybinary.exe");
+        std::fs::write(&bin_path, b"").unwrap();
+        // Query WITH extension — should find via exact match, not PATHEXT loop.
+        let result = super::which_in_dir(tmp.path(), "mybinary.exe");
+        assert_eq!(result, Some(bin_path));
+    }
+
+    /// Array-form commands spawn directly (no shell), so an argument containing
+    /// `&` is passed verbatim to the child process rather than interpreted by a
+    /// shell.  We verify by running `echo` with an arg that contains `&foo` and
+    /// asserting the output contains the literal ampersand — if it were passed
+    /// to a shell the `&` would fork a background job instead.
+    ///
+    /// This test covers Unix only because `echo` semantics on Windows differ;
+    /// the security property (no shell involved) applies on all platforms.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn array_command_with_ampersand_does_not_spawn_second_command() {
+        let (handler, session_mgr, _approval_mgr, _broadcast_tx) = test_handler(1);
+        session_mgr
+            .set_mode("session-1", SessionMode::AutoAccept, 0)
+            .await;
+
+        // The arg "hello&world" must arrive verbatim; a shell would interpret
+        // `&` as a command separator and the output would just be "hello".
+        let invoke = array_command_invoke("session-1", vec!["echo", "hello&world"], None);
+
+        let (result, _event) = handler.handle_invoke(invoke).await;
+        let payload = payload_json(&result);
+        assert_eq!(
+            payload["success"], true,
+            "direct-spawn echo should succeed: {:?}",
+            payload
+        );
+        let stdout = payload["stdout"].as_str().unwrap_or("").trim().to_string();
+        assert_eq!(
+            stdout, "hello&world",
+            "ampersand must be passed verbatim, not shell-interpreted; got: {stdout:?}"
+        );
+    }
+
+    // ── path_override_is_prepend_only tests ──────────────────────────────────
+
+    /// Build a platform-correct PATH string from a list of directory strings
+    /// using std::env::join_paths so the separator is always correct.
+    fn join_path_entries(entries: &[&str]) -> String {
+        let paths: Vec<std::path::PathBuf> = entries.iter().map(std::path::PathBuf::from).collect();
+        std::env::join_paths(&paths)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn path_override_prepend_single_entry_is_accepted() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        let override_val = join_path_entries(&["/custom/bin", "/usr/bin", "/bin"]);
+        assert!(
+            super::path_override_is_prepend_only(&override_val, &base),
+            "prepending one entry to base must be accepted"
+        );
+    }
+
+    #[test]
+    fn path_override_prepend_multiple_entries_is_accepted() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        let override_val = join_path_entries(&["/a", "/b", "/usr/bin", "/bin"]);
+        assert!(
+            super::path_override_is_prepend_only(&override_val, &base),
+            "prepending multiple entries to base must be accepted"
+        );
+    }
+
+    #[test]
+    fn path_override_identical_to_base_is_accepted() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        // Same entries, zero prepended — still valid (nothing harmful added).
+        assert!(
+            super::path_override_is_prepend_only(&base, &base),
+            "PATH identical to base must be accepted"
+        );
+    }
+
+    #[test]
+    fn path_override_full_replace_is_rejected() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        let override_val = join_path_entries(&["/attacker/bin", "/other"]);
+        assert!(
+            !super::path_override_is_prepend_only(&override_val, &base),
+            "full replacement of base entries must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_override_middle_insert_is_rejected() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        // Insert an entry between the two base entries — this is not a pure prepend.
+        let override_val = join_path_entries(&["/usr/bin", "/injected", "/bin"]);
+        assert!(
+            !super::path_override_is_prepend_only(&override_val, &base),
+            "inserting an entry in the middle of base entries must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_override_reorder_is_rejected() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        // Reversed order — base entries are present but not as a suffix.
+        let override_val = join_path_entries(&["/bin", "/usr/bin"]);
+        assert!(
+            !super::path_override_is_prepend_only(&override_val, &base),
+            "reordering base entries must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_override_empty_override_is_rejected() {
+        let base = join_path_entries(&["/usr/bin"]);
+        assert!(
+            !super::path_override_is_prepend_only("", &base),
+            "empty override must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_override_empty_base_non_empty_override_is_accepted() {
+        // Empty base: any non-empty override is treated as "all prepended".
+        let override_val = join_path_entries(&["/custom/bin"]);
+        assert!(
+            super::path_override_is_prepend_only(&override_val, ""),
+            "non-empty override with empty base must be accepted"
+        );
+    }
+
+    #[test]
+    fn path_override_empty_base_empty_override_is_rejected() {
+        assert!(
+            !super::path_override_is_prepend_only("", ""),
+            "both empty must be rejected (empty override adds nothing)"
+        );
+    }
+
+    /// An override that is the base entries followed by an extra entry is an
+    /// append, not a prepend — and must be rejected.  The base entries appear
+    /// as a PREFIX of the override, not a suffix.
+    #[test]
+    fn path_override_append_is_rejected() {
+        let base = join_path_entries(&["/usr/bin", "/bin"]);
+        // base entries first, then an extra entry — this is an append, not a prepend.
+        let override_val = join_path_entries(&["/usr/bin", "/bin", "/evil"]);
+        assert!(
+            !super::path_override_is_prepend_only(&override_val, &base),
+            "appending an entry after base entries must be rejected (not a pure prepend)"
+        );
+    }
+
+    // ── sanitize_env blocked-key tests ───────────────────────────────────────
+
+    #[test]
+    fn sanitize_env_strips_pythonexecutable() {
+        // Assert the platform-robust invariant: a malicious override for a blocked
+        // key never takes effect.  (`!contains_key` only happens to hold here
+        // because PYTHONEXECUTABLE isn't in a normal base env; the override-never-
+        // wins assertion is correct even if some host did set it.)
+        let malicious = "/attacker/python";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("PYTHONEXECUTABLE".to_string(), malicious.to_string());
+        overrides.insert("SAFE_VAR".to_string(), "hello".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("PYTHONEXECUTABLE").map(String::as_str),
+            Some(malicious),
+            "a blocked PYTHONEXECUTABLE override must never take effect"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("hello"),
+            "non-blocked variables must pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_pythonstartup() {
+        let malicious = "/attacker/startup.py";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("PYTHONSTARTUP".to_string(), malicious.to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("PYTHONSTARTUP").map(String::as_str),
+            Some(malicious),
+            "a blocked PYTHONSTARTUP override must never take effect"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_node_path() {
+        let malicious = "/attacker/node_modules";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("NODE_PATH".to_string(), malicious.to_string());
+        overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("NODE_PATH").map(String::as_str),
+            Some(malicious),
+            "a blocked NODE_PATH override must never take effect"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("ok"),
+            "non-blocked variables must pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_bash_env() {
+        let malicious = "/attacker/inject.sh";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("BASH_ENV".to_string(), malicious.to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("BASH_ENV").map(String::as_str),
+            Some(malicious),
+            "a blocked BASH_ENV override must never take effect"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_pathext() {
+        // On Windows, cmd.exe uses PATHEXT to resolve a bare command's extension;
+        // a cloud JobRequest could hide an env override that changes which
+        // script/exe an approved bare command resolves to.  The real invariant is
+        // that a malicious override never *takes effect*: `sanitize_env` seeds its
+        // result from the daemon's own process env, so a blocked key already in the
+        // base env (PATHEXT/COMSPEC are present on Windows) keeps the daemon's
+        // value — but the override value must never win.  Asserting absence would
+        // be wrong on Windows; asserting the override didn't take is correct on
+        // every platform.
+        let malicious = ".BAT;.CMD;.VBS";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("PATHEXT".to_string(), malicious.to_string());
+        overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("PATHEXT").map(String::as_str),
+            Some(malicious),
+            "a blocked PATHEXT override must never take effect (base value is kept, \
+             override is rejected)"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("ok"),
+            "non-blocked variables must pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_comspec() {
+        // A child-env COMSPEC override redirects the command interpreter
+        // %COMSPEC% resolves to, allowing an attacker-controlled binary to be
+        // invoked as the shell.  On Windows COMSPEC is present in the base process
+        // env, so the result keeps the daemon's value; the invariant we assert is
+        // that the malicious override value never wins (platform-robust).
+        let malicious = r"C:\attacker\evil.exe";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("COMSPEC".to_string(), malicious.to_string());
+        overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("COMSPEC").map(String::as_str),
+            Some(malicious),
+            "a blocked COMSPEC override must never take effect (base value is kept, \
+             override is rejected)"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("ok"),
+            "non-blocked variables must pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_strips_existing_blocked_keys() {
+        let blocked = &[
+            "NODE_OPTIONS",
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "PERL5LIB",
+            "PERL5OPT",
+            "RUBYOPT",
+        ];
+        let malicious = "injected";
+        let mut overrides = std::collections::HashMap::new();
+        for key in blocked {
+            overrides.insert((*key).to_string(), malicious.to_string());
+        }
+
+        let result = super::sanitize_env(&overrides);
+
+        for key in blocked {
+            assert_ne!(
+                result.get(*key).map(String::as_str),
+                Some(malicious),
+                "a blocked {key} override must never take effect"
+            );
+        }
+    }
+
+    // ── sanitize_env BLOCKED_PREFIXES tests ──────────────────────────────────
+
+    /// DYLD_INSERT_LIBRARIES and DYLD_LIBRARY_PATH are macOS loader-injection
+    /// vectors; LD_PRELOAD is the Linux/ELF equivalent.  They are the ONLY
+    /// loader-injection defence and must be blocked unconditionally on every
+    /// platform (the blocklist is enforced by `BLOCKED_PREFIXES`, so the same
+    /// code path runs on Windows too).
+    #[test]
+    fn sanitize_env_blocks_dyld_insert_libraries() {
+        let malicious = "/attacker/evil.dylib";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("DYLD_INSERT_LIBRARIES".to_string(), malicious.to_string());
+        overrides.insert("SAFE_VAR".to_string(), "ok".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("DYLD_INSERT_LIBRARIES").map(String::as_str),
+            Some(malicious),
+            "a blocked DYLD_INSERT_LIBRARIES override must never take effect"
+        );
+        assert_eq!(
+            result.get("SAFE_VAR").map(String::as_str),
+            Some("ok"),
+            "non-blocked variables must pass through"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_blocks_dyld_library_path() {
+        let malicious = "/attacker/libs";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("DYLD_LIBRARY_PATH".to_string(), malicious.to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("DYLD_LIBRARY_PATH").map(String::as_str),
+            Some(malicious),
+            "a blocked DYLD_LIBRARY_PATH override must never take effect"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_blocks_ld_preload() {
+        let malicious = "/attacker/inject.so";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("LD_PRELOAD".to_string(), malicious.to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("LD_PRELOAD").map(String::as_str),
+            Some(malicious),
+            "a blocked LD_PRELOAD override must never take effect"
+        );
+    }
+
+    // ── sanitize_env case-variant key bypass tests ────────────────────────────
+
+    /// sanitize_env uppercases all keys before comparing against BLOCKED_KEYS
+    /// and BLOCKED_PREFIXES.  A lowercase variant of a blocked key must not
+    /// bypass the blocklist.
+    #[test]
+    fn sanitize_env_case_variant_blocked_keys() {
+        // Exact-key blocks: lowercase variants of BLOCKED_KEYS entries must not
+        // win (the uppercase-normalisation must apply before the check).
+        let malicious = "injected_value";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("node_options".to_string(), malicious.to_string());
+        overrides.insert("pythonpath".to_string(), malicious.to_string());
+        overrides.insert("SAFE_CUSTOM".to_string(), "legit".to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        // Neither the lowercase key nor the uppercase form must hold the malicious value.
+        assert_ne!(
+            result.get("node_options").map(String::as_str),
+            Some(malicious),
+            "lowercase 'node_options' key must be treated as blocked NODE_OPTIONS"
+        );
+        assert_ne!(
+            result.get("NODE_OPTIONS").map(String::as_str),
+            Some(malicious),
+            "blocked NODE_OPTIONS must not appear with attacker value under any casing"
+        );
+        assert_ne!(
+            result.get("pythonpath").map(String::as_str),
+            Some(malicious),
+            "lowercase 'pythonpath' key must be treated as blocked PYTHONPATH"
+        );
+        assert_ne!(
+            result.get("PYTHONPATH").map(String::as_str),
+            Some(malicious),
+            "blocked PYTHONPATH must not appear with attacker value under any casing"
+        );
+        assert_eq!(
+            result.get("SAFE_CUSTOM").map(String::as_str),
+            Some("legit"),
+            "non-blocked variables must still pass through"
+        );
+    }
+
+    /// A lowercase variant of a BLOCKED_PREFIX key must also be blocked.
+    /// The prefix check runs on the uppercased key, so `dyld_insert_libraries`
+    /// must be treated identically to `DYLD_INSERT_LIBRARIES`.
+    #[test]
+    fn sanitize_env_case_variant_blocked_prefix() {
+        let malicious = "/attacker/evil.dylib";
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("dyld_insert_libraries".to_string(), malicious.to_string());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_ne!(
+            result.get("dyld_insert_libraries").map(String::as_str),
+            Some(malicious),
+            "lowercase 'dyld_insert_libraries' must be blocked by the DYLD_ prefix rule"
+        );
+        assert_ne!(
+            result.get("DYLD_INSERT_LIBRARIES").map(String::as_str),
+            Some(malicious),
+            "the uppercase form must also not hold the malicious value"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_path_prepend_is_accepted() {
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        if base_path.is_empty() {
+            // Can't meaningfully test PATH prepend without a base PATH.
+            return;
+        }
+        let new_dir = join_path_entries(&["/prepended/bin"]);
+        let prepended = format!(
+            "{}",
+            std::env::join_paths(
+                std::iter::once(std::path::PathBuf::from("/prepended/bin"))
+                    .chain(std::env::split_paths(&base_path))
+            )
+            .unwrap()
+            .to_string_lossy()
+        );
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("PATH".to_string(), prepended.clone());
+
+        let result = super::sanitize_env(&overrides);
+
+        assert_eq!(
+            result.get("PATH").map(String::as_str),
+            Some(prepended.as_str()),
+            "PATH prepend must be accepted; base_path={base_path:?} new_dir={new_dir:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_env_path_full_replace_is_rejected() {
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        if base_path.is_empty() {
+            return;
+        }
+        let replace = join_path_entries(&["/attacker/bin"]);
+
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("PATH".to_string(), replace);
+
+        let result = super::sanitize_env(&overrides);
+
+        // The PATH in result must still be the original base (not the attacker's).
+        assert_ne!(
+            result.get("PATH").map(String::as_str),
+            Some("/attacker/bin"),
+            "full PATH replacement must be rejected"
+        );
     }
 }

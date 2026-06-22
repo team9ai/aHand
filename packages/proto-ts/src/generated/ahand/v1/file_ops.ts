@@ -111,6 +111,57 @@ export function imageFormatToJSON(object: ImageFormat): string {
   }
 }
 
+export enum FileReadPdfMode {
+  FILE_READ_PDF_MODE_AUTO = 0,
+  FILE_READ_PDF_MODE_METADATA = 1,
+  FILE_READ_PDF_MODE_RAW = 2,
+  FILE_READ_PDF_MODE_IMGS = 3,
+  FILE_READ_PDF_MODE_TEXT = 4,
+  UNRECOGNIZED = -1,
+}
+
+export function fileReadPdfModeFromJSON(object: any): FileReadPdfMode {
+  switch (object) {
+    case 0:
+    case "FILE_READ_PDF_MODE_AUTO":
+      return FileReadPdfMode.FILE_READ_PDF_MODE_AUTO;
+    case 1:
+    case "FILE_READ_PDF_MODE_METADATA":
+      return FileReadPdfMode.FILE_READ_PDF_MODE_METADATA;
+    case 2:
+    case "FILE_READ_PDF_MODE_RAW":
+      return FileReadPdfMode.FILE_READ_PDF_MODE_RAW;
+    case 3:
+    case "FILE_READ_PDF_MODE_IMGS":
+      return FileReadPdfMode.FILE_READ_PDF_MODE_IMGS;
+    case 4:
+    case "FILE_READ_PDF_MODE_TEXT":
+      return FileReadPdfMode.FILE_READ_PDF_MODE_TEXT;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return FileReadPdfMode.UNRECOGNIZED;
+  }
+}
+
+export function fileReadPdfModeToJSON(object: FileReadPdfMode): string {
+  switch (object) {
+    case FileReadPdfMode.FILE_READ_PDF_MODE_AUTO:
+      return "FILE_READ_PDF_MODE_AUTO";
+    case FileReadPdfMode.FILE_READ_PDF_MODE_METADATA:
+      return "FILE_READ_PDF_MODE_METADATA";
+    case FileReadPdfMode.FILE_READ_PDF_MODE_RAW:
+      return "FILE_READ_PDF_MODE_RAW";
+    case FileReadPdfMode.FILE_READ_PDF_MODE_IMGS:
+      return "FILE_READ_PDF_MODE_IMGS";
+    case FileReadPdfMode.FILE_READ_PDF_MODE_TEXT:
+      return "FILE_READ_PDF_MODE_TEXT";
+    case FileReadPdfMode.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 export enum WriteAction {
   WRITE_ACTION_CREATED = 0,
   WRITE_ACTION_OVERWRITTEN = 1,
@@ -371,6 +422,7 @@ export interface FileRequest {
   readText?: FileReadText | undefined;
   readBinary?: FileReadBinary | undefined;
   readImage?: FileReadImage | undefined;
+  readPdf?: FileReadPdf | undefined;
   write?: FileWrite | undefined;
   edit?: FileEdit | undefined;
   delete?: FileDelete | undefined;
@@ -390,6 +442,7 @@ export interface FileResponse {
   readText?: FileReadTextResult | undefined;
   readBinary?: FileReadBinaryResult | undefined;
   readImage?: FileReadImageResult | undefined;
+  readPdf?: FileReadPdfResult | undefined;
   write?: FileWriteResult | undefined;
   edit?: FileEditResult | undefined;
   delete?: FileDeleteResult | undefined;
@@ -521,6 +574,52 @@ export interface FileReadImageResult {
   downloadUrlExpiresMs?: number | undefined;
 }
 
+export interface PdfPageRange {
+  /** 1-based, inclusive */
+  startPage: number;
+  /** 1-based, inclusive */
+  endPage: number;
+}
+
+export interface FileReadPdf {
+  path: string;
+  /** default auto */
+  mode: FileReadPdfMode;
+  pageRange?: PdfPageRange | undefined;
+  noFollowSymlink: boolean;
+}
+
+export interface PdfMetadata {
+  path: string;
+  totalFileBytes: number;
+  totalPages: number;
+}
+
+export interface PdfPageImage {
+  /** 1-based */
+  pageNumber: number;
+  content: Buffer;
+  format: ImageFormat;
+  width: number;
+  height: number;
+  outputBytes: number;
+}
+
+export interface PdfPageText {
+  /** 1-based */
+  pageNumber: number;
+  content: string;
+}
+
+export interface FileReadPdfResult {
+  mode: FileReadPdfMode;
+  metadata?: PdfMetadata | undefined;
+  pageRange?: PdfPageRange | undefined;
+  rawContent: Buffer;
+  images: PdfPageImage[];
+  textPages: PdfPageText[];
+}
+
 export interface FileWrite {
   path: string;
   createParents: boolean;
@@ -541,7 +640,18 @@ export interface FileWrite {
 
 export interface FullWrite {
   content?: Buffer | undefined;
-  s3ObjectKey?: string | undefined;
+  s3ObjectKey?:
+    | string
+    | undefined;
+  /**
+   * Hub-injected presigned GET URL when source is s3_object_key.
+   * Daemons fetch the bytes via plain HTTP GET against this URL and
+   * write them to disk. Clients leave these empty — the hub fills them
+   * in before forwarding the FileRequest to the daemon. This keeps S3
+   * credentials hub-side: the daemon never speaks to S3 directly.
+   */
+  s3DownloadUrl?: string | undefined;
+  s3DownloadUrlExpiresMs?: number | undefined;
 }
 
 export interface FileAppend {
@@ -747,6 +857,14 @@ export interface FileError {
   path: string;
 }
 
+/**
+ * Deprecated: not used on the wire as of the v2 large-file flow.
+ * The same data now arrives as the JSON body of
+ * `POST /api/devices/{id}/files/upload-url`. Kept for forward-
+ * compatibility / clients that still reference the type name.
+ *
+ * @deprecated
+ */
 export interface FileTransferUrl {
   url: string;
   expiresMs: number;
@@ -759,6 +877,7 @@ function createBaseFileRequest(): FileRequest {
     readText: undefined,
     readBinary: undefined,
     readImage: undefined,
+    readPdf: undefined,
     write: undefined,
     edit: undefined,
     delete: undefined,
@@ -786,6 +905,9 @@ export const FileRequest: MessageFns<FileRequest> = {
     }
     if (message.readImage !== undefined) {
       FileReadImage.encode(message.readImage, writer.uint32(98).fork()).join();
+    }
+    if (message.readPdf !== undefined) {
+      FileReadPdf.encode(message.readPdf, writer.uint32(194).fork()).join();
     }
     if (message.write !== undefined) {
       FileWrite.encode(message.write, writer.uint32(106).fork()).join();
@@ -860,6 +982,14 @@ export const FileRequest: MessageFns<FileRequest> = {
           }
 
           message.readImage = FileReadImage.decode(reader, reader.uint32());
+          continue;
+        }
+        case 24: {
+          if (tag !== 194) {
+            break;
+          }
+
+          message.readPdf = FileReadPdf.decode(reader, reader.uint32());
           continue;
         }
         case 13: {
@@ -981,6 +1111,11 @@ export const FileRequest: MessageFns<FileRequest> = {
         : isSet(object.read_image)
         ? FileReadImage.fromJSON(object.read_image)
         : undefined,
+      readPdf: isSet(object.readPdf)
+        ? FileReadPdf.fromJSON(object.readPdf)
+        : isSet(object.read_pdf)
+        ? FileReadPdf.fromJSON(object.read_pdf)
+        : undefined,
       write: isSet(object.write) ? FileWrite.fromJSON(object.write) : undefined,
       edit: isSet(object.edit) ? FileEdit.fromJSON(object.edit) : undefined,
       delete: isSet(object.delete) ? FileDelete.fromJSON(object.delete) : undefined,
@@ -1012,6 +1147,9 @@ export const FileRequest: MessageFns<FileRequest> = {
     }
     if (message.readImage !== undefined) {
       obj.readImage = FileReadImage.toJSON(message.readImage);
+    }
+    if (message.readPdf !== undefined) {
+      obj.readPdf = FileReadPdf.toJSON(message.readPdf);
     }
     if (message.write !== undefined) {
       obj.write = FileWrite.toJSON(message.write);
@@ -1064,6 +1202,9 @@ export const FileRequest: MessageFns<FileRequest> = {
     message.readImage = (object.readImage !== undefined && object.readImage !== null)
       ? FileReadImage.fromPartial(object.readImage)
       : undefined;
+    message.readPdf = (object.readPdf !== undefined && object.readPdf !== null)
+      ? FileReadPdf.fromPartial(object.readPdf)
+      : undefined;
     message.write = (object.write !== undefined && object.write !== null)
       ? FileWrite.fromPartial(object.write)
       : undefined;
@@ -1096,6 +1237,7 @@ function createBaseFileResponse(): FileResponse {
     readText: undefined,
     readBinary: undefined,
     readImage: undefined,
+    readPdf: undefined,
     write: undefined,
     edit: undefined,
     delete: undefined,
@@ -1126,6 +1268,9 @@ export const FileResponse: MessageFns<FileResponse> = {
     }
     if (message.readImage !== undefined) {
       FileReadImageResult.encode(message.readImage, writer.uint32(98).fork()).join();
+    }
+    if (message.readPdf !== undefined) {
+      FileReadPdfResult.encode(message.readPdf, writer.uint32(194).fork()).join();
     }
     if (message.write !== undefined) {
       FileWriteResult.encode(message.write, writer.uint32(106).fork()).join();
@@ -1208,6 +1353,14 @@ export const FileResponse: MessageFns<FileResponse> = {
           }
 
           message.readImage = FileReadImageResult.decode(reader, reader.uint32());
+          continue;
+        }
+        case 24: {
+          if (tag !== 194) {
+            break;
+          }
+
+          message.readPdf = FileReadPdfResult.decode(reader, reader.uint32());
           continue;
         }
         case 13: {
@@ -1330,6 +1483,11 @@ export const FileResponse: MessageFns<FileResponse> = {
         : isSet(object.read_image)
         ? FileReadImageResult.fromJSON(object.read_image)
         : undefined,
+      readPdf: isSet(object.readPdf)
+        ? FileReadPdfResult.fromJSON(object.readPdf)
+        : isSet(object.read_pdf)
+        ? FileReadPdfResult.fromJSON(object.read_pdf)
+        : undefined,
       write: isSet(object.write) ? FileWriteResult.fromJSON(object.write) : undefined,
       edit: isSet(object.edit) ? FileEditResult.fromJSON(object.edit) : undefined,
       delete: isSet(object.delete) ? FileDeleteResult.fromJSON(object.delete) : undefined,
@@ -1368,6 +1526,9 @@ export const FileResponse: MessageFns<FileResponse> = {
     }
     if (message.readImage !== undefined) {
       obj.readImage = FileReadImageResult.toJSON(message.readImage);
+    }
+    if (message.readPdf !== undefined) {
+      obj.readPdf = FileReadPdfResult.toJSON(message.readPdf);
     }
     if (message.write !== undefined) {
       obj.write = FileWriteResult.toJSON(message.write);
@@ -1422,6 +1583,9 @@ export const FileResponse: MessageFns<FileResponse> = {
       : undefined;
     message.readImage = (object.readImage !== undefined && object.readImage !== null)
       ? FileReadImageResult.fromPartial(object.readImage)
+      : undefined;
+    message.readPdf = (object.readPdf !== undefined && object.readPdf !== null)
+      ? FileReadPdfResult.fromPartial(object.readPdf)
       : undefined;
     message.write = (object.write !== undefined && object.write !== null)
       ? FileWriteResult.fromPartial(object.write)
@@ -3048,6 +3212,692 @@ export const FileReadImageResult: MessageFns<FileReadImageResult> = {
   },
 };
 
+function createBasePdfPageRange(): PdfPageRange {
+  return { startPage: 0, endPage: 0 };
+}
+
+export const PdfPageRange: MessageFns<PdfPageRange> = {
+  encode(message: PdfPageRange, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.startPage !== 0) {
+      writer.uint32(8).uint32(message.startPage);
+    }
+    if (message.endPage !== 0) {
+      writer.uint32(16).uint32(message.endPage);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PdfPageRange {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePdfPageRange();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.startPage = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.endPage = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PdfPageRange {
+    return {
+      startPage: isSet(object.startPage)
+        ? globalThis.Number(object.startPage)
+        : isSet(object.start_page)
+        ? globalThis.Number(object.start_page)
+        : 0,
+      endPage: isSet(object.endPage)
+        ? globalThis.Number(object.endPage)
+        : isSet(object.end_page)
+        ? globalThis.Number(object.end_page)
+        : 0,
+    };
+  },
+
+  toJSON(message: PdfPageRange): unknown {
+    const obj: any = {};
+    if (message.startPage !== 0) {
+      obj.startPage = Math.round(message.startPage);
+    }
+    if (message.endPage !== 0) {
+      obj.endPage = Math.round(message.endPage);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PdfPageRange>): PdfPageRange {
+    return PdfPageRange.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PdfPageRange>): PdfPageRange {
+    const message = createBasePdfPageRange();
+    message.startPage = object.startPage ?? 0;
+    message.endPage = object.endPage ?? 0;
+    return message;
+  },
+};
+
+function createBaseFileReadPdf(): FileReadPdf {
+  return { path: "", mode: 0, pageRange: undefined, noFollowSymlink: false };
+}
+
+export const FileReadPdf: MessageFns<FileReadPdf> = {
+  encode(message: FileReadPdf, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.path !== "") {
+      writer.uint32(10).string(message.path);
+    }
+    if (message.mode !== 0) {
+      writer.uint32(16).int32(message.mode);
+    }
+    if (message.pageRange !== undefined) {
+      PdfPageRange.encode(message.pageRange, writer.uint32(26).fork()).join();
+    }
+    if (message.noFollowSymlink !== false) {
+      writer.uint32(32).bool(message.noFollowSymlink);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): FileReadPdf {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseFileReadPdf();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.path = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.mode = reader.int32() as any;
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.pageRange = PdfPageRange.decode(reader, reader.uint32());
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.noFollowSymlink = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): FileReadPdf {
+    return {
+      path: isSet(object.path) ? globalThis.String(object.path) : "",
+      mode: isSet(object.mode) ? fileReadPdfModeFromJSON(object.mode) : 0,
+      pageRange: isSet(object.pageRange)
+        ? PdfPageRange.fromJSON(object.pageRange)
+        : isSet(object.page_range)
+        ? PdfPageRange.fromJSON(object.page_range)
+        : undefined,
+      noFollowSymlink: isSet(object.noFollowSymlink)
+        ? globalThis.Boolean(object.noFollowSymlink)
+        : isSet(object.no_follow_symlink)
+        ? globalThis.Boolean(object.no_follow_symlink)
+        : false,
+    };
+  },
+
+  toJSON(message: FileReadPdf): unknown {
+    const obj: any = {};
+    if (message.path !== "") {
+      obj.path = message.path;
+    }
+    if (message.mode !== 0) {
+      obj.mode = fileReadPdfModeToJSON(message.mode);
+    }
+    if (message.pageRange !== undefined) {
+      obj.pageRange = PdfPageRange.toJSON(message.pageRange);
+    }
+    if (message.noFollowSymlink !== false) {
+      obj.noFollowSymlink = message.noFollowSymlink;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<FileReadPdf>): FileReadPdf {
+    return FileReadPdf.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<FileReadPdf>): FileReadPdf {
+    const message = createBaseFileReadPdf();
+    message.path = object.path ?? "";
+    message.mode = object.mode ?? 0;
+    message.pageRange = (object.pageRange !== undefined && object.pageRange !== null)
+      ? PdfPageRange.fromPartial(object.pageRange)
+      : undefined;
+    message.noFollowSymlink = object.noFollowSymlink ?? false;
+    return message;
+  },
+};
+
+function createBasePdfMetadata(): PdfMetadata {
+  return { path: "", totalFileBytes: 0, totalPages: 0 };
+}
+
+export const PdfMetadata: MessageFns<PdfMetadata> = {
+  encode(message: PdfMetadata, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.path !== "") {
+      writer.uint32(10).string(message.path);
+    }
+    if (message.totalFileBytes !== 0) {
+      writer.uint32(16).uint64(message.totalFileBytes);
+    }
+    if (message.totalPages !== 0) {
+      writer.uint32(24).uint32(message.totalPages);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PdfMetadata {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePdfMetadata();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.path = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.totalFileBytes = longToNumber(reader.uint64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.totalPages = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PdfMetadata {
+    return {
+      path: isSet(object.path) ? globalThis.String(object.path) : "",
+      totalFileBytes: isSet(object.totalFileBytes)
+        ? globalThis.Number(object.totalFileBytes)
+        : isSet(object.total_file_bytes)
+        ? globalThis.Number(object.total_file_bytes)
+        : 0,
+      totalPages: isSet(object.totalPages)
+        ? globalThis.Number(object.totalPages)
+        : isSet(object.total_pages)
+        ? globalThis.Number(object.total_pages)
+        : 0,
+    };
+  },
+
+  toJSON(message: PdfMetadata): unknown {
+    const obj: any = {};
+    if (message.path !== "") {
+      obj.path = message.path;
+    }
+    if (message.totalFileBytes !== 0) {
+      obj.totalFileBytes = Math.round(message.totalFileBytes);
+    }
+    if (message.totalPages !== 0) {
+      obj.totalPages = Math.round(message.totalPages);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PdfMetadata>): PdfMetadata {
+    return PdfMetadata.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PdfMetadata>): PdfMetadata {
+    const message = createBasePdfMetadata();
+    message.path = object.path ?? "";
+    message.totalFileBytes = object.totalFileBytes ?? 0;
+    message.totalPages = object.totalPages ?? 0;
+    return message;
+  },
+};
+
+function createBasePdfPageImage(): PdfPageImage {
+  return { pageNumber: 0, content: Buffer.alloc(0), format: 0, width: 0, height: 0, outputBytes: 0 };
+}
+
+export const PdfPageImage: MessageFns<PdfPageImage> = {
+  encode(message: PdfPageImage, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.pageNumber !== 0) {
+      writer.uint32(8).uint32(message.pageNumber);
+    }
+    if (message.content.length !== 0) {
+      writer.uint32(18).bytes(message.content);
+    }
+    if (message.format !== 0) {
+      writer.uint32(24).int32(message.format);
+    }
+    if (message.width !== 0) {
+      writer.uint32(32).uint32(message.width);
+    }
+    if (message.height !== 0) {
+      writer.uint32(40).uint32(message.height);
+    }
+    if (message.outputBytes !== 0) {
+      writer.uint32(48).uint64(message.outputBytes);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PdfPageImage {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePdfPageImage();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.pageNumber = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.content = Buffer.from(reader.bytes());
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.format = reader.int32() as any;
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.width = reader.uint32();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.height = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.outputBytes = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PdfPageImage {
+    return {
+      pageNumber: isSet(object.pageNumber)
+        ? globalThis.Number(object.pageNumber)
+        : isSet(object.page_number)
+        ? globalThis.Number(object.page_number)
+        : 0,
+      content: isSet(object.content) ? Buffer.from(bytesFromBase64(object.content)) : Buffer.alloc(0),
+      format: isSet(object.format) ? imageFormatFromJSON(object.format) : 0,
+      width: isSet(object.width) ? globalThis.Number(object.width) : 0,
+      height: isSet(object.height) ? globalThis.Number(object.height) : 0,
+      outputBytes: isSet(object.outputBytes)
+        ? globalThis.Number(object.outputBytes)
+        : isSet(object.output_bytes)
+        ? globalThis.Number(object.output_bytes)
+        : 0,
+    };
+  },
+
+  toJSON(message: PdfPageImage): unknown {
+    const obj: any = {};
+    if (message.pageNumber !== 0) {
+      obj.pageNumber = Math.round(message.pageNumber);
+    }
+    if (message.content.length !== 0) {
+      obj.content = base64FromBytes(message.content);
+    }
+    if (message.format !== 0) {
+      obj.format = imageFormatToJSON(message.format);
+    }
+    if (message.width !== 0) {
+      obj.width = Math.round(message.width);
+    }
+    if (message.height !== 0) {
+      obj.height = Math.round(message.height);
+    }
+    if (message.outputBytes !== 0) {
+      obj.outputBytes = Math.round(message.outputBytes);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PdfPageImage>): PdfPageImage {
+    return PdfPageImage.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PdfPageImage>): PdfPageImage {
+    const message = createBasePdfPageImage();
+    message.pageNumber = object.pageNumber ?? 0;
+    message.content = object.content ?? Buffer.alloc(0);
+    message.format = object.format ?? 0;
+    message.width = object.width ?? 0;
+    message.height = object.height ?? 0;
+    message.outputBytes = object.outputBytes ?? 0;
+    return message;
+  },
+};
+
+function createBasePdfPageText(): PdfPageText {
+  return { pageNumber: 0, content: "" };
+}
+
+export const PdfPageText: MessageFns<PdfPageText> = {
+  encode(message: PdfPageText, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.pageNumber !== 0) {
+      writer.uint32(8).uint32(message.pageNumber);
+    }
+    if (message.content !== "") {
+      writer.uint32(18).string(message.content);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PdfPageText {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePdfPageText();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.pageNumber = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.content = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PdfPageText {
+    return {
+      pageNumber: isSet(object.pageNumber)
+        ? globalThis.Number(object.pageNumber)
+        : isSet(object.page_number)
+        ? globalThis.Number(object.page_number)
+        : 0,
+      content: isSet(object.content) ? globalThis.String(object.content) : "",
+    };
+  },
+
+  toJSON(message: PdfPageText): unknown {
+    const obj: any = {};
+    if (message.pageNumber !== 0) {
+      obj.pageNumber = Math.round(message.pageNumber);
+    }
+    if (message.content !== "") {
+      obj.content = message.content;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PdfPageText>): PdfPageText {
+    return PdfPageText.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PdfPageText>): PdfPageText {
+    const message = createBasePdfPageText();
+    message.pageNumber = object.pageNumber ?? 0;
+    message.content = object.content ?? "";
+    return message;
+  },
+};
+
+function createBaseFileReadPdfResult(): FileReadPdfResult {
+  return { mode: 0, metadata: undefined, pageRange: undefined, rawContent: Buffer.alloc(0), images: [], textPages: [] };
+}
+
+export const FileReadPdfResult: MessageFns<FileReadPdfResult> = {
+  encode(message: FileReadPdfResult, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.mode !== 0) {
+      writer.uint32(8).int32(message.mode);
+    }
+    if (message.metadata !== undefined) {
+      PdfMetadata.encode(message.metadata, writer.uint32(18).fork()).join();
+    }
+    if (message.pageRange !== undefined) {
+      PdfPageRange.encode(message.pageRange, writer.uint32(26).fork()).join();
+    }
+    if (message.rawContent.length !== 0) {
+      writer.uint32(34).bytes(message.rawContent);
+    }
+    for (const v of message.images) {
+      PdfPageImage.encode(v!, writer.uint32(42).fork()).join();
+    }
+    for (const v of message.textPages) {
+      PdfPageText.encode(v!, writer.uint32(50).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): FileReadPdfResult {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseFileReadPdfResult();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.mode = reader.int32() as any;
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.metadata = PdfMetadata.decode(reader, reader.uint32());
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.pageRange = PdfPageRange.decode(reader, reader.uint32());
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.rawContent = Buffer.from(reader.bytes());
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.images.push(PdfPageImage.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.textPages.push(PdfPageText.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): FileReadPdfResult {
+    return {
+      mode: isSet(object.mode) ? fileReadPdfModeFromJSON(object.mode) : 0,
+      metadata: isSet(object.metadata) ? PdfMetadata.fromJSON(object.metadata) : undefined,
+      pageRange: isSet(object.pageRange)
+        ? PdfPageRange.fromJSON(object.pageRange)
+        : isSet(object.page_range)
+        ? PdfPageRange.fromJSON(object.page_range)
+        : undefined,
+      rawContent: isSet(object.rawContent)
+        ? Buffer.from(bytesFromBase64(object.rawContent))
+        : isSet(object.raw_content)
+        ? Buffer.from(bytesFromBase64(object.raw_content))
+        : Buffer.alloc(0),
+      images: globalThis.Array.isArray(object?.images) ? object.images.map((e: any) => PdfPageImage.fromJSON(e)) : [],
+      textPages: globalThis.Array.isArray(object?.textPages)
+        ? object.textPages.map((e: any) => PdfPageText.fromJSON(e))
+        : globalThis.Array.isArray(object?.text_pages)
+        ? object.text_pages.map((e: any) => PdfPageText.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: FileReadPdfResult): unknown {
+    const obj: any = {};
+    if (message.mode !== 0) {
+      obj.mode = fileReadPdfModeToJSON(message.mode);
+    }
+    if (message.metadata !== undefined) {
+      obj.metadata = PdfMetadata.toJSON(message.metadata);
+    }
+    if (message.pageRange !== undefined) {
+      obj.pageRange = PdfPageRange.toJSON(message.pageRange);
+    }
+    if (message.rawContent.length !== 0) {
+      obj.rawContent = base64FromBytes(message.rawContent);
+    }
+    if (message.images?.length) {
+      obj.images = message.images.map((e) => PdfPageImage.toJSON(e));
+    }
+    if (message.textPages?.length) {
+      obj.textPages = message.textPages.map((e) => PdfPageText.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<FileReadPdfResult>): FileReadPdfResult {
+    return FileReadPdfResult.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<FileReadPdfResult>): FileReadPdfResult {
+    const message = createBaseFileReadPdfResult();
+    message.mode = object.mode ?? 0;
+    message.metadata = (object.metadata !== undefined && object.metadata !== null)
+      ? PdfMetadata.fromPartial(object.metadata)
+      : undefined;
+    message.pageRange = (object.pageRange !== undefined && object.pageRange !== null)
+      ? PdfPageRange.fromPartial(object.pageRange)
+      : undefined;
+    message.rawContent = object.rawContent ?? Buffer.alloc(0);
+    message.images = object.images?.map((e) => PdfPageImage.fromPartial(e)) || [];
+    message.textPages = object.textPages?.map((e) => PdfPageText.fromPartial(e)) || [];
+    return message;
+  },
+};
+
 function createBaseFileWrite(): FileWrite {
   return {
     path: "",
@@ -3281,7 +4131,7 @@ export const FileWrite: MessageFns<FileWrite> = {
 };
 
 function createBaseFullWrite(): FullWrite {
-  return { content: undefined, s3ObjectKey: undefined };
+  return { content: undefined, s3ObjectKey: undefined, s3DownloadUrl: undefined, s3DownloadUrlExpiresMs: undefined };
 }
 
 export const FullWrite: MessageFns<FullWrite> = {
@@ -3291,6 +4141,12 @@ export const FullWrite: MessageFns<FullWrite> = {
     }
     if (message.s3ObjectKey !== undefined) {
       writer.uint32(18).string(message.s3ObjectKey);
+    }
+    if (message.s3DownloadUrl !== undefined) {
+      writer.uint32(82).string(message.s3DownloadUrl);
+    }
+    if (message.s3DownloadUrlExpiresMs !== undefined) {
+      writer.uint32(88).uint64(message.s3DownloadUrlExpiresMs);
     }
     return writer;
   },
@@ -3318,6 +4174,22 @@ export const FullWrite: MessageFns<FullWrite> = {
           message.s3ObjectKey = reader.string();
           continue;
         }
+        case 10: {
+          if (tag !== 82) {
+            break;
+          }
+
+          message.s3DownloadUrl = reader.string();
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.s3DownloadUrlExpiresMs = longToNumber(reader.uint64());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -3335,6 +4207,16 @@ export const FullWrite: MessageFns<FullWrite> = {
         : isSet(object.s3_object_key)
         ? globalThis.String(object.s3_object_key)
         : undefined,
+      s3DownloadUrl: isSet(object.s3DownloadUrl)
+        ? globalThis.String(object.s3DownloadUrl)
+        : isSet(object.s3_download_url)
+        ? globalThis.String(object.s3_download_url)
+        : undefined,
+      s3DownloadUrlExpiresMs: isSet(object.s3DownloadUrlExpiresMs)
+        ? globalThis.Number(object.s3DownloadUrlExpiresMs)
+        : isSet(object.s3_download_url_expires_ms)
+        ? globalThis.Number(object.s3_download_url_expires_ms)
+        : undefined,
     };
   },
 
@@ -3346,6 +4228,12 @@ export const FullWrite: MessageFns<FullWrite> = {
     if (message.s3ObjectKey !== undefined) {
       obj.s3ObjectKey = message.s3ObjectKey;
     }
+    if (message.s3DownloadUrl !== undefined) {
+      obj.s3DownloadUrl = message.s3DownloadUrl;
+    }
+    if (message.s3DownloadUrlExpiresMs !== undefined) {
+      obj.s3DownloadUrlExpiresMs = Math.round(message.s3DownloadUrlExpiresMs);
+    }
     return obj;
   },
 
@@ -3356,6 +4244,8 @@ export const FullWrite: MessageFns<FullWrite> = {
     const message = createBaseFullWrite();
     message.content = object.content ?? undefined;
     message.s3ObjectKey = object.s3ObjectKey ?? undefined;
+    message.s3DownloadUrl = object.s3DownloadUrl ?? undefined;
+    message.s3DownloadUrlExpiresMs = object.s3DownloadUrlExpiresMs ?? undefined;
     return message;
   },
 };
