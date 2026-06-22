@@ -554,7 +554,7 @@ impl DaemonHandle {
         let mut env = provider.env.clone();
         env.extend(request.env);
         let command = std::iter::once(provider.executable.to_string_lossy().to_string())
-            .chain(request.args.into_iter())
+            .chain(request.args)
             .collect::<Vec<_>>();
 
         self.execute_sandbox_command(

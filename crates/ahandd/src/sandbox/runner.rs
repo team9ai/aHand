@@ -132,7 +132,7 @@ mod tests {
         let python = bin.join("python");
         std::fs::write(&python, "").unwrap();
 
-        let resolved = resolve_executable("python", &[bin.clone()]).unwrap();
+        let resolved = resolve_executable("python", std::slice::from_ref(&bin)).unwrap();
 
         assert_eq!(resolved, python.canonicalize().unwrap());
     }
