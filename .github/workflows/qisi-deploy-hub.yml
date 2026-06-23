@@ -1,0 +1,173 @@
+name: Qisi Deploy Hub
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "crates/ahand-hub/**"
+      - "crates/ahand-hub-core/**"
+      - "crates/ahand-hub-store/**"
+      - "crates/ahand-protocol/**"
+      - "proto/**"
+      - "Cargo.lock"
+      - "deploy/hub/Dockerfile"
+      - ".github/workflows/qisi-deploy-hub.yml"
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Target qisi environment"
+        required: true
+        type: choice
+        options:
+          - production
+          - dev
+          - staging
+
+concurrency:
+  group: qisi-ahand-hub-deploy-${{ github.event.inputs.target_env || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: registry.image.coffice.qisiai.top
+  IMAGE_NAMESPACE: coffice/ahand
+
+jobs:
+  resolve-target:
+    runs-on: ubuntu-latest
+    outputs:
+      env_name: ${{ steps.target.outputs.env_name }}
+      k8s_namespace: ${{ steps.target.outputs.k8s_namespace }}
+    steps:
+      - id: target
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            target_env="${{ github.event.inputs.target_env }}"
+          else
+            case "${GITHUB_REF_NAME}" in
+              main)
+                target_env="production"
+                ;;
+              dev)
+                target_env="dev"
+                ;;
+              *)
+                echo "unsupported branch: ${GITHUB_REF_NAME}" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          case "$target_env" in
+            production)
+              echo "env_name=production" >> "$GITHUB_OUTPUT"
+              echo "k8s_namespace=coffice-prod" >> "$GITHUB_OUTPUT"
+              ;;
+            dev)
+              echo "env_name=dev" >> "$GITHUB_OUTPUT"
+              echo "k8s_namespace=coffice-dev" >> "$GITHUB_OUTPUT"
+              ;;
+            staging)
+              echo "env_name=staging" >> "$GITHUB_OUTPUT"
+              echo "k8s_namespace=coffice-staging" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unsupported environment: $target_env" >&2
+              exit 1
+              ;;
+          esac
+
+  build-images:
+    needs: resolve-target
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ahand-hub
+            target: hub
+          - image: ahand-hub-dashboard
+            target: dashboard
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.QISI_REGISTRY_USERNAME }}
+          password: ${{ secrets.QISI_REGISTRY_PASSWORD }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/hub/Dockerfile
+          target: ${{ matrix.target }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ needs.resolve-target.outputs.env_name }}-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ needs.resolve-target.outputs.env_name }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=ahand-${{ matrix.image }}
+          cache-to: type=gha,scope=ahand-${{ matrix.image }},mode=max
+
+      - name: Dispatch GitOps image update
+        env:
+          GH_TOKEN: ${{ secrets.COFFICE_GITOPS_TOKEN }}
+          K8S_NAMESPACE: ${{ needs.resolve-target.outputs.k8s_namespace }}
+          ENV_NAME: ${{ needs.resolve-target.outputs.env_name }}
+          IMAGE_NAME: ${{ matrix.image }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "missing COFFICE_GITOPS_TOKEN" >&2
+            exit 1
+          fi
+          if [[ -z "${IMAGE_DIGEST:-}" ]]; then
+            echo "missing build image digest" >&2
+            exit 1
+          fi
+
+          image_ref="${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${ENV_NAME}-${GITHUB_SHA}"
+          image_with_digest="${image_ref}@${IMAGE_DIGEST}"
+
+          case "$IMAGE_NAME" in
+            ahand-hub)
+              deployment="ahand-hub"
+              container="hub"
+              env_json=$(jq -nc --arg image "$image_with_digest" --arg sha "$GITHUB_SHA" \
+                '{AHAND_HUB_IMAGE: $image, GIT_SHA: $sha, SENTRY_RELEASE: $sha}')
+              ;;
+            ahand-hub-dashboard)
+              deployment="ahand-dashboard"
+              container="dashboard"
+              env_json=$(jq -nc --arg image "$image_with_digest" --arg sha "$GITHUB_SHA" \
+                '{AHAND_HUB_DASHBOARD_IMAGE: $image, SENTRY_RELEASE: $sha}')
+              ;;
+            *)
+              echo "unsupported image: $IMAGE_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          jq -nc \
+            --arg namespace "$K8S_NAMESPACE" \
+            --arg deployment "$deployment" \
+            --arg container "$container" \
+            --arg image "$image_ref" \
+            --arg digest "$IMAGE_DIGEST" \
+            --argjson env "$env_json" \
+            '{event_type:"update-app-image",client_payload:{namespace:$namespace,deployment:$deployment,container:$container,image:$image,digest:$digest,env:$env}}' \
+            > /tmp/gitops-dispatch.json
+
+          gh api repos/weightwave/coffice-cn-gitops/dispatches \
+            --method POST \
+            --input /tmp/gitops-dispatch.json
