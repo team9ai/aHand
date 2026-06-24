@@ -49,19 +49,24 @@ fn inherit_case_insensitive(env: &mut HashMap<String, String>, key: &str, fallba
 }
 
 fn apply_no_network_to_env(env: &mut HashMap<String, String>) {
-    env.insert("SBX_NONET_ACTIVE".to_string(), "1".to_string());
-    insert_default(env, "HTTP_PROXY", "http://127.0.0.1:9");
-    insert_default(env, "HTTPS_PROXY", "http://127.0.0.1:9");
-    insert_default(env, "ALL_PROXY", "http://127.0.0.1:9");
-    insert_default(env, "NO_PROXY", "localhost,127.0.0.1,::1");
-    insert_default(env, "PIP_NO_INDEX", "1");
-    insert_default(env, "PIP_DISABLE_PIP_VERSION_CHECK", "1");
-    insert_default(env, "NPM_CONFIG_OFFLINE", "true");
-    insert_default(env, "CARGO_NET_OFFLINE", "true");
-    insert_default(env, "GIT_HTTP_PROXY", "http://127.0.0.1:9");
-    insert_default(env, "GIT_HTTPS_PROXY", "http://127.0.0.1:9");
-    insert_default(env, "GIT_SSH_COMMAND", "cmd /c exit 1");
-    insert_default(env, "GIT_ALLOW_PROTOCOLS", "");
+    set_canonical_case_insensitive(env, "SBX_NONET_ACTIVE", "1");
+    set_canonical_case_insensitive(env, "HTTP_PROXY", "http://127.0.0.1:9");
+    set_canonical_case_insensitive(env, "HTTPS_PROXY", "http://127.0.0.1:9");
+    set_canonical_case_insensitive(env, "ALL_PROXY", "http://127.0.0.1:9");
+    set_canonical_case_insensitive(env, "NO_PROXY", "localhost,127.0.0.1,::1");
+    set_canonical_case_insensitive(env, "PIP_NO_INDEX", "1");
+    set_canonical_case_insensitive(env, "PIP_DISABLE_PIP_VERSION_CHECK", "1");
+    set_canonical_case_insensitive(env, "NPM_CONFIG_OFFLINE", "true");
+    set_canonical_case_insensitive(env, "CARGO_NET_OFFLINE", "true");
+    set_canonical_case_insensitive(env, "GIT_HTTP_PROXY", "http://127.0.0.1:9");
+    set_canonical_case_insensitive(env, "GIT_HTTPS_PROXY", "http://127.0.0.1:9");
+    set_canonical_case_insensitive(env, "GIT_SSH_COMMAND", "cmd /c exit 1");
+    set_canonical_case_insensitive(env, "GIT_ALLOW_PROTOCOLS", "");
+}
+
+fn set_canonical_case_insensitive(env: &mut HashMap<String, String>, key: &str, value: &str) {
+    env.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
+    env.insert(key.to_string(), value.to_string());
 }
 
 #[cfg(test)]
@@ -97,6 +102,36 @@ mod tests {
             env.get("NPM_CONFIG_OFFLINE").map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn disabled_network_overrides_lowercase_proxy_values() {
+        let env = normalize_env(
+            HashMap::from([(
+                "http_proxy".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            )]),
+            NetworkPolicy::Disabled,
+        )
+        .unwrap();
+
+        assert_eq!(
+            env.get("HTTP_PROXY").map(String::as_str),
+            Some("http://127.0.0.1:9")
+        );
+        assert!(!env.contains_key("http_proxy"));
+    }
+
+    #[test]
+    fn disabled_network_overrides_lowercase_nonet_marker() {
+        let env = normalize_env(
+            HashMap::from([("sbx_nonet_active".to_string(), "0".to_string())]),
+            NetworkPolicy::Disabled,
+        )
+        .unwrap();
+
+        assert_eq!(env.get("SBX_NONET_ACTIVE").map(String::as_str), Some("1"));
+        assert!(!env.contains_key("sbx_nonet_active"));
     }
 
     #[test]
