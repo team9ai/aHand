@@ -22,7 +22,15 @@ pub(super) struct SandboxCreds {
 
 #[allow(dead_code)]
 pub(super) fn sandbox_setup_is_complete(state_root: &Path) -> bool {
-    let marker_ok = matches!(load_marker(state_root), Ok(Some(marker)) if marker.version_matches() && marker.usernames_match() && marker.hard_network_block_ready());
+    sandbox_setup_is_complete_for_identity(SandboxNetworkIdentity::Offline, state_root)
+}
+
+#[allow(dead_code)]
+pub(super) fn sandbox_setup_is_complete_for_identity(
+    network_identity: SandboxNetworkIdentity,
+    state_root: &Path,
+) -> bool {
+    let marker_ok = matches!(load_marker(state_root), Ok(Some(marker)) if marker.version_matches() && marker.usernames_match() && (!network_identity.uses_offline_identity() || marker.hard_network_block_ready()));
     if !marker_ok {
         return false;
     }
@@ -236,6 +244,22 @@ mod tests {
         write_users(temp.path(), SETUP_VERSION);
 
         assert!(sandbox_setup_is_complete(temp.path()));
+    }
+
+    #[test]
+    fn online_setup_complete_without_hard_network_block_readiness() {
+        let temp = tempfile::tempdir().unwrap();
+        write_marker(temp.path(), SETUP_VERSION, vec![], false, false);
+        write_users(temp.path(), SETUP_VERSION);
+
+        assert!(sandbox_setup_is_complete_for_identity(
+            SandboxNetworkIdentity::Online,
+            temp.path()
+        ));
+        assert!(!sandbox_setup_is_complete_for_identity(
+            SandboxNetworkIdentity::Offline,
+            temp.path()
+        ));
     }
 
     #[test]

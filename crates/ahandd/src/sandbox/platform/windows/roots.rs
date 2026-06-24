@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::sandbox::runner::RuntimeSandboxPolicy;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FilesystemRoots {
+pub(super) struct DerivedFilesystemRoots {
     pub(super) read_roots: Vec<PathBuf>,
     pub(super) write_roots: Vec<PathBuf>,
 }
@@ -14,7 +14,7 @@ pub(super) struct FilesystemRoots {
 pub(super) fn derive_filesystem_roots(
     policy: &RuntimeSandboxPolicy,
     state_root: &Path,
-) -> FilesystemRoots {
+) -> DerivedFilesystemRoots {
     let mut write_roots = canonical_existing(std::slice::from_ref(&policy.writable_root));
     filter_sensitive_state_roots(&mut write_roots, state_root);
     let write_keys = write_roots
@@ -26,7 +26,7 @@ pub(super) fn derive_filesystem_roots(
     read_roots.retain(|root| !write_keys.iter().any(|key| *key == path_key(root)));
     filter_sensitive_state_roots(&mut read_roots, state_root);
 
-    FilesystemRoots {
+    DerivedFilesystemRoots {
         read_roots,
         write_roots,
     }

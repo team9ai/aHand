@@ -1,4 +1,5 @@
 //! Restricted token creation for Windows sandboxed commands.
+#![allow(dead_code)]
 
 use std::ffi::c_void;
 use std::io;

@@ -1,4 +1,5 @@
 //! Sandbox capability SID helpers for Windows.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};

@@ -1,4 +1,5 @@
 //! Windows path conversion helpers for Win32 calls.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::io;
 use std::path::{Path, PathBuf};

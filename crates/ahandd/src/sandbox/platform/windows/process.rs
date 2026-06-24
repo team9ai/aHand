@@ -1,4 +1,5 @@
 //! Restricted Windows process launch and stdio capture.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::io;

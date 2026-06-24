@@ -2,7 +2,9 @@
 
 use std::ffi::c_void;
 use std::io;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
@@ -27,6 +29,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct AppliedAcl {
     pub(super) path: PathBuf,
@@ -40,6 +43,21 @@ pub(super) enum AppliedAccess {
     Readonly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+enum AclTrustee {
+    SandboxUsersGroup,
+    Capability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct PlannedAcl {
+    path: PathBuf,
+    access: AppliedAccess,
+    trustees: Vec<AclTrustee>,
+}
+
 #[cfg(windows)]
 pub(super) const WRITE_ALLOW_MASK: u32 =
     FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
@@ -47,12 +65,38 @@ pub(super) const WRITE_ALLOW_MASK: u32 =
 pub(super) const READ_EXECUTE_ALLOW_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 const CONTAINER_AND_OBJECT_INHERIT_ACE: u32 = 0x03;
 
+fn plan_filesystem_acls(roots: &super::roots::DerivedFilesystemRoots) -> Vec<PlannedAcl> {
+    let mut plan = Vec::with_capacity(roots.write_roots.len() + roots.read_roots.len());
+    for root in &roots.write_roots {
+        plan.push(PlannedAcl {
+            path: root.clone(),
+            access: AppliedAccess::Writable,
+            trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+        });
+    }
+    for root in &roots.read_roots {
+        plan.push(PlannedAcl {
+            path: root.clone(),
+            access: AppliedAccess::Readonly,
+            trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+        });
+    }
+    plan
+}
+
 #[cfg(windows)]
-pub(super) fn apply_policy(
-    writable_root: &Path,
-    readonly_roots: &[PathBuf],
+#[allow(dead_code)]
+pub(super) fn apply_filesystem_roots(
+    roots: &super::roots::DerivedFilesystemRoots,
+    sandbox_users_group_sid: *mut c_void,
     capability_sid: *mut c_void,
 ) -> io::Result<Vec<AppliedAcl>> {
+    if sandbox_users_group_sid.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sandbox users group SID pointer is null",
+        ));
+    }
     if capability_sid.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -60,42 +104,45 @@ pub(super) fn apply_policy(
         ));
     }
 
-    let mut applied = Vec::with_capacity(readonly_roots.len() + 1);
-
-    ensure_allow_mask_aces_with_inheritance(
-        writable_root,
-        &[capability_sid],
-        WRITE_ALLOW_MASK,
-        CONTAINER_AND_OBJECT_INHERIT_ACE,
-    )?;
-    applied.push(AppliedAcl {
-        path: writable_root.to_path_buf(),
-        access: AppliedAccess::Writable,
-    });
-
-    for root in readonly_roots {
+    let plan = plan_filesystem_acls(roots);
+    let mut applied = Vec::with_capacity(plan.len());
+    for entry in plan {
+        // Group ACEs let the sandbox-user logon runner access prepared roots;
+        // capability ACEs preserve the per-workspace boundary for the child.
+        let sids = entry
+            .trustees
+            .iter()
+            .map(|trustee| match trustee {
+                AclTrustee::SandboxUsersGroup => sandbox_users_group_sid,
+                AclTrustee::Capability => capability_sid,
+            })
+            .collect::<Vec<_>>();
+        let allow_mask = match entry.access {
+            AppliedAccess::Writable => WRITE_ALLOW_MASK,
+            AppliedAccess::Readonly => READ_EXECUTE_ALLOW_MASK,
+        };
         ensure_allow_mask_aces_with_inheritance(
-            root,
-            &[capability_sid],
-            READ_EXECUTE_ALLOW_MASK,
+            &entry.path,
+            &sids,
+            allow_mask,
             CONTAINER_AND_OBJECT_INHERIT_ACE,
         )?;
         applied.push(AppliedAcl {
-            path: root.clone(),
-            access: AppliedAccess::Readonly,
+            path: entry.path,
+            access: entry.access,
         });
     }
-
     Ok(applied)
 }
 
 #[cfg(not(windows))]
-pub(super) fn apply_policy(
-    writable_root: &Path,
-    readonly_roots: &[PathBuf],
+#[allow(dead_code)]
+pub(super) fn apply_filesystem_roots(
+    roots: &super::roots::DerivedFilesystemRoots,
+    sandbox_users_group_sid: *mut c_void,
     capability_sid: *mut c_void,
 ) -> io::Result<Vec<AppliedAcl>> {
-    let _ = (writable_root, readonly_roots, capability_sid);
+    let _ = (roots, sandbox_users_group_sid, capability_sid);
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Windows ACL sandbox policy is unavailable on this platform",
@@ -219,7 +266,7 @@ fn dacl_mask_allows_with_inheritance(
     required_inheritance: Option<u32>,
 ) -> bool {
     if dacl.is_null() {
-        return true;
+        return false;
     }
 
     unsafe {
@@ -368,6 +415,7 @@ fn ensure_allow_mask_aces_with_inheritance(
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
     if capability_sid.is_null() {
         return Err(io::Error::new(
@@ -457,6 +505,7 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
     let _ = capability_sid;
     Ok(())
@@ -481,6 +530,32 @@ mod inheritance_tests {
             CONTAINER_AND_OBJECT_INHERIT_ACE
         ));
     }
+
+    #[test]
+    fn filesystem_acl_plan_grants_group_and_capability_to_all_roots() {
+        let roots = super::super::roots::DerivedFilesystemRoots {
+            write_roots: vec![PathBuf::from(r"C:\workspace")],
+            read_roots: vec![PathBuf::from(r"C:\runtime")],
+        };
+
+        let plan = plan_filesystem_acls(&roots);
+
+        assert_eq!(
+            plan,
+            vec![
+                PlannedAcl {
+                    path: PathBuf::from(r"C:\workspace"),
+                    access: AppliedAccess::Writable,
+                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                },
+                PlannedAcl {
+                    path: PathBuf::from(r"C:\runtime"),
+                    access: AppliedAccess::Readonly,
+                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                },
+            ]
+        );
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -488,14 +563,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn null_dacl_is_treated_as_already_allowing_access() {
-        assert!(dacl_mask_allows(
+    fn null_dacl_is_not_treated_as_prepared_access() {
+        assert!(!dacl_mask_allows(
             std::ptr::null_mut(),
             &[],
             WRITE_ALLOW_MASK,
             true
         ));
-        assert!(dacl_mask_allows_with_inheritance(
+        assert!(!dacl_mask_allows_with_inheritance(
             std::ptr::null_mut(),
             &[],
             WRITE_ALLOW_MASK,
@@ -511,10 +586,17 @@ mod tests {
         let cap =
             crate::sandbox::platform::windows::cap::capability_for_root(workspace.path()).unwrap();
         let token = crate::sandbox::platform::windows::token::create(&cap).unwrap();
+        let mut sandbox_users_group_sid =
+            crate::sandbox::platform::windows::winutil::sid_bytes_from_string("S-1-5-32-545")
+                .unwrap();
+        let roots = crate::sandbox::platform::windows::roots::DerivedFilesystemRoots {
+            write_roots: vec![workspace.path().to_path_buf()],
+            read_roots: vec![runtime.path().to_path_buf()],
+        };
 
-        let applied = apply_policy(
-            workspace.path(),
-            &[runtime.path().to_path_buf()],
+        let applied = apply_filesystem_roots(
+            &roots,
+            sandbox_users_group_sid.as_mut_ptr() as *mut std::ffi::c_void,
             token.capability_sid(),
         )
         .unwrap();
@@ -540,8 +622,26 @@ mod tests {
         );
         assert!(
             path_mask_allows(
+                workspace.path(),
+                &[sandbox_users_group_sid.as_mut_ptr() as *mut std::ffi::c_void],
+                WRITE_ALLOW_MASK,
+                true
+            )
+            .unwrap()
+        );
+        assert!(
+            path_mask_allows(
                 runtime.path(),
                 &[token.capability_sid()],
+                READ_EXECUTE_ALLOW_MASK,
+                true
+            )
+            .unwrap()
+        );
+        assert!(
+            path_mask_allows(
+                runtime.path(),
+                &[sandbox_users_group_sid.as_mut_ptr() as *mut std::ffi::c_void],
                 READ_EXECUTE_ALLOW_MASK,
                 true
             )

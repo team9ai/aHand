@@ -148,11 +148,16 @@ pub(super) fn prepare_network_context(
     sandbox_state_root: &Path,
 ) -> SandboxResult<WindowsNetworkContext> {
     match mode {
-        WindowsNetworkMode::Online => Ok(WindowsNetworkContext {
-            mode,
-            state_root: sandbox_state_root.to_path_buf(),
-            sandbox_creds: None,
-        }),
+        WindowsNetworkMode::Online => match run_online_setup(env, sandbox_state_root) {
+            Ok(creds) => Ok(WindowsNetworkContext {
+                mode,
+                state_root: sandbox_state_root.to_path_buf(),
+                sandbox_creds: Some(creds),
+            }),
+            Err(err) => Err(SandboxError::unavailable(format!(
+                "NetworkPolicy::Enabled sandbox user setup is unavailable or incomplete on Windows: {err}"
+            ))),
+        },
         WindowsNetworkMode::Offline => match run_offline_setup(env, sandbox_state_root) {
             Ok(creds) => Ok(WindowsNetworkContext {
                 mode,
@@ -164,6 +169,85 @@ pub(super) fn prepare_network_context(
             ))),
         },
     }
+}
+
+pub(super) fn run_online_setup(
+    env: &HashMap<String, String>,
+    state_root: &Path,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    match super::identity::load_sandbox_creds_for_identity(
+        SandboxNetworkIdentity::Online,
+        state_root,
+        env,
+    ) {
+        Ok(creds) => Ok(creds),
+        Err(loader_error) => run_online_setup_inner(env, state_root, loader_error),
+    }
+}
+
+#[cfg(not(windows))]
+fn run_online_setup_inner(
+    _: &HashMap<String, String>,
+    _: &Path,
+    loader_error: SetupFailure,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    Err(SetupFailure::unavailable(format!(
+        "online sandbox user setup requires Windows local user support; existing setup is missing or unverified: {loader_error}"
+    )))
+}
+
+#[cfg(windows)]
+fn run_online_setup_inner(
+    env: &HashMap<String, String>,
+    state_root: &Path,
+    loader_error: SetupFailure,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    if !is_elevated()? {
+        return Err(SetupFailure::new(
+            SetupErrorCode::ElevationRequired,
+            format!(
+                "online sandbox user setup requires elevation; helper launch is not wired in this slice; existing setup is missing or unverified: {loader_error}"
+            ),
+        ));
+    }
+
+    let sandbox_dir = sandbox_dir(state_root);
+    std::fs::create_dir_all(&sandbox_dir).map_err(|err| {
+        SetupFailure::new(
+            SetupErrorCode::SetupLogFailed,
+            format!("failed to create {}: {err}", sandbox_dir.display()),
+        )
+    })?;
+    let log_path = sandbox_dir.join("setup.log");
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|err| {
+            SetupFailure::new(
+                SetupErrorCode::SetupLogFailed,
+                format!("failed to open {}: {err}", log_path.display()),
+            )
+        })?;
+
+    let marker_network_settings =
+        offline_proxy_settings_from_env(env, SandboxNetworkIdentity::Online);
+    let users = super::sandbox_users::provision_sandbox_user_accounts(&mut log)?;
+    super::sandbox_users::write_sandbox_users_state(
+        state_root,
+        OFFLINE_USERNAME,
+        &users.offline_password,
+        ONLINE_USERNAME,
+        &users.online_password,
+        &marker_network_settings.proxy_ports,
+        marker_network_settings.allow_local_binding,
+        false,
+    )?;
+    super::identity::load_sandbox_creds_for_identity(
+        SandboxNetworkIdentity::Online,
+        state_root,
+        env,
+    )
 }
 
 pub(super) fn run_offline_setup(
@@ -416,14 +500,30 @@ mod tests {
     }
 
     #[test]
-    fn online_network_context_succeeds_without_setup() {
+    fn online_network_context_fails_closed_until_sandbox_user_setup_exists() {
         let temp = tempfile::tempdir().unwrap();
+        let err = prepare_network_context(WindowsNetworkMode::Online, &HashMap::new(), temp.path())
+            .unwrap_err();
+
+        assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
+        assert!(err.message.contains("Enabled"));
+        assert!(err.message.contains("sandbox user setup"));
+        assert!(err.message.contains("missing"));
+    }
+
+    #[test]
+    fn online_network_context_loads_existing_online_creds_without_hard_network_block() {
+        let temp = tempfile::tempdir().unwrap();
+        write_valid_test_setup_state(temp.path());
+
         let context =
             prepare_network_context(WindowsNetworkMode::Online, &HashMap::new(), temp.path())
                 .unwrap();
 
         assert_eq!(context.mode, WindowsNetworkMode::Online);
-        assert!(context.sandbox_creds.is_none());
+        let creds = context.sandbox_creds.unwrap();
+        assert_eq!(creds.username, ONLINE_USERNAME);
+        assert_eq!(creds.password, "online-password");
     }
 
     #[test]
