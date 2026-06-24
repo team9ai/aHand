@@ -11,6 +11,7 @@ mod identity;
 mod network;
 mod path;
 mod process;
+mod roots;
 mod sandbox_users;
 mod setup;
 mod setup_error;
