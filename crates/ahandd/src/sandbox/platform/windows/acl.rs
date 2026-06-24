@@ -45,7 +45,6 @@ pub(super) const WRITE_ALLOW_MASK: u32 =
     FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE | FILE_DELETE_CHILD;
 #[cfg(windows)]
 pub(super) const READ_EXECUTE_ALLOW_MASK: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
-#[cfg(windows)]
 const CONTAINER_AND_OBJECT_INHERIT_ACE: u32 = 0x03;
 
 #[cfg(windows)]
@@ -208,8 +207,19 @@ fn dacl_mask_allows(
     desired_mask: u32,
     require_all_bits: bool,
 ) -> bool {
+    dacl_mask_allows_with_inheritance(dacl, psids, desired_mask, require_all_bits, None)
+}
+
+#[cfg(windows)]
+fn dacl_mask_allows_with_inheritance(
+    dacl: *mut ACL,
+    psids: &[*mut c_void],
+    desired_mask: u32,
+    require_all_bits: bool,
+    required_inheritance: Option<u32>,
+) -> bool {
     if dacl.is_null() {
-        return false;
+        return true;
     }
 
     unsafe {
@@ -244,6 +254,11 @@ fn dacl_mask_allows(
             if (header.AceFlags & INHERIT_ONLY_ACE as u8) != 0 {
                 continue;
             }
+            if let Some(inheritance) = required_inheritance {
+                if !ace_has_requested_inheritance(header.AceFlags, inheritance) {
+                    continue;
+                }
+            }
 
             let ace = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
             let sid_ptr = std::ptr::addr_of!(ace.SidStart) as *mut c_void;
@@ -262,6 +277,10 @@ fn dacl_mask_allows(
     }
 
     false
+}
+
+fn ace_has_requested_inheritance(ace_flags: u8, requested_inheritance: u32) -> bool {
+    (ace_flags as u32 & requested_inheritance) == requested_inheritance
 }
 
 #[cfg(windows)]
@@ -298,7 +317,7 @@ fn ensure_allow_mask_aces_with_inheritance(
                 "SID pointer is null",
             ));
         }
-        if dacl_mask_allows(dacl, &[*sid], allow_mask, true) {
+        if dacl_mask_allows_with_inheritance(dacl, &[*sid], allow_mask, true, Some(inheritance)) {
             continue;
         }
 
@@ -394,6 +413,9 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
     }
     let _security_descriptor = _security_descriptor
         .ok_or_else(|| io::Error::other("GetSecurityInfo returned no NUL security descriptor"))?;
+    if dacl.is_null() {
+        return Ok(());
+    }
 
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
@@ -440,9 +462,47 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod inheritance_tests {
+    use super::*;
+
+    #[test]
+    fn ace_inheritance_match_requires_all_requested_flags() {
+        assert!(ace_has_requested_inheritance(
+            CONTAINER_AND_OBJECT_INHERIT_ACE as u8,
+            CONTAINER_AND_OBJECT_INHERIT_ACE
+        ));
+        assert!(!ace_has_requested_inheritance(
+            0x01,
+            CONTAINER_AND_OBJECT_INHERIT_ACE
+        ));
+        assert!(!ace_has_requested_inheritance(
+            0x02,
+            CONTAINER_AND_OBJECT_INHERIT_ACE
+        ));
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn null_dacl_is_treated_as_already_allowing_access() {
+        assert!(dacl_mask_allows(
+            std::ptr::null_mut(),
+            &[],
+            WRITE_ALLOW_MASK,
+            true
+        ));
+        assert!(dacl_mask_allows_with_inheritance(
+            std::ptr::null_mut(),
+            &[],
+            WRITE_ALLOW_MASK,
+            true,
+            Some(CONTAINER_AND_OBJECT_INHERIT_ACE)
+        ));
+    }
 
     #[test]
     fn applies_writable_and_readonly_acl_entries() {

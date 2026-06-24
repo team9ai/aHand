@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::sandbox::runner::PlatformExecuteRequest;
+use crate::sandbox::runner::{PlatformExecuteRequest, RuntimeSandboxPolicy};
 use crate::sandbox::types::{RuntimeExecuteResult, SandboxError, SandboxResult};
 
 pub(super) fn run_capture(
@@ -43,12 +43,40 @@ pub(super) fn run_capture(
     let executable_wide = super::path::wide_null(&executable);
     let cwd_wide = super::path::wide_null(&cwd);
     let null_device_wide = super::path::string_wide_null("NUL");
-    let token = super::token::create(&capability).map_err(|err| {
+    let security_preparation = prepare_security_for_process;
+    let _ = (
+        env,
+        executable_wide,
+        cwd_wide,
+        null_device_wide,
+        capability_sid,
+        security_preparation,
+        request.args,
+        request.policy,
+        timeout,
+    );
+    Err(SandboxError::unavailable(
+        "Windows restricted runtime execution requires the aHand Windows sandbox backend",
+    ))
+}
+
+#[allow(dead_code)]
+struct PreparedWindowsSecurity {
+    token: super::token::RestrictedToken,
+    applied_acl: Vec<super::acl::AppliedAcl>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn prepare_security_for_process(
+    capability: &super::cap::CapabilitySid,
+    policy: &RuntimeSandboxPolicy,
+) -> SandboxResult<PreparedWindowsSecurity> {
+    let token = super::token::create(capability).map_err(|err| {
         SandboxError::unavailable(format!("failed to create Windows sandbox token: {err}"))
     })?;
     let applied_acl = super::acl::apply_policy(
-        &request.policy.writable_root,
-        &request.policy.readonly_roots,
+        &policy.writable_root,
+        &policy.readonly_roots,
         token.capability_sid(),
     )
     .map_err(|err| {
@@ -59,23 +87,8 @@ pub(super) fn run_capture(
             "failed to allow Windows sandbox access to NUL: {err}"
         ))
     })?;
-    let token_handle = token.handle();
-    let _ = (
-        env,
-        executable_wide,
-        cwd_wide,
-        null_device_wide,
-        capability_sid,
-        token_handle,
-        token,
-        applied_acl,
-        request.args,
-        request.policy,
-        timeout,
-    );
-    Err(SandboxError::unavailable(
-        "Windows restricted runtime execution requires the aHand Windows sandbox backend",
-    ))
+
+    Ok(PreparedWindowsSecurity { token, applied_acl })
 }
 
 struct StubCapabilityCleanup {
@@ -148,6 +161,11 @@ mod tests {
         let err = run_capture(request, Duration::from_secs(1)).unwrap_err();
 
         assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
+        assert_eq!(
+            err.message,
+            "Windows restricted runtime execution requires the aHand Windows sandbox backend"
+        );
         assert!(!workspace.join(".ahand-sandbox").join("cap_sid").exists());
+        assert!(!workspace.join(".ahand-sandbox").exists());
     }
 }

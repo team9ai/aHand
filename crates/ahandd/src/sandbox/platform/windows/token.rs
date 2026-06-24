@@ -31,14 +31,17 @@ type RawTokenHandle = usize;
 #[cfg(windows)]
 const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) struct RestrictedToken {
     handle: RawTokenHandle,
     capability_sid: *mut c_void,
 }
 
 impl RestrictedToken {
-    pub(super) fn handle(&self) -> usize {
-        self.handle as usize
+    #[allow(dead_code)]
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(super) fn handle(&self) -> RawTokenHandle {
+        self.handle
     }
 
     pub(super) fn capability_sid(&self) -> *mut c_void {
@@ -487,7 +490,7 @@ mod tests {
         let cap = crate::sandbox::platform::windows::cap::capability_for_root(temp.path()).unwrap();
         let token = create(&cap).unwrap();
 
-        assert_ne!(token.handle(), 0);
+        assert!(!token.handle().is_null());
         assert!(!token.capability_sid().is_null());
     }
 }
