@@ -39,7 +39,50 @@ pub struct PlatformExecuteRequest {
 }
 
 pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
+    if request.policy.network == NetworkPolicy::ProxyOnly {
+        return Err(SandboxError::unavailable(
+            "NetworkPolicy::ProxyOnly is not supported by the aHand sandbox yet",
+        ));
+    }
     platform::execute(request).await
+}
+
+fn executable_candidates(program: &str) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let pathext = std::env::var("PATHEXT").ok();
+        windows_executable_candidates(program, pathext.as_deref())
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![program.to_string()]
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_executable_candidates(program: &str, pathext: Option<&str>) -> Vec<String> {
+    if std::path::Path::new(program).extension().is_some() {
+        return vec![program.to_string()];
+    }
+
+    let mut candidates = vec![program.to_string()];
+    let pathext = pathext
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(".COM;.EXE;.BAT;.CMD");
+    for ext in pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| !ext.is_empty())
+    {
+        let suffix = if ext.starts_with('.') {
+            ext.to_string()
+        } else {
+            format!(".{ext}")
+        };
+        candidates.push(format!("{program}{suffix}"));
+    }
+    candidates
 }
 
 pub fn resolve_executable(program: &str, path_entries: &[PathBuf]) -> SandboxResult<PathBuf> {
@@ -76,15 +119,18 @@ pub fn resolve_executable(program: &str, path_entries: &[PathBuf]) -> SandboxRes
         )));
     }
 
+    let candidates = executable_candidates(program);
     for entry in path_entries {
-        let candidate = entry.join(program);
-        if candidate.exists() {
-            return candidate.canonicalize().map_err(|e| {
-                SandboxError::command_not_found(format!(
-                    "failed to resolve sandbox command '{}': {e}",
-                    candidate.display()
-                ))
-            });
+        for candidate in &candidates {
+            let candidate = entry.join(candidate);
+            if candidate.exists() {
+                return candidate.canonicalize().map_err(|e| {
+                    SandboxError::command_not_found(format!(
+                        "failed to resolve sandbox command '{}': {e}",
+                        candidate.display()
+                    ))
+                });
+            }
         }
     }
 
@@ -138,6 +184,39 @@ mod tests {
     }
 
     #[test]
+    fn windows_executable_candidates_add_pathext_suffixes() {
+        let candidates = windows_executable_candidates("python", Some(".EXE;.CMD"));
+
+        assert_eq!(
+            candidates,
+            vec![
+                "python".to_string(),
+                "python.EXE".to_string(),
+                "python.CMD".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_executable_candidates_preserve_explicit_extension() {
+        let candidates = windows_executable_candidates("node.exe", Some(".EXE;.CMD"));
+
+        assert_eq!(candidates, vec!["node.exe".to_string()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_executable_finds_exe_suffix_from_registered_path_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let python = temp.path().join("python.exe");
+        std::fs::write(&python, "").unwrap();
+
+        let resolved = resolve_executable("python", &[temp.path().to_path_buf()]).unwrap();
+
+        assert_eq!(resolved, python.canonicalize().unwrap());
+    }
+
+    #[test]
     fn resolve_executable_rejects_unknown_bare_command() {
         let temp = tempfile::tempdir().unwrap();
         let err = resolve_executable("python", &[temp.path().to_path_buf()]).unwrap_err();
@@ -185,6 +264,27 @@ mod tests {
         let resolved = resolve_executable(&alias.to_string_lossy(), &[bin]).unwrap();
 
         assert_eq!(resolved, target_program.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn proxy_only_network_policy_is_rejected_before_platform_dispatch() {
+        let request = PlatformExecuteRequest {
+            executable: PathBuf::from("ignored"),
+            args: vec![],
+            cwd: PathBuf::from("."),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(1),
+            policy: RuntimeSandboxPolicy {
+                writable_root: PathBuf::from("."),
+                readonly_roots: vec![],
+                network: NetworkPolicy::ProxyOnly,
+            },
+        };
+
+        let err = execute(request).await.unwrap_err();
+
+        assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
+        assert!(err.message.contains("ProxyOnly"));
     }
 
     #[tokio::test]
