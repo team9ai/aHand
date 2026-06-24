@@ -170,14 +170,42 @@ pub(super) fn run_offline_setup(
     env: &HashMap<String, String>,
     state_root: &Path,
 ) -> Result<super::identity::SandboxCreds, SetupFailure> {
-    match super::identity::load_sandbox_creds_for_identity(
-        SandboxNetworkIdentity::Offline,
-        state_root,
-        env,
-    ) {
+    #[cfg(not(windows))]
+    {
+        let loader_error = super::identity::load_sandbox_creds_for_identity(
+            SandboxNetworkIdentity::Offline,
+            state_root,
+            env,
+        )
+        .err()
+        .unwrap_or_else(|| {
+            SetupFailure::unavailable(
+                "offline hard network block marker is present but cannot be trusted without Windows firewall support",
+            )
+        });
+        return run_offline_setup_inner(env, state_root, loader_error);
+    }
+
+    #[cfg(windows)]
+    match load_verified_offline_setup(env, state_root) {
         Ok(creds) => Ok(creds),
         Err(loader_error) => run_offline_setup_inner(env, state_root, loader_error),
     }
+}
+
+#[cfg(windows)]
+fn load_verified_offline_setup(
+    env: &HashMap<String, String>,
+    state_root: &Path,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    let creds = super::identity::load_sandbox_creds_for_identity(
+        SandboxNetworkIdentity::Offline,
+        state_root,
+        env,
+    )?;
+    let offline_sid = super::sandbox_users::resolve_sandbox_user_sid(OFFLINE_USERNAME)?;
+    super::firewall::verify_offline_outbound_block(&offline_sid)?;
+    Ok(creds)
 }
 
 #[cfg(not(windows))]
@@ -240,11 +268,7 @@ fn run_offline_setup_inner(
         offline_proxy_settings.allow_local_binding,
         true,
     )?;
-    super::identity::load_sandbox_creds_for_identity(
-        SandboxNetworkIdentity::Offline,
-        state_root,
-        env,
-    )
+    load_verified_offline_setup(env, state_root)
 }
 
 #[cfg(windows)]
@@ -444,6 +468,7 @@ mod tests {
         assert!(!marker.hard_network_block);
     }
 
+    #[cfg(windows)]
     #[test]
     fn offline_network_context_loads_creds_when_hard_block_is_ready() {
         let temp = tempfile::tempdir().unwrap();
@@ -461,6 +486,26 @@ mod tests {
 
         assert_eq!(context.mode, WindowsNetworkMode::Offline);
         assert_eq!(context.sandbox_creds.unwrap().username, OFFLINE_USERNAME);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn offline_network_context_rejects_ready_marker_without_windows_firewall_support() {
+        let temp = tempfile::tempdir().unwrap();
+        write_valid_test_setup_state(temp.path());
+
+        let mut marker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(setup_marker_path(temp.path())).unwrap())
+                .unwrap();
+        marker["hard_network_block"] = serde_json::Value::Bool(true);
+        fs::write(setup_marker_path(temp.path()), marker.to_string()).unwrap();
+
+        let err =
+            prepare_network_context(WindowsNetworkMode::Offline, &HashMap::new(), temp.path())
+                .unwrap_err();
+
+        assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
+        assert!(err.message.contains("Windows firewall support"));
     }
 
     #[test]
