@@ -43,12 +43,32 @@ pub(super) fn run_capture(
     let executable_wide = super::path::wide_null(&executable);
     let cwd_wide = super::path::wide_null(&cwd);
     let null_device_wide = super::path::string_wide_null("NUL");
+    let token = super::token::create(&capability).map_err(|err| {
+        SandboxError::unavailable(format!("failed to create Windows sandbox token: {err}"))
+    })?;
+    let applied_acl = super::acl::apply_policy(
+        &request.policy.writable_root,
+        &request.policy.readonly_roots,
+        token.capability_sid(),
+    )
+    .map_err(|err| {
+        SandboxError::unavailable(format!("failed to apply Windows sandbox ACLs: {err}"))
+    })?;
+    super::acl::allow_null_device(token.capability_sid()).map_err(|err| {
+        SandboxError::unavailable(format!(
+            "failed to allow Windows sandbox access to NUL: {err}"
+        ))
+    })?;
+    let token_handle = token.handle();
     let _ = (
         env,
         executable_wide,
         cwd_wide,
         null_device_wide,
         capability_sid,
+        token_handle,
+        token,
+        applied_acl,
         request.args,
         request.policy,
         timeout,
