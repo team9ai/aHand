@@ -27,6 +27,7 @@ pub(super) enum SetupErrorCode {
     SetupErrorReportWriteFailed,
     SetupUnavailable,
     UsersGroupCreateFailed,
+    UsersGroupMemberAddFailed,
     UserCreateOrUpdateFailed,
     SidResolveFailed,
 }
@@ -49,6 +50,7 @@ impl SetupErrorCode {
             Self::SetupErrorReportWriteFailed => "setup_error_report_write_failed",
             Self::SetupUnavailable => "setup_unavailable",
             Self::UsersGroupCreateFailed => "users_group_create_failed",
+            Self::UsersGroupMemberAddFailed => "users_group_member_add_failed",
             Self::UserCreateOrUpdateFailed => "user_create_or_update_failed",
             Self::SidResolveFailed => "sid_resolve_failed",
         }

@@ -148,11 +148,9 @@ pub(super) fn prepare_network_context(
                 sandbox_state_root,
                 env,
             ) {
-                Ok(creds) => Ok(WindowsNetworkContext {
-                    mode,
-                    state_root: sandbox_state_root.to_path_buf(),
-                    sandbox_creds: Some(creds),
-                }),
+                Ok(_) => Err(SandboxError::unavailable(
+                    "NetworkPolicy::Disabled hard network blocking is not implemented on Windows",
+                )),
                 Err(err) => Err(SandboxError::unavailable(format!(
                     "NetworkPolicy::Disabled hard network blocking/setup is unavailable or incomplete on Windows: {err}"
                 ))),
@@ -215,9 +213,46 @@ fn loopback_proxy_port_from_url(url: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
 
     use super::super::network::WindowsNetworkMode;
     use super::*;
+
+    fn write_valid_test_setup_state(state_root: &Path) {
+        fs::create_dir_all(sandbox_dir(state_root)).unwrap();
+        fs::write(
+            setup_marker_path(state_root),
+            serde_json::json!({
+                "version": SETUP_VERSION,
+                "offline_username": OFFLINE_USERNAME,
+                "online_username": ONLINE_USERNAME,
+                "created_at": "2026-06-24T00:00:00Z",
+                "proxy_ports": [],
+                "allow_local_binding": false,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        fs::create_dir_all(sandbox_secrets_dir(state_root)).unwrap();
+        fs::write(
+            sandbox_users_path(state_root),
+            serde_json::json!({
+                "version": SETUP_VERSION,
+                "offline": {
+                    "username": OFFLINE_USERNAME,
+                    "password": "test-plain:offline-password",
+                },
+                "online": {
+                    "username": ONLINE_USERNAME,
+                    "password": "test-plain:online-password",
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn online_network_context_succeeds_without_setup() {
@@ -241,6 +276,20 @@ mod tests {
         assert!(err.message.contains("Disabled"));
         assert!(err.message.contains("hard network blocking"));
         assert!(err.message.contains("setup is unavailable or incomplete"));
+    }
+
+    #[test]
+    fn offline_network_context_still_fails_closed_when_identity_state_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        write_valid_test_setup_state(temp.path());
+
+        let err =
+            prepare_network_context(WindowsNetworkMode::Offline, &HashMap::new(), temp.path())
+                .unwrap_err();
+
+        assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
+        assert!(err.message.contains("hard network blocking"));
+        assert!(err.message.contains("not implemented"));
     }
 
     #[test]

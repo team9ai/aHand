@@ -56,8 +56,7 @@ pub(super) fn protect(data: &[u8]) -> Result<Vec<u8>, SetupFailure> {
 pub(super) fn unprotect(blob: &[u8]) -> Result<Vec<u8>, SetupFailure> {
     use windows_sys::Win32::Foundation::{GetLastError, HLOCAL, LocalFree};
     use windows_sys::Win32::Security::Cryptography::{
-        CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
-        CryptUnprotectData,
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
     };
 
     let mut in_blob = make_blob(blob);
@@ -72,7 +71,7 @@ pub(super) fn unprotect(blob: &[u8]) -> Result<Vec<u8>, SetupFailure> {
             std::ptr::null(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE,
+            CRYPTPROTECT_UI_FORBIDDEN,
             &mut out_blob,
         )
     };

@@ -88,8 +88,7 @@ pub(super) fn ensure_sandbox_user(
     log: &mut File,
 ) -> Result<(), SetupFailure> {
     ensure_local_user(username, password, log)?;
-    ensure_local_group_member(SANDBOX_USERS_GROUP, username);
-    Ok(())
+    ensure_local_group_member(SANDBOX_USERS_GROUP, username)
 }
 
 #[cfg(windows)]
@@ -204,7 +203,7 @@ fn ensure_local_group(name: &str, comment: &str, log: &mut File) -> Result<(), S
 }
 
 #[cfg(windows)]
-fn ensure_local_group_member(group_name: &str, member_name: &str) {
+fn ensure_local_group_member(group_name: &str, member_name: &str) -> Result<(), SetupFailure> {
     use std::ffi::OsStr;
     use windows_sys::Win32::NetworkManagement::NetManagement::{
         LOCALGROUP_MEMBERS_INFO_3, NetLocalGroupAddMembers,
@@ -216,14 +215,35 @@ fn ensure_local_group_member(group_name: &str, member_name: &str) {
         let member = LOCALGROUP_MEMBERS_INFO_3 {
             lgrmi3_domainandname: member_w.as_ptr() as *mut u16,
         };
-        let _ = NetLocalGroupAddMembers(
+        let status = NetLocalGroupAddMembers(
             std::ptr::null(),
             group_w.as_ptr(),
             3,
             &member as *const _ as *mut u8,
             1,
         );
+        if !local_group_member_add_status_is_success(status) {
+            return Err(SetupFailure::new(
+                SetupErrorCode::UsersGroupMemberAddFailed,
+                format!(
+                    "failed to add user {member_name} to local group {group_name}, code {status}"
+                ),
+            ));
+        }
     }
+    Ok(())
+}
+
+fn local_group_member_add_status_is_success(status: u32) -> bool {
+    const NERR_SUCCESS: u32 = 0;
+    const ERROR_MEMBER_IN_GROUP: u32 = 1320;
+    const ERROR_MEMBER_IN_ALIAS: u32 = 1378;
+    const NERR_USER_IN_GROUP: u32 = 2236;
+
+    matches!(
+        status,
+        NERR_SUCCESS | ERROR_MEMBER_IN_GROUP | ERROR_MEMBER_IN_ALIAS | NERR_USER_IN_GROUP
+    )
 }
 
 #[cfg(windows)]
@@ -446,4 +466,20 @@ fn random_password() -> String {
     (0..24)
         .map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_group_member_status_accepts_success_and_existing_membership_only() {
+        assert!(local_group_member_add_status_is_success(0));
+        assert!(local_group_member_add_status_is_success(1378));
+        assert!(local_group_member_add_status_is_success(1320));
+        assert!(local_group_member_add_status_is_success(2236));
+
+        assert!(!local_group_member_add_status_is_success(2220));
+        assert!(!local_group_member_add_status_is_success(5));
+    }
 }
