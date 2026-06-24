@@ -6,6 +6,7 @@ mod cap;
 mod capture;
 mod dpapi;
 mod env;
+mod firewall;
 mod identity;
 mod network;
 mod path;

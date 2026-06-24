@@ -2,9 +2,14 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 use super::network::WindowsNetworkMode;
+#[cfg(windows)]
+use super::setup_error::SetupErrorCode;
+use super::setup_error::SetupFailure;
 use crate::sandbox::types::{SandboxError, SandboxResult};
 
 pub(super) const SETUP_VERSION: u32 = 1;
@@ -35,6 +40,8 @@ pub(super) struct SetupMarker {
     #[serde(default)]
     pub(super) created_at: Option<String>,
     #[serde(default)]
+    pub(super) hard_network_block: bool,
+    #[serde(default)]
     pub(super) proxy_ports: Vec<u16>,
     #[serde(default)]
     pub(super) allow_local_binding: bool,
@@ -47,6 +54,10 @@ impl SetupMarker {
 
     pub(super) fn usernames_match(&self) -> bool {
         self.offline_username == OFFLINE_USERNAME && self.online_username == ONLINE_USERNAME
+    }
+
+    pub(super) fn hard_network_block_ready(&self) -> bool {
+        self.hard_network_block
     }
 
     pub(super) fn request_mismatch_reason(
@@ -142,20 +153,145 @@ pub(super) fn prepare_network_context(
             state_root: sandbox_state_root.to_path_buf(),
             sandbox_creds: None,
         }),
-        WindowsNetworkMode::Offline => {
-            match super::identity::load_sandbox_creds_for_identity(
-                SandboxNetworkIdentity::Offline,
-                sandbox_state_root,
-                env,
-            ) {
-                Ok(_) => Err(SandboxError::unavailable(
-                    "NetworkPolicy::Disabled hard network blocking is not implemented on Windows",
-                )),
-                Err(err) => Err(SandboxError::unavailable(format!(
-                    "NetworkPolicy::Disabled hard network blocking/setup is unavailable or incomplete on Windows: {err}"
-                ))),
-            }
+        WindowsNetworkMode::Offline => match run_offline_setup(env, sandbox_state_root) {
+            Ok(creds) => Ok(WindowsNetworkContext {
+                mode,
+                state_root: sandbox_state_root.to_path_buf(),
+                sandbox_creds: Some(creds),
+            }),
+            Err(err) => Err(SandboxError::unavailable(format!(
+                "NetworkPolicy::Disabled hard network blocking/setup is unavailable or incomplete on Windows: {err}"
+            ))),
+        },
+    }
+}
+
+pub(super) fn run_offline_setup(
+    env: &HashMap<String, String>,
+    state_root: &Path,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    match super::identity::load_sandbox_creds_for_identity(
+        SandboxNetworkIdentity::Offline,
+        state_root,
+        env,
+    ) {
+        Ok(creds) => Ok(creds),
+        Err(loader_error) => run_offline_setup_inner(env, state_root, loader_error),
+    }
+}
+
+#[cfg(not(windows))]
+fn run_offline_setup_inner(
+    _: &HashMap<String, String>,
+    _: &Path,
+    loader_error: SetupFailure,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    Err(SetupFailure::unavailable(format!(
+        "offline hard network block setup requires Windows firewall support; existing setup is missing or unverified: {loader_error}"
+    )))
+}
+
+#[cfg(windows)]
+fn run_offline_setup_inner(
+    env: &HashMap<String, String>,
+    state_root: &Path,
+    loader_error: SetupFailure,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    if !is_elevated()? {
+        return Err(SetupFailure::new(
+            SetupErrorCode::ElevationRequired,
+            format!(
+                "offline hard network block setup requires elevation; helper launch is not wired in this slice; existing setup is missing or unverified: {loader_error}"
+            ),
+        ));
+    }
+
+    let sandbox_dir = sandbox_dir(state_root);
+    std::fs::create_dir_all(&sandbox_dir).map_err(|err| {
+        SetupFailure::new(
+            SetupErrorCode::SetupLogFailed,
+            format!("failed to create {}: {err}", sandbox_dir.display()),
+        )
+    })?;
+    let log_path = sandbox_dir.join("setup.log");
+    let mut log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|err| {
+            SetupFailure::new(
+                SetupErrorCode::SetupLogFailed,
+                format!("failed to open {}: {err}", log_path.display()),
+            )
+        })?;
+
+    let offline_proxy_settings =
+        offline_proxy_settings_from_env(env, SandboxNetworkIdentity::Offline);
+    let users = super::sandbox_users::provision_sandbox_user_accounts(&mut log)?;
+    let offline_sid = super::sandbox_users::resolve_sandbox_user_sid(OFFLINE_USERNAME)?;
+    super::firewall::ensure_offline_outbound_block(&offline_sid, &mut log)?;
+    super::sandbox_users::write_sandbox_users_state(
+        state_root,
+        OFFLINE_USERNAME,
+        &users.offline_password,
+        ONLINE_USERNAME,
+        &users.online_password,
+        &offline_proxy_settings.proxy_ports,
+        offline_proxy_settings.allow_local_binding,
+        true,
+    )?;
+    super::identity::load_sandbox_creds_for_identity(
+        SandboxNetworkIdentity::Offline,
+        state_root,
+        env,
+    )
+}
+
+#[cfg(windows)]
+fn is_elevated() -> Result<bool, SetupFailure> {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Security::{
+        AllocateAndInitializeSid, CheckTokenMembership, FreeSid, SECURITY_NT_AUTHORITY,
+    };
+
+    const SECURITY_BUILTIN_DOMAIN_RID: u32 = 0x0000_0020;
+    const DOMAIN_ALIAS_RID_ADMINS: u32 = 0x0000_0220;
+
+    unsafe {
+        let mut administrators_group: *mut std::ffi::c_void = std::ptr::null_mut();
+        let ok = AllocateAndInitializeSid(
+            &SECURITY_NT_AUTHORITY,
+            2,
+            SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            &mut administrators_group,
+        );
+        if ok == 0 {
+            return Err(SetupFailure::unavailable(format!(
+                "AllocateAndInitializeSid failed while checking elevation: {}",
+                GetLastError()
+            )));
         }
+        let mut is_member = 0i32;
+        let check = CheckTokenMembership(
+            std::ptr::null_mut(),
+            administrators_group,
+            &mut is_member as *mut _,
+        );
+        FreeSid(administrators_group);
+        if check == 0 {
+            return Err(SetupFailure::unavailable(format!(
+                "CheckTokenMembership failed while checking elevation: {}",
+                GetLastError()
+            )));
+        }
+        Ok(is_member != 0)
     }
 }
 
@@ -228,6 +364,7 @@ mod tests {
                 "offline_username": OFFLINE_USERNAME,
                 "online_username": ONLINE_USERNAME,
                 "created_at": "2026-06-24T00:00:00Z",
+                "hard_network_block": false,
                 "proxy_ports": [],
                 "allow_local_binding": false,
             })
@@ -289,7 +426,41 @@ mod tests {
 
         assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
         assert!(err.message.contains("hard network blocking"));
-        assert!(err.message.contains("not implemented"));
+        assert!(err.message.contains("hard network block"));
+    }
+
+    #[test]
+    fn setup_marker_defaults_hard_network_block_to_false_when_absent() {
+        let marker: SetupMarker = serde_json::from_value(serde_json::json!({
+            "version": SETUP_VERSION,
+            "offline_username": OFFLINE_USERNAME,
+            "online_username": ONLINE_USERNAME,
+            "created_at": "2026-06-24T00:00:00Z",
+            "proxy_ports": [],
+            "allow_local_binding": false,
+        }))
+        .unwrap();
+
+        assert!(!marker.hard_network_block);
+    }
+
+    #[test]
+    fn offline_network_context_loads_creds_when_hard_block_is_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        write_valid_test_setup_state(temp.path());
+
+        let mut marker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(setup_marker_path(temp.path())).unwrap())
+                .unwrap();
+        marker["hard_network_block"] = serde_json::Value::Bool(true);
+        fs::write(setup_marker_path(temp.path()), marker.to_string()).unwrap();
+
+        let context =
+            prepare_network_context(WindowsNetworkMode::Offline, &HashMap::new(), temp.path())
+                .unwrap();
+
+        assert_eq!(context.mode, WindowsNetworkMode::Offline);
+        assert_eq!(context.sandbox_creds.unwrap().username, OFFLINE_USERNAME);
     }
 
     #[test]
@@ -394,6 +565,7 @@ mod tests {
             offline_username: OFFLINE_USERNAME.to_string(),
             online_username: ONLINE_USERNAME.to_string(),
             created_at: None,
+            hard_network_block: true,
             proxy_ports: vec![3128],
             allow_local_binding: false,
         };
@@ -415,6 +587,7 @@ mod tests {
             offline_username: OFFLINE_USERNAME.to_string(),
             online_username: ONLINE_USERNAME.to_string(),
             created_at: None,
+            hard_network_block: true,
             proxy_ports: vec![3128],
             allow_local_binding: false,
         };

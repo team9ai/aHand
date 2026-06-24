@@ -76,6 +76,11 @@ xz2 = { version = "0.1", features = ["static"] }
 # Feature set mirrors ahand-platform/ipc.rs (T6) plus the Authorization module
 # for SetNamedSecurityInfoW / SE_FILE_OBJECT and SID stringification.
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.56", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_System_Com",
+] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_NetManagement",

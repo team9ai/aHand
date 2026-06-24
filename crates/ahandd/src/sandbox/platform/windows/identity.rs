@@ -22,7 +22,7 @@ pub(super) struct SandboxCreds {
 
 #[allow(dead_code)]
 pub(super) fn sandbox_setup_is_complete(state_root: &Path) -> bool {
-    let marker_ok = matches!(load_marker(state_root), Ok(Some(marker)) if marker.version_matches() && marker.usernames_match());
+    let marker_ok = matches!(load_marker(state_root), Ok(Some(marker)) if marker.version_matches() && marker.usernames_match() && marker.hard_network_block_ready());
     if !marker_ok {
         return false;
     }
@@ -52,6 +52,11 @@ pub(super) fn load_sandbox_creds_for_identity(
             "sandbox setup marker uses unexpected usernames offline={} online={}",
             marker.offline_username, marker.online_username
         )));
+    }
+    if network_identity.uses_offline_identity() && !marker.hard_network_block_ready() {
+        return Err(SetupFailure::unavailable(
+            "offline sandbox hard network block is not marked verified",
+        ));
     }
 
     let desired_proxy_settings = offline_proxy_settings_from_env(env, network_identity);
@@ -176,6 +181,7 @@ mod tests {
         version: u32,
         proxy_ports: Vec<u16>,
         allow_local_binding: bool,
+        hard_network_block: bool,
     ) {
         fs::create_dir_all(sandbox_dir(state_root)).unwrap();
         fs::write(
@@ -185,6 +191,7 @@ mod tests {
                 "offline_username": OFFLINE_USERNAME,
                 "online_username": ONLINE_USERNAME,
                 "created_at": "2026-06-24T00:00:00Z",
+                "hard_network_block": hard_network_block,
                 "proxy_ports": proxy_ports,
                 "allow_local_binding": allow_local_binding,
             }))
@@ -218,14 +225,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         assert!(!sandbox_setup_is_complete(temp.path()));
 
-        write_marker(temp.path(), SETUP_VERSION, vec![], false);
+        write_marker(temp.path(), SETUP_VERSION, vec![], false, false);
         assert!(!sandbox_setup_is_complete(temp.path()));
     }
 
     #[test]
-    fn setup_complete_when_valid_marker_and_users_exist() {
+    fn setup_complete_when_valid_marker_users_and_hard_block_readiness_exist() {
         let temp = tempfile::tempdir().unwrap();
-        write_marker(temp.path(), SETUP_VERSION, vec![], false);
+        write_marker(temp.path(), SETUP_VERSION, vec![], false, true);
         write_users(temp.path(), SETUP_VERSION);
 
         assert!(sandbox_setup_is_complete(temp.path()));
@@ -234,7 +241,7 @@ mod tests {
     #[test]
     fn offline_identity_rejects_marker_proxy_drift() {
         let temp = tempfile::tempdir().unwrap();
-        write_marker(temp.path(), SETUP_VERSION, vec![8080], false);
+        write_marker(temp.path(), SETUP_VERSION, vec![8080], false, true);
         write_users(temp.path(), SETUP_VERSION);
 
         let env = HashMap::new();
@@ -252,7 +259,7 @@ mod tests {
     #[test]
     fn online_identity_loads_online_creds_without_offline_proxy_match() {
         let temp = tempfile::tempdir().unwrap();
-        write_marker(temp.path(), SETUP_VERSION, vec![8080], true);
+        write_marker(temp.path(), SETUP_VERSION, vec![8080], true, false);
         write_users(temp.path(), SETUP_VERSION);
 
         let env = HashMap::from([(
@@ -265,5 +272,48 @@ mod tests {
 
         assert_eq!(creds.username, ONLINE_USERNAME);
         assert_eq!(creds.password, "online-password");
+    }
+
+    #[test]
+    fn offline_identity_rejects_marker_without_hard_network_block_readiness() {
+        let temp = tempfile::tempdir().unwrap();
+        write_marker(temp.path(), SETUP_VERSION, vec![], false, false);
+        write_users(temp.path(), SETUP_VERSION);
+
+        let err = load_sandbox_creds_for_identity(
+            SandboxNetworkIdentity::Offline,
+            temp.path(),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.code,
+            super::super::setup_error::SetupErrorCode::SetupUnavailable
+        );
+        assert!(err.message.contains("hard network block"));
+    }
+
+    #[test]
+    fn offline_identity_loads_creds_when_hard_network_block_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        write_marker(temp.path(), SETUP_VERSION, vec![], false, false);
+        write_users(temp.path(), SETUP_VERSION);
+
+        let marker_path = sandbox_dir(temp.path()).join("setup_marker.json");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker["hard_network_block"] = serde_json::Value::Bool(true);
+        fs::write(&marker_path, serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+
+        let creds = load_sandbox_creds_for_identity(
+            SandboxNetworkIdentity::Offline,
+            temp.path(),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(creds.username, OFFLINE_USERNAME);
+        assert_eq!(creds.password, "offline-password");
     }
 }

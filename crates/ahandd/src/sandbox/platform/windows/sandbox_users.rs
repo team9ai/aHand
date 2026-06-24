@@ -53,19 +53,16 @@ pub(super) fn provision_sandbox_users(
     allow_local_binding: bool,
     log: &mut File,
 ) -> Result<(), SetupFailure> {
-    ensure_sandbox_users_group(log)?;
-    let offline_password = random_password();
-    let online_password = random_password();
-    ensure_sandbox_user(OFFLINE_USERNAME, &offline_password, log)?;
-    ensure_sandbox_user(ONLINE_USERNAME, &online_password, log)?;
-    write_secrets(
+    let users = provision_sandbox_user_accounts(log)?;
+    write_sandbox_users_state(
         state_root,
         OFFLINE_USERNAME,
-        &offline_password,
+        &users.offline_password,
         ONLINE_USERNAME,
-        &online_password,
+        &users.online_password,
         proxy_ports,
         allow_local_binding,
+        false,
     )
 }
 
@@ -89,6 +86,27 @@ pub(super) fn ensure_sandbox_user(
 ) -> Result<(), SetupFailure> {
     ensure_local_user(username, password, log)?;
     ensure_local_group_member(SANDBOX_USERS_GROUP, username)
+}
+
+#[cfg(windows)]
+pub(super) struct ProvisionedSandboxUsers {
+    pub(super) offline_password: String,
+    pub(super) online_password: String,
+}
+
+#[cfg(windows)]
+pub(super) fn provision_sandbox_user_accounts(
+    log: &mut File,
+) -> Result<ProvisionedSandboxUsers, SetupFailure> {
+    ensure_sandbox_users_group(log)?;
+    let offline_password = random_password();
+    let online_password = random_password();
+    ensure_sandbox_user(OFFLINE_USERNAME, &offline_password, log)?;
+    ensure_sandbox_user(ONLINE_USERNAME, &online_password, log)?;
+    Ok(ProvisionedSandboxUsers {
+        offline_password,
+        online_password,
+    })
 }
 
 #[cfg(windows)]
@@ -291,6 +309,12 @@ fn resolve_sid(name: &str) -> Result<Vec<u8>, SetupFailure> {
 }
 
 #[cfg(windows)]
+pub(super) fn resolve_sandbox_user_sid(username: &str) -> Result<String, SetupFailure> {
+    let sid = resolve_sid(username)?;
+    super::winutil::string_from_sid_bytes(&sid)
+}
+
+#[cfg(windows)]
 fn well_known_sid_str(name: &str) -> Option<&'static str> {
     match name {
         "Administrators" => Some("S-1-5-32-544"),
@@ -376,7 +400,7 @@ fn lookup_account_name_for_sid(sid_str: &str) -> Result<String, SetupFailure> {
         .to_string())
 }
 
-fn write_secrets(
+pub(super) fn write_sandbox_users_state(
     state_root: &Path,
     offline_user: &str,
     offline_pwd: &str,
@@ -384,6 +408,7 @@ fn write_secrets(
     online_pwd: &str,
     proxy_ports: &[u16],
     allow_local_binding: bool,
+    hard_network_block: bool,
 ) -> Result<(), SetupFailure> {
     let sandbox_dir = sandbox_dir(state_root);
     std::fs::create_dir_all(&sandbox_dir).map_err(|err| {
@@ -427,6 +452,7 @@ fn write_secrets(
         offline_username: offline_user.to_string(),
         online_username: online_user.to_string(),
         created_at: None,
+        hard_network_block,
         proxy_ports: proxy_ports.to_vec(),
         allow_local_binding,
     };

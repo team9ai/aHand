@@ -30,6 +30,12 @@ pub(super) enum SetupErrorCode {
     UsersGroupMemberAddFailed,
     UserCreateOrUpdateFailed,
     SidResolveFailed,
+    FirewallComInitFailed,
+    FirewallPolicyAccessFailed,
+    FirewallRuleCreateOrAddFailed,
+    FirewallRuleVerifyFailed,
+    SetupLogFailed,
+    ElevationRequired,
 }
 
 impl SetupErrorCode {
@@ -53,6 +59,12 @@ impl SetupErrorCode {
             Self::UsersGroupMemberAddFailed => "users_group_member_add_failed",
             Self::UserCreateOrUpdateFailed => "user_create_or_update_failed",
             Self::SidResolveFailed => "sid_resolve_failed",
+            Self::FirewallComInitFailed => "firewall_com_init_failed",
+            Self::FirewallPolicyAccessFailed => "firewall_policy_access_failed",
+            Self::FirewallRuleCreateOrAddFailed => "firewall_rule_create_or_add_failed",
+            Self::FirewallRuleVerifyFailed => "firewall_rule_verify_failed",
+            Self::SetupLogFailed => "setup_log_failed",
+            Self::ElevationRequired => "elevation_required",
         }
     }
 }
