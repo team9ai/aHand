@@ -4,7 +4,7 @@ use super::types::{RuntimeExecuteResult, SandboxResult};
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod unsupported;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 pub mod windows;
 
 pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
