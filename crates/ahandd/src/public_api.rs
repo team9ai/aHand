@@ -245,6 +245,7 @@ pub struct DaemonHandle {
     approval_mgr: Arc<ApprovalManager>,
     session_mgr: Arc<SessionManager>,
     sandbox_registry: Arc<AsyncMutex<SandboxRegistry>>,
+    sandbox_state_root: PathBuf,
 }
 
 impl std::fmt::Debug for DaemonHandle {
@@ -527,6 +528,7 @@ impl DaemonHandle {
             env,
             timeout,
             policy,
+            sandbox_state_root: self.sandbox_state_root.clone(),
         })
         .await
     }
@@ -714,6 +716,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     }));
 
     let inner_config = build_inner_config(&config, &identity_path);
+    let sandbox_state_root = config.identity_dir.join("windows-sandbox");
     // FileManager is policy-driven; library callers don't yet expose
     // file-policy config so we hand it the inner config's `file_policy`
     // (defaulted in `build_inner_config`).
@@ -782,6 +785,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         approval_mgr: approval_mgr_for_handle,
         session_mgr: session_mgr_for_handle,
         sandbox_registry: Arc::new(AsyncMutex::new(SandboxRegistry::default())),
+        sandbox_state_root,
     })
 }
 

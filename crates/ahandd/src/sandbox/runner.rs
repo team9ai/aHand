@@ -36,6 +36,7 @@ pub struct PlatformExecuteRequest {
     pub env: HashMap<String, String>,
     pub timeout: Duration,
     pub policy: RuntimeSandboxPolicy,
+    pub sandbox_state_root: PathBuf,
 }
 
 pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
@@ -279,6 +280,7 @@ mod tests {
                 readonly_roots: vec![],
                 network: NetworkPolicy::ProxyOnly,
             },
+            sandbox_state_root: PathBuf::from(".ahand-sandbox-state"),
         };
 
         let err = execute(request).await.unwrap_err();
@@ -300,6 +302,7 @@ mod tests {
                 readonly_roots: vec![],
                 network: NetworkPolicy::Enabled,
             },
+            sandbox_state_root: PathBuf::from("/tmp/.ahand-sandbox-state"),
         };
 
         let err = platform::unsupported::execute(request).await.unwrap_err();

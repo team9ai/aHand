@@ -9,6 +9,10 @@ pub(super) fn run_capture(
     request: PlatformExecuteRequest,
     timeout: Duration,
 ) -> SandboxResult<RuntimeExecuteResult> {
+    let env = super::env::normalize_env(request.env, request.policy.network)?;
+    let network_mode = super::network::mode_for_policy(request.policy.network)?;
+    let network_context =
+        super::setup::prepare_network_context(network_mode, &env, &request.sandbox_state_root)?;
     let _stub_capability_cleanup =
         match StubCapabilityCleanup::for_root(&request.policy.writable_root) {
             Ok(cleanup) => cleanup,
@@ -27,7 +31,6 @@ pub(super) fn run_capture(
             ))
         })?;
     let capability_sid = capability.sid_string().to_string();
-    let env = super::env::normalize_env(request.env, request.policy.network)?;
     let executable = super::path::absolute(&request.executable).map_err(|err| {
         SandboxError::unavailable(format!(
             "failed to resolve Windows sandbox executable '{}': {err}",
@@ -51,6 +54,7 @@ pub(super) fn run_capture(
         null_device_wide,
         capability_sid,
         security_preparation,
+        network_context,
         request.args,
         request.policy,
         timeout,
@@ -156,6 +160,7 @@ mod tests {
                 readonly_roots: vec![],
                 network: NetworkPolicy::Enabled,
             },
+            sandbox_state_root: temp.path().join("windows-sandbox"),
         };
 
         let err = run_capture(request, Duration::from_secs(1)).unwrap_err();
