@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use super::platform;
@@ -51,6 +51,12 @@ pub fn resolve_executable(program: &str, path_entries: &[PathBuf]) -> SandboxRes
 
     let program_path = PathBuf::from(program);
     if program_path.is_absolute() {
+        if contains_parent_component(&program_path) {
+            return Err(SandboxError::invalid_command(format!(
+                "absolute sandbox command '{}' must not contain parent components",
+                program
+            )));
+        }
         let is_registered_entry_path = path_entries
             .iter()
             .any(|entry| program_path.starts_with(entry));
@@ -60,8 +66,10 @@ pub fn resolve_executable(program: &str, path_entries: &[PathBuf]) -> SandboxRes
                 program
             ))
         })?;
-        if is_registered_entry_path || path_entries.iter().any(|entry| resolved.starts_with(entry))
-        {
+        if is_registered_entry_path {
+            return Ok(program_path);
+        }
+        if path_entries.iter().any(|entry| resolved.starts_with(entry)) {
             return Ok(resolved);
         }
         return Err(SandboxError::invalid_command(format!(
@@ -79,18 +87,24 @@ pub fn resolve_executable(program: &str, path_entries: &[PathBuf]) -> SandboxRes
     for entry in path_entries {
         let candidate = entry.join(program);
         if candidate.exists() {
-            return candidate.canonicalize().map_err(|e| {
+            candidate.canonicalize().map_err(|e| {
                 SandboxError::command_not_found(format!(
                     "failed to resolve sandbox command '{}': {e}",
                     candidate.display()
                 ))
-            });
+            })?;
+            return Ok(candidate);
         }
     }
 
     Err(SandboxError::command_not_found(format!(
         "sandbox command '{program}' was not found in registered runtime PATH"
     )))
+}
+
+fn contains_parent_component(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
 }
 
 #[cfg(test)]
@@ -134,7 +148,27 @@ mod tests {
 
         let resolved = resolve_executable("python", std::slice::from_ref(&bin)).unwrap();
 
-        assert_eq!(resolved, python.canonicalize().unwrap());
+        assert_eq!(resolved, python);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_executable_preserves_registered_bare_symlink_entry() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        let target_dir = temp.path().join("target");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target_program = target_dir.join("python3");
+        std::fs::write(&target_program, "").unwrap();
+        let alias = bin.join("python");
+        symlink(&target_program, &alias).unwrap();
+
+        let resolved = resolve_executable("python", std::slice::from_ref(&bin)).unwrap();
+
+        assert_eq!(resolved, alias);
     }
 
     #[test]
@@ -184,7 +218,22 @@ mod tests {
 
         let resolved = resolve_executable(&alias.to_string_lossy(), &[bin]).unwrap();
 
-        assert_eq!(resolved, target_program.canonicalize().unwrap());
+        assert_eq!(resolved, alias);
+    }
+
+    #[test]
+    fn resolve_executable_rejects_absolute_program_with_parent_components() {
+        let temp = tempfile::tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        let denied = temp.path().join("denied");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::write(denied.join("python"), "").unwrap();
+        let traversal = allowed.join("..").join("denied").join("python");
+
+        let err = resolve_executable(&traversal.to_string_lossy(), &[allowed]).unwrap_err();
+
+        assert_eq!(err.code, "INVALID_COMMAND");
     }
 
     #[tokio::test]
