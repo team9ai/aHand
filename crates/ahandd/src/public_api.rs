@@ -37,6 +37,10 @@ use crate::sandbox::{
     registry::SandboxRegistry,
     runner::{self, PlatformExecuteRequest, RuntimeSandboxPolicy},
 };
+pub use crate::sandbox::{
+    MountAccess, MountScope, MountSource, MountSourceSnapshot, RegisteredSandboxMount,
+    SandboxInvocationContext, SandboxMountSpec,
+};
 use crate::session::SessionManager;
 
 pub use crate::app_tool_registry::{
@@ -491,6 +495,7 @@ impl DaemonHandle {
             cwd,
             env: request_env,
             timeout: request_timeout,
+            context: _context,
         } = request;
         let (program, args) = command.split_first().ok_or_else(|| {
             crate::sandbox::SandboxError::invalid_command("sandbox command must not be empty")
@@ -566,6 +571,7 @@ impl DaemonHandle {
                 cwd: request.cwd,
                 env,
                 timeout: request.timeout.or(Some(provider.default_timeout)),
+                context: None,
             },
         )
         .await
@@ -1202,6 +1208,7 @@ mod tests {
                 permission_mode: SandboxPermissionMode::Readonly,
                 workspace_root,
                 network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
             })
             .await
             .unwrap();
@@ -1214,6 +1221,7 @@ mod tests {
                     cwd: None,
                     env: HashMap::new(),
                     timeout: Some(Duration::from_secs(1)),
+                    context: None,
                 },
             )
             .await

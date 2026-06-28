@@ -6,8 +6,10 @@ pub mod runner;
 pub mod types;
 
 pub use types::{
-    CommitResult, FileVersion, FileVersionStatus, HostFileRef, NetworkPolicy, PermissionSnapshot,
-    RegisterVersionRequest, RegisteredExecEnvironment, RuntimeExecuteRequest, RuntimeExecuteResult,
+    CommitResult, FileVersion, FileVersionStatus, HostFileRef, MountAccess, MountScope,
+    MountSource, MountSourceSnapshot, NetworkPolicy, PermissionSnapshot, RegisterVersionRequest,
+    RegisteredExecEnvironment, RegisteredSandboxMount, RuntimeExecuteRequest, RuntimeExecuteResult,
     RuntimeProviderConfig, SandboxError, SandboxExecRequest, SandboxExecResult, SandboxFile,
-    SandboxPermissionMode, SandboxResult, SandboxSessionConfig,
+    SandboxInvocationContext, SandboxMountSpec, SandboxPermissionMode, SandboxResult,
+    SandboxSessionConfig,
 };

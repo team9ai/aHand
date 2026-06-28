@@ -372,6 +372,7 @@ mod tests {
                 permission_mode: SandboxPermissionMode::Readonly,
                 workspace_root: root.to_path_buf(),
                 network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
             })
             .unwrap();
         registry

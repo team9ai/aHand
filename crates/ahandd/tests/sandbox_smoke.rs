@@ -79,6 +79,7 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
             permission_mode: SandboxPermissionMode::Readonly,
             workspace_root: sandbox_root.clone(),
             network: NetworkPolicy::Enabled,
+            mounts: Vec::new(),
         })
         .await
         .unwrap();
@@ -145,6 +146,7 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
                 cwd: None,
                 env: HashMap::new(),
                 timeout: Some(Duration::from_secs(10)),
+                context: None,
             },
         )
         .await
@@ -164,6 +166,7 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
                 cwd: None,
                 env: HashMap::new(),
                 timeout: Some(Duration::from_secs(10)),
+                context: None,
             },
         )
         .await

@@ -20,6 +20,7 @@ pub use ahand_protocol::ApprovalRequest;
 pub use device_identity::DeviceIdentity;
 pub use public_api::{
     AppToolDef, AppToolError, AppToolHandler, AppToolInvocation, ApprovalSubscription,
-    DaemonConfig, DaemonConfigBuilder, DaemonHandle, DaemonStatus, ErrorKind, SessionMode,
-    args_only_handler, load_or_create_identity, spawn,
+    DaemonConfig, DaemonConfigBuilder, DaemonHandle, DaemonStatus, ErrorKind, MountAccess,
+    MountScope, MountSource, MountSourceSnapshot, RegisteredSandboxMount, SandboxInvocationContext,
+    SandboxMountSpec, SessionMode, args_only_handler, load_or_create_identity, spawn,
 };
