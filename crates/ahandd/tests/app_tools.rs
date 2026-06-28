@@ -673,6 +673,70 @@ async fn app_tool_invalid_context_json_returns_invalid_args_without_handler() {
     handle.shutdown().await.expect("shutdown clean");
 }
 
+/// Whitespace-only context_json is not the protobuf default empty string; it is
+/// invalid JSON and must fail closed before handler execution.
+#[tokio::test]
+async fn app_tool_whitespace_context_json_returns_invalid_args_without_handler() {
+    let (mock, handle, _tmp) = setup_dispatch_daemon().await;
+
+    let def = AppToolDef {
+        name: "whitespace_context_tool".into(),
+        description: "Should not run when context is whitespace".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let run_count = Arc::new(AtomicUsize::new(0));
+    let run_count_clone = Arc::clone(&run_count);
+    let handler: AppToolHandler = Arc::new(move |_invocation| {
+        let counter = Arc::clone(&run_count_clone);
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"unexpected": true}))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register_app_tool ok");
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request_with_context(
+        "call-whitespace-context-json",
+        "whitespace_context_tool",
+        r#"{"ok":true}"#,
+        "   ",
+        5000,
+    )
+    .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    match &responses[0].result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(err.code, "INVALID_ARGS");
+            assert!(
+                err.message.contains("context_json is not valid JSON"),
+                "error message should mention invalid context_json: {}",
+                err.message
+            );
+        }
+        other => panic!("expected INVALID_ARGS error, got {other:?}"),
+    }
+    assert_eq!(
+        run_count.load(Ordering::SeqCst),
+        0,
+        "handler must not run when context_json is whitespace only"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
 /// Non-object context_json is valid JSON but not trusted context; reject it
 /// before the handler can observe it.
 #[tokio::test]

@@ -2201,10 +2201,10 @@ async fn handle_app_tool_request<T>(
 }
 
 /// Record a failed app-tool call in the idempotency cache and send the error
-/// envelope to the WS. Used at all five fail paths (deny, timeout, bad-JSON,
-/// non-object args, concurrency limit) to keep them DRY and avoid the
-/// double-construction drift risk where code and message diverge between
-/// mark_completed and the envelope.
+/// envelope to the WS. Used at all app-tool fail paths (deny, timeout,
+/// bad-JSON/non-object args, invalid context, concurrency limit) to keep them
+/// DRY and avoid the double-construction drift risk where code and message
+/// diverge between mark_completed and the envelope.
 async fn fail_app_tool_call<T: crate::executor::EnvelopeSink>(
     app_tools: &Arc<AppToolRegistry>,
     tx: &T,
@@ -2300,7 +2300,7 @@ async fn validate_and_execute_app_tool<T>(
         return;
     }
 
-    let context = if context_json.trim().is_empty() {
+    let context = if context_json.is_empty() {
         None
     } else {
         match serde_json::from_str::<serde_json::Value>(&context_json) {
