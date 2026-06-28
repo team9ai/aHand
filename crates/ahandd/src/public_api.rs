@@ -635,13 +635,19 @@ pub(crate) async fn execute_sandbox_command_with_registry(
         timeout: request_timeout,
         context,
     } = request;
-    let (workspace_root, network, exec_env): (PathBuf, NetworkPolicy, RegisteredExecEnvironment) = {
+    let (workspace_root, network, exec_env, reserved_mount_env): (
+        PathBuf,
+        NetworkPolicy,
+        RegisteredExecEnvironment,
+        HashSet<String>,
+    ) = {
         let registry = sandbox_registry.lock().await;
         let session = registry.session(session_id)?;
         (
             session.workspace_root.clone(),
             session.network,
-            session.exec_environment_for(context.as_ref())?,
+            session.exec_environment_for(context.as_ref()),
+            session.registered_mount_env_vars().into_iter().collect(),
         )
     };
 
@@ -661,17 +667,25 @@ pub(crate) async fn execute_sandbox_command_with_registry(
         })?,
     };
     let command = runner::command_argv_from_sandbox_command(&command)?;
-    let protected_mount_env = exec_env
+    let active_mount_env = exec_env
         .mounts
         .iter()
         .filter_map(|mount| mount.env_var.clone())
         .collect::<HashSet<_>>();
+    if let Some((key, _)) = request_env
+        .iter()
+        .find(|(key, _)| reserved_mount_env.contains(*key) && !active_mount_env.contains(*key))
+    {
+        return Err(crate::sandbox::SandboxError::mount_scope_mismatch(format!(
+            "sandbox mount env var '{key}' is not active for this invocation context"
+        )));
+    }
     let mut env = exec_env.env;
     merge_path_entries(&mut env, &exec_env.path_entries);
     env.extend(
         request_env
             .into_iter()
-            .filter(|(key, _)| !protected_mount_env.contains(key)),
+            .filter(|(key, _)| !active_mount_env.contains(key)),
     );
     let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
     let policy = RuntimeSandboxPolicy {
