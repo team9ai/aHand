@@ -22,13 +22,11 @@ pub fn register_mount(
         SandboxError::mount_target_invalid(format!("failed to resolve sandbox workspace root: {e}"))
     })?;
     let mount_namespace = workspace_root.join("workspace").join("mounts");
-    let canonical_namespace = mount_namespace.canonicalize().map_err(|e| {
-        SandboxError::mount_target_invalid(format!("failed to resolve mount namespace: {e}"))
-    })?;
+    let canonical_namespace = validate_mount_namespace(&workspace_root, &mount_namespace)?;
     let (source, source_snapshot) = resolve_source(spec.source)?;
     let target = match spec.target {
         Some(target) => resolve_explicit_target(&workspace_root, &canonical_namespace, &target)?,
-        None => allocate_auto_target(&canonical_namespace, &slug_from_mount_id(&spec.mount_id)),
+        None => allocate_auto_target(&mount_namespace, &slug_from_mount_id(&spec.mount_id)),
     };
 
     Ok(RegisteredSandboxMount {
@@ -66,14 +64,47 @@ fn resolve_source(source: MountSource) -> SandboxResult<(MountSource, MountSourc
             let snapshot = snapshot_for_path(&canonical)?;
             Ok((MountSource::HostPath(canonical), snapshot))
         }
-        other => Ok((
-            other,
-            MountSourceSnapshot {
-                exists: false,
-                is_dir: false,
-            },
-        )),
+        MountSource::SandboxPath(_) | MountSource::RuntimePath(_) => {
+            Err(SandboxError::mount_source_unsupported(
+                "only host path mount sources are currently supported",
+            ))
+        }
     }
+}
+
+fn validate_mount_namespace(
+    workspace_root: &Path,
+    mount_namespace: &Path,
+) -> SandboxResult<PathBuf> {
+    let metadata = fs::symlink_metadata(mount_namespace).map_err(|e| {
+        SandboxError::mount_target_invalid(format!("failed to inspect mount namespace: {e}"))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(SandboxError::mount_target_invalid(
+            "mount namespace must not be a symlink",
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(SandboxError::mount_target_invalid(
+            "mount namespace must be a directory",
+        ));
+    }
+
+    let canonical_namespace = mount_namespace.canonicalize().map_err(|e| {
+        SandboxError::mount_target_invalid(format!("failed to resolve mount namespace: {e}"))
+    })?;
+    if canonical_namespace != mount_namespace {
+        return Err(SandboxError::mount_target_invalid(
+            "mount namespace must resolve inside workspace/mounts without symlinks",
+        ));
+    }
+    if !canonical_namespace.starts_with(workspace_root) {
+        return Err(SandboxError::mount_target_invalid(
+            "mount namespace escapes the session root",
+        ));
+    }
+
+    Ok(canonical_namespace)
 }
 
 fn snapshot_for_path(path: &Path) -> SandboxResult<MountSourceSnapshot> {
@@ -258,6 +289,29 @@ mod tests {
         register_mount(&session(workspace_root), spec)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn auto_target_rejects_symlinked_mount_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let outside = temp.path().join("outside-mounts");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(workspace_root.join("workspace")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, workspace_root.join("workspace").join("mounts")).unwrap();
+
+        let err = register_for_test(
+            &workspace_root,
+            readonly_host_spec("selected-folder", source),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_TARGET_INVALID");
+    }
+
     #[test]
     fn auto_target_uses_mount_id_not_host_path() {
         let temp = tempfile::tempdir().unwrap();
@@ -315,6 +369,30 @@ mod tests {
             ),
         )
         .unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_SOURCE_UNSUPPORTED");
+    }
+
+    #[test]
+    fn sandbox_path_source_returns_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let mut spec = readonly_host_spec("session-assets", temp.path().join("unused"));
+        spec.source = MountSource::SandboxPath(PathBuf::from("workspace/assets"));
+
+        let err = register_for_test(&workspace_root, spec).unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_SOURCE_UNSUPPORTED");
+    }
+
+    #[test]
+    fn runtime_path_source_returns_unsupported() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let mut spec = readonly_host_spec("runtime-cache", temp.path().join("unused"));
+        spec.source = MountSource::RuntimePath(PathBuf::from("/runtime/cache"));
+
+        let err = register_for_test(&workspace_root, spec).unwrap_err();
 
         assert_eq!(err.code, "MOUNT_SOURCE_UNSUPPORTED");
     }
