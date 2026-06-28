@@ -227,14 +227,16 @@ impl SandboxToolProvider {
         let cwd = optional_string_arg(&invocation.args, "cwd")?.map(PathBuf::from);
         let env = optional_string_map_arg(&invocation.args, "env")?;
         let timeout = optional_timeout_arg(&invocation.args, "timeoutSeconds")?;
+        let session_id = context.session_id.clone();
         let result = self
             .execute_command(
-                &context.session_id,
+                &session_id,
                 SandboxExecRequest {
                     command,
                     cwd,
                     env,
                     timeout,
+                    context: Some(context),
                 },
             )
             .await
@@ -254,14 +256,16 @@ impl SandboxToolProvider {
         let command = SandboxCommand::Argv {
             command: std::iter::once("node".to_string()).chain(args).collect(),
         };
+        let session_id = context.session_id.clone();
         let result = self
             .execute_command(
-                &context.session_id,
+                &session_id,
                 SandboxExecRequest {
                     command,
                     cwd,
                     env: HashMap::new(),
                     timeout,
+                    context: Some(context),
                 },
             )
             .await

@@ -8,7 +8,8 @@ use ahandd::{
     AppToolDef, AppToolHandler, DaemonConfig, args_only_handler,
     sandbox::{
         HostFileRef, MountAccess, MountScope, MountSource, NetworkPolicy, RegisterVersionRequest,
-        SandboxMountSpec, SandboxPermissionMode, SandboxSessionConfig,
+        SandboxCommand, SandboxExecRequest, SandboxInvocationContext, SandboxMountSpec,
+        SandboxPermissionMode, SandboxSessionConfig,
     },
 };
 
@@ -118,6 +119,94 @@ async fn sandbox_api_daemon_handle_registers_lists_and_unregisters_sandbox_mount
             .unwrap()
             .is_empty()
     );
+
+    handle.shutdown().await.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn execute_sandbox_command_request_env_cannot_override_trusted_mount_env() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    let sandbox_root = temp.path().join("sandbox");
+    let source = temp.path().join("host");
+    std::fs::create_dir_all(&sandbox_root).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+
+    let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+        .heartbeat_interval(Duration::from_millis(50))
+        .build();
+    let handle = ahandd::spawn(cfg).await.unwrap();
+    handle
+        .create_sandbox_session(SandboxSessionConfig {
+            session_id: "session-1".to_string(),
+            permission_mode: SandboxPermissionMode::Readonly,
+            workspace_root: sandbox_root.clone(),
+            network: NetworkPolicy::Enabled,
+            mounts: Vec::new(),
+        })
+        .await
+        .unwrap();
+    handle
+        .register_sandbox_runtime(
+            "session-1",
+            RuntimeProviderConfig {
+                name: "shell".to_string(),
+                executable: PathBuf::from("/bin/sh"),
+                readonly_roots: vec![PathBuf::from("/bin")],
+                env: HashMap::new(),
+                default_timeout: Duration::from_secs(3),
+            },
+        )
+        .await
+        .unwrap();
+    let registered = handle
+        .register_sandbox_mount(
+            "session-1",
+            SandboxMountSpec {
+                mount_id: "selected-folder".to_string(),
+                source: MountSource::HostPath(source),
+                access: MountAccess::ReadOnly,
+                scope: MountScope::Run {
+                    run_id: "run-1".to_string(),
+                },
+                target: None,
+                env_var: Some("COFFICE_SELECTED_FOLDER_DIR".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = handle
+        .execute_sandbox_command(
+            "session-1",
+            SandboxExecRequest {
+                command: SandboxCommand::Argv {
+                    command: vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "printf '%s' \"$COFFICE_SELECTED_FOLDER_DIR\"".to_string(),
+                    ],
+                },
+                cwd: None,
+                env: HashMap::from([(
+                    "COFFICE_SELECTED_FOLDER_DIR".to_string(),
+                    "/tmp/spoofed".to_string(),
+                )]),
+                timeout: Some(Duration::from_secs(3)),
+                context: Some(SandboxInvocationContext {
+                    session_id: "session-1".to_string(),
+                    run_id: Some("run-1".to_string()),
+                    scope_id: None,
+                    invocation_id: None,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.stdout, registered.target.to_string_lossy());
 
     handle.shutdown().await.unwrap();
 }

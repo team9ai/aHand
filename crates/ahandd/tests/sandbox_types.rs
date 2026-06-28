@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use ahandd::sandbox::{
     MountAccess, MountScope, MountSource, MountSourceSnapshot, NetworkPolicy,
-    RegisteredSandboxMount, SandboxExecRequest, SandboxInvocationContext, SandboxMountSpec,
-    SandboxPermissionMode, SandboxSessionConfig,
+    RegisteredSandboxMount, SandboxCommand, SandboxExecRequest, SandboxInvocationContext,
+    SandboxMountSpec, SandboxPermissionMode, SandboxSessionConfig,
 };
 
 #[test]
@@ -80,11 +80,13 @@ fn sandbox_types_preserve_registered_mount_resolution() {
 #[test]
 fn sandbox_types_attach_invocation_context_to_exec_request() {
     let request = SandboxExecRequest {
-        command: vec![
-            "python".to_string(),
-            "-c".to_string(),
-            "print(1)".to_string(),
-        ],
+        command: SandboxCommand::Argv {
+            command: vec![
+                "python".to_string(),
+                "-c".to_string(),
+                "print(1)".to_string(),
+            ],
+        },
         cwd: Some(PathBuf::from("workspace")),
         env: HashMap::from([("EXAMPLE".to_string(), "1".to_string())]),
         timeout: Some(Duration::from_secs(5)),

@@ -39,7 +39,7 @@ use crate::sandbox::{
 };
 pub use crate::sandbox::{
     MountAccess, MountScope, MountSource, MountSourceSnapshot, RegisteredSandboxMount,
-    SandboxInvocationContext, SandboxMountSpec,
+    SandboxMountSpec,
 };
 use crate::session::SessionManager;
 
@@ -628,21 +628,22 @@ pub(crate) async fn execute_sandbox_command_with_registry(
     session_id: &str,
     request: SandboxExecRequest,
 ) -> SandboxResult<SandboxExecResult> {
+    let SandboxExecRequest {
+        command,
+        cwd,
+        env: request_env,
+        timeout: request_timeout,
+        context,
+    } = request;
     let (workspace_root, network, exec_env): (PathBuf, NetworkPolicy, RegisteredExecEnvironment) = {
         let registry = sandbox_registry.lock().await;
         let session = registry.session(session_id)?;
         (
             session.workspace_root.clone(),
             session.network,
-            session.exec_environment(),
+            session.exec_environment_for(context.as_ref())?,
         )
     };
-    let SandboxExecRequest {
-        command,
-        cwd,
-        env: request_env,
-        timeout: request_timeout,
-    } = request;
 
     std::fs::create_dir_all(&workspace_root).map_err(|e| {
         crate::sandbox::SandboxError::unavailable(format!(
@@ -660,9 +661,18 @@ pub(crate) async fn execute_sandbox_command_with_registry(
         })?,
     };
     let command = runner::command_argv_from_sandbox_command(&command)?;
+    let protected_mount_env = exec_env
+        .mounts
+        .iter()
+        .filter_map(|mount| mount.env_var.clone())
+        .collect::<HashSet<_>>();
     let mut env = exec_env.env;
     merge_path_entries(&mut env, &exec_env.path_entries);
-    env.extend(request_env);
+    env.extend(
+        request_env
+            .into_iter()
+            .filter(|(key, _)| !protected_mount_env.contains(key)),
+    );
     let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
     let policy = RuntimeSandboxPolicy {
         writable_root: workspace_root,
@@ -1299,6 +1309,7 @@ mod tests {
                 permission_mode: SandboxPermissionMode::Readonly,
                 workspace_root,
                 network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
             })
             .await
             .unwrap();
@@ -1313,6 +1324,7 @@ mod tests {
                     cwd: None,
                     env: HashMap::new(),
                     timeout: Some(Duration::from_secs(5)),
+                    context: None,
                 },
             )
             .await;
