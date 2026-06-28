@@ -467,6 +467,7 @@ export interface InvokeAppToolOptions {
    */
   timeoutMs?: number;
   signal?: AbortSignal;
+  context?: Record<string, unknown>;
 }
 
 /** Discriminated error codes surfaced by `CloudClient`. */
@@ -1970,6 +1971,7 @@ export class CloudClient {
     const requestBody: Record<string, unknown> = { deviceId, name };
     if (args !== undefined) requestBody.args = args;
     if (opts?.timeoutMs !== undefined) requestBody.timeoutMs = opts.timeoutMs;
+    if (opts?.context !== undefined) requestBody.context = opts.context;
 
     let res: Response;
     try {

@@ -2122,6 +2122,28 @@ describe("CloudClient.invokeAppTool", () => {
     expect("args" in body).toBe(false);
   });
 
+  it("happy path: serializes trusted context separately from args", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ toolCallId: "tc-context", result: null }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await client.invokeAppTool(
+      "device-1",
+      "sandbox_exec",
+      { context: "spoof" },
+      {
+        context: { source: "coffice", scopeType: "run", scopeId: "run-1" },
+      },
+    );
+    const fetchBody = JSON.parse(calls[0].init?.body as string);
+    expect(fetchBody.args).toEqual({ context: "spoof" });
+    expect(fetchBody.context).toEqual({
+      source: "coffice",
+      scopeType: "run",
+      scopeId: "run-1",
+    });
+  });
+
   it("happy path: returns null when result field is missing", async () => {
     const { fn } = mockFetch([
       () => jsonResponse({ toolCallId: "tc-004" }),

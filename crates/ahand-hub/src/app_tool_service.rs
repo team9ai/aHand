@@ -84,6 +84,8 @@ pub struct AppToolInput {
     pub name: String,
     /// Pre-serialized args JSON object (e.g. `"{}"` when args are absent).
     pub args_json: String,
+    /// Pre-serialized trusted caller context JSON object, or empty when absent.
+    pub context_json: String,
     /// Caller-supplied timeout in milliseconds. Will be clamped to
     /// `[MIN_TIMEOUT_MS, MAX_TIMEOUT_MS]` by this function.
     pub timeout_ms: u64,
@@ -165,7 +167,7 @@ pub async fn invoke(
                 args_json: input.args_json,
                 // Daemon field is u32; clamp guarantees [1_000, 300_000].
                 timeout_ms: clamped as u32,
-                context_json: String::new(),
+                context_json: input.context_json,
             },
         )),
         ..Default::default()

@@ -52,7 +52,7 @@ use axum::routing::{get, post};
 use base64::Engine as _;
 use futures_util::Stream;
 use governor::clock::{Clock, DefaultClock};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::app_tool_service::{self, AppToolInput, AppToolServiceError};
@@ -1300,10 +1300,22 @@ pub struct InvokeAppToolRequest {
     /// Tool arguments as a JSON object. Defaults to `{}` when absent.
     #[serde(default)]
     pub args: Option<serde_json::Value>,
+    /// Trusted caller context as a JSON object. Defaults to absent.
+    #[serde(default, deserialize_with = "deserialize_optional_json_value")]
+    pub context: Option<serde_json::Value>,
     /// Hub-side timeout in milliseconds. Clamped to `[1_000, 300_000]`.
     /// Defaults to 60_000 (60 s) when absent or zero.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+fn deserialize_optional_json_value<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Serialize)]
@@ -1392,6 +1404,14 @@ async fn invoke_app_tool(
         ));
     }
 
+    if let Some(context) = &req.context
+        && !context.is_object()
+    {
+        return Err(ControlError::BadRequest(
+            "context must be a JSON object".into(),
+        ));
+    }
+
     // Rate-limit BEFORE the ownership lookup so storms can't DOS the
     // device store — same order as create_job.
     if !control_rate_limit_ok(&state, &claims.external_user_id, "invoke_app_tool") {
@@ -1444,6 +1464,11 @@ async fn invoke_app_tool(
         .as_ref()
         .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".into());
+    let context_json = req
+        .context
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_default();
 
     let timeout_ms = req.timeout_ms.unwrap_or(0); // 0 → service default
 
@@ -1461,6 +1486,7 @@ async fn invoke_app_tool(
             device_id: device.id.clone(),
             name: req.name.clone(),
             args_json,
+            context_json,
             timeout_ms,
         },
     )
