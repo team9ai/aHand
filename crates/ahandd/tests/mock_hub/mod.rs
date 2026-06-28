@@ -185,6 +185,7 @@ impl Mock {
                 name: name.into(),
                 args_json: args_json.into(),
                 timeout_ms,
+                context_json: String::new(),
             })),
             ..Default::default()
         };
