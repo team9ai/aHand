@@ -176,6 +176,19 @@ impl Mock {
         args_json: impl Into<String>,
         timeout_ms: u32,
     ) -> Result<(), String> {
+        self.send_app_tool_request_with_context(tool_call_id, name, args_json, "", timeout_ms)
+    }
+
+    /// Send an `AppToolRequest` envelope with trusted context_json to the
+    /// connected daemon. Returns `Err` if no daemon is currently connected.
+    pub fn send_app_tool_request_with_context(
+        &self,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        args_json: impl Into<String>,
+        context_json: impl Into<String>,
+        timeout_ms: u32,
+    ) -> Result<(), String> {
         let env = Envelope {
             device_id: "mock-hub".into(),
             msg_id: "app-tool-req".into(),
@@ -185,7 +198,7 @@ impl Mock {
                 name: name.into(),
                 args_json: args_json.into(),
                 timeout_ms,
-                context_json: String::new(),
+                context_json: context_json.into(),
             })),
             ..Default::default()
         };

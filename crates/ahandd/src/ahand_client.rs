@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use tokio::sync::watch;
 
-use crate::app_tool_registry::AppToolRegistry;
+use crate::app_tool_registry::{AppToolInvocation, AppToolRegistry};
 use crate::approval::ApprovalManager;
 use crate::browser::BrowserManager;
 use crate::config::Config;
@@ -2091,6 +2091,7 @@ async fn handle_app_tool_request<T>(
         let tool_call_id = req.tool_call_id.clone();
         let tool_name = req.name.clone();
         let args_json = req.args_json.clone();
+        let context_json = req.context_json.clone();
         let approval_job_id_clone = approval_job_id.clone();
 
         tokio::spawn(async move {
@@ -2119,6 +2120,7 @@ async fn handle_app_tool_request<T>(
                         tool_call_id,
                         tool_name,
                         args_json,
+                        context_json,
                         remaining_ms,
                         handler,
                         &tx_clone,
@@ -2189,6 +2191,7 @@ async fn handle_app_tool_request<T>(
         req.tool_call_id,
         req.name,
         req.args_json,
+        req.context_json,
         req.timeout_ms,
         handler,
         tx,
@@ -2247,6 +2250,7 @@ async fn validate_and_execute_app_tool<T>(
     tool_call_id: String,
     tool_name: String,
     args_json: String,
+    context_json: String,
     timeout_ms_req: u32,
     handler: crate::app_tool_registry::AppToolHandler,
     tx: &T,
@@ -2296,6 +2300,32 @@ async fn validate_and_execute_app_tool<T>(
         return;
     }
 
+    let context = if context_json.trim().is_empty() {
+        None
+    } else {
+        match serde_json::from_str(&context_json) {
+            Ok(v) => Some(v),
+            Err(err) => {
+                warn!(
+                    tool_call_id = %tool_call_id,
+                    tool_name = %tool_name,
+                    error = %err,
+                    "invalid app tool context"
+                );
+                fail_app_tool_call(
+                    app_tools,
+                    tx,
+                    device_id,
+                    &tool_call_id,
+                    "INVALID_ARGS",
+                    format!("context_json is not valid JSON: {err}"),
+                )
+                .await;
+                return;
+            }
+        }
+    };
+
     // ── Concurrency permit (fail-fast) ────────────────────────────────────
     let permit = match app_tools.try_acquire_permit() {
         Some(p) => p,
@@ -2329,13 +2359,14 @@ async fn validate_and_execute_app_tool<T>(
     let did = device_id.to_string();
     let app_tools_clone = Arc::clone(app_tools);
     let timeout_ms = AppToolRegistry::clamp_timeout(timeout_ms_req);
+    let invocation = AppToolInvocation { args, context };
 
     tokio::spawn(async move {
         execute_app_tool(
             &did,
             tool_call_id,
             tool_name,
-            args,
+            invocation,
             handler,
             permit,
             timeout_ms,
@@ -2358,7 +2389,7 @@ async fn execute_app_tool<T>(
     device_id: &str,
     tool_call_id: String,
     tool_name: String,
-    args: serde_json::Value,
+    invocation: AppToolInvocation,
     handler: crate::app_tool_registry::AppToolHandler,
     permit: tokio::sync::OwnedSemaphorePermit,
     timeout_ms: u32,
@@ -2376,7 +2407,7 @@ async fn execute_app_tool<T>(
     // abort() the task because the handler may hold app-owned locks).
     let handler_task = tokio::spawn(async move {
         let _permit = permit; // keep permit alive until handler completes
-        handler(args).await
+        handler(invocation).await
     });
 
     let (code, message, result_json) = match tokio::time::timeout(timeout, handler_task).await {

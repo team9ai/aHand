@@ -39,7 +39,9 @@ use crate::sandbox::{
 };
 use crate::session::SessionManager;
 
-pub use crate::app_tool_registry::{AppToolDef, AppToolError, AppToolHandler};
+pub use crate::app_tool_registry::{
+    AppToolDef, AppToolError, AppToolHandler, AppToolInvocation, args_only_handler,
+};
 
 use crate::device_identity::IDENTITY_FILE as IDENTITY_FILE_NAME;
 

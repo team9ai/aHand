@@ -16,6 +16,7 @@
 //! never taken.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::sync::Arc;
 
 use ahand_protocol::{AppToolDescriptor, AppToolsUpdate};
@@ -47,11 +48,33 @@ pub struct AppToolError {
     pub message: String,
 }
 
+// Bin target never reads invocation fields directly; embedders consume this via
+// the public lib API (`DaemonHandle::register_app_tool`).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct AppToolInvocation {
+    pub args: serde_json::Value,
+    pub context: Option<serde_json::Value>,
+}
+
 pub type AppToolHandler = Arc<
-    dyn Fn(serde_json::Value) -> BoxFuture<'static, Result<serde_json::Value, AppToolError>>
+    dyn Fn(AppToolInvocation) -> BoxFuture<'static, Result<serde_json::Value, AppToolError>>
         + Send
         + Sync,
 >;
+
+#[allow(dead_code)]
+pub fn args_only_handler<F, Fut>(f: F) -> AppToolHandler
+where
+    F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<serde_json::Value, AppToolError>> + Send + 'static,
+{
+    Arc::new(
+        move |invocation| -> BoxFuture<'static, Result<serde_json::Value, AppToolError>> {
+            Box::pin(f(invocation.args))
+        },
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct CompletedAppToolCall {
@@ -279,7 +302,7 @@ mod tests {
     use serde_json::json;
 
     fn make_handler() -> AppToolHandler {
-        Arc::new(|_args| Box::pin(async move { Ok(json!({"ok": true})) }))
+        args_only_handler(|_args| async move { Ok(json!({"ok": true})) })
     }
 
     fn make_def(name: &str) -> AppToolDef {

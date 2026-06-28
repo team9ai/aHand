@@ -45,7 +45,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ahand_protocol::app_tool_response;
-use ahandd::{AppToolDef, AppToolHandler, DaemonConfig, DaemonStatus, SessionMode, spawn};
+use ahandd::{
+    AppToolDef, AppToolHandler, DaemonConfig, DaemonStatus, SessionMode, args_only_handler, spawn,
+};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -54,7 +56,7 @@ mod mock_hub;
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn echo_handler() -> AppToolHandler {
-    Arc::new(|args| Box::pin(async move { Ok(json!({ "echo": args })) }))
+    args_only_handler(|args| async move { Ok(json!({ "echo": args })) })
 }
 
 fn demo_echo_def() -> AppToolDef {
@@ -374,7 +376,7 @@ async fn register_echo(handle: &ahandd::DaemonHandle, name: &str) {
         requires_approval: false,
     };
     let handler: AppToolHandler =
-        Arc::new(|args| Box::pin(async move { Ok(json!({"result": args})) }));
+        args_only_handler(|args| async move { Ok(json!({"result": args})) });
     handle
         .register_app_tool(def, handler)
         .await
@@ -425,6 +427,181 @@ async fn happy_path_invocation() {
         Some(app_tool_response::Result::ResultJson(json_str)) => {
             let v: serde_json::Value = serde_json::from_str(json_str).expect("valid json");
             assert_eq!(v["result"]["key"], "val", "handler should echo the args");
+        }
+        other => panic!("expected ResultJson, got {other:?}"),
+    }
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// AppToolRequest.context_json is trusted daemon context and reaches handlers
+/// separately from model-controlled args_json.
+#[tokio::test]
+async fn app_tool_handler_receives_trusted_context_json() {
+    let (mock, handle, _tmp) = setup_dispatch_daemon().await;
+
+    let def = AppToolDef {
+        name: "context_echo".into(),
+        description: "Echoes args and trusted context".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let handler: AppToolHandler = Arc::new(|invocation| {
+        Box::pin(async move {
+            Ok(json!({
+                "args": invocation.args,
+                "context": invocation.context,
+            }))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register_app_tool ok");
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request_with_context(
+        "call-context",
+        "context_echo",
+        r#"{"message":"hi"}"#,
+        r#"{"source":"coffice","scopeId":"scope-real","runId":"run-real"}"#,
+        5000,
+    )
+    .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    match &responses[0].result {
+        Some(app_tool_response::Result::ResultJson(json_str)) => {
+            let v: serde_json::Value = serde_json::from_str(json_str).expect("valid json");
+            assert_eq!(v["args"], json!({"message": "hi"}));
+            assert_eq!(
+                v["context"],
+                json!({"source": "coffice", "scopeId": "scope-real", "runId": "run-real"})
+            );
+        }
+        other => panic!("expected ResultJson, got {other:?}"),
+    }
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Context-looking values inside args_json are preserved as ordinary args and
+/// must not override the trusted AppToolRequest.context_json payload.
+#[tokio::test]
+async fn app_tool_spoofed_args_context_does_not_override_trusted_context() {
+    let (mock, handle, _tmp) = setup_dispatch_daemon().await;
+
+    let def = AppToolDef {
+        name: "context_echo_spoof".into(),
+        description: "Echoes args and trusted context".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let handler: AppToolHandler = Arc::new(|invocation| {
+        Box::pin(async move {
+            Ok(json!({
+                "args": invocation.args,
+                "context": invocation.context,
+            }))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register_app_tool ok");
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request_with_context(
+        "call-spoofed-context",
+        "context_echo_spoof",
+        r#"{"context":{"runId":"fake"},"runId":"fake","scopeId":"fake","cofficeContext":{"runId":"fake"}}"#,
+        r#"{"source":"coffice","scopeId":"scope-real","runId":"run-real"}"#,
+        5000,
+    )
+    .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    match &responses[0].result {
+        Some(app_tool_response::Result::ResultJson(json_str)) => {
+            let v: serde_json::Value = serde_json::from_str(json_str).expect("valid json");
+            assert_eq!(v["args"]["context"], json!({"runId": "fake"}));
+            assert_eq!(v["args"]["runId"], "fake");
+            assert_eq!(v["args"]["scopeId"], "fake");
+            assert_eq!(v["args"]["cofficeContext"], json!({"runId": "fake"}));
+            assert_eq!(
+                v["context"],
+                json!({"source": "coffice", "scopeId": "scope-real", "runId": "run-real"})
+            );
+        }
+        other => panic!("expected ResultJson, got {other:?}"),
+    }
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Empty context_json remains absent trusted context for existing callers.
+#[tokio::test]
+async fn app_tool_empty_context_json_yields_none_context() {
+    let (mock, handle, _tmp) = setup_dispatch_daemon().await;
+
+    let def = AppToolDef {
+        name: "context_echo_empty".into(),
+        description: "Echoes args and trusted context".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let handler: AppToolHandler = Arc::new(|invocation| {
+        Box::pin(async move {
+            Ok(json!({
+                "args": invocation.args,
+                "context": invocation.context,
+            }))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register_app_tool ok");
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request(
+        "call-empty-context",
+        "context_echo_empty",
+        r#"{"ok":true}"#,
+        5000,
+    )
+    .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    match &responses[0].result {
+        Some(app_tool_response::Result::ResultJson(json_str)) => {
+            let v: serde_json::Value = serde_json::from_str(json_str).expect("valid json");
+            assert_eq!(v["args"], json!({"ok": true}));
+            assert!(
+                v["context"].is_null(),
+                "empty context_json should become None"
+            );
         }
         other => panic!("expected ResultJson, got {other:?}"),
     }
@@ -518,11 +695,9 @@ async fn timeout_returns_execution_timeout() {
         input_schema: json!({"type": "object", "properties": {}}),
         requires_approval: false,
     };
-    let handler: AppToolHandler = Arc::new(|_args| {
-        Box::pin(async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            Ok(json!({"done": true}))
-        })
+    let handler: AppToolHandler = args_only_handler(|_args| async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(json!({"done": true}))
     });
     handle
         .register_app_tool(def, handler)
@@ -578,10 +753,8 @@ async fn panic_isolated_daemon_survives() {
         input_schema: json!({"type": "object", "properties": {}}),
         requires_approval: false,
     };
-    let panic_handler: AppToolHandler = Arc::new(|_args| {
-        Box::pin(async move {
-            panic!("intentional test panic");
-        })
+    let panic_handler: AppToolHandler = args_only_handler(|_args| async move {
+        panic!("intentional test panic");
     });
     handle
         .register_app_tool(panic_def, panic_handler)
@@ -661,11 +834,9 @@ async fn concurrency_limit_fifth_call() {
         input_schema: json!({"type": "object", "properties": {}}),
         requires_approval: false,
     };
-    let handler: AppToolHandler = Arc::new(|_args| {
-        Box::pin(async move {
-            tokio::time::sleep(Duration::from_millis(2500)).await;
-            Ok(json!({"done": true}))
-        })
+    let handler: AppToolHandler = args_only_handler(|_args| async move {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        Ok(json!({"done": true}))
     });
     handle
         .register_app_tool(def, handler)
@@ -738,12 +909,12 @@ async fn duplicate_call_id_replays_cached_response() {
         input_schema: json!({"type": "object", "properties": {}}),
         requires_approval: false,
     };
-    let handler: AppToolHandler = Arc::new(move |_args| {
+    let handler: AppToolHandler = args_only_handler(move |_args| {
         let counter = Arc::clone(&run_count_clone);
-        Box::pin(async move {
+        async move {
             counter.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"invocation_count": 1}))
-        })
+        }
     });
     handle
         .register_app_tool(def, handler)
@@ -813,13 +984,13 @@ async fn duplicate_call_id_while_running_is_ignored() {
         input_schema: json!({"type": "object", "properties": {}}),
         requires_approval: false,
     };
-    let handler: AppToolHandler = Arc::new(move |_args| {
+    let handler: AppToolHandler = args_only_handler(move |_args| {
         let counter = Arc::clone(&run_count_clone);
-        Box::pin(async move {
+        async move {
             counter.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_secs(2)).await;
             Ok(json!({"done": true}))
-        })
+        }
     });
     handle
         .register_app_tool(def, handler)
@@ -930,12 +1101,12 @@ async fn register_counted_echo(
         requires_approval,
     };
     let counter_clone = Arc::clone(&counter);
-    let handler: AppToolHandler = Arc::new(move |_args| {
+    let handler: AppToolHandler = args_only_handler(move |_args| {
         let c = Arc::clone(&counter_clone);
-        Box::pin(async move {
+        async move {
             c.fetch_add(1, Ordering::SeqCst);
             Ok(json!({"ran": true}))
-        })
+        }
     });
     handle
         .register_app_tool(def, handler)
@@ -1729,13 +1900,13 @@ async fn approval_consuming_budget_shrinks_execution_timeout() {
         requires_approval: true,
     };
     let run_count_clone = Arc::clone(&run_count);
-    let handler: AppToolHandler = Arc::new(move |_args| {
+    let handler: AppToolHandler = args_only_handler(move |_args| {
         let c = Arc::clone(&run_count_clone);
-        Box::pin(async move {
+        async move {
             c.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(Duration::from_secs(60)).await;
             Ok(json!({"done": true}))
-        })
+        }
     });
     handle
         .register_app_tool(def, handler)
