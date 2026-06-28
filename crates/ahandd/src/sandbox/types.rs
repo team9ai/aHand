@@ -17,6 +17,7 @@ pub const CODE_MOUNT_SOURCE_UNSUPPORTED: &str = "MOUNT_SOURCE_UNSUPPORTED";
 pub const CODE_MOUNT_TARGET_INVALID: &str = "MOUNT_TARGET_INVALID";
 pub const CODE_MOUNT_TARGET_CONFLICT: &str = "MOUNT_TARGET_CONFLICT";
 pub const CODE_MOUNT_ACCESS_DENIED: &str = "MOUNT_ACCESS_DENIED";
+pub const CODE_MOUNT_ALREADY_REGISTERED: &str = "MOUNT_ALREADY_REGISTERED";
 pub const CODE_MOUNT_NOT_REGISTERED: &str = "MOUNT_NOT_REGISTERED";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,6 +280,10 @@ impl SandboxError {
 
     pub fn mount_access_denied(message: impl Into<String>) -> Self {
         Self::new(CODE_MOUNT_ACCESS_DENIED, message)
+    }
+
+    pub fn mount_already_registered(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_ALREADY_REGISTERED, message)
     }
 
     pub fn mount_not_registered(message: impl Into<String>) -> Self {
