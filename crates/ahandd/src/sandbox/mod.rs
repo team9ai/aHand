@@ -1,4 +1,5 @@
 pub mod file_lifecycle;
+pub mod mounts;
 pub mod path_policy;
 pub mod platform;
 pub mod registry;

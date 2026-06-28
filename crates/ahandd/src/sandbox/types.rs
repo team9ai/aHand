@@ -12,6 +12,11 @@ pub const CODE_UNKNOWN_VERSION: &str = "UNKNOWN_VERSION";
 pub const CODE_RUNTIME_NOT_REGISTERED: &str = "RUNTIME_NOT_REGISTERED";
 pub const CODE_INVALID_COMMAND: &str = "INVALID_COMMAND";
 pub const CODE_COMMAND_NOT_FOUND: &str = "COMMAND_NOT_FOUND";
+pub const CODE_MOUNT_SOURCE_NOT_FOUND: &str = "MOUNT_SOURCE_NOT_FOUND";
+pub const CODE_MOUNT_SOURCE_UNSUPPORTED: &str = "MOUNT_SOURCE_UNSUPPORTED";
+pub const CODE_MOUNT_TARGET_INVALID: &str = "MOUNT_TARGET_INVALID";
+pub const CODE_MOUNT_TARGET_CONFLICT: &str = "MOUNT_TARGET_CONFLICT";
+pub const CODE_MOUNT_ACCESS_DENIED: &str = "MOUNT_ACCESS_DENIED";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -245,6 +250,26 @@ impl SandboxError {
 
     pub fn unknown_version(message: impl Into<String>) -> Self {
         Self::new(CODE_UNKNOWN_VERSION, message)
+    }
+
+    pub fn mount_source_not_found(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_SOURCE_NOT_FOUND, message)
+    }
+
+    pub fn mount_source_unsupported(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_SOURCE_UNSUPPORTED, message)
+    }
+
+    pub fn mount_target_invalid(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_TARGET_INVALID, message)
+    }
+
+    pub fn mount_target_conflict(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_TARGET_CONFLICT, message)
+    }
+
+    pub fn mount_access_denied(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_ACCESS_DENIED, message)
     }
 }
 
