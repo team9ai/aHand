@@ -20,6 +20,7 @@ pub const CODE_MOUNT_ACCESS_DENIED: &str = "MOUNT_ACCESS_DENIED";
 pub const CODE_MOUNT_ALREADY_REGISTERED: &str = "MOUNT_ALREADY_REGISTERED";
 pub const CODE_MOUNT_NOT_REGISTERED: &str = "MOUNT_NOT_REGISTERED";
 pub const CODE_MOUNT_SCOPE_MISMATCH: &str = "MOUNT_SCOPE_MISMATCH";
+pub const CODE_MOUNT_ENV_CONFLICT: &str = "MOUNT_ENV_CONFLICT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -287,6 +288,10 @@ impl SandboxError {
     pub fn mount_scope_mismatch(message: impl Into<String>) -> Self {
         Self::new(CODE_MOUNT_SCOPE_MISMATCH, message)
     }
+
+    pub fn mount_env_conflict(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_ENV_CONFLICT, message)
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +399,13 @@ mod tests {
         let err = SandboxError::mount_scope_mismatch("mount scope does not match invocation");
 
         assert_eq!(err.code, "MOUNT_SCOPE_MISMATCH");
+    }
+
+    #[test]
+    fn mount_env_conflict_constructor_preserves_code() {
+        let err = SandboxError::mount_env_conflict("mount env var is already registered");
+
+        assert_eq!(err.code, "MOUNT_ENV_CONFLICT");
     }
 
     #[test]

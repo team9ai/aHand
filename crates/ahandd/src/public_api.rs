@@ -507,17 +507,19 @@ impl DaemonHandle {
         session_id: &str,
         request: SandboxExecRequest,
     ) -> SandboxResult<SandboxExecResult> {
-        let (workspace_root, network, exec_env): (
+        let (workspace_root, network, exec_env, reserved_mount_env): (
             PathBuf,
             NetworkPolicy,
             RegisteredExecEnvironment,
+            HashSet<String>,
         ) = {
             let registry = self.sandbox_registry.lock().await;
             let session = registry.session(session_id)?;
             (
                 session.workspace_root.clone(),
                 session.network,
-                session.exec_environment_for(request.context.as_ref())?,
+                session.exec_environment_for(request.context.as_ref()),
+                session.registered_mount_env_vars().into_iter().collect(),
             )
         };
         let SandboxExecRequest {
@@ -530,6 +532,19 @@ impl DaemonHandle {
         let (program, args) = command.split_first().ok_or_else(|| {
             crate::sandbox::SandboxError::invalid_command("sandbox command must not be empty")
         })?;
+        let active_mount_env = exec_env
+            .mounts
+            .iter()
+            .filter_map(|mount| mount.env_var.clone())
+            .collect::<HashSet<_>>();
+        if let Some((key, _)) = request_env
+            .iter()
+            .find(|(key, _)| reserved_mount_env.contains(*key) && !active_mount_env.contains(*key))
+        {
+            return Err(crate::sandbox::SandboxError::mount_scope_mismatch(format!(
+                "sandbox mount env var '{key}' is not active for this invocation context"
+            )));
+        }
 
         std::fs::create_dir_all(&workspace_root).map_err(|e| {
             crate::sandbox::SandboxError::unavailable(format!(
@@ -547,17 +562,12 @@ impl DaemonHandle {
             })?,
         };
         let executable = runner::resolve_executable(program, &exec_env.path_entries)?;
-        let protected_mount_env = exec_env
-            .mounts
-            .iter()
-            .filter_map(|mount| mount.env_var.clone())
-            .collect::<HashSet<_>>();
         let mut env = exec_env.env;
         merge_path_entries(&mut env, &exec_env.path_entries);
         env.extend(
             request_env
                 .into_iter()
-                .filter(|(key, _)| !protected_mount_env.contains(key)),
+                .filter(|(key, _)| !active_mount_env.contains(key)),
         );
         let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
         let policy = RuntimeSandboxPolicy {
