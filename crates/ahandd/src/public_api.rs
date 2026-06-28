@@ -458,6 +458,36 @@ impl DaemonHandle {
         self.sandbox_registry.lock().await.create_session(config)
     }
 
+    pub async fn register_sandbox_mount(
+        &self,
+        session_id: &str,
+        spec: SandboxMountSpec,
+    ) -> SandboxResult<RegisteredSandboxMount> {
+        self.sandbox_registry
+            .lock()
+            .await
+            .register_mount(session_id, spec)
+    }
+
+    pub async fn unregister_sandbox_mount(
+        &self,
+        session_id: &str,
+        mount_id: &str,
+        scope: MountScope,
+    ) -> SandboxResult<()> {
+        self.sandbox_registry
+            .lock()
+            .await
+            .unregister_mount(session_id, mount_id, scope)
+    }
+
+    pub async fn list_sandbox_mounts(
+        &self,
+        session_id: &str,
+    ) -> SandboxResult<Vec<RegisteredSandboxMount>> {
+        self.sandbox_registry.lock().await.list_mounts(session_id)
+    }
+
     pub async fn update_sandbox_permission_mode(
         &self,
         session_id: &str,

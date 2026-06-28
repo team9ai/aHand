@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::mounts;
 use super::types::{
-    FileVersion, HostFileRef, NetworkPolicy, PermissionSnapshot, RegisteredExecEnvironment,
-    RuntimeProviderConfig, SandboxError, SandboxFile, SandboxPermissionMode, SandboxResult,
-    SandboxSessionConfig,
+    FileVersion, HostFileRef, MountScope, NetworkPolicy, PermissionSnapshot,
+    RegisteredExecEnvironment, RegisteredSandboxMount, RuntimeProviderConfig, SandboxError,
+    SandboxFile, SandboxMountSpec, SandboxPermissionMode, SandboxResult, SandboxSessionConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -17,21 +18,31 @@ pub struct SandboxSessionState {
     pub host_file_refs: BTreeMap<String, HostFileRef>,
     pub imported_files: BTreeMap<String, SandboxFile>,
     pub file_versions: BTreeMap<String, FileVersion>,
+    pub mounts: BTreeMap<(String, MountScope), RegisteredSandboxMount>,
     permission: PermissionSnapshot,
 }
 
 impl SandboxSessionState {
     pub fn from_config(config: SandboxSessionConfig) -> Self {
+        let SandboxSessionConfig {
+            session_id,
+            permission_mode,
+            workspace_root,
+            network,
+            mounts: _,
+        } = config;
+
         Self {
-            session_id: config.session_id,
-            workspace_root: config.workspace_root,
-            network: config.network,
+            session_id,
+            workspace_root,
+            network,
             runtimes: BTreeMap::new(),
             host_file_refs: BTreeMap::new(),
             imported_files: BTreeMap::new(),
             file_versions: BTreeMap::new(),
+            mounts: BTreeMap::new(),
             permission: PermissionSnapshot {
-                mode: config.permission_mode,
+                mode: permission_mode,
                 version: 1,
             },
         }
@@ -97,12 +108,16 @@ impl SandboxRegistry {
             SandboxError::unavailable(format!("failed to resolve sandbox workspace root: {e}"))
         })?;
         let session_id = config.session_id.clone();
-        let config = SandboxSessionConfig {
+        let mut config = SandboxSessionConfig {
             workspace_root,
             ..config
         };
-        self.sessions
-            .insert(session_id, SandboxSessionState::from_config(config));
+        let initial_mounts = std::mem::take(&mut config.mounts);
+        let mut session = SandboxSessionState::from_config(config);
+        for spec in initial_mounts {
+            Self::register_mount_for_session(&mut session, spec)?;
+        }
+        self.sessions.insert(session_id, session);
         Ok(())
     }
 
@@ -129,12 +144,65 @@ impl SandboxRegistry {
     ) -> SandboxResult<PermissionSnapshot> {
         Ok(self.session_mut(session_id)?.update_permission(mode))
     }
+
+    pub fn register_mount(
+        &mut self,
+        session_id: &str,
+        spec: SandboxMountSpec,
+    ) -> SandboxResult<RegisteredSandboxMount> {
+        let session = self.session_mut(session_id)?;
+        Self::register_mount_for_session(session, spec)
+    }
+
+    pub fn unregister_mount(
+        &mut self,
+        session_id: &str,
+        mount_id: &str,
+        scope: MountScope,
+    ) -> SandboxResult<()> {
+        let session = self.session_mut(session_id)?;
+        let key = (mount_id.to_string(), scope);
+        session.mounts.remove(&key).map(|_| ()).ok_or_else(|| {
+            SandboxError::mount_not_registered(format!(
+                "sandbox mount '{mount_id}' is not registered for the requested scope"
+            ))
+        })
+    }
+
+    pub fn list_mounts(&self, session_id: &str) -> SandboxResult<Vec<RegisteredSandboxMount>> {
+        Ok(self.session(session_id)?.mounts.values().cloned().collect())
+    }
+
+    fn register_mount_for_session(
+        session: &mut SandboxSessionState,
+        spec: SandboxMountSpec,
+    ) -> SandboxResult<RegisteredSandboxMount> {
+        let key = (spec.mount_id.clone(), spec.scope.clone());
+        if session.mounts.contains_key(&key) {
+            return Err(SandboxError::mount_target_conflict(format!(
+                "sandbox mount '{}' is already registered for the requested scope",
+                spec.mount_id
+            )));
+        }
+        let existing_targets = session
+            .mounts
+            .values()
+            .map(|mount| mount.target.as_path())
+            .collect::<Vec<_>>();
+        let registered =
+            mounts::register_mount_with_existing_targets(session, spec, existing_targets)?;
+        session.mounts.insert(key, registered.clone());
+        Ok(registered)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::types::{NetworkPolicy, SandboxPermissionMode, SandboxSessionConfig};
+    use crate::sandbox::types::{
+        MountAccess, MountScope, MountSource, NetworkPolicy, SandboxMountSpec,
+        SandboxPermissionMode, SandboxSessionConfig,
+    };
     use std::fs;
     use std::path::PathBuf;
 
@@ -145,6 +213,17 @@ mod tests {
             workspace_root,
             network: NetworkPolicy::Enabled,
             mounts: Vec::new(),
+        }
+    }
+
+    fn readonly_mount(mount_id: &str, source: PathBuf, scope: MountScope) -> SandboxMountSpec {
+        SandboxMountSpec {
+            mount_id: mount_id.to_string(),
+            source: MountSource::HostPath(source),
+            access: MountAccess::ReadOnly,
+            scope,
+            target: None,
+            env_var: None,
         }
     }
 
@@ -176,6 +255,206 @@ mod tests {
             registry.session("session-1").unwrap().workspace_root,
             workspace_root.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn sandbox_registry_create_session_registers_initial_config_mounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut config = config(workspace_root.clone());
+        config.mounts = vec![readonly_mount(
+            "selected-folder",
+            source.clone(),
+            MountScope::Session,
+        )];
+        let mut registry = SandboxRegistry::default();
+
+        registry.create_session(config).unwrap();
+        let mounts = registry.list_mounts("session-1").unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].mount_id, "selected-folder");
+        assert_eq!(
+            mounts[0].source,
+            MountSource::HostPath(source.canonicalize().unwrap())
+        );
+        assert_eq!(
+            mounts[0].target,
+            workspace_root
+                .canonicalize()
+                .unwrap()
+                .join("workspace/mounts/selected-folder")
+        );
+    }
+
+    #[test]
+    fn sandbox_registry_create_session_fails_when_initial_mount_invalid() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut config = config(workspace_root);
+        config.mounts = vec![readonly_mount(
+            "selected-folder",
+            temp.path().join("missing"),
+            MountScope::Session,
+        )];
+        let mut registry = SandboxRegistry::default();
+
+        let err = registry.create_session(config).unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_SOURCE_NOT_FOUND");
+        assert!(registry.session("session-1").is_err());
+    }
+
+    #[test]
+    fn sandbox_registry_register_list_unregister_mount_round_trip() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry.create_session(config(workspace_root)).unwrap();
+
+        let registered = registry
+            .register_mount(
+                "session-1",
+                readonly_mount(
+                    "selected-folder",
+                    source,
+                    MountScope::Run {
+                        run_id: "run-1".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        assert_eq!(registry.list_mounts("session-1").unwrap(), vec![registered]);
+
+        registry
+            .unregister_mount(
+                "session-1",
+                "selected-folder",
+                MountScope::Run {
+                    run_id: "run-1".to_string(),
+                },
+            )
+            .unwrap();
+
+        assert!(registry.list_mounts("session-1").unwrap().is_empty());
+        let err = registry
+            .unregister_mount("session-1", "selected-folder", MountScope::Session)
+            .unwrap_err();
+        assert_eq!(err.code, "MOUNT_NOT_REGISTERED");
+    }
+
+    #[test]
+    fn sandbox_registry_duplicate_mount_id_same_scope_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry.create_session(config(workspace_root)).unwrap();
+        let scope = MountScope::Run {
+            run_id: "run-1".to_string(),
+        };
+        registry
+            .register_mount(
+                "session-1",
+                readonly_mount("selected-folder", source.clone(), scope.clone()),
+            )
+            .unwrap();
+
+        let err = registry
+            .register_mount(
+                "session-1",
+                readonly_mount("selected-folder", source, scope),
+            )
+            .unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_TARGET_CONFLICT");
+    }
+
+    #[test]
+    fn sandbox_registry_duplicate_mount_id_different_scope_is_allowed_with_auto_suffixes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry
+            .create_session(config(workspace_root.clone()))
+            .unwrap();
+
+        let first = registry
+            .register_mount(
+                "session-1",
+                readonly_mount(
+                    "selected-folder",
+                    source.clone(),
+                    MountScope::Run {
+                        run_id: "run-1".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+        let second = registry
+            .register_mount(
+                "session-1",
+                readonly_mount(
+                    "selected-folder",
+                    source,
+                    MountScope::Run {
+                        run_id: "run-2".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+
+        let namespace = workspace_root
+            .canonicalize()
+            .unwrap()
+            .join("workspace/mounts");
+        assert_eq!(first.target, namespace.join("selected-folder"));
+        assert_eq!(second.target, namespace.join("selected-folder-2"));
+        assert_eq!(
+            registry.list_mounts("session-1").unwrap(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn sandbox_registry_explicit_target_conflicts_with_registered_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry.create_session(config(workspace_root)).unwrap();
+        registry
+            .register_mount(
+                "session-1",
+                readonly_mount("selected-folder", source.clone(), MountScope::Session),
+            )
+            .unwrap();
+        let mut spec = readonly_mount(
+            "other-folder",
+            source,
+            MountScope::Run {
+                run_id: "run-1".to_string(),
+            },
+        );
+        spec.target = Some(PathBuf::from("workspace/mounts/selected-folder"));
+
+        let err = registry.register_mount("session-1", spec).unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_TARGET_CONFLICT");
     }
 
     #[test]

@@ -7,8 +7,8 @@ use ahandd::sandbox::{RuntimeExecuteRequest, RuntimeProviderConfig};
 use ahandd::{
     AppToolDef, AppToolHandler, DaemonConfig, args_only_handler,
     sandbox::{
-        HostFileRef, NetworkPolicy, RegisterVersionRequest, SandboxPermissionMode,
-        SandboxSessionConfig,
+        HostFileRef, MountAccess, MountScope, MountSource, NetworkPolicy, RegisterVersionRequest,
+        SandboxMountSpec, SandboxPermissionMode, SandboxSessionConfig,
     },
 };
 
@@ -41,6 +41,83 @@ async fn daemon_handle_exposes_sandbox_permission_updates() {
 
     assert_eq!(snapshot.mode, SandboxPermissionMode::Full);
     assert_eq!(snapshot.version, 2);
+
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sandbox_api_daemon_handle_registers_lists_and_unregisters_sandbox_mounts() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    let sandbox_root = temp.path().join("sandbox");
+    let source = temp.path().join("host");
+    std::fs::create_dir_all(&sandbox_root).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+
+    let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+        .heartbeat_interval(Duration::from_millis(50))
+        .build();
+    let handle = ahandd::spawn(cfg).await.unwrap();
+    handle
+        .create_sandbox_session(SandboxSessionConfig {
+            session_id: "session-1".to_string(),
+            permission_mode: SandboxPermissionMode::Readonly,
+            workspace_root: sandbox_root.clone(),
+            network: NetworkPolicy::Enabled,
+            mounts: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let registered = handle
+        .register_sandbox_mount(
+            "session-1",
+            SandboxMountSpec {
+                mount_id: "selected-folder".to_string(),
+                source: MountSource::HostPath(source.clone()),
+                access: MountAccess::ReadOnly,
+                scope: MountScope::Run {
+                    run_id: "run-1".to_string(),
+                },
+                target: None,
+                env_var: Some("COFFICE_SELECTED_FOLDER_DIR".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+    let mounts = handle.list_sandbox_mounts("session-1").await.unwrap();
+
+    assert_eq!(mounts, vec![registered.clone()]);
+    assert_eq!(
+        registered.source,
+        MountSource::HostPath(source.canonicalize().unwrap())
+    );
+    assert_eq!(
+        registered.target,
+        sandbox_root
+            .canonicalize()
+            .unwrap()
+            .join("workspace/mounts/selected-folder")
+    );
+
+    handle
+        .unregister_sandbox_mount(
+            "session-1",
+            "selected-folder",
+            MountScope::Run {
+                run_id: "run-1".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        handle
+            .list_sandbox_mounts("session-1")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     handle.shutdown().await.unwrap();
 }

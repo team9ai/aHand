@@ -12,6 +12,14 @@ pub fn register_mount(
     session: &SandboxSessionState,
     spec: SandboxMountSpec,
 ) -> SandboxResult<RegisteredSandboxMount> {
+    register_mount_with_existing_targets(session, spec, std::iter::empty::<&Path>())
+}
+
+pub(crate) fn register_mount_with_existing_targets<'a>(
+    session: &SandboxSessionState,
+    spec: SandboxMountSpec,
+    existing_targets: impl IntoIterator<Item = &'a Path>,
+) -> SandboxResult<RegisteredSandboxMount> {
     if spec.access != MountAccess::ReadOnly {
         return Err(SandboxError::mount_access_denied(
             "sandbox mounts currently support read-only access only",
@@ -22,11 +30,25 @@ pub fn register_mount(
         SandboxError::mount_target_invalid(format!("failed to resolve sandbox workspace root: {e}"))
     })?;
     let mount_namespace = workspace_root.join("workspace").join("mounts");
+    ensure_mount_namespace(&workspace_root, &mount_namespace)?;
     let canonical_namespace = validate_mount_namespace(&workspace_root, &mount_namespace)?;
+    let existing_targets = existing_targets
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
     let (source, source_snapshot) = resolve_source(spec.source)?;
     let target = match spec.target {
-        Some(target) => resolve_explicit_target(&workspace_root, &canonical_namespace, &target)?,
-        None => allocate_auto_target(&mount_namespace, &slug_from_mount_id(&spec.mount_id)),
+        Some(target) => resolve_explicit_target(
+            &workspace_root,
+            &canonical_namespace,
+            &target,
+            &existing_targets,
+        )?,
+        None => allocate_auto_target(
+            &mount_namespace,
+            &slug_from_mount_id(&spec.mount_id),
+            &existing_targets,
+        ),
     };
 
     Ok(RegisteredSandboxMount {
@@ -38,6 +60,39 @@ pub fn register_mount(
         env_var: spec.env_var,
         source_snapshot,
     })
+}
+
+fn ensure_mount_namespace(workspace_root: &Path, mount_namespace: &Path) -> SandboxResult<()> {
+    let workspace_dir = workspace_root.join("workspace");
+    ensure_plain_directory(&workspace_dir, "workspace directory")?;
+    ensure_plain_directory(mount_namespace, "mount namespace")
+}
+
+fn ensure_plain_directory(path: &Path, label: &str) -> SandboxResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(SandboxError::mount_target_invalid(format!(
+                    "{label} must not be a symlink"
+                )));
+            }
+            if !metadata.is_dir() {
+                return Err(SandboxError::mount_target_invalid(format!(
+                    "{label} must be a directory"
+                )));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|e| {
+                SandboxError::mount_target_invalid(format!("failed to create {label}: {e}"))
+            })?;
+            Ok(())
+        }
+        Err(e) => Err(SandboxError::mount_target_invalid(format!(
+            "failed to inspect {label}: {e}"
+        ))),
+    }
 }
 
 fn resolve_source(source: MountSource) -> SandboxResult<(MountSource, MountSourceSnapshot)> {
@@ -124,6 +179,7 @@ fn resolve_explicit_target(
     workspace_root: &Path,
     canonical_namespace: &Path,
     target: &Path,
+    existing_targets: &[PathBuf],
 ) -> SandboxResult<PathBuf> {
     if target.is_absolute() {
         return Err(SandboxError::mount_target_invalid(
@@ -146,6 +202,12 @@ fn resolve_explicit_target(
         return Err(SandboxError::mount_target_invalid(
             "mount target must be under workspace/mounts",
         ));
+    }
+    if target_conflicts(&candidate, existing_targets) {
+        return Err(SandboxError::mount_target_conflict(format!(
+            "mount target already registered: {}",
+            candidate.display()
+        )));
     }
 
     if path_exists(&candidate) {
@@ -184,7 +246,11 @@ fn resolve_explicit_target(
     Ok(candidate)
 }
 
-fn allocate_auto_target(canonical_namespace: &Path, slug: &str) -> PathBuf {
+fn allocate_auto_target(
+    canonical_namespace: &Path,
+    slug: &str,
+    existing_targets: &[PathBuf],
+) -> PathBuf {
     let mut suffix = 1;
     loop {
         let name = if suffix == 1 {
@@ -193,11 +259,17 @@ fn allocate_auto_target(canonical_namespace: &Path, slug: &str) -> PathBuf {
             format!("{slug}-{suffix}")
         };
         let candidate = canonical_namespace.join(name);
-        if !path_exists(&candidate) {
+        if !path_exists(&candidate) && !target_conflicts(&candidate, existing_targets) {
             return candidate;
         }
         suffix += 1;
     }
+}
+
+fn target_conflicts(candidate: &Path, existing_targets: &[PathBuf]) -> bool {
+    existing_targets
+        .iter()
+        .any(|existing| existing == candidate)
 }
 
 fn path_exists(path: &Path) -> bool {
