@@ -45,11 +45,69 @@ pub struct RuntimeProviderConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxMountSpec {
+    pub mount_id: String,
+    pub source: MountSource,
+    pub access: MountAccess,
+    pub scope: MountScope,
+    pub target: Option<PathBuf>,
+    pub env_var: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredSandboxMount {
+    pub mount_id: String,
+    pub source: MountSource,
+    pub access: MountAccess,
+    pub scope: MountScope,
+    pub target: PathBuf,
+    pub env_var: Option<String>,
+    pub source_snapshot: MountSourceSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountSource {
+    HostPath(PathBuf),
+    SandboxPath(PathBuf),
+    RuntimePath(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+    CopyOnWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountScope {
+    Session,
+    Run { run_id: String },
+    Invocation { invocation_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountSourceSnapshot {
+    pub exists: bool,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxInvocationContext {
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub scope_id: Option<String>,
+    pub invocation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxSessionConfig {
     pub session_id: String,
     pub permission_mode: SandboxPermissionMode,
     pub workspace_root: PathBuf,
     pub network: NetworkPolicy,
+    pub mounts: Vec<SandboxMountSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +149,7 @@ pub struct SandboxExecRequest {
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub timeout: Option<Duration>,
+    pub context: Option<SandboxInvocationContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +323,7 @@ mod tests {
             cwd: Some(PathBuf::from("workspace")),
             env: HashMap::from([("EXAMPLE".to_string(), "1".to_string())]),
             timeout: Some(Duration::from_secs(7)),
+            context: None,
         };
 
         assert_eq!(

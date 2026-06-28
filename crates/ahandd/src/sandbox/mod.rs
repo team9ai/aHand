@@ -7,12 +7,14 @@ pub mod tool_provider;
 pub mod types;
 
 pub use tool_provider::{
-    FixedSandboxInvocationResolver, SandboxInvocationContext, SandboxInvocationResolver,
-    SandboxToolProvider, SandboxToolProviderOptions,
+    FixedSandboxInvocationResolver, SandboxInvocationResolver, SandboxToolProvider,
+    SandboxToolProviderOptions,
 };
 pub use types::{
-    CommitResult, FileVersion, FileVersionStatus, HostFileRef, NetworkPolicy, PermissionSnapshot,
-    RegisterVersionRequest, RegisteredExecEnvironment, RuntimeExecuteRequest, RuntimeExecuteResult,
+    CommitResult, FileVersion, FileVersionStatus, HostFileRef, MountAccess, MountScope,
+    MountSource, MountSourceSnapshot, NetworkPolicy, PermissionSnapshot, RegisterVersionRequest,
+    RegisteredExecEnvironment, RegisteredSandboxMount, RuntimeExecuteRequest, RuntimeExecuteResult,
     RuntimeProviderConfig, SandboxCommand, SandboxError, SandboxExecRequest, SandboxExecResult,
-    SandboxFile, SandboxPermissionMode, SandboxResult, SandboxSessionConfig,
+    SandboxFile, SandboxInvocationContext, SandboxMountSpec, SandboxPermissionMode, SandboxResult,
+    SandboxSessionConfig,
 };

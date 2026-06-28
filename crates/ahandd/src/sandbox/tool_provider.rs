@@ -14,7 +14,7 @@ use crate::sandbox::{
     types::{
         CommitResult, FileVersion, HostFileRef, RegisterVersionRequest, RuntimeExecuteResult,
         SandboxCommand, SandboxError, SandboxExecRequest, SandboxExecResult, SandboxFile,
-        SandboxResult,
+        SandboxInvocationContext, SandboxResult,
     },
 };
 
@@ -23,13 +23,6 @@ pub const CODE_SANDBOX_CONTEXT_REQUIRED: &str = "SANDBOX_CONTEXT_REQUIRED";
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxToolProviderOptions {
     pub include_compat_aliases: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxInvocationContext {
-    pub session_id: String,
-    pub run_id: Option<String>,
-    pub scope_id: Option<String>,
 }
 
 pub trait SandboxInvocationResolver: Send + Sync {
@@ -80,6 +73,7 @@ impl SandboxInvocationResolver for FixedSandboxInvocationResolver {
             session_id,
             run_id: trusted_string(context, "runId"),
             scope_id: trusted_string(context, "scopeId"),
+            invocation_id: trusted_string(context, "invocationId"),
         })
     }
 }
@@ -711,6 +705,7 @@ mod tests {
                 permission_mode,
                 workspace_root,
                 network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
             })
             .unwrap();
         Arc::new(AsyncMutex::new(registry))

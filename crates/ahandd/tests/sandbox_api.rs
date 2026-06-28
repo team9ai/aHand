@@ -30,6 +30,7 @@ async fn daemon_handle_exposes_sandbox_permission_updates() {
             permission_mode: SandboxPermissionMode::Readonly,
             workspace_root: sandbox_root,
             network: NetworkPolicy::Enabled,
+            mounts: Vec::new(),
         })
         .await
         .unwrap();
@@ -129,6 +130,7 @@ async fn daemon_handle_persists_and_user_commits_candidate_versions() {
             permission_mode: SandboxPermissionMode::Readonly,
             workspace_root: sandbox_root.clone(),
             network: NetworkPolicy::Enabled,
+            mounts: Vec::new(),
         })
         .await
         .unwrap();
@@ -213,6 +215,7 @@ async fn daemon_handle_saves_candidate_version_as_user_selected_file() {
             permission_mode: SandboxPermissionMode::Copy,
             workspace_root: sandbox_root,
             network: NetworkPolicy::Enabled,
+            mounts: Vec::new(),
         })
         .await
         .unwrap();
@@ -261,6 +264,7 @@ async fn daemon_handle_executes_registered_runtime_inside_sandbox() {
             permission_mode: SandboxPermissionMode::Readonly,
             workspace_root: sandbox_root,
             network: NetworkPolicy::Enabled,
+            mounts: Vec::new(),
         })
         .await
         .unwrap();

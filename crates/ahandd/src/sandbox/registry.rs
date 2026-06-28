@@ -144,6 +144,7 @@ mod tests {
             permission_mode: SandboxPermissionMode::Readonly,
             workspace_root,
             network: NetworkPolicy::Enabled,
+            mounts: Vec::new(),
         }
     }
 
