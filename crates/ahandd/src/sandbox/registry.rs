@@ -179,7 +179,7 @@ impl SandboxRegistry {
     ) -> SandboxResult<RegisteredSandboxMount> {
         let key = (spec.mount_id.clone(), spec.scope.clone());
         if session.mounts.contains_key(&key) {
-            return Err(SandboxError::mount_target_conflict(format!(
+            return Err(SandboxError::mount_already_registered(format!(
                 "sandbox mount '{}' is already registered for the requested scope",
                 spec.mount_id
             )));
@@ -376,7 +376,7 @@ mod tests {
             )
             .unwrap_err();
 
-        assert_eq!(err.code, "MOUNT_TARGET_CONFLICT");
+        assert_eq!(err.code, "MOUNT_ALREADY_REGISTERED");
     }
 
     #[test]
