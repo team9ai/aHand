@@ -492,8 +492,23 @@ fn golden_app_tool_request() {
         name: "list_documents".into(),
         args_json: r#"{"limit":10}"#.into(),
         timeout_ms: 60_000,
+        context_json: "".into(),
     }));
     assert_golden("app_tool_request", &env);
+}
+
+#[test]
+fn golden_app_tool_request_without_context_decodes_empty_context() {
+    let path = fixture_dir().join("app_tool_request.bin");
+    let golden =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    let decoded = Envelope::decode(golden.as_slice())
+        .unwrap_or_else(|e| panic!("decode app_tool_request fixture: {e}"));
+
+    match decoded.payload {
+        Some(envelope::Payload::AppToolRequest(req)) => assert_eq!(req.context_json, ""),
+        other => panic!("wrong payload variant: {other:?}"),
+    }
 }
 
 #[test]

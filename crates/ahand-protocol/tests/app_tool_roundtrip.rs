@@ -38,9 +38,11 @@ fn app_tools_update_roundtrips() {
 fn app_tool_request_roundtrips() {
     let req = AppToolRequest {
         tool_call_id: "call-1".into(),
-        name: "list_documents".into(),
-        args_json: r#"{"limit":5}"#.into(),
+        name: "sandbox_exec".into(),
+        args_json: r#"{"command":["pwd"]}"#.into(),
         timeout_ms: 30_000,
+        context_json: r#"{"source":"coffice","scopeType":"run","scopeId":"run-1","runId":"run-1"}"#
+            .into(),
     };
     match roundtrip(envelope::Payload::AppToolRequest(req.clone())) {
         envelope::Payload::AppToolRequest(got) => assert_eq!(got, req),
