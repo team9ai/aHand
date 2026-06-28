@@ -157,9 +157,8 @@ Host applications that embed `ahandd` can register application-defined tools at 
 
 ```rust
 // in the host application that embeds ahandd
-use ahandd::{AppToolDef, AppToolError, AppToolHandler};
-use serde_json::{Value, json};
-use std::sync::Arc;
+use ahandd::{args_only_handler, AppToolDef, AppToolHandler};
+use serde_json::json;
 
 let def = AppToolDef {
     name: "run_analysis".to_string(),
@@ -170,11 +169,9 @@ let def = AppToolDef {
     }),
     requires_approval: false,
 };
-let handler: AppToolHandler = Arc::new(|_args: Value| {
-    Box::pin(async move {
-        // ... handler logic ...
-        Ok(json!({"status": "done"}))
-    })
+let handler: AppToolHandler = args_only_handler(|_args| async move {
+    // ... handler logic ...
+    Ok(json!({"status": "done"}))
 });
 daemon_handle.register_app_tool(def, handler).await?;
 ```
