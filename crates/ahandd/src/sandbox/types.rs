@@ -19,6 +19,7 @@ pub const CODE_MOUNT_TARGET_CONFLICT: &str = "MOUNT_TARGET_CONFLICT";
 pub const CODE_MOUNT_ACCESS_DENIED: &str = "MOUNT_ACCESS_DENIED";
 pub const CODE_MOUNT_ALREADY_REGISTERED: &str = "MOUNT_ALREADY_REGISTERED";
 pub const CODE_MOUNT_NOT_REGISTERED: &str = "MOUNT_NOT_REGISTERED";
+pub const CODE_MOUNT_SCOPE_MISMATCH: &str = "MOUNT_SCOPE_MISMATCH";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -166,6 +167,7 @@ pub struct RegisteredExecEnvironment {
     pub path_entries: Vec<PathBuf>,
     pub readonly_roots: Vec<PathBuf>,
     pub env: HashMap<String, String>,
+    pub mounts: Vec<RegisteredSandboxMount>,
     pub default_timeout: Duration,
 }
 
@@ -281,6 +283,10 @@ impl SandboxError {
     pub fn mount_not_registered(message: impl Into<String>) -> Self {
         Self::new(CODE_MOUNT_NOT_REGISTERED, message)
     }
+
+    pub fn mount_scope_mismatch(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_SCOPE_MISMATCH, message)
+    }
 }
 
 #[cfg(test)]
@@ -363,12 +369,14 @@ mod tests {
             path_entries: vec![PathBuf::from("/runtime/python/bin")],
             readonly_roots: vec![PathBuf::from("/runtime/python")],
             env: HashMap::from([("PYTHONNOUSERSITE".to_string(), "1".to_string())]),
+            mounts: Vec::new(),
             default_timeout: Duration::from_secs(30),
         };
 
         assert_eq!(env.path_entries, vec![PathBuf::from("/runtime/python/bin")]);
         assert_eq!(env.readonly_roots, vec![PathBuf::from("/runtime/python")]);
         assert_eq!(env.env["PYTHONNOUSERSITE"], "1");
+        assert!(env.mounts.is_empty());
         assert_eq!(env.default_timeout, Duration::from_secs(30));
     }
 
@@ -379,6 +387,13 @@ mod tests {
 
         assert_eq!(invalid.code, "INVALID_COMMAND");
         assert_eq!(missing.code, "COMMAND_NOT_FOUND");
+    }
+
+    #[test]
+    fn mount_scope_mismatch_constructor_preserves_code() {
+        let err = SandboxError::mount_scope_mismatch("mount scope does not match invocation");
+
+        assert_eq!(err.code, "MOUNT_SCOPE_MISMATCH");
     }
 
     #[test]

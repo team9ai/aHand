@@ -517,7 +517,7 @@ impl DaemonHandle {
             (
                 session.workspace_root.clone(),
                 session.network,
-                session.exec_environment(),
+                session.exec_environment_for(request.context.as_ref())?,
             )
         };
         let SandboxExecRequest {
@@ -525,7 +525,7 @@ impl DaemonHandle {
             cwd,
             env: request_env,
             timeout: request_timeout,
-            context: _context,
+            context: _,
         } = request;
         let (program, args) = command.split_first().ok_or_else(|| {
             crate::sandbox::SandboxError::invalid_command("sandbox command must not be empty")
@@ -547,9 +547,18 @@ impl DaemonHandle {
             })?,
         };
         let executable = runner::resolve_executable(program, &exec_env.path_entries)?;
+        let protected_mount_env = exec_env
+            .mounts
+            .iter()
+            .filter_map(|mount| mount.env_var.clone())
+            .collect::<HashSet<_>>();
         let mut env = exec_env.env;
         merge_path_entries(&mut env, &exec_env.path_entries);
-        env.extend(request_env);
+        env.extend(
+            request_env
+                .into_iter()
+                .filter(|(key, _)| !protected_mount_env.contains(key)),
+        );
         let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
         let policy = RuntimeSandboxPolicy {
             writable_root: workspace_root,

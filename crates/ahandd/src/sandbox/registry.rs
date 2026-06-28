@@ -6,7 +6,8 @@ use super::mounts;
 use super::types::{
     FileVersion, HostFileRef, MountScope, NetworkPolicy, PermissionSnapshot,
     RegisteredExecEnvironment, RegisteredSandboxMount, RuntimeProviderConfig, SandboxError,
-    SandboxFile, SandboxMountSpec, SandboxPermissionMode, SandboxResult, SandboxSessionConfig,
+    SandboxFile, SandboxInvocationContext, SandboxMountSpec, SandboxPermissionMode, SandboxResult,
+    SandboxSessionConfig,
 };
 
 #[derive(Debug, Clone)]
@@ -63,9 +64,18 @@ impl SandboxSessionState {
     }
 
     pub fn exec_environment(&self) -> RegisteredExecEnvironment {
+        self.exec_environment_for(None)
+            .expect("sandbox exec environment without context should not fail")
+    }
+
+    pub fn exec_environment_for(
+        &self,
+        context: Option<&SandboxInvocationContext>,
+    ) -> SandboxResult<RegisteredExecEnvironment> {
         let mut path_entries = Vec::new();
         let mut readonly_roots = Vec::new();
         let mut env = HashMap::new();
+        let mut active_mounts = Vec::new();
 
         for provider in self.runtimes.values() {
             if let Some(parent) = provider.executable.parent() {
@@ -79,16 +89,49 @@ impl SandboxSessionState {
             }
         }
 
+        for mount in self.mounts.values() {
+            let active = mount_scope_active(&mount.scope, context);
+            if active {
+                if let Some(env_var) = &mount.env_var {
+                    env.insert(env_var.clone(), mount.target.to_string_lossy().to_string());
+                }
+                active_mounts.push(mount.clone());
+            } else if mount.env_var.is_some() && mount_scope_requires_context(&mount.scope) {
+                return Err(SandboxError::mount_scope_mismatch(format!(
+                    "sandbox mount '{}' is scoped to a different invocation context",
+                    mount.mount_id
+                )));
+            }
+        }
+
         path_entries.sort();
         readonly_roots.sort();
 
-        RegisteredExecEnvironment {
+        Ok(RegisteredExecEnvironment {
             path_entries,
             readonly_roots,
             env,
+            mounts: active_mounts,
             default_timeout: Duration::from_secs(30),
+        })
+    }
+}
+
+fn mount_scope_active(scope: &MountScope, context: Option<&SandboxInvocationContext>) -> bool {
+    match scope {
+        MountScope::Session => true,
+        MountScope::Run { run_id } => {
+            context.and_then(|context| context.run_id.as_deref()) == Some(run_id.as_str())
+        }
+        MountScope::Invocation { invocation_id } => {
+            context.and_then(|context| context.invocation_id.as_deref())
+                == Some(invocation_id.as_str())
         }
     }
+}
+
+fn mount_scope_requires_context(scope: &MountScope) -> bool {
+    !matches!(scope, MountScope::Session)
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -200,8 +243,8 @@ impl SandboxRegistry {
 mod tests {
     use super::*;
     use crate::sandbox::types::{
-        MountAccess, MountScope, MountSource, NetworkPolicy, SandboxMountSpec,
-        SandboxPermissionMode, SandboxSessionConfig,
+        MountAccess, MountScope, MountSource, NetworkPolicy, SandboxInvocationContext,
+        SandboxMountSpec, SandboxPermissionMode, SandboxSessionConfig,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -224,6 +267,18 @@ mod tests {
             scope,
             target: None,
             env_var: None,
+        }
+    }
+
+    fn readonly_mount_with_env(
+        mount_id: &str,
+        source: PathBuf,
+        scope: MountScope,
+        env_var: &str,
+    ) -> SandboxMountSpec {
+        SandboxMountSpec {
+            env_var: Some(env_var.to_string()),
+            ..readonly_mount(mount_id, source, scope)
         }
     }
 
@@ -566,5 +621,217 @@ mod tests {
             env.readonly_roots,
             vec![runtime_root.canonicalize().unwrap()]
         );
+    }
+
+    #[test]
+    fn sandbox_exec_environment_session_mount_is_active_without_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry
+            .create_session(config(workspace_root.clone()))
+            .unwrap();
+        registry
+            .register_mount(
+                "session-1",
+                readonly_mount_with_env(
+                    "selected-folder",
+                    source,
+                    MountScope::Session,
+                    "COFFICE_SELECTED_FOLDER_DIR",
+                ),
+            )
+            .unwrap();
+
+        let env = registry
+            .session("session-1")
+            .unwrap()
+            .exec_environment_for(None)
+            .unwrap();
+
+        let target = workspace_root
+            .canonicalize()
+            .unwrap()
+            .join("workspace/mounts/selected-folder");
+        assert_eq!(env.mounts.len(), 1);
+        assert_eq!(env.mounts[0].target, target);
+        assert_eq!(
+            env.env["COFFICE_SELECTED_FOLDER_DIR"],
+            target.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn sandbox_exec_environment_run_mount_requires_matching_run_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry
+            .create_session(config(workspace_root.clone()))
+            .unwrap();
+        registry
+            .register_mount(
+                "session-1",
+                readonly_mount_with_env(
+                    "selected-folder",
+                    source,
+                    MountScope::Run {
+                        run_id: "run-1".to_string(),
+                    },
+                    "COFFICE_SELECTED_FOLDER_DIR",
+                ),
+            )
+            .unwrap();
+
+        let matching = registry
+            .session("session-1")
+            .unwrap()
+            .exec_environment_for(Some(&SandboxInvocationContext {
+                run_id: Some("run-1".to_string()),
+                invocation_id: None,
+            }))
+            .unwrap();
+        let mismatched = registry
+            .session("session-1")
+            .unwrap()
+            .exec_environment_for(Some(&SandboxInvocationContext {
+                run_id: Some("run-2".to_string()),
+                invocation_id: None,
+            }))
+            .unwrap_err();
+
+        let target = workspace_root
+            .canonicalize()
+            .unwrap()
+            .join("workspace/mounts/selected-folder");
+        assert_eq!(
+            matching.env["COFFICE_SELECTED_FOLDER_DIR"],
+            target.to_string_lossy()
+        );
+        assert_eq!(matching.mounts.len(), 1);
+        assert_eq!(mismatched.code, "MOUNT_SCOPE_MISMATCH");
+    }
+
+    #[test]
+    fn sandbox_exec_environment_invocation_mount_requires_matching_invocation_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry
+            .create_session(config(workspace_root.clone()))
+            .unwrap();
+        registry
+            .register_mount(
+                "session-1",
+                readonly_mount_with_env(
+                    "selected-folder",
+                    source,
+                    MountScope::Invocation {
+                        invocation_id: "inv-1".to_string(),
+                    },
+                    "COFFICE_SELECTED_FOLDER_DIR",
+                ),
+            )
+            .unwrap();
+
+        let matching = registry
+            .session("session-1")
+            .unwrap()
+            .exec_environment_for(Some(&SandboxInvocationContext {
+                run_id: None,
+                invocation_id: Some("inv-1".to_string()),
+            }))
+            .unwrap();
+        let mismatched = registry
+            .session("session-1")
+            .unwrap()
+            .exec_environment_for(Some(&SandboxInvocationContext {
+                run_id: None,
+                invocation_id: Some("inv-2".to_string()),
+            }))
+            .unwrap_err();
+
+        let target = workspace_root
+            .canonicalize()
+            .unwrap()
+            .join("workspace/mounts/selected-folder");
+        assert_eq!(
+            matching.env["COFFICE_SELECTED_FOLDER_DIR"],
+            target.to_string_lossy()
+        );
+        assert_eq!(matching.mounts.len(), 1);
+        assert_eq!(mismatched.code, "MOUNT_SCOPE_MISMATCH");
+    }
+
+    #[test]
+    fn sandbox_exec_environment_run_mount_env_var_fails_closed_without_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry.create_session(config(workspace_root)).unwrap();
+        registry
+            .register_mount(
+                "session-1",
+                readonly_mount_with_env(
+                    "selected-folder",
+                    source,
+                    MountScope::Run {
+                        run_id: "run-1".to_string(),
+                    },
+                    "COFFICE_SELECTED_FOLDER_DIR",
+                ),
+            )
+            .unwrap();
+
+        let err = registry
+            .session("session-1")
+            .unwrap()
+            .exec_environment_for(None)
+            .unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_SCOPE_MISMATCH");
+    }
+
+    #[test]
+    fn sandbox_exec_environment_scoped_mount_without_env_var_can_be_inactive() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry.create_session(config(workspace_root)).unwrap();
+        registry
+            .register_mount(
+                "session-1",
+                readonly_mount(
+                    "selected-folder",
+                    source,
+                    MountScope::Run {
+                        run_id: "run-1".to_string(),
+                    },
+                ),
+            )
+            .unwrap();
+
+        let env = registry
+            .session("session-1")
+            .unwrap()
+            .exec_environment_for(None)
+            .unwrap();
+
+        assert!(env.mounts.is_empty());
     }
 }
