@@ -691,6 +691,7 @@ pub(crate) async fn execute_sandbox_command_with_registry(
     let policy = RuntimeSandboxPolicy {
         writable_root: workspace_root,
         readonly_roots: exec_env.readonly_roots,
+        mounts: exec_env.mounts,
         network,
     };
 

@@ -10,8 +10,9 @@ use std::time::Duration;
 use ahandd::{
     DaemonConfig,
     sandbox::{
-        HostFileRef, NetworkPolicy, RegisterVersionRequest, RuntimeProviderConfig, SandboxCommand,
-        SandboxExecRequest, SandboxPermissionMode, SandboxSessionConfig,
+        HostFileRef, MountAccess, MountScope, MountSource, NetworkPolicy, RegisterVersionRequest,
+        RuntimeProviderConfig, SandboxCommand, SandboxExecRequest, SandboxInvocationContext,
+        SandboxMountSpec, SandboxPermissionMode, SandboxSessionConfig,
     },
 };
 
@@ -206,6 +207,98 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
         .unwrap();
     assert_eq!(user_commit.bytes_written, 7);
     assert_eq!(std::fs::read_to_string(&source).unwrap(), "changed");
+
+    handle.shutdown().await.unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn coffice_sandbox_smoke_readonly_host_directory_mount_reads_and_denies_write() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity_dir = temp.path().join("identity");
+    let sandbox_root = temp.path().join("sandbox");
+    let host_dir = temp.path().join("selected");
+    std::fs::create_dir_all(sandbox_root.join("workspace")).unwrap();
+    std::fs::create_dir_all(&host_dir).unwrap();
+    std::fs::write(host_dir.join("data.txt"), "mounted-data").unwrap();
+
+    let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+        .heartbeat_interval(Duration::from_millis(50))
+        .build();
+    let handle = ahandd::spawn(cfg).await.unwrap();
+    handle
+        .create_sandbox_session(SandboxSessionConfig {
+            session_id: "session-mount".to_string(),
+            permission_mode: SandboxPermissionMode::Readonly,
+            workspace_root: sandbox_root.clone(),
+            network: NetworkPolicy::Enabled,
+            mounts: Vec::new(),
+        })
+        .await
+        .unwrap();
+    handle
+        .register_sandbox_runtime(
+            "session-mount",
+            RuntimeProviderConfig {
+                name: "sh".to_string(),
+                executable: PathBuf::from("/bin/sh"),
+                readonly_roots: vec![PathBuf::from("/bin")],
+                env: HashMap::new(),
+                default_timeout: Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap();
+    handle
+        .register_sandbox_mount(
+            "session-mount",
+            SandboxMountSpec {
+                mount_id: "selected-folder".to_string(),
+                source: MountSource::HostPath(host_dir.clone()),
+                access: MountAccess::ReadOnly,
+                scope: MountScope::Run {
+                    run_id: "run-1".to_string(),
+                },
+                target: None,
+                env_var: Some("COFFICE_SELECTED_FOLDER_DIR".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let result = handle
+        .execute_sandbox_command(
+            "session-mount",
+            SandboxExecRequest {
+                command: SandboxCommand::Argv {
+                    command: vec![
+                        "sh".to_string(),
+                        "-lc".to_string(),
+                        "cat \"$COFFICE_SELECTED_FOLDER_DIR/data.txt\"; touch \"$COFFICE_SELECTED_FOLDER_DIR/new.txt\"".to_string(),
+                    ],
+                },
+                cwd: None,
+                env: HashMap::new(),
+                timeout: Some(Duration::from_secs(10)),
+                context: Some(SandboxInvocationContext {
+                    session_id: "session-mount".to_string(),
+                    run_id: Some("run-1".to_string()),
+                    scope_id: None,
+                    invocation_id: None,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        result.stdout.contains("mounted-data"),
+        "stdout: {:?}, stderr: {:?}",
+        result.stdout,
+        result.stderr
+    );
+    assert_ne!(result.exit_code, Some(0), "{}", result.stderr);
+    assert!(!host_dir.join("new.txt").exists());
 
     handle.shutdown().await.unwrap();
 }

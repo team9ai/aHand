@@ -21,6 +21,7 @@ pub const CODE_MOUNT_ALREADY_REGISTERED: &str = "MOUNT_ALREADY_REGISTERED";
 pub const CODE_MOUNT_NOT_REGISTERED: &str = "MOUNT_NOT_REGISTERED";
 pub const CODE_MOUNT_SCOPE_MISMATCH: &str = "MOUNT_SCOPE_MISMATCH";
 pub const CODE_MOUNT_ENV_CONFLICT: &str = "MOUNT_ENV_CONFLICT";
+pub const CODE_MOUNT_PLATFORM_UNSUPPORTED: &str = "MOUNT_PLATFORM_UNSUPPORTED";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -299,6 +300,10 @@ impl SandboxError {
 
     pub fn mount_env_conflict(message: impl Into<String>) -> Self {
         Self::new(CODE_MOUNT_ENV_CONFLICT, message)
+    }
+
+    pub fn mount_platform_unsupported(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_PLATFORM_UNSUPPORTED, message)
     }
 }
 
