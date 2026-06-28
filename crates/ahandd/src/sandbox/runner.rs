@@ -141,49 +141,13 @@ fn materialize_mount_target_symlink(
     let canonical_workspace = workspace_root.canonicalize().map_err(|e| {
         SandboxError::mount_target_invalid(format!("failed to resolve sandbox workspace root: {e}"))
     })?;
-    let mount_namespace = canonical_workspace.join("workspace").join("mounts");
-    fs::create_dir_all(&mount_namespace).map_err(|e| {
-        SandboxError::mount_target_invalid(format!("failed to create mount namespace: {e}"))
-    })?;
-    let namespace_metadata = fs::symlink_metadata(&mount_namespace).map_err(|e| {
-        SandboxError::mount_target_invalid(format!("failed to inspect mount namespace: {e}"))
-    })?;
-    if namespace_metadata.file_type().is_symlink() || !namespace_metadata.is_dir() {
-        return Err(SandboxError::mount_target_invalid(
-            "mount namespace must be a plain directory",
-        ));
-    }
-    let canonical_namespace = mount_namespace.canonicalize().map_err(|e| {
-        SandboxError::mount_target_invalid(format!("failed to resolve mount namespace: {e}"))
-    })?;
-    if canonical_namespace != mount_namespace {
-        return Err(SandboxError::mount_target_invalid(
-            "mount namespace must resolve without symlinks",
-        ));
-    }
+    let canonical_namespace = prepare_mount_namespace(&canonical_workspace)?;
     if !target.is_absolute() || contains_parent_component(target) {
         return Err(SandboxError::mount_target_invalid(
             "resolved mount target must be an absolute path without traversal",
         ));
     }
-    let parent = target.parent().ok_or_else(|| {
-        SandboxError::mount_target_invalid("mount target has no parent namespace")
-    })?;
-    let file_name = target.file_name().ok_or_else(|| {
-        SandboxError::mount_target_invalid("mount target must include a final path component")
-    })?;
-    let canonical_parent = parent.canonicalize().map_err(|e| {
-        SandboxError::mount_target_invalid(format!(
-            "failed to resolve mount target parent '{}': {e}",
-            parent.display()
-        ))
-    })?;
-    let canonical_target_path = canonical_parent.join(file_name);
-    if !canonical_target_path.starts_with(&canonical_namespace) {
-        return Err(SandboxError::mount_target_invalid(
-            "mount target parent escapes workspace/mounts",
-        ));
-    }
+    let parent = validate_mount_target_parent(&canonical_namespace, target)?;
 
     match fs::symlink_metadata(target) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -228,7 +192,95 @@ fn materialize_mount_target_symlink(
         }
     }
 
+    validate_mount_target_parent(&canonical_namespace, target)?;
     create_symlink(canonical_source, target)
+}
+
+fn prepare_mount_namespace(canonical_workspace: &Path) -> SandboxResult<PathBuf> {
+    ensure_existing_plain_directory(canonical_workspace, "sandbox workspace root")?;
+    let workspace_dir =
+        ensure_plain_child_directory(canonical_workspace, "workspace", "sandbox workspace")?;
+    let mount_namespace =
+        ensure_plain_child_directory(&workspace_dir, "mounts", "mount namespace")?;
+    let canonical_namespace = mount_namespace.canonicalize().map_err(|e| {
+        SandboxError::mount_target_invalid(format!("failed to resolve mount namespace: {e}"))
+    })?;
+    if canonical_namespace != mount_namespace {
+        return Err(SandboxError::mount_target_invalid(
+            "mount namespace must resolve without symlinks",
+        ));
+    }
+    Ok(canonical_namespace)
+}
+
+fn ensure_plain_child_directory(parent: &Path, child: &str, label: &str) -> SandboxResult<PathBuf> {
+    ensure_existing_plain_directory(parent, &format!("{label} parent"))?;
+    let path = parent.join(child);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => ensure_existing_plain_directory(&path, label)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ensure_existing_plain_directory(parent, &format!("{label} parent"))?;
+            match fs::create_dir(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(SandboxError::mount_target_invalid(format!(
+                        "failed to create {label}: {e}"
+                    )));
+                }
+            }
+            ensure_existing_plain_directory(&path, label)?;
+        }
+        Err(e) => {
+            return Err(SandboxError::mount_target_invalid(format!(
+                "failed to inspect {label}: {e}"
+            )));
+        }
+    }
+    Ok(path)
+}
+
+fn ensure_existing_plain_directory(path: &Path, label: &str) -> SandboxResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        SandboxError::mount_target_invalid(format!("failed to inspect {label}: {e}"))
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(SandboxError::mount_target_invalid(format!(
+            "{label} must not be a symlink"
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(SandboxError::mount_target_invalid(format!(
+            "{label} must be a directory"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_mount_target_parent(
+    canonical_namespace: &Path,
+    target: &Path,
+) -> SandboxResult<PathBuf> {
+    let parent = target.parent().ok_or_else(|| {
+        SandboxError::mount_target_invalid("mount target has no parent namespace")
+    })?;
+    ensure_existing_plain_directory(parent, "mount target parent")?;
+    let file_name = target.file_name().ok_or_else(|| {
+        SandboxError::mount_target_invalid("mount target must include a final path component")
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|e| {
+        SandboxError::mount_target_invalid(format!(
+            "failed to resolve mount target parent '{}': {e}",
+            parent.display()
+        ))
+    })?;
+    let canonical_target_path = canonical_parent.join(file_name);
+    if !canonical_target_path.starts_with(canonical_namespace) {
+        return Err(SandboxError::mount_target_invalid(
+            "mount target parent escapes workspace/mounts",
+        ));
+    }
+    Ok(parent.to_path_buf())
 }
 
 #[cfg(unix)]
@@ -561,6 +613,29 @@ mod tests {
         let err = materialize_active_mounts_with_platform_support(&mut policy, true).unwrap_err();
 
         assert_eq!(err.code, "MOUNT_TARGET_CONFLICT");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_mount_materialization_rejects_symlinked_workspace_without_creating_outside_mounts() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let outside = temp.path().join("outside");
+        let target = workspace_root.join("workspace/mounts/selected-folder");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, workspace_root.join("workspace")).unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        let mut policy = policy_with_mount(workspace_root, canonical_source, target);
+
+        let err = materialize_active_mounts_with_platform_support(&mut policy, true).unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_TARGET_INVALID");
+        assert!(!outside.join("mounts").exists());
     }
 
     #[test]
