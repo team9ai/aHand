@@ -609,6 +609,130 @@ async fn app_tool_empty_context_json_yields_none_context() {
     handle.shutdown().await.expect("shutdown clean");
 }
 
+/// Invalid context_json fails at the daemon trust boundary before handler
+/// execution.
+#[tokio::test]
+async fn app_tool_invalid_context_json_returns_invalid_args_without_handler() {
+    let (mock, handle, _tmp) = setup_dispatch_daemon().await;
+
+    let def = AppToolDef {
+        name: "invalid_context_tool".into(),
+        description: "Should not run when context is invalid".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let run_count = Arc::new(AtomicUsize::new(0));
+    let run_count_clone = Arc::clone(&run_count);
+    let handler: AppToolHandler = Arc::new(move |_invocation| {
+        let counter = Arc::clone(&run_count_clone);
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"unexpected": true}))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register_app_tool ok");
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request_with_context(
+        "call-invalid-context-json",
+        "invalid_context_tool",
+        r#"{"ok":true}"#,
+        r#"{"source":"coffice""#,
+        5000,
+    )
+    .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    match &responses[0].result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(err.code, "INVALID_ARGS");
+            assert!(
+                err.message.contains("context_json is not valid JSON"),
+                "error message should mention invalid context_json: {}",
+                err.message
+            );
+        }
+        other => panic!("expected INVALID_ARGS error, got {other:?}"),
+    }
+    assert_eq!(
+        run_count.load(Ordering::SeqCst),
+        0,
+        "handler must not run when context_json is invalid"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Non-object context_json is valid JSON but not trusted context; reject it
+/// before the handler can observe it.
+#[tokio::test]
+async fn app_tool_non_object_context_json_returns_invalid_args_without_handler() {
+    let (mock, handle, _tmp) = setup_dispatch_daemon().await;
+
+    let def = AppToolDef {
+        name: "non_object_context_tool".into(),
+        description: "Should not run when context is not an object".into(),
+        input_schema: json!({"type": "object", "properties": {}}),
+        requires_approval: false,
+    };
+    let run_count = Arc::new(AtomicUsize::new(0));
+    let run_count_clone = Arc::clone(&run_count);
+    let handler: AppToolHandler = Arc::new(move |_invocation| {
+        let counter = Arc::clone(&run_count_clone);
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({"unexpected": true}))
+        })
+    });
+    handle
+        .register_app_tool(def, handler)
+        .await
+        .expect("register_app_tool ok");
+
+    mock.wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("tool snapshot");
+
+    mock.send_app_tool_request_with_context(
+        "call-non-object-context-json",
+        "non_object_context_tool",
+        r#"{"ok":true}"#,
+        r#"[]"#,
+        5000,
+    )
+    .expect("send ok");
+
+    let responses = mock
+        .wait_for_app_tool_responses(1, Duration::from_secs(5))
+        .await
+        .expect("AppToolResponse not received within 5s");
+
+    match &responses[0].result {
+        Some(app_tool_response::Result::Error(err)) => {
+            assert_eq!(err.code, "INVALID_ARGS");
+            assert_eq!(err.message, "context_json must be a JSON object");
+        }
+        other => panic!("expected INVALID_ARGS error, got {other:?}"),
+    }
+    assert_eq!(
+        run_count.load(Ordering::SeqCst),
+        0,
+        "handler must not run when context_json is not an object"
+    );
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
 /// Unknown tool → TOOL_NOT_FOUND error code.
 #[tokio::test]
 async fn unknown_tool_returns_tool_not_found() {

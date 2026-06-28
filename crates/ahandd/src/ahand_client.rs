@@ -2303,8 +2303,25 @@ async fn validate_and_execute_app_tool<T>(
     let context = if context_json.trim().is_empty() {
         None
     } else {
-        match serde_json::from_str(&context_json) {
-            Ok(v) => Some(v),
+        match serde_json::from_str::<serde_json::Value>(&context_json) {
+            Ok(v) if v.is_object() => Some(v),
+            Ok(_) => {
+                warn!(
+                    tool_call_id = %tool_call_id,
+                    tool_name = %tool_name,
+                    "invalid app tool context: not a JSON object"
+                );
+                fail_app_tool_call(
+                    app_tools,
+                    tx,
+                    device_id,
+                    &tool_call_id,
+                    "INVALID_ARGS",
+                    "context_json must be a JSON object".to_string(),
+                )
+                .await;
+                return;
+            }
             Err(err) => {
                 warn!(
                     tool_call_id = %tool_call_id,
