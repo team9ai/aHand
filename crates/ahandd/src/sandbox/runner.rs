@@ -1,16 +1,21 @@
 use std::collections::HashMap;
+use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use super::platform;
 use super::types::{
-    NetworkPolicy, RuntimeExecuteResult, RuntimeProviderConfig, SandboxError, SandboxResult,
+    MountAccess, MountSource, NetworkPolicy, RegisteredSandboxMount, RuntimeExecuteResult,
+    RuntimeProviderConfig, SandboxError, SandboxResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSandboxPolicy {
     pub writable_root: PathBuf,
     pub readonly_roots: Vec<PathBuf>,
+    pub mounts: Vec<RegisteredSandboxMount>,
     pub network: NetworkPolicy,
 }
 
@@ -23,6 +28,7 @@ impl RuntimeSandboxPolicy {
         Self {
             writable_root,
             readonly_roots: provider.readonly_roots,
+            mounts: Vec::new(),
             network,
         }
     }
@@ -38,8 +44,214 @@ pub struct PlatformExecuteRequest {
     pub policy: RuntimeSandboxPolicy,
 }
 
-pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
+pub async fn execute(mut request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
+    materialize_active_mounts(&mut request.policy)?;
     platform::execute(request).await
+}
+
+fn materialize_active_mounts(policy: &mut RuntimeSandboxPolicy) -> SandboxResult<()> {
+    materialize_active_mounts_with_platform_support(
+        policy,
+        platform_supports_readonly_host_directory_mounts(),
+    )
+}
+
+fn platform_supports_readonly_host_directory_mounts() -> bool {
+    cfg!(target_os = "macos")
+}
+
+fn materialize_active_mounts_with_platform_support(
+    policy: &mut RuntimeSandboxPolicy,
+    platform_supported: bool,
+) -> SandboxResult<()> {
+    if policy.mounts.is_empty() {
+        return Ok(());
+    }
+    if !platform_supported {
+        return Err(SandboxError::mount_platform_unsupported(
+            "read-only host directory mounts are not supported on this platform",
+        ));
+    }
+
+    for mount in policy.mounts.clone() {
+        let canonical_source = materialize_readonly_host_directory_mount(policy, &mount)?;
+        push_unique_path(&mut policy.readonly_roots, canonical_source);
+    }
+    policy.readonly_roots.sort();
+    policy.readonly_roots.dedup();
+    Ok(())
+}
+
+fn materialize_readonly_host_directory_mount(
+    policy: &RuntimeSandboxPolicy,
+    mount: &RegisteredSandboxMount,
+) -> SandboxResult<PathBuf> {
+    if mount.access != MountAccess::ReadOnly {
+        return Err(SandboxError::mount_platform_unsupported(
+            "only read-only host directory mounts can be materialized",
+        ));
+    }
+    if !mount.source_snapshot.exists {
+        return Err(SandboxError::mount_source_not_found(format!(
+            "mount source no longer exists for '{}'",
+            mount.mount_id
+        )));
+    }
+    if !mount.source_snapshot.is_dir {
+        return Err(SandboxError::mount_source_unsupported(
+            "only host directory mounts can be materialized",
+        ));
+    }
+
+    let source = match &mount.source {
+        MountSource::HostPath(path) => path,
+        MountSource::SandboxPath(_) | MountSource::RuntimePath(_) => {
+            return Err(SandboxError::mount_platform_unsupported(
+                "only host path mounts can be materialized",
+            ));
+        }
+    };
+    let canonical_source = source.canonicalize().map_err(|e| {
+        SandboxError::mount_source_not_found(format!(
+            "failed to resolve mount source '{}': {e}",
+            source.display()
+        ))
+    })?;
+    let metadata = fs::metadata(&canonical_source).map_err(|e| {
+        SandboxError::mount_source_not_found(format!(
+            "failed to inspect mount source '{}': {e}",
+            canonical_source.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(SandboxError::mount_source_unsupported(
+            "only host directory mounts can be materialized",
+        ));
+    }
+
+    materialize_mount_target_symlink(&policy.writable_root, &mount.target, &canonical_source)?;
+    Ok(canonical_source)
+}
+
+fn materialize_mount_target_symlink(
+    workspace_root: &Path,
+    target: &Path,
+    canonical_source: &Path,
+) -> SandboxResult<()> {
+    let canonical_workspace = workspace_root.canonicalize().map_err(|e| {
+        SandboxError::mount_target_invalid(format!("failed to resolve sandbox workspace root: {e}"))
+    })?;
+    let mount_namespace = canonical_workspace.join("workspace").join("mounts");
+    fs::create_dir_all(&mount_namespace).map_err(|e| {
+        SandboxError::mount_target_invalid(format!("failed to create mount namespace: {e}"))
+    })?;
+    let namespace_metadata = fs::symlink_metadata(&mount_namespace).map_err(|e| {
+        SandboxError::mount_target_invalid(format!("failed to inspect mount namespace: {e}"))
+    })?;
+    if namespace_metadata.file_type().is_symlink() || !namespace_metadata.is_dir() {
+        return Err(SandboxError::mount_target_invalid(
+            "mount namespace must be a plain directory",
+        ));
+    }
+    let canonical_namespace = mount_namespace.canonicalize().map_err(|e| {
+        SandboxError::mount_target_invalid(format!("failed to resolve mount namespace: {e}"))
+    })?;
+    if canonical_namespace != mount_namespace {
+        return Err(SandboxError::mount_target_invalid(
+            "mount namespace must resolve without symlinks",
+        ));
+    }
+    if !target.is_absolute() || contains_parent_component(target) {
+        return Err(SandboxError::mount_target_invalid(
+            "resolved mount target must be an absolute path without traversal",
+        ));
+    }
+    let parent = target.parent().ok_or_else(|| {
+        SandboxError::mount_target_invalid("mount target has no parent namespace")
+    })?;
+    let file_name = target.file_name().ok_or_else(|| {
+        SandboxError::mount_target_invalid("mount target must include a final path component")
+    })?;
+    let canonical_parent = parent.canonicalize().map_err(|e| {
+        SandboxError::mount_target_invalid(format!(
+            "failed to resolve mount target parent '{}': {e}",
+            parent.display()
+        ))
+    })?;
+    let canonical_target_path = canonical_parent.join(file_name);
+    if !canonical_target_path.starts_with(&canonical_namespace) {
+        return Err(SandboxError::mount_target_invalid(
+            "mount target parent escapes workspace/mounts",
+        ));
+    }
+
+    match fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let link_target = fs::read_link(target).map_err(|e| {
+                SandboxError::mount_target_invalid(format!(
+                    "failed to read mount target symlink '{}': {e}",
+                    target.display()
+                ))
+            })?;
+            let resolved_link = if link_target.is_absolute() {
+                link_target
+            } else {
+                parent.join(link_target)
+            }
+            .canonicalize()
+            .map_err(|e| {
+                SandboxError::mount_target_invalid(format!(
+                    "failed to resolve mount target symlink '{}': {e}",
+                    target.display()
+                ))
+            })?;
+            if resolved_link == canonical_source {
+                return Ok(());
+            }
+            return Err(SandboxError::mount_target_conflict(format!(
+                "mount target already points elsewhere: {}",
+                target.display()
+            )));
+        }
+        Ok(_) => {
+            return Err(SandboxError::mount_target_conflict(format!(
+                "mount target already exists: {}",
+                target.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(SandboxError::mount_target_invalid(format!(
+                "failed to inspect mount target '{}': {e}",
+                target.display()
+            )));
+        }
+    }
+
+    create_symlink(canonical_source, target)
+}
+
+#[cfg(unix)]
+fn create_symlink(source: &Path, target: &Path) -> SandboxResult<()> {
+    symlink(source, target).map_err(|e| {
+        SandboxError::mount_target_invalid(format!(
+            "failed to create mount target symlink '{}': {e}",
+            target.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_source: &Path, _target: &Path) -> SandboxResult<()> {
+    Err(SandboxError::mount_platform_unsupported(
+        "read-only host directory mounts require symlink support",
+    ))
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
 }
 
 pub fn resolve_executable(program: &str, path_entries: &[PathBuf]) -> SandboxResult<PathBuf> {
@@ -110,7 +322,10 @@ fn contains_parent_component(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::types::{NetworkPolicy, RuntimeProviderConfig};
+    use crate::sandbox::types::{
+        MountAccess, MountScope, MountSource, MountSourceSnapshot, NetworkPolicy,
+        RegisteredSandboxMount, RuntimeProviderConfig,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -247,6 +462,7 @@ mod tests {
             policy: RuntimeSandboxPolicy {
                 writable_root: PathBuf::from("/tmp"),
                 readonly_roots: vec![],
+                mounts: Vec::new(),
                 network: NetworkPolicy::Enabled,
             },
         };
@@ -254,5 +470,112 @@ mod tests {
         let err = platform::unsupported::execute(request).await.unwrap_err();
 
         assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
+    }
+
+    fn readonly_host_dir_mount(
+        mount_id: &str,
+        source: PathBuf,
+        target: PathBuf,
+    ) -> RegisteredSandboxMount {
+        RegisteredSandboxMount {
+            mount_id: mount_id.to_string(),
+            source: MountSource::HostPath(source),
+            access: MountAccess::ReadOnly,
+            scope: MountScope::Session,
+            target,
+            env_var: None,
+            source_snapshot: MountSourceSnapshot {
+                exists: true,
+                is_dir: true,
+            },
+        }
+    }
+
+    fn policy_with_mount(
+        workspace_root: PathBuf,
+        source: PathBuf,
+        target: PathBuf,
+    ) -> RuntimeSandboxPolicy {
+        RuntimeSandboxPolicy {
+            writable_root: workspace_root,
+            readonly_roots: Vec::new(),
+            mounts: vec![readonly_host_dir_mount("selected-folder", source, target)],
+            network: NetworkPolicy::Enabled,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_mount_materialization_creates_symlink_and_adds_readonly_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let target = workspace_root.join("workspace/mounts/selected-folder");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        let mut policy =
+            policy_with_mount(workspace_root, canonical_source.clone(), target.clone());
+
+        materialize_active_mounts_with_platform_support(&mut policy, true).unwrap();
+
+        assert_eq!(std::fs::read_link(&target).unwrap(), canonical_source);
+        assert_eq!(policy.readonly_roots, vec![source.canonicalize().unwrap()]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_mount_materialization_accepts_existing_correct_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let target = workspace_root.join("workspace/mounts/selected-folder");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        symlink(&canonical_source, &target).unwrap();
+        let mut policy =
+            policy_with_mount(workspace_root, canonical_source.clone(), target.clone());
+
+        materialize_active_mounts_with_platform_support(&mut policy, true).unwrap();
+
+        assert_eq!(std::fs::read_link(&target).unwrap(), canonical_source);
+        assert_eq!(policy.readonly_roots, vec![source.canonicalize().unwrap()]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sandbox_mount_materialization_rejects_existing_conflicting_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let target = workspace_root.join("workspace/mounts/selected-folder");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "conflict").unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        let mut policy = policy_with_mount(workspace_root, canonical_source, target);
+
+        let err = materialize_active_mounts_with_platform_support(&mut policy, true).unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_TARGET_CONFLICT");
+    }
+
+    #[test]
+    fn sandbox_mount_materialization_unsupported_platform_active_mounts_fail() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let target = workspace_root.join("workspace/mounts/selected-folder");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        let mut policy = policy_with_mount(workspace_root, canonical_source, target);
+
+        let err = materialize_active_mounts_with_platform_support(&mut policy, false).unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_PLATFORM_UNSUPPORTED");
     }
 }
