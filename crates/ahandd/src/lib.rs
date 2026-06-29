@@ -23,3 +23,7 @@ pub use public_api::{
     ApprovalSubscription, DaemonConfig, DaemonConfigBuilder, DaemonHandle, DaemonStatus, ErrorKind,
     SessionMode, args_only_handler, load_or_create_identity, spawn,
 };
+pub use sandbox::{
+    FixedSandboxInvocationResolver, SandboxInvocationContext, SandboxInvocationResolver,
+    SandboxToolProviderOptions,
+};

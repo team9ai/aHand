@@ -348,6 +348,23 @@ impl DaemonHandle {
         self.app_tools.register(def, handler).await
     }
 
+    /// Register the built-in sandbox tool provider as app tools.
+    ///
+    /// The provider catalog is registered as one snapshot mutation so the hub
+    /// never observes a partially-registered sandbox tool set.
+    pub async fn register_sandbox_tools(
+        &self,
+        resolver: Arc<dyn crate::sandbox::SandboxInvocationResolver>,
+        options: crate::sandbox::SandboxToolProviderOptions,
+    ) -> anyhow::Result<()> {
+        let provider = crate::sandbox::SandboxToolProvider::new(
+            Arc::clone(&self.sandbox_registry),
+            resolver,
+            options,
+        );
+        self.app_tools.register_many(provider.tool_handlers()).await
+    }
+
     /// Unregister an app-defined tool by name. Returns `true` if the tool
     /// existed. The daemon pushes a new snapshot (without the tool) to the
     /// hub immediately if connected.

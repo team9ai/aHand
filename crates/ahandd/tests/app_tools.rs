@@ -155,6 +155,47 @@ async fn snapshot_sent_after_hello_and_on_register() {
     handle.shutdown().await.expect("shutdown clean");
 }
 
+#[tokio::test]
+async fn embedded_handle_registers_sandbox_tool_provider() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
+        .heartbeat_interval(Duration::from_secs(60))
+        .build();
+
+    let handle = spawn(config).await.expect("spawn ok");
+    wait_online(&handle).await;
+    mock.wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("initial AppToolsUpdate not received within 5s");
+
+    handle
+        .register_sandbox_tools(
+            Arc::new(ahandd::FixedSandboxInvocationResolver::new("session-1")),
+            ahandd::SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+        )
+        .await
+        .expect("register_sandbox_tools should succeed");
+
+    let updates = mock
+        .wait_for_app_tools_updates(2, Duration::from_secs(5))
+        .await
+        .expect("sandbox AppToolsUpdate not received within 5s");
+    let names = updates[1]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(names.contains(&"run_command"));
+    assert!(names.contains(&"sandbox_exec"));
+    assert!(names.contains(&"run_node"));
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
 /// register then unregister: final snapshot must have revision=2 and be empty.
 #[tokio::test]
 async fn unregister_pushes_snapshot_without_tool() {
