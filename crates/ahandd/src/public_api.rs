@@ -474,63 +474,11 @@ impl DaemonHandle {
         session_id: &str,
         request: SandboxExecRequest,
     ) -> SandboxResult<SandboxExecResult> {
-        let (workspace_root, network, exec_env): (
-            PathBuf,
-            NetworkPolicy,
-            RegisteredExecEnvironment,
-        ) = {
-            let registry = self.sandbox_registry.lock().await;
-            let session = registry.session(session_id)?;
-            (
-                session.workspace_root.clone(),
-                session.network,
-                session.exec_environment(),
-            )
-        };
-        let SandboxExecRequest {
-            command,
-            cwd,
-            env: request_env,
-            timeout: request_timeout,
-        } = request;
-        let (program, args) = command.split_first().ok_or_else(|| {
-            crate::sandbox::SandboxError::invalid_command("sandbox command must not be empty")
-        })?;
-
-        std::fs::create_dir_all(&workspace_root).map_err(|e| {
-            crate::sandbox::SandboxError::unavailable(format!(
-                "failed to create sandbox workspace root: {e}"
-            ))
-        })?;
-        let cwd = match cwd {
-            Some(cwd) => {
-                path_policy::resolve_existing_sandbox_path(&workspace_root, &cwd.to_string_lossy())?
-            }
-            None => workspace_root.canonicalize().map_err(|e| {
-                crate::sandbox::SandboxError::invalid_sandbox_path(format!(
-                    "failed to resolve sandbox workspace root: {e}"
-                ))
-            })?,
-        };
-        let executable = runner::resolve_executable(program, &exec_env.path_entries)?;
-        let mut env = exec_env.env;
-        merge_path_entries(&mut env, &exec_env.path_entries);
-        env.extend(request_env);
-        let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
-        let policy = RuntimeSandboxPolicy {
-            writable_root: workspace_root,
-            readonly_roots: exec_env.readonly_roots,
-            network,
-        };
-
-        runner::execute(PlatformExecuteRequest {
-            executable,
-            args: args.to_vec(),
-            cwd,
-            env,
-            timeout,
-            policy,
-        })
+        execute_sandbox_command_with_registry(
+            Arc::clone(&self.sandbox_registry),
+            session_id,
+            request,
+        )
         .await
     }
 
@@ -621,6 +569,67 @@ impl DaemonHandle {
             target_path.to_path_buf(),
         )
     }
+}
+
+pub(crate) async fn execute_sandbox_command_with_registry(
+    sandbox_registry: Arc<AsyncMutex<SandboxRegistry>>,
+    session_id: &str,
+    request: SandboxExecRequest,
+) -> SandboxResult<SandboxExecResult> {
+    let (workspace_root, network, exec_env): (PathBuf, NetworkPolicy, RegisteredExecEnvironment) = {
+        let registry = sandbox_registry.lock().await;
+        let session = registry.session(session_id)?;
+        (
+            session.workspace_root.clone(),
+            session.network,
+            session.exec_environment(),
+        )
+    };
+    let SandboxExecRequest {
+        command,
+        cwd,
+        env: request_env,
+        timeout: request_timeout,
+    } = request;
+    let (program, args) = command.split_first().ok_or_else(|| {
+        crate::sandbox::SandboxError::invalid_command("sandbox command must not be empty")
+    })?;
+
+    std::fs::create_dir_all(&workspace_root).map_err(|e| {
+        crate::sandbox::SandboxError::unavailable(format!(
+            "failed to create sandbox workspace root: {e}"
+        ))
+    })?;
+    let cwd = match cwd {
+        Some(cwd) => {
+            path_policy::resolve_existing_sandbox_path(&workspace_root, &cwd.to_string_lossy())?
+        }
+        None => workspace_root.canonicalize().map_err(|e| {
+            crate::sandbox::SandboxError::invalid_sandbox_path(format!(
+                "failed to resolve sandbox workspace root: {e}"
+            ))
+        })?,
+    };
+    let executable = runner::resolve_executable(program, &exec_env.path_entries)?;
+    let mut env = exec_env.env;
+    merge_path_entries(&mut env, &exec_env.path_entries);
+    env.extend(request_env);
+    let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
+    let policy = RuntimeSandboxPolicy {
+        writable_root: workspace_root,
+        readonly_roots: exec_env.readonly_roots,
+        network,
+    };
+
+    runner::execute(PlatformExecuteRequest {
+        executable,
+        args: args.to_vec(),
+        cwd,
+        env,
+        timeout,
+        policy,
+    })
+    .await
 }
 
 fn canonicalize_runtime_provider(

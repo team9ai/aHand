@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,8 +8,14 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::app_tool_registry::{AppToolDef, AppToolError, AppToolHandler, AppToolInvocation};
-use crate::sandbox::registry::SandboxRegistry;
-use crate::sandbox::types::{SandboxError, SandboxResult};
+use crate::sandbox::{
+    file_lifecycle,
+    registry::SandboxRegistry,
+    types::{
+        CommitResult, FileVersion, HostFileRef, RegisterVersionRequest, RuntimeExecuteResult,
+        SandboxError, SandboxExecRequest, SandboxExecResult, SandboxFile, SandboxResult,
+    },
+};
 
 pub const CODE_SANDBOX_CONTEXT_REQUIRED: &str = "SANDBOX_CONTEXT_REQUIRED";
 
@@ -26,6 +33,17 @@ pub struct SandboxInvocationContext {
 
 pub trait SandboxInvocationResolver: Send + Sync {
     fn resolve(&self, invocation: &AppToolInvocation) -> SandboxResult<SandboxInvocationContext>;
+
+    fn resolve_host_file_ref(
+        &self,
+        invocation: &AppToolInvocation,
+        file_ref_id: &str,
+    ) -> SandboxResult<HostFileRef> {
+        let _ = invocation;
+        Err(SandboxError::unknown_file_ref(format!(
+            "unknown host file reference '{file_ref_id}'"
+        )))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -65,10 +83,13 @@ impl SandboxInvocationResolver for FixedSandboxInvocationResolver {
     }
 }
 
+#[derive(Clone)]
 pub struct SandboxToolProvider {
     registry: Arc<AsyncMutex<SandboxRegistry>>,
     resolver: Arc<dyn SandboxInvocationResolver>,
     options: SandboxToolProviderOptions,
+    #[cfg(test)]
+    captured_exec: Option<Arc<AsyncMutex<Option<SandboxExecRequest>>>>,
 }
 
 impl SandboxToolProvider {
@@ -81,6 +102,23 @@ impl SandboxToolProvider {
             registry,
             resolver,
             options,
+            #[cfg(test)]
+            captured_exec: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test_with_exec_capture(
+        registry: Arc<AsyncMutex<SandboxRegistry>>,
+        resolver: Arc<dyn SandboxInvocationResolver>,
+        options: SandboxToolProviderOptions,
+        captured_exec: Arc<AsyncMutex<Option<SandboxExecRequest>>>,
+    ) -> Self {
+        Self {
+            registry,
+            resolver,
+            options,
+            captured_exec: Some(captured_exec),
         }
     }
 
@@ -113,29 +151,196 @@ impl SandboxToolProvider {
     }
 
     fn import_file_handler(&self) -> AppToolHandler {
-        self.unavailable_handler("import_file")
+        let provider = self.clone();
+        Arc::new(move |invocation| {
+            let provider = provider.clone();
+            let future: BoxFuture<'static, Result<Value, AppToolError>> =
+                Box::pin(async move { provider.import_file(invocation).await });
+            future
+        })
     }
 
-    fn run_command_handler(&self, tool_name: &'static str) -> AppToolHandler {
-        self.unavailable_handler(tool_name)
+    fn run_command_handler(&self, _tool_name: &'static str) -> AppToolHandler {
+        let provider = self.clone();
+        Arc::new(move |invocation| {
+            let provider = provider.clone();
+            let future: BoxFuture<'static, Result<Value, AppToolError>> =
+                Box::pin(async move { provider.run_command(invocation).await });
+            future
+        })
     }
 
     fn register_file_version_handler(&self) -> AppToolHandler {
-        self.unavailable_handler("register_file_version")
+        let provider = self.clone();
+        Arc::new(move |invocation| {
+            let provider = provider.clone();
+            let future: BoxFuture<'static, Result<Value, AppToolError>> =
+                Box::pin(async move { provider.register_file_version(invocation).await });
+            future
+        })
     }
 
     fn commit_file_version_handler(&self) -> AppToolHandler {
-        self.unavailable_handler("commit_file_version")
+        let provider = self.clone();
+        Arc::new(move |invocation| {
+            let provider = provider.clone();
+            let future: BoxFuture<'static, Result<Value, AppToolError>> =
+                Box::pin(async move { provider.commit_file_version(invocation).await });
+            future
+        })
     }
 
     fn run_node_handler(&self) -> AppToolHandler {
-        self.unavailable_handler("run_node")
+        let provider = self.clone();
+        Arc::new(move |invocation| {
+            let provider = provider.clone();
+            let future: BoxFuture<'static, Result<Value, AppToolError>> =
+                Box::pin(async move { provider.run_node(invocation).await });
+            future
+        })
     }
 
-    fn unavailable_handler(&self, tool_name: &'static str) -> AppToolHandler {
-        let _registry = Arc::clone(&self.registry);
-        let _resolver = Arc::clone(&self.resolver);
-        unavailable_handler(tool_name)
+    async fn import_file(&self, invocation: AppToolInvocation) -> Result<Value, AppToolError> {
+        let context = self
+            .resolver
+            .resolve(&invocation)
+            .map_err(app_tool_error_from_sandbox)?;
+        let file_ref_id = require_string_arg(&invocation.args, "fileRefId")?;
+        let mut host_file_ref = self
+            .resolver
+            .resolve_host_file_ref(&invocation, &file_ref_id)
+            .map_err(app_tool_error_from_sandbox)?;
+        if host_file_ref.conversation_id.is_none() {
+            host_file_ref.conversation_id = context.run_id.clone();
+        }
+
+        let file = {
+            let mut registry = self.registry.lock().await;
+            file_lifecycle::import_file(&mut registry, &context.session_id, host_file_ref)
+        }
+        .map_err(app_tool_error_from_sandbox)?;
+
+        Ok(sandbox_file_json(&file))
+    }
+
+    async fn run_command(&self, invocation: AppToolInvocation) -> Result<Value, AppToolError> {
+        let context = self
+            .resolver
+            .resolve(&invocation)
+            .map_err(app_tool_error_from_sandbox)?;
+        let command = require_non_empty_string_array_arg(&invocation.args, "command")?;
+        let cwd = optional_string_arg(&invocation.args, "cwd")?.map(PathBuf::from);
+        let env = optional_string_map_arg(&invocation.args, "env")?;
+        let timeout = optional_timeout_arg(&invocation.args, "timeoutSeconds")?;
+        let result = self
+            .execute_command(
+                &context.session_id,
+                SandboxExecRequest {
+                    command,
+                    cwd,
+                    env,
+                    timeout,
+                },
+            )
+            .await
+            .map_err(app_tool_error_from_sandbox)?;
+
+        Ok(runtime_execute_result_json(&result))
+    }
+
+    async fn run_node(&self, invocation: AppToolInvocation) -> Result<Value, AppToolError> {
+        let context = self
+            .resolver
+            .resolve(&invocation)
+            .map_err(app_tool_error_from_sandbox)?;
+        let args = require_string_array_arg(&invocation.args, "args")?;
+        let cwd = optional_string_arg(&invocation.args, "cwd")?.map(PathBuf::from);
+        let timeout = optional_timeout_arg(&invocation.args, "timeoutSeconds")?;
+        let command = std::iter::once("node".to_string()).chain(args).collect();
+        let result = self
+            .execute_command(
+                &context.session_id,
+                SandboxExecRequest {
+                    command,
+                    cwd,
+                    env: HashMap::new(),
+                    timeout,
+                },
+            )
+            .await
+            .map_err(app_tool_error_from_sandbox)?;
+
+        Ok(runtime_execute_result_json(&result))
+    }
+
+    async fn register_file_version(
+        &self,
+        invocation: AppToolInvocation,
+    ) -> Result<Value, AppToolError> {
+        let context = self
+            .resolver
+            .resolve(&invocation)
+            .map_err(app_tool_error_from_sandbox)?;
+        let sandbox_path = require_string_arg(&invocation.args, "sandboxPath")?;
+        let source_file_ref_id = optional_string_arg(&invocation.args, "sourceFileRefId")?;
+
+        let version = {
+            let mut registry = self.registry.lock().await;
+            file_lifecycle::register_file_version(
+                &mut registry,
+                &context.session_id,
+                RegisterVersionRequest {
+                    sandbox_path: PathBuf::from(sandbox_path),
+                    source_file_ref_id,
+                },
+            )
+        }
+        .map_err(app_tool_error_from_sandbox)?;
+
+        Ok(file_version_json(&version))
+    }
+
+    async fn commit_file_version(
+        &self,
+        invocation: AppToolInvocation,
+    ) -> Result<Value, AppToolError> {
+        let context = self
+            .resolver
+            .resolve(&invocation)
+            .map_err(app_tool_error_from_sandbox)?;
+        let version_id = require_string_arg(&invocation.args, "versionId")?;
+
+        let result = {
+            let mut registry = self.registry.lock().await;
+            file_lifecycle::commit_file_version(&mut registry, &context.session_id, &version_id)
+        }
+        .map_err(app_tool_error_from_sandbox)?;
+
+        Ok(commit_result_json(&result))
+    }
+
+    async fn execute_command(
+        &self,
+        session_id: &str,
+        request: SandboxExecRequest,
+    ) -> SandboxResult<SandboxExecResult> {
+        #[cfg(test)]
+        if let Some(captured_exec) = &self.captured_exec {
+            *captured_exec.lock().await = Some(request);
+            return Ok(RuntimeExecuteResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: Some(0),
+                timed_out: false,
+            });
+        }
+
+        crate::public_api::execute_sandbox_command_with_registry(
+            Arc::clone(&self.registry),
+            session_id,
+            request,
+        )
+        .await
     }
 }
 
@@ -181,6 +386,17 @@ pub fn require_string_array_arg(args: &Value, name: &str) -> Result<Vec<String>,
                 .ok_or_else(|| invalid_arg(name, "must be an array of strings"))
         })
         .collect()
+}
+
+pub fn require_non_empty_string_array_arg(
+    args: &Value,
+    name: &str,
+) -> Result<Vec<String>, AppToolError> {
+    let items = require_string_array_arg(args, name)?;
+    if items.is_empty() {
+        return Err(invalid_arg(name, "must contain at least one item"));
+    }
+    Ok(items)
 }
 
 pub fn optional_string_map_arg(
@@ -234,6 +450,50 @@ pub fn app_tool_error_from_sandbox(error: SandboxError) -> AppToolError {
     }
 }
 
+fn runtime_execute_result_json(result: &RuntimeExecuteResult) -> Value {
+    json!({
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "exitCode": result.exit_code,
+        "timedOut": result.timed_out,
+    })
+}
+
+fn sandbox_file_json(file: &SandboxFile) -> Value {
+    json!({
+        "sandboxFileId": file.sandbox_file_id,
+        "fileRefId": file.file_ref_id,
+        "sandboxPath": file.sandbox_path.to_string_lossy().to_string(),
+        "size": file.size,
+    })
+}
+
+fn file_version_json(version: &FileVersion) -> Value {
+    json!({
+        "versionId": version.version_id,
+        "sandboxPath": version.sandbox_path.to_string_lossy().to_string(),
+        "sourceFileRefId": version.source_file_ref_id,
+        "size": version.size,
+        "hash": version.hash,
+        "status": serde_json::to_value(&version.status)
+            .expect("file version status serializes to JSON"),
+    })
+}
+
+fn commit_result_json(result: &CommitResult) -> Value {
+    json!({
+        "versionId": result.version_id,
+        "sourceFileRefId": result.source_file_ref_id,
+        "backupId": result.backup_id,
+        "oldHash": result.old_hash,
+        "newHash": result.new_hash,
+        "bytesWritten": result.bytes_written,
+        "permissionMode": serde_json::to_value(result.permission_mode)
+            .expect("sandbox permission mode serializes to JSON"),
+        "permissionVersion": result.permission_version,
+    })
+}
+
 fn trusted_string(context: &Value, name: &str) -> Option<String> {
     context
         .get(name)
@@ -267,7 +527,8 @@ fn run_command_def(name: &'static str) -> AppToolDef {
             "properties": {
                 "command": {
                     "type": "array",
-                    "items": { "type": "string" }
+                    "items": { "type": "string" },
+                    "minItems": 1
                 },
                 "cwd": { "type": "string" },
                 "env": {
@@ -345,22 +606,12 @@ fn commit_file_version_def() -> AppToolDef {
     }
 }
 
-fn unavailable_handler(tool_name: &'static str) -> AppToolHandler {
-    Arc::new(move |_invocation| {
-        let future: BoxFuture<'static, Result<Value, AppToolError>> = Box::pin(async move {
-            Err(AppToolError {
-                code: "SANDBOX_UNAVAILABLE".to_string(),
-                message: format!("sandbox tool '{tool_name}' is not configured"),
-            })
-        });
-        future
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use serde_json::{Value, json};
     use tokio::sync::Mutex as AsyncMutex;
@@ -368,6 +619,9 @@ mod tests {
     use super::*;
     use crate::app_tool_registry::AppToolInvocation;
     use crate::sandbox::registry::SandboxRegistry;
+    use crate::sandbox::types::{
+        HostFileRef, NetworkPolicy, SandboxExecRequest, SandboxPermissionMode, SandboxSessionConfig,
+    };
 
     fn provider(include_compat_aliases: bool) -> SandboxToolProvider {
         SandboxToolProvider::new(
@@ -387,6 +641,15 @@ mod tests {
             .collect()
     }
 
+    fn handler(provider: &SandboxToolProvider, name: &str) -> AppToolHandler {
+        provider
+            .tool_handlers()
+            .into_iter()
+            .find(|(def, _)| def.name == name)
+            .map(|(_, handler)| handler)
+            .expect("tool handler registered")
+    }
+
     fn invocation(args: Value, context: Option<Value>) -> AppToolInvocation {
         AppToolInvocation {
             tool_call_id: "call-1".to_string(),
@@ -394,6 +657,65 @@ mod tests {
             args,
             timeout_ms: 5_000,
             context,
+        }
+    }
+
+    fn trusted_context() -> Value {
+        json!({
+            "sessionId": "session-1",
+            "runId": "run-1",
+            "scopeId": "scope-1",
+        })
+    }
+
+    fn registry_with_session(
+        workspace_root: PathBuf,
+        permission_mode: SandboxPermissionMode,
+    ) -> Arc<AsyncMutex<SandboxRegistry>> {
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry
+            .create_session(SandboxSessionConfig {
+                session_id: "session-1".to_string(),
+                permission_mode,
+                workspace_root,
+                network: NetworkPolicy::Enabled,
+            })
+            .unwrap();
+        Arc::new(AsyncMutex::new(registry))
+    }
+
+    #[derive(Debug)]
+    struct HostFileResolver {
+        source_path: PathBuf,
+        file_ref_id: Option<String>,
+    }
+
+    impl SandboxInvocationResolver for HostFileResolver {
+        fn resolve(
+            &self,
+            invocation: &AppToolInvocation,
+        ) -> SandboxResult<SandboxInvocationContext> {
+            FixedSandboxInvocationResolver::new("session-1").resolve(invocation)
+        }
+
+        fn resolve_host_file_ref(
+            &self,
+            invocation: &AppToolInvocation,
+            file_ref_id: &str,
+        ) -> SandboxResult<HostFileRef> {
+            let _ = invocation;
+            Ok(HostFileRef {
+                file_ref_id: self
+                    .file_ref_id
+                    .clone()
+                    .unwrap_or_else(|| file_ref_id.to_string()),
+                source_path: self.source_path.clone(),
+                display_name: "source.txt".to_string(),
+                size: 5,
+                mtime_ms: None,
+                conversation_id: None,
+            })
         }
     }
 
@@ -482,5 +804,193 @@ mod tests {
             .unwrap();
 
         assert_eq!(fallback.session_id, "fixed-session");
+    }
+
+    #[tokio::test]
+    async fn run_command_requires_trusted_context() {
+        let provider = provider(true);
+        let err =
+            handler(&provider, "run_command")(invocation(json!({"command": ["echo", "ok"]}), None))
+                .await
+                .unwrap_err();
+
+        assert_eq!(err.code, CODE_SANDBOX_CONTEXT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn run_node_wrapper_builds_node_command_request() {
+        let captured_exec = Arc::new(AsyncMutex::new(None));
+        let provider = SandboxToolProvider::new_for_test_with_exec_capture(
+            Arc::new(AsyncMutex::new(SandboxRegistry::default())),
+            Arc::new(FixedSandboxInvocationResolver::new("session-1")),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+            Arc::clone(&captured_exec),
+        );
+
+        let result = handler(&provider, "run_node")(invocation(
+            json!({
+                "args": ["script.js"],
+                "cwd": "workspace",
+                "timeoutSeconds": 7
+            }),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(result["exitCode"], json!(0));
+        let captured: SandboxExecRequest = captured_exec.lock().await.clone().unwrap();
+        assert_eq!(captured.command, vec!["node", "script.js"]);
+        assert_eq!(captured.cwd, Some(PathBuf::from("workspace")));
+        assert_eq!(captured.timeout, Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_empty_command_before_runner() {
+        let captured_exec = Arc::new(AsyncMutex::new(None));
+        let provider = SandboxToolProvider::new_for_test_with_exec_capture(
+            Arc::new(AsyncMutex::new(SandboxRegistry::default())),
+            Arc::new(FixedSandboxInvocationResolver::new("session-1")),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+            Arc::clone(&captured_exec),
+        );
+
+        let err = handler(&provider, "run_command")(invocation(
+            json!({"command": []}),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, "INVALID_ARGUMENT");
+        assert!(captured_exec.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn import_file_resolves_host_file_ref_through_resolver() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, "hello").unwrap();
+        let registry = registry_with_session(workspace_root, SandboxPermissionMode::Readonly);
+        let provider = SandboxToolProvider::new(
+            Arc::clone(&registry),
+            Arc::new(HostFileResolver {
+                source_path: source,
+                file_ref_id: None,
+            }),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+        );
+        let args = json!({"fileRefId": "public-file-1"});
+        assert!(args.get("sourcePath").is_none());
+
+        let result = handler(&provider, "import_file")(invocation(args, Some(trusted_context())))
+            .await
+            .unwrap();
+
+        let sandbox_path = result["sandboxPath"].as_str().unwrap();
+        assert!(sandbox_path.contains("input"));
+        assert_eq!(std::fs::read_to_string(sandbox_path).unwrap(), "hello");
+        let registry = registry.lock().await;
+        let file_ref = registry
+            .session("session-1")
+            .unwrap()
+            .host_file_refs
+            .get("public-file-1")
+            .unwrap();
+        assert_eq!(file_ref.conversation_id.as_deref(), Some("run-1"));
+    }
+
+    #[tokio::test]
+    async fn import_file_safely_handles_resolver_hostile_file_ref_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, "hello").unwrap();
+        let registry =
+            registry_with_session(workspace_root.clone(), SandboxPermissionMode::Readonly);
+        let provider = SandboxToolProvider::new(
+            Arc::clone(&registry),
+            Arc::new(HostFileResolver {
+                source_path: source,
+                file_ref_id: Some("../escape".to_string()),
+            }),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+        );
+        let args = json!({"fileRefId": "public-file-1"});
+        assert!(args.get("sourcePath").is_none());
+        assert!(args.get("displayName").is_none());
+
+        let result = handler(&provider, "import_file")(invocation(args, Some(trusted_context())))
+            .await
+            .unwrap();
+
+        let sandbox_path = PathBuf::from(result["sandboxPath"].as_str().unwrap());
+        assert!(sandbox_path.starts_with(workspace_root.canonicalize().unwrap().join("input")));
+        assert_eq!(std::fs::read_to_string(&sandbox_path).unwrap(), "hello");
+        assert!(!workspace_root.join("escape/source.txt").exists());
+        assert_eq!(result["fileRefId"], json!("../escape"));
+    }
+
+    #[tokio::test]
+    async fn register_and_commit_file_handlers_call_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, "original").unwrap();
+        let registry = registry_with_session(workspace_root.clone(), SandboxPermissionMode::Full);
+        let provider = SandboxToolProvider::new(
+            Arc::clone(&registry),
+            Arc::new(HostFileResolver {
+                source_path: source.clone(),
+                file_ref_id: None,
+            }),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+        );
+        let import_result = handler(&provider, "import_file")(invocation(
+            json!({"fileRefId": "public-file-1"}),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap();
+        let sandbox_path = PathBuf::from(import_result["sandboxPath"].as_str().unwrap());
+        let sandbox_relative_path = sandbox_path
+            .strip_prefix(workspace_root.canonicalize().unwrap())
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        std::fs::write(&sandbox_path, "updated").unwrap();
+
+        let version = handler(&provider, "register_file_version")(invocation(
+            json!({
+                "sandboxPath": sandbox_relative_path,
+                "sourceFileRefId": "public-file-1"
+            }),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(version["status"], json!("candidate"));
+        let commit = handler(&provider, "commit_file_version")(invocation(
+            json!({"versionId": version["versionId"].as_str().unwrap()}),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(commit["sourceFileRefId"], json!("public-file-1"));
+        assert_eq!(commit["bytesWritten"], json!(7));
+        assert_eq!(std::fs::read_to_string(source).unwrap(), "updated");
     }
 }
