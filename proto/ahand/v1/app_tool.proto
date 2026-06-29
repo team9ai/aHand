@@ -24,6 +24,7 @@ message AppToolRequest {
   string name         = 2;
   string args_json    = 3; // JSON object matching input_schema_json
   uint32 timeout_ms   = 4; // daemon clamps to [1_000, 300_000]; 0 => 60_000; bounds approval wait + execution for approval-gated tools
+  string context_json = 5; // Optional trusted invocation context JSON object supplied by the hub/host path, never by tool args
 }
 
 // AppToolError - structured failure for one invocation; code is machine-readable, message is a human-readable remediation hint.

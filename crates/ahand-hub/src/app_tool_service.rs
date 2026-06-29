@@ -165,6 +165,7 @@ pub async fn invoke(
                 args_json: input.args_json,
                 // Daemon field is u32; clamp guarantees [1_000, 300_000].
                 timeout_ms: clamped as u32,
+                context_json: String::new(),
             },
         )),
         ..Default::default()
