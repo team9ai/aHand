@@ -455,6 +455,11 @@ export interface ListAppToolsOptions {
 /** Options for `invokeAppTool()`. */
 export interface InvokeAppToolOptions {
   /**
+   * Trusted invocation context forwarded to the device as
+   * `AppToolRequest.context_json`. The hub validates this as a JSON object.
+   */
+  context?: Record<string, unknown>;
+  /**
    * Per-request timeout in milliseconds. Defaults to `60_000` (60 s)
    * when omitted. The hub clamps the value to `[1_000, 300_000]`
    * (1 s – 5 min).
@@ -1971,6 +1976,7 @@ export class CloudClient {
     // camelCase body; omit undefined optional fields
     const requestBody: Record<string, unknown> = { deviceId, name };
     if (args !== undefined) requestBody.args = args;
+    if (opts?.context !== undefined) requestBody.context = opts.context;
     if (opts?.timeoutMs !== undefined) requestBody.timeoutMs = opts.timeoutMs;
 
     let res: Response;
