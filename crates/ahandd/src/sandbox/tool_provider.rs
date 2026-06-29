@@ -36,10 +36,10 @@ pub trait SandboxInvocationResolver: Send + Sync {
 
     fn resolve_host_file_ref(
         &self,
-        invocation: &AppToolInvocation,
+        context: &SandboxInvocationContext,
         file_ref_id: &str,
     ) -> SandboxResult<HostFileRef> {
-        let _ = invocation;
+        let _ = context;
         Err(SandboxError::unknown_file_ref(format!(
             "unknown host file reference '{file_ref_id}'"
         )))
@@ -208,7 +208,7 @@ impl SandboxToolProvider {
         let file_ref_id = require_string_arg(&invocation.args, "fileRefId")?;
         let mut host_file_ref = self
             .resolver
-            .resolve_host_file_ref(&invocation, &file_ref_id)
+            .resolve_host_file_ref(&context, &file_ref_id)
             .map_err(app_tool_error_from_sandbox)?;
         if host_file_ref.conversation_id.is_none() {
             host_file_ref.conversation_id = context.run_id.clone();
@@ -701,10 +701,10 @@ mod tests {
 
         fn resolve_host_file_ref(
             &self,
-            invocation: &AppToolInvocation,
+            context: &SandboxInvocationContext,
             file_ref_id: &str,
         ) -> SandboxResult<HostFileRef> {
-            let _ = invocation;
+            let _ = context;
             Ok(HostFileRef {
                 file_ref_id: self
                     .file_ref_id
