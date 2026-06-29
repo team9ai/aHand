@@ -1300,6 +1300,10 @@ pub struct InvokeAppToolRequest {
     /// Tool arguments as a JSON object. Defaults to `{}` when absent.
     #[serde(default)]
     pub args: Option<serde_json::Value>,
+    /// Trusted invocation context supplied by the control-plane caller.
+    /// Defaults to no context when absent.
+    #[serde(default)]
+    pub context: Option<serde_json::Value>,
     /// Hub-side timeout in milliseconds. Clamped to `[1_000, 300_000]`.
     /// Defaults to 60_000 (60 s) when absent or zero.
     #[serde(default)]
@@ -1391,6 +1395,13 @@ async fn invoke_app_tool(
             "args must be a JSON object".into(),
         ));
     }
+    if let Some(context) = &req.context
+        && !context.is_object()
+    {
+        return Err(ControlError::BadRequest(
+            "context must be a JSON object".into(),
+        ));
+    }
 
     // Rate-limit BEFORE the ownership lookup so storms can't DOS the
     // device store — same order as create_job.
@@ -1444,6 +1455,12 @@ async fn invoke_app_tool(
         .as_ref()
         .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".into());
+    let context_json = req
+        .context
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| ControlError::BadRequest("context must be serializable JSON".into()))?;
 
     let timeout_ms = req.timeout_ms.unwrap_or(0); // 0 → service default
 
@@ -1461,6 +1478,7 @@ async fn invoke_app_tool(
             device_id: device.id.clone(),
             name: req.name.clone(),
             args_json,
+            context_json,
             timeout_ms,
         },
     )
