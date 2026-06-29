@@ -73,6 +73,7 @@ struct QueuedEnvelope {
 #[allow(clippy::large_enum_variant)] // Envelope is the hot path; boxing adds indirection cost
 enum OutboundFrame {
     Envelope(QueuedEnvelope),
+    #[cfg(not(feature = "disable-ws-ping"))]
     WsPing(Vec<u8>),
     DirectEnvelope(Envelope),
 }
@@ -84,6 +85,7 @@ impl BufferedEnvelopeSender {
 
     /// Send a raw WebSocket Ping. Returns Err only if the receiver task has
     /// already exited (session tearing down).
+    #[cfg(not(feature = "disable-ws-ping"))]
     fn send_ping(&self, payload: Vec<u8>) -> Result<(), ()> {
         self.tx.send(OutboundFrame::WsPing(payload)).map_err(|_| ())
     }
@@ -500,6 +502,7 @@ async fn connect_with_auth(
                     }
                     tungstenite::Message::Binary(queued.frame)
                 }
+                #[cfg(not(feature = "disable-ws-ping"))]
                 OutboundFrame::WsPing(payload) => tungstenite::Message::Ping(payload),
                 // Direct envelopes (e.g. AppToolsUpdate snapshots) bypass
                 // outbox sequencing/replay but are still trace-logged.
