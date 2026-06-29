@@ -5,7 +5,7 @@ use std::{path::PathBuf, time::Duration};
 #[cfg(target_os = "macos")]
 use ahandd::sandbox::{RuntimeExecuteRequest, RuntimeProviderConfig};
 use ahandd::{
-    AppToolDef, AppToolHandler, DaemonConfig,
+    AppToolDef, AppToolHandler, DaemonConfig, args_only_handler,
     sandbox::{
         HostFileRef, NetworkPolicy, RegisterVersionRequest, SandboxPermissionMode,
         SandboxSessionConfig,
@@ -52,9 +52,9 @@ async fn daemon_handle_registers_app_tool_handlers() {
         .heartbeat_interval(Duration::from_millis(50))
         .build();
     let handle = ahandd::spawn(cfg).await.unwrap();
-    let handler: AppToolHandler = std::sync::Arc::new(|args| {
+    let handler: AppToolHandler = args_only_handler(std::sync::Arc::new(|args| {
         Box::pin(async move { Ok(serde_json::json!({ "received": args })) })
-    });
+    }));
 
     handle
         .register_app_tool(

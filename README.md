@@ -155,10 +155,12 @@ max_write_bytes = 10485760   # 10 MB
 
 Host applications that embed `ahandd` can register application-defined tools at runtime. Cloud callers discover and invoke them through the hub without custom protocol work.
 
+Handlers receive an `AppToolInvocation` containing metadata, trusted context, and model-supplied args. Use `args_only_handler(...)` when the handler only needs the args value.
+
 ```rust
 // in the host application that embeds ahandd
-use ahandd::{AppToolDef, AppToolError, AppToolHandler};
-use serde_json::{Value, json};
+use ahandd::{args_only_handler, AppToolDef, AppToolHandler};
+use serde_json::json;
 use std::sync::Arc;
 
 let def = AppToolDef {
@@ -170,12 +172,12 @@ let def = AppToolDef {
     }),
     requires_approval: false,
 };
-let handler: AppToolHandler = Arc::new(|_args: Value| {
+let handler: AppToolHandler = args_only_handler(Arc::new(|_args| {
     Box::pin(async move {
         // ... handler logic ...
         Ok(json!({"status": "done"}))
     })
-});
+}));
 daemon_handle.register_app_tool(def, handler).await?;
 ```
 

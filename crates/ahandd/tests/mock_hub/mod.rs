@@ -196,6 +196,34 @@ impl Mock {
         }
     }
 
+    pub fn send_app_tool_request_with_context(
+        &self,
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        args_json: impl Into<String>,
+        context_json: impl Into<String>,
+        timeout_ms: u32,
+    ) -> Result<(), String> {
+        let env = Envelope {
+            device_id: "mock-hub".into(),
+            msg_id: "app-tool-req".into(),
+            ts_ms: 0,
+            payload: Some(envelope::Payload::AppToolRequest(AppToolRequest {
+                tool_call_id: tool_call_id.into(),
+                name: name.into(),
+                args_json: args_json.into(),
+                timeout_ms,
+                context_json: context_json.into(),
+            })),
+            ..Default::default()
+        };
+        let guard = self.inject_tx.lock().unwrap();
+        match guard.as_ref() {
+            Some((_gen, tx)) => tx.send(env).map_err(|e| e.to_string()),
+            None => Err("no active connection inject channel".to_string()),
+        }
+    }
+
     /// Wait until at least `n` `AppToolResponse` envelopes have been received,
     /// then return all of them. Returns `None` on timeout.
     pub async fn wait_for_app_tool_responses(

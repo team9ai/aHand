@@ -29,9 +29,11 @@ message AppToolRequest {
 
 // AppToolError - structured failure for one invocation; code is machine-readable, message is a human-readable remediation hint.
 message AppToolError {
-  string code    = 1; // TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE | APPROVAL_DENIED
-                      // | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT | HANDLER_PANIC
-                      // | HANDLER_ERROR | CONCURRENCY_LIMIT
+  // Well-known daemon codes:
+  // TOOL_NOT_FOUND | INVALID_ARGS | INVALID_CONTEXT | SESSION_INACTIVE
+  // | APPROVAL_DENIED | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT
+  // | HANDLER_PANIC | HANDLER_ERROR | CONCURRENCY_LIMIT
+  string code    = 1;
   string message = 2; // human-readable, host-neutral remediation hint
 }
 

@@ -19,7 +19,7 @@ mod public_api;
 pub use ahand_protocol::ApprovalRequest;
 pub use device_identity::DeviceIdentity;
 pub use public_api::{
-    AppToolDef, AppToolError, AppToolHandler, ApprovalSubscription, DaemonConfig,
-    DaemonConfigBuilder, DaemonHandle, DaemonStatus, ErrorKind, SessionMode,
-    load_or_create_identity, spawn,
+    AppToolArgsHandler, AppToolDef, AppToolError, AppToolHandler, AppToolInvocation,
+    ApprovalSubscription, DaemonConfig, DaemonConfigBuilder, DaemonHandle, DaemonStatus, ErrorKind,
+    SessionMode, args_only_handler, load_or_create_identity, spawn,
 };

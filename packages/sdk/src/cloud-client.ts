@@ -1934,10 +1934,12 @@ export class CloudClient {
    * Hub-level errors (auth, offline, timeout) throw `CloudClientError`.
    * Daemon-level failures surface as `CloudClientError("app_tool_error")`
    * with the daemon error code in `jobErrorCode`. The well-known daemon
-   * error codes are: `TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE |
-   * APPROVAL_DENIED | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT |
-   * HANDLER_PANIC | CONCURRENCY_LIMIT`. Handler-supplied codes pass
-   * through verbatim; `HANDLER_ERROR` is only the empty-code fallback.
+   * error codes are: `TOOL_NOT_FOUND | INVALID_ARGS | INVALID_CONTEXT |
+   * SESSION_INACTIVE | APPROVAL_DENIED | APPROVAL_TIMEOUT |
+   * EXECUTION_TIMEOUT | HANDLER_PANIC | HANDLER_ERROR |
+   * CONCURRENCY_LIMIT`.
+   * Handler-supplied codes pass through verbatim; `HANDLER_ERROR` is only
+   * the empty-code fallback.
    * Do not treat this set as closed — future daemon versions may add
    * codes. See `proto/ahand/v1/app_tool.proto` comments for details.
    *

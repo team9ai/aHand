@@ -47,11 +47,39 @@ pub struct AppToolError {
     pub message: String,
 }
 
+// Bin target never constructs this directly; AppToolInvocation is consumed by
+// embedder-registered handlers through the lib API.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct AppToolInvocation {
+    pub tool_call_id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+    /// Daemon-clamped execution budget delivered to the handler. For
+    /// approval-gated calls this may be the remaining budget after approval
+    /// wait, not the original request timeout.
+    pub timeout_ms: u32,
+    pub context: Option<serde_json::Value>,
+}
+
+#[allow(dead_code)]
 pub type AppToolHandler = Arc<
+    dyn Fn(AppToolInvocation) -> BoxFuture<'static, Result<serde_json::Value, AppToolError>>
+        + Send
+        + Sync,
+>;
+
+#[allow(dead_code)]
+pub type AppToolArgsHandler = Arc<
     dyn Fn(serde_json::Value) -> BoxFuture<'static, Result<serde_json::Value, AppToolError>>
         + Send
         + Sync,
 >;
+
+#[allow(dead_code)]
+pub fn args_only_handler(handler: AppToolArgsHandler) -> AppToolHandler {
+    Arc::new(move |invocation: AppToolInvocation| handler(invocation.args))
+}
 
 #[derive(Debug, Clone)]
 pub struct CompletedAppToolCall {
@@ -279,7 +307,7 @@ mod tests {
     use serde_json::json;
 
     fn make_handler() -> AppToolHandler {
-        Arc::new(|_args| Box::pin(async move { Ok(json!({"ok": true})) }))
+        Arc::new(|_invocation| Box::pin(async move { Ok(json!({"ok": true})) }))
     }
 
     fn make_def(name: &str) -> AppToolDef {

@@ -47,12 +47,14 @@ export interface AppToolRequest {
 
 /** AppToolError - structured failure for one invocation; code is machine-readable, message is a human-readable remediation hint. */
 export interface AppToolError {
-  /** TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE | APPROVAL_DENIED */
-  code: string;
   /**
-   * | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT | HANDLER_PANIC
-   * | HANDLER_ERROR | CONCURRENCY_LIMIT
+   * Well-known daemon codes:
+   * TOOL_NOT_FOUND | INVALID_ARGS | INVALID_CONTEXT | SESSION_INACTIVE
+   * | APPROVAL_DENIED | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT
+   * | HANDLER_PANIC | HANDLER_ERROR | CONCURRENCY_LIMIT
    */
+  code: string;
+  /** human-readable, host-neutral remediation hint */
   message: string;
 }
 
