@@ -32,7 +32,7 @@ use crate::registry::JobRegistry;
 use crate::sandbox::{
     CommitResult, FileVersion, HostFileRef, NetworkPolicy, PermissionSnapshot,
     RegisterVersionRequest, RegisteredExecEnvironment, RuntimeExecuteRequest, RuntimeExecuteResult,
-    RuntimeProviderConfig, SandboxExecRequest, SandboxExecResult, SandboxFile,
+    RuntimeProviderConfig, SandboxCommand, SandboxExecRequest, SandboxExecResult, SandboxFile,
     SandboxPermissionMode, SandboxResult, SandboxSessionConfig, file_lifecycle, path_policy,
     registry::SandboxRegistry,
     runner::{self, PlatformExecuteRequest, RuntimeSandboxPolicy},
@@ -528,7 +528,7 @@ impl DaemonHandle {
         self.execute_sandbox_command(
             session_id,
             SandboxExecRequest {
-                command,
+                command: SandboxCommand::Argv { command },
                 cwd: request.cwd,
                 env,
                 timeout: request.timeout.or(Some(provider.default_timeout)),
@@ -608,9 +608,6 @@ pub(crate) async fn execute_sandbox_command_with_registry(
         env: request_env,
         timeout: request_timeout,
     } = request;
-    let (program, args) = command.split_first().ok_or_else(|| {
-        crate::sandbox::SandboxError::invalid_command("sandbox command must not be empty")
-    })?;
 
     std::fs::create_dir_all(&workspace_root).map_err(|e| {
         crate::sandbox::SandboxError::unavailable(format!(
@@ -627,7 +624,7 @@ pub(crate) async fn execute_sandbox_command_with_registry(
             ))
         })?,
     };
-    let executable = runner::resolve_executable(program, &exec_env.path_entries)?;
+    let command = runner::command_argv_from_sandbox_command(&command)?;
     let mut env = exec_env.env;
     merge_path_entries(&mut env, &exec_env.path_entries);
     env.extend(request_env);
@@ -639,8 +636,7 @@ pub(crate) async fn execute_sandbox_command_with_registry(
     };
 
     runner::execute(PlatformExecuteRequest {
-        executable,
-        args: args.to_vec(),
+        command,
         cwd,
         env,
         timeout,
@@ -1237,7 +1233,7 @@ mod tests {
             .execute_sandbox_command(
                 "session-1",
                 SandboxExecRequest {
-                    command: vec![],
+                    command: SandboxCommand::Argv { command: vec![] },
                     cwd: None,
                     env: HashMap::new(),
                     timeout: Some(Duration::from_secs(1)),
@@ -1247,6 +1243,48 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code, "INVALID_COMMAND");
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_sandbox_command_accepts_shell_command_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity_dir = temp.path().join("identity");
+        let workspace_root = temp.path().join("sandbox");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+            .heartbeat_interval(Duration::from_millis(50))
+            .build();
+        let handle = spawn(cfg).await.unwrap();
+        handle
+            .create_sandbox_session(SandboxSessionConfig {
+                session_id: "session-1".to_string(),
+                permission_mode: SandboxPermissionMode::Readonly,
+                workspace_root,
+                network: NetworkPolicy::Enabled,
+            })
+            .await
+            .unwrap();
+
+        let result = handle
+            .execute_sandbox_command(
+                "session-1",
+                SandboxExecRequest {
+                    command: SandboxCommand::Shell {
+                        cmd: "echo ok".to_string(),
+                    },
+                    cwd: None,
+                    env: HashMap::new(),
+                    timeout: Some(Duration::from_secs(5)),
+                },
+            )
+            .await;
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(result.unwrap().stdout.trim(), "ok");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(result.unwrap_err().code, "SANDBOX_UNAVAILABLE");
+
         handle.shutdown().await.unwrap();
     }
 

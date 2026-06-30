@@ -13,7 +13,8 @@ use crate::sandbox::{
     registry::SandboxRegistry,
     types::{
         CommitResult, FileVersion, HostFileRef, RegisterVersionRequest, RuntimeExecuteResult,
-        SandboxError, SandboxExecRequest, SandboxExecResult, SandboxFile, SandboxResult,
+        SandboxCommand, SandboxError, SandboxExecRequest, SandboxExecResult, SandboxFile,
+        SandboxResult,
     },
 };
 
@@ -228,7 +229,7 @@ impl SandboxToolProvider {
             .resolver
             .resolve(&invocation)
             .map_err(app_tool_error_from_sandbox)?;
-        let command = require_non_empty_string_array_arg(&invocation.args, "command")?;
+        let command = parse_sandbox_command_arg(&invocation.args)?;
         let cwd = optional_string_arg(&invocation.args, "cwd")?.map(PathBuf::from);
         let env = optional_string_map_arg(&invocation.args, "env")?;
         let timeout = optional_timeout_arg(&invocation.args, "timeoutSeconds")?;
@@ -256,7 +257,9 @@ impl SandboxToolProvider {
         let args = require_string_array_arg(&invocation.args, "args")?;
         let cwd = optional_string_arg(&invocation.args, "cwd")?.map(PathBuf::from);
         let timeout = optional_timeout_arg(&invocation.args, "timeoutSeconds")?;
-        let command = std::iter::once("node".to_string()).chain(args).collect();
+        let command = SandboxCommand::Argv {
+            command: std::iter::once("node".to_string()).chain(args).collect(),
+        };
         let result = self
             .execute_command(
                 &context.session_id,
@@ -399,6 +402,26 @@ pub fn require_non_empty_string_array_arg(
     Ok(items)
 }
 
+fn parse_sandbox_command_arg(args: &Value) -> Result<SandboxCommand, AppToolError> {
+    let has_cmd = args.get("cmd").is_some();
+    let has_command = args.get("command").is_some();
+
+    match (has_cmd, has_command) {
+        (true, false) => {
+            let cmd = require_string_arg(args, "cmd")?;
+            if cmd.trim().is_empty() {
+                return Err(invalid_arg("cmd", "must not be empty"));
+            }
+            Ok(SandboxCommand::Shell { cmd })
+        }
+        (false, true) => Ok(SandboxCommand::Argv {
+            command: require_non_empty_string_array_arg(args, "command")?,
+        }),
+        (true, true) => Err(invalid_arg("cmd", "provide exactly one of cmd or command")),
+        (false, false) => Err(invalid_arg("cmd", "provide exactly one of cmd or command")),
+    }
+}
+
 pub fn optional_string_map_arg(
     args: &Value,
     name: &str,
@@ -525,6 +548,10 @@ fn run_command_def(name: &'static str) -> AppToolDef {
         input_schema: json!({
             "type": "object",
             "properties": {
+                "cmd": {
+                    "type": "string",
+                    "minLength": 1
+                },
                 "command": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -541,7 +568,10 @@ fn run_command_def(name: &'static str) -> AppToolDef {
                     "maximum": 120
                 }
             },
-            "required": ["command"],
+            "oneOf": [
+                { "required": ["cmd"], "not": { "required": ["command"] } },
+                { "required": ["command"], "not": { "required": ["cmd"] } }
+            ],
             "additionalProperties": false
         }),
         requires_approval: false,
@@ -620,7 +650,8 @@ mod tests {
     use crate::app_tool_registry::AppToolInvocation;
     use crate::sandbox::registry::SandboxRegistry;
     use crate::sandbox::types::{
-        HostFileRef, NetworkPolicy, SandboxExecRequest, SandboxPermissionMode, SandboxSessionConfig,
+        HostFileRef, NetworkPolicy, SandboxCommand, SandboxExecRequest, SandboxPermissionMode,
+        SandboxSessionConfig,
     };
 
     fn provider(include_compat_aliases: bool) -> SandboxToolProvider {
@@ -842,9 +873,129 @@ mod tests {
 
         assert_eq!(result["exitCode"], json!(0));
         let captured: SandboxExecRequest = captured_exec.lock().await.clone().unwrap();
-        assert_eq!(captured.command, vec!["node", "script.js"]);
+        assert_eq!(
+            captured.command,
+            SandboxCommand::Argv {
+                command: vec!["node".to_string(), "script.js".to_string()]
+            }
+        );
         assert_eq!(captured.cwd, Some(PathBuf::from("workspace")));
         assert_eq!(captured.timeout, Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn run_command_accepts_shell_cmd_request() {
+        let captured_exec = Arc::new(AsyncMutex::new(None));
+        let provider = SandboxToolProvider::new_for_test_with_exec_capture(
+            Arc::new(AsyncMutex::new(SandboxRegistry::default())),
+            Arc::new(FixedSandboxInvocationResolver::new("session-1")),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+            Arc::clone(&captured_exec),
+        );
+
+        let result = handler(&provider, "run_command")(invocation(
+            json!({
+                "cmd": "echo ok",
+                "cwd": "workspace",
+                "env": { "EXAMPLE": "1" },
+                "timeoutSeconds": 7
+            }),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(result["exitCode"], json!(0));
+        let captured: SandboxExecRequest = captured_exec.lock().await.clone().unwrap();
+        assert_eq!(
+            captured.command,
+            SandboxCommand::Shell {
+                cmd: "echo ok".to_string()
+            }
+        );
+        assert_eq!(captured.cwd, Some(PathBuf::from("workspace")));
+        assert_eq!(captured.env["EXAMPLE"], "1");
+        assert_eq!(captured.timeout, Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn run_command_accepts_legacy_argv_request() {
+        let captured_exec = Arc::new(AsyncMutex::new(None));
+        let provider = SandboxToolProvider::new_for_test_with_exec_capture(
+            Arc::new(AsyncMutex::new(SandboxRegistry::default())),
+            Arc::new(FixedSandboxInvocationResolver::new("session-1")),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+            Arc::clone(&captured_exec),
+        );
+
+        handler(&provider, "sandbox_exec")(invocation(
+            json!({"command": ["python", "-c", "print('ok')"]}),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap();
+
+        let captured: SandboxExecRequest = captured_exec.lock().await.clone().unwrap();
+        assert_eq!(
+            captured.command,
+            SandboxCommand::Argv {
+                command: vec![
+                    "python".to_string(),
+                    "-c".to_string(),
+                    "print('ok')".to_string(),
+                ]
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_cmd_and_command_together() {
+        let captured_exec = Arc::new(AsyncMutex::new(None));
+        let provider = SandboxToolProvider::new_for_test_with_exec_capture(
+            Arc::new(AsyncMutex::new(SandboxRegistry::default())),
+            Arc::new(FixedSandboxInvocationResolver::new("session-1")),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+            Arc::clone(&captured_exec),
+        );
+
+        let err = handler(&provider, "run_command")(invocation(
+            json!({"cmd": "echo ok", "command": ["echo", "ok"]}),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, "INVALID_ARGUMENT");
+        assert!(captured_exec.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_command_rejects_missing_cmd_and_command() {
+        let captured_exec = Arc::new(AsyncMutex::new(None));
+        let provider = SandboxToolProvider::new_for_test_with_exec_capture(
+            Arc::new(AsyncMutex::new(SandboxRegistry::default())),
+            Arc::new(FixedSandboxInvocationResolver::new("session-1")),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+            Arc::clone(&captured_exec),
+        );
+
+        let err = handler(&provider, "run_command")(invocation(
+            json!({"cwd": "workspace"}),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code, "INVALID_ARGUMENT");
+        assert!(captured_exec.lock().await.is_none());
     }
 
     #[tokio::test]

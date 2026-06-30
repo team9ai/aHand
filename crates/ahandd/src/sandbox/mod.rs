@@ -13,6 +13,6 @@ pub use tool_provider::{
 pub use types::{
     CommitResult, FileVersion, FileVersionStatus, HostFileRef, NetworkPolicy, PermissionSnapshot,
     RegisterVersionRequest, RegisteredExecEnvironment, RuntimeExecuteRequest, RuntimeExecuteResult,
-    RuntimeProviderConfig, SandboxError, SandboxExecRequest, SandboxExecResult, SandboxFile,
-    SandboxPermissionMode, SandboxResult, SandboxSessionConfig,
+    RuntimeProviderConfig, SandboxCommand, SandboxError, SandboxExecRequest, SandboxExecResult,
+    SandboxFile, SandboxPermissionMode, SandboxResult, SandboxSessionConfig,
 };

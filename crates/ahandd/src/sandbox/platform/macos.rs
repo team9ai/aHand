@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::path::Path;
 use std::process::Stdio;
 
 use tokio::io::AsyncReadExt;
@@ -18,6 +17,8 @@ const SYSTEM_READONLY_ROOTS: &[&str] = &[
     "/usr/libexec",
     "/usr/sbin",
     "/usr/share",
+    "/opt/homebrew",
+    "/usr/local",
     "/System/Library/CoreServices",
     "/System/Library/Extensions",
     "/System/Library/Frameworks",
@@ -34,6 +35,8 @@ const SYSTEM_EXECUTABLE_ROOTS: &[&str] = &[
     "/usr/lib",
     "/usr/libexec",
     "/usr/sbin",
+    "/opt/homebrew",
+    "/usr/local",
     "/System/Library/Extensions",
     "/System/Library/Frameworks",
     "/System/Library/PrivateFrameworks",
@@ -43,8 +46,13 @@ const SYSTEM_EXECUTABLE_ROOTS: &[&str] = &[
 ];
 
 pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
+    if request.command.is_empty() {
+        return Err(SandboxError::invalid_command(
+            "sandbox command must not be empty",
+        ));
+    }
     let policy = render_policy(&request.policy);
-    let args = sandbox_exec_args(policy, &request.executable, &request.args);
+    let args = sandbox_exec_args(policy, &request.command);
     let mut command = Command::new(SANDBOX_EXEC);
     command
         .args(args)
@@ -102,14 +110,13 @@ pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeEx
     })
 }
 
-fn sandbox_exec_args(policy: String, executable: &Path, args: &[String]) -> Vec<OsString> {
+fn sandbox_exec_args(policy: String, command: &[String]) -> Vec<OsString> {
     let mut argv = vec![
         OsString::from("-p"),
         OsString::from(policy),
         OsString::from("--"),
-        executable.as_os_str().to_os_string(),
     ];
-    argv.extend(args.iter().map(OsString::from));
+    argv.extend(command.iter().map(OsString::from));
     argv
 }
 
@@ -204,8 +211,11 @@ mod tests {
     fn sandbox_exec_argv_separates_policy_from_sandboxed_command() {
         let argv = sandbox_exec_args(
             "(version 1)".to_string(),
-            &PathBuf::from("/runtime/python/bin/python"),
-            &["-c".to_string(), "print('ok')".to_string()],
+            &[
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "echo ok".to_string(),
+            ],
         );
         let argv = argv
             .iter()
@@ -215,9 +225,9 @@ mod tests {
         assert_eq!(argv[0], "-p");
         assert_eq!(argv[1], "(version 1)");
         assert_eq!(argv[2], "--");
-        assert_eq!(argv[3], "/runtime/python/bin/python");
+        assert_eq!(argv[3], "/bin/sh");
         assert_eq!(argv[4], "-c");
-        assert_eq!(argv[5], "print('ok')");
+        assert_eq!(argv[5], "echo ok");
     }
 
     #[tokio::test]
@@ -225,8 +235,7 @@ mod tests {
     async fn macos_runtime_denies_outside_read() {
         let temp = tempfile::tempdir().unwrap();
         let result = execute(PlatformExecuteRequest {
-            executable: PathBuf::from("/bin/sh"),
-            args: vec!["-c".into(), "/bin/cat /etc/passwd".into()],
+            command: vec!["/bin/sh".into(), "-c".into(), "/bin/cat /etc/passwd".into()],
             cwd: temp.path().to_path_buf(),
             env: HashMap::new(),
             timeout: Duration::from_secs(5),
