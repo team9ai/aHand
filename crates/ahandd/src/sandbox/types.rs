@@ -80,8 +80,14 @@ pub struct RuntimeExecuteRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SandboxCommand {
+    Shell { cmd: String },
+    Argv { command: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxExecRequest {
-    pub command: Vec<String>,
+    pub command: SandboxCommand,
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub timeout: Option<Duration>,
@@ -248,17 +254,50 @@ mod tests {
     #[test]
     fn sandbox_exec_request_keeps_command_cwd_env_and_timeout() {
         let request = SandboxExecRequest {
-            command: vec![
-                "python".to_string(),
-                "-c".to_string(),
-                "print('ok')".to_string(),
-            ],
+            command: SandboxCommand::Argv {
+                command: vec![
+                    "python".to_string(),
+                    "-c".to_string(),
+                    "print('ok')".to_string(),
+                ],
+            },
             cwd: Some(PathBuf::from("workspace")),
             env: HashMap::from([("EXAMPLE".to_string(), "1".to_string())]),
             timeout: Some(Duration::from_secs(7)),
         };
 
-        assert_eq!(request.command[0], "python");
+        assert_eq!(
+            request.command,
+            SandboxCommand::Argv {
+                command: vec![
+                    "python".to_string(),
+                    "-c".to_string(),
+                    "print('ok')".to_string(),
+                ]
+            }
+        );
+        assert_eq!(request.cwd, Some(PathBuf::from("workspace")));
+        assert_eq!(request.env["EXAMPLE"], "1");
+        assert_eq!(request.timeout, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn sandbox_exec_request_keeps_shell_command_cwd_env_and_timeout() {
+        let request = SandboxExecRequest {
+            command: SandboxCommand::Shell {
+                cmd: "echo ok".to_string(),
+            },
+            cwd: Some(PathBuf::from("workspace")),
+            env: HashMap::from([("EXAMPLE".to_string(), "1".to_string())]),
+            timeout: Some(Duration::from_secs(7)),
+        };
+
+        assert_eq!(
+            request.command,
+            SandboxCommand::Shell {
+                cmd: "echo ok".to_string()
+            }
+        );
         assert_eq!(request.cwd, Some(PathBuf::from("workspace")));
         assert_eq!(request.env["EXAMPLE"], "1");
         assert_eq!(request.timeout, Some(Duration::from_secs(7)));

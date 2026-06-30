@@ -21,7 +21,7 @@ pub fn import_file(
     let input_dir = session
         .workspace_root
         .join("input")
-        .join(&file_ref.file_ref_id);
+        .join(safe_file_ref_dir(&file_ref.file_ref_id));
     fs::create_dir_all(&input_dir).map_err(|e| {
         SandboxError::unavailable(format!("failed to create sandbox input dir: {e}"))
     })?;
@@ -332,6 +332,10 @@ fn safe_file_name(name: &str) -> String {
         .to_string()
 }
 
+fn safe_file_ref_dir(file_ref_id: &str) -> String {
+    format!("file-ref-{}", sha256_hex(file_ref_id.as_bytes()))
+}
+
 fn sha256_file(path: &Path) -> SandboxResult<String> {
     let mut file = fs::File::open(path)
         .map_err(|e| SandboxError::unavailable(format!("failed to open file for hashing: {e}")))?;
@@ -435,6 +439,43 @@ mod tests {
                 .starts_with(root.canonicalize().unwrap().join("input"))
         );
         assert_eq!(file.sandbox_path.file_name().unwrap(), "source.txt");
+    }
+
+    #[test]
+    fn import_file_uses_safe_directory_for_hostile_file_ref_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sandbox");
+        let source = temp.path().join("source.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, "hello").unwrap();
+        let mut registry = registry_with_session(&root);
+
+        let file = import_file(
+            &mut registry,
+            "session-1",
+            HostFileRef {
+                file_ref_id: "../escape".to_string(),
+                source_path: source,
+                display_name: "source.txt".to_string(),
+                size: 5,
+                mtime_ms: None,
+                conversation_id: None,
+            },
+        )
+        .unwrap();
+
+        let input_root = root.canonicalize().unwrap().join("input");
+        assert!(file.sandbox_path.starts_with(&input_root));
+        assert_eq!(fs::read_to_string(&file.sandbox_path).unwrap(), "hello");
+        assert!(!root.join("escape/source.txt").exists());
+        assert_eq!(file.file_ref_id, "../escape");
+        assert!(
+            registry
+                .session("session-1")
+                .unwrap()
+                .host_file_refs
+                .contains_key("../escape")
+        );
     }
 
     #[test]

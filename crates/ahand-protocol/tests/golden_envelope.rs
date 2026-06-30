@@ -492,6 +492,7 @@ fn golden_app_tool_request() {
         name: "list_documents".into(),
         args_json: r#"{"limit":10}"#.into(),
         timeout_ms: 60_000,
+        context_json: r#"{"source":"coffice","scopeType":"run","runId":"run-golden"}"#.into(),
     }));
     assert_golden("app_tool_request", &env);
 }
