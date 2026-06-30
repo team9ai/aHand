@@ -23,15 +23,22 @@ use ahand_hub_store::webhook_delivery_store::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dashmap::{DashMap, mapref::entry::Entry};
-use governor::{Quota, RateLimiter, clock::DefaultClock, state::keyed::DefaultKeyedStateStore};
+use governor::{
+    Quota, RateLimiter, clock::MonotonicClock, middleware::NoOpMiddleware,
+    state::keyed::DefaultKeyedStateStore,
+};
 
 /// Control-plane rate limiter keyed by `external_user_id`.
 ///
 /// Default policy: **10 requests per second sustained, 100-request burst**
 /// — matches the plan's § 8 guidance. Tuning hooks (env vars, per-scope
 /// caps) can be added later without changing the type alias.
-pub type ControlPlaneRateLimiter =
-    RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
+pub type ControlPlaneRateLimiter = RateLimiter<
+    String,
+    DefaultKeyedStateStore<String>,
+    MonotonicClock,
+    NoOpMiddleware<std::time::Instant>,
+>;
 
 pub fn default_control_plane_rate_limiter() -> ControlPlaneRateLimiter {
     // Burst = 100 means we allow up to 100 rapid requests before
@@ -40,7 +47,9 @@ pub fn default_control_plane_rate_limiter() -> ControlPlaneRateLimiter {
     // widens the bucket.
     let quota = Quota::per_second(std::num::NonZeroU32::new(10).expect("10 is non-zero"))
         .allow_burst(std::num::NonZeroU32::new(100).expect("100 is non-zero"));
-    RateLimiter::keyed(quota)
+    let state = DefaultKeyedStateStore::<String>::default();
+    let clock = MonotonicClock::default();
+    RateLimiter::new(quota, state, &clock)
 }
 
 #[derive(Clone)]

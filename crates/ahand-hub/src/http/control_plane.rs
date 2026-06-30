@@ -51,7 +51,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use futures_util::Stream;
-use governor::clock::{Clock, DefaultClock};
+use governor::clock::{Clock, MonotonicClock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -135,7 +135,7 @@ fn control_rate_limit_ok(
         }
         Err(not_until) => {
             let wait_ms = not_until
-                .wait_time_from(DefaultClock::default().now())
+                .wait_time_from(MonotonicClock::default().now())
                 .as_millis();
             tracing::warn!(
                 endpoint,
