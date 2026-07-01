@@ -349,7 +349,7 @@ fn set_default_dacl(token: HANDLE, sids: &[*mut c_void]) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
     let new_dacl =
-        LocalMemory::new(new_dacl as *mut c_void).ok_or_else(|| io::Error::last_os_error())?;
+        LocalMemory::new(new_dacl as *mut c_void).ok_or_else(io::Error::last_os_error)?;
 
     let info = TokenDefaultDaclInfo {
         default_dacl: new_dacl.as_ptr() as *mut ACL,

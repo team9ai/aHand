@@ -301,10 +301,10 @@ fn dacl_mask_allows_with_inheritance(
             if (header.AceFlags & INHERIT_ONLY_ACE as u8) != 0 {
                 continue;
             }
-            if let Some(inheritance) = required_inheritance {
-                if !ace_has_requested_inheritance(header.AceFlags, inheritance) {
-                    continue;
-                }
+            if required_inheritance.is_some_and(|inheritance| {
+                !ace_has_requested_inheritance(header.AceFlags, inheritance)
+            }) {
+                continue;
             }
 
             let ace = &*(ace_ptr as *const ACCESS_ALLOWED_ACE);
@@ -393,7 +393,7 @@ fn ensure_allow_mask_aces_with_inheritance(
         return Err(io::Error::from_raw_os_error(code as i32));
     }
     let new_dacl =
-        LocalMemory::new(new_dacl as *mut c_void).ok_or_else(|| io::Error::last_os_error())?;
+        LocalMemory::new(new_dacl as *mut c_void).ok_or_else(io::Error::last_os_error)?;
 
     let wide_path = super::path::wide_null(path);
     let code = unsafe {
@@ -484,7 +484,7 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
     let new_dacl =
-        LocalMemory::new(new_dacl as *mut c_void).ok_or_else(|| io::Error::last_os_error())?;
+        LocalMemory::new(new_dacl as *mut c_void).ok_or_else(io::Error::last_os_error)?;
 
     let code = unsafe {
         SetSecurityInfo(
