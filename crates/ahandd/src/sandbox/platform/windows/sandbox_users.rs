@@ -54,16 +54,16 @@ pub(super) fn provision_sandbox_users(
     log: &mut File,
 ) -> Result<(), SetupFailure> {
     let users = provision_sandbox_user_accounts(log)?;
-    write_sandbox_users_state(
+    write_sandbox_users_state(SandboxUsersStateWrite {
         state_root,
-        OFFLINE_USERNAME,
-        &users.offline_password,
-        ONLINE_USERNAME,
-        &users.online_password,
+        offline_user: OFFLINE_USERNAME,
+        offline_pwd: &users.offline_password,
+        online_user: ONLINE_USERNAME,
+        online_pwd: &users.online_password,
         proxy_ports,
         allow_local_binding,
-        false,
-    )
+        hard_network_block: false,
+    })
 }
 
 #[cfg(not(windows))]
@@ -400,37 +400,41 @@ fn lookup_account_name_for_sid(sid_str: &str) -> Result<String, SetupFailure> {
         .to_string())
 }
 
+pub(super) struct SandboxUsersStateWrite<'a> {
+    pub(super) state_root: &'a Path,
+    pub(super) offline_user: &'a str,
+    pub(super) offline_pwd: &'a str,
+    pub(super) online_user: &'a str,
+    pub(super) online_pwd: &'a str,
+    pub(super) proxy_ports: &'a [u16],
+    pub(super) allow_local_binding: bool,
+    pub(super) hard_network_block: bool,
+}
+
 pub(super) fn write_sandbox_users_state(
-    state_root: &Path,
-    offline_user: &str,
-    offline_pwd: &str,
-    online_user: &str,
-    online_pwd: &str,
-    proxy_ports: &[u16],
-    allow_local_binding: bool,
-    hard_network_block: bool,
+    request: SandboxUsersStateWrite<'_>,
 ) -> Result<(), SetupFailure> {
-    let sandbox_dir = sandbox_dir(state_root);
+    let sandbox_dir = sandbox_dir(request.state_root);
     std::fs::create_dir_all(&sandbox_dir).map_err(|err| {
         SetupFailure::new(
             SetupErrorCode::SecretsWriteFailed,
             format!("failed to create {}: {err}", sandbox_dir.display()),
         )
     })?;
-    let secrets_dir = sandbox_secrets_dir(state_root);
+    let secrets_dir = sandbox_secrets_dir(request.state_root);
     std::fs::create_dir_all(&secrets_dir).map_err(|err| {
         SetupFailure::new(
             SetupErrorCode::SecretsWriteFailed,
             format!("failed to create {}: {err}", secrets_dir.display()),
         )
     })?;
-    let offline_blob = super::dpapi::protect(offline_pwd.as_bytes()).map_err(|err| {
+    let offline_blob = super::dpapi::protect(request.offline_pwd.as_bytes()).map_err(|err| {
         SetupFailure::new(
             SetupErrorCode::DpapiProtectFailed,
             format!("dpapi protect failed for offline user: {err}"),
         )
     })?;
-    let online_blob = super::dpapi::protect(online_pwd.as_bytes()).map_err(|err| {
+    let online_blob = super::dpapi::protect(request.online_pwd.as_bytes()).map_err(|err| {
         SetupFailure::new(
             SetupErrorCode::DpapiProtectFailed,
             format!("dpapi protect failed for online user: {err}"),
@@ -439,22 +443,22 @@ pub(super) fn write_sandbox_users_state(
     let users = SandboxUsersFile {
         version: SETUP_VERSION,
         offline: SandboxUserRecord {
-            username: offline_user.to_string(),
+            username: request.offline_user.to_string(),
             password: BASE64_STANDARD.encode(offline_blob),
         },
         online: SandboxUserRecord {
-            username: online_user.to_string(),
+            username: request.online_user.to_string(),
             password: BASE64_STANDARD.encode(online_blob),
         },
     };
     let marker = SetupMarker {
         version: SETUP_VERSION,
-        offline_username: offline_user.to_string(),
-        online_username: online_user.to_string(),
+        offline_username: request.offline_user.to_string(),
+        online_username: request.online_user.to_string(),
         created_at: None,
-        hard_network_block,
-        proxy_ports: proxy_ports.to_vec(),
-        allow_local_binding,
+        hard_network_block: request.hard_network_block,
+        proxy_ports: request.proxy_ports.to_vec(),
+        allow_local_binding: request.allow_local_binding,
     };
     let users_path = secrets_dir.join("sandbox_users.json");
     let marker_path = sandbox_dir.join("setup_marker.json");

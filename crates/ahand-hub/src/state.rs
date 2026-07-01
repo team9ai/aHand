@@ -48,7 +48,7 @@ pub fn default_control_plane_rate_limiter() -> ControlPlaneRateLimiter {
     let quota = Quota::per_second(std::num::NonZeroU32::new(10).expect("10 is non-zero"))
         .allow_burst(std::num::NonZeroU32::new(100).expect("100 is non-zero"));
     let state = DefaultKeyedStateStore::<String>::default();
-    let clock = MonotonicClock::default();
+    let clock = MonotonicClock;
     RateLimiter::new(quota, state, &clock)
 }
 

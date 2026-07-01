@@ -25,12 +25,12 @@ pub(super) fn capability_for_root(root: &Path) -> io::Result<CapabilitySid> {
     let canonical_root = root.canonicalize()?;
     let _guard = CAPABILITY_SID_FILE_LOCK
         .lock()
-        .map_err(|_| io::Error::new(io::ErrorKind::Other, "capability SID lock poisoned"))?;
-    capability_for_canonical_root(&canonical_root)
+        .map_err(|_| io::Error::other("capability SID lock poisoned"))?;
+    capability_for_canonical_root(canonical_root.as_path())
 }
 
 fn capability_for_canonical_root(canonical_root: &Path) -> io::Result<CapabilitySid> {
-    let path = cap_sid_file(&canonical_root);
+    let path = cap_sid_file(canonical_root);
 
     loop {
         if let Some(sid_string) = read_valid_cap_sid_file(&path)? {

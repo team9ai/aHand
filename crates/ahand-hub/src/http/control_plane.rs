@@ -134,9 +134,7 @@ fn control_rate_limit_ok(
             true
         }
         Err(not_until) => {
-            let wait_ms = not_until
-                .wait_time_from(MonotonicClock::default().now())
-                .as_millis();
+            let wait_ms = not_until.wait_time_from(MonotonicClock.now()).as_millis();
             tracing::warn!(
                 endpoint,
                 external_user_hash = %external_user_hash(external_user_id),

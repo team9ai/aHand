@@ -234,14 +234,16 @@ fn run_online_setup_inner(
         offline_proxy_settings_from_env(env, SandboxNetworkIdentity::Online);
     let users = super::sandbox_users::provision_sandbox_user_accounts(&mut log)?;
     super::sandbox_users::write_sandbox_users_state(
-        state_root,
-        OFFLINE_USERNAME,
-        &users.offline_password,
-        ONLINE_USERNAME,
-        &users.online_password,
-        &marker_network_settings.proxy_ports,
-        marker_network_settings.allow_local_binding,
-        false,
+        super::sandbox_users::SandboxUsersStateWrite {
+            state_root,
+            offline_user: OFFLINE_USERNAME,
+            offline_pwd: &users.offline_password,
+            online_user: ONLINE_USERNAME,
+            online_pwd: &users.online_password,
+            proxy_ports: &marker_network_settings.proxy_ports,
+            allow_local_binding: marker_network_settings.allow_local_binding,
+            hard_network_block: false,
+        },
     )?;
     super::identity::load_sandbox_creds_for_identity(
         SandboxNetworkIdentity::Online,
@@ -267,7 +269,7 @@ pub(super) fn run_offline_setup(
                 "offline hard network block marker is present but cannot be trusted without Windows firewall support",
             )
         });
-        return run_offline_setup_inner(env, state_root, loader_error);
+        run_offline_setup_inner(env, state_root, loader_error)
     }
 
     #[cfg(windows)]
@@ -343,14 +345,16 @@ fn run_offline_setup_inner(
     let offline_sid = super::sandbox_users::resolve_sandbox_user_sid(OFFLINE_USERNAME)?;
     super::firewall::ensure_offline_outbound_block(&offline_sid, &mut log)?;
     super::sandbox_users::write_sandbox_users_state(
-        state_root,
-        OFFLINE_USERNAME,
-        &users.offline_password,
-        ONLINE_USERNAME,
-        &users.online_password,
-        &offline_proxy_settings.proxy_ports,
-        offline_proxy_settings.allow_local_binding,
-        true,
+        super::sandbox_users::SandboxUsersStateWrite {
+            state_root,
+            offline_user: OFFLINE_USERNAME,
+            offline_pwd: &users.offline_password,
+            online_user: ONLINE_USERNAME,
+            online_pwd: &users.online_password,
+            proxy_ports: &offline_proxy_settings.proxy_ports,
+            allow_local_binding: offline_proxy_settings.allow_local_binding,
+            hard_network_block: true,
+        },
     )?;
     load_verified_offline_setup(env, state_root)
 }
