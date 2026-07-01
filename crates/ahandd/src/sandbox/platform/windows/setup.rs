@@ -134,6 +134,8 @@ const PROXY_ENV_KEYS: &[&str] = &[
     "wss_proxy",
 ];
 const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "AHAND_NETWORK_ALLOW_LOCAL_BINDING";
+#[cfg(all(windows, test))]
+const ALLOW_REAL_SETUP_IN_TESTS_ENV_KEY: &str = "AHAND_WINDOWS_SANDBOX_ALLOW_REAL_SETUP_IN_TESTS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WindowsNetworkContext {
@@ -202,6 +204,14 @@ fn run_online_setup_inner(
     state_root: &Path,
     loader_error: SetupFailure,
 ) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    #[cfg(test)]
+    if !real_setup_allowed_in_tests() {
+        return Err(test_real_setup_disabled_error(
+            "online sandbox user setup",
+            &loader_error,
+        ));
+    }
+
     if !is_elevated()? {
         return Err(SetupFailure::new(
             SetupErrorCode::ElevationRequired,
@@ -289,6 +299,11 @@ fn load_verified_offline_setup(
         state_root,
         env,
     )?;
+    #[cfg(test)]
+    if !real_setup_allowed_in_tests() {
+        return Ok(creds);
+    }
+
     let offline_sid = super::sandbox_users::resolve_sandbox_user_sid(OFFLINE_USERNAME)?;
     super::firewall::verify_offline_outbound_block(&offline_sid)?;
     Ok(creds)
@@ -311,6 +326,14 @@ fn run_offline_setup_inner(
     state_root: &Path,
     loader_error: SetupFailure,
 ) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    #[cfg(test)]
+    if !real_setup_allowed_in_tests() {
+        return Err(test_real_setup_disabled_error(
+            "offline hard network block setup",
+            &loader_error,
+        ));
+    }
+
     if !is_elevated()? {
         return Err(SetupFailure::new(
             SetupErrorCode::ElevationRequired,
@@ -405,6 +428,18 @@ fn is_elevated() -> Result<bool, SetupFailure> {
         }
         Ok(is_member != 0)
     }
+}
+
+#[cfg(all(windows, test))]
+fn real_setup_allowed_in_tests() -> bool {
+    std::env::var_os(ALLOW_REAL_SETUP_IN_TESTS_ENV_KEY).is_some()
+}
+
+#[cfg(all(windows, test))]
+fn test_real_setup_disabled_error(kind: &str, loader_error: &SetupFailure) -> SetupFailure {
+    SetupFailure::unavailable(format!(
+        "{kind} is disabled during unit tests; existing setup is missing or unverified: {loader_error}"
+    ))
 }
 
 pub(super) fn offline_proxy_settings_from_env(

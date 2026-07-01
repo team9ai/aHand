@@ -17,7 +17,7 @@ struct BlockRuleSpec<'a> {
     application_name: &'a str,
     service_name: &'a str,
     local_addresses: &'a str,
-    local_ports: &'a str,
+    local_ports: Option<&'a str>,
     interface_types: &'a str,
     remote_addresses: &'a str,
     remote_ports: &'a str,
@@ -131,10 +131,12 @@ fn verify_block_rule_readback(
             spec.local_addresses, readback.local_addresses
         ));
     }
-    if readback.local_ports != spec.local_ports {
+    if let Some(local_ports) = spec.local_ports
+        && readback.local_ports != local_ports
+    {
         mismatches.push(format!(
             "LocalPorts expected {}, got {}",
-            spec.local_ports, readback.local_ports
+            local_ports, readback.local_ports
         ));
     }
     if readback.interface_types != spec.interface_types {
@@ -202,7 +204,7 @@ pub(super) fn ensure_offline_outbound_block(
         application_name: "",
         service_name: "",
         local_addresses: "*",
-        local_ports: "*",
+        local_ports: None,
         interface_types: "All",
         remote_addresses: non_loopback_remote_addresses(),
         remote_ports: "*",
@@ -246,7 +248,7 @@ pub(super) fn verify_offline_outbound_block(offline_sid: &str) -> Result<(), Set
         application_name: "",
         service_name: "",
         local_addresses: "*",
-        local_ports: "*",
+        local_ports: None,
         interface_types: "All",
         remote_addresses: non_loopback_remote_addresses(),
         remote_ports: "*",
@@ -534,8 +536,10 @@ fn configure_rule(
             .map_err(|err| firewall_rule_error("SetServiceName", err))?;
         rule.SetLocalAddresses(&BSTR::from(spec.local_addresses))
             .map_err(|err| firewall_rule_error("SetLocalAddresses", err))?;
-        rule.SetLocalPorts(&BSTR::from(spec.local_ports))
-            .map_err(|err| firewall_rule_error("SetLocalPorts", err))?;
+        if let Some(local_ports) = spec.local_ports {
+            rule.SetLocalPorts(&BSTR::from(local_ports))
+                .map_err(|err| firewall_rule_error("SetLocalPorts", err))?;
+        }
         rule.SetInterfaceTypes(&BSTR::from(spec.interface_types))
             .map_err(|err| firewall_rule_error("SetInterfaceTypes", err))?;
         rule.SetRemoteAddresses(&BSTR::from(spec.remote_addresses))
@@ -638,7 +642,7 @@ mod tests {
             application_name: "",
             service_name: "",
             local_addresses: "*",
-            local_ports: "*",
+            local_ports: None,
             interface_types: "All",
             remote_addresses: non_loopback_remote_addresses(),
             remote_ports: "*",
