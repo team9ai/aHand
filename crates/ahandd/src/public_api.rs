@@ -37,6 +37,10 @@ use crate::sandbox::{
     registry::SandboxRegistry,
     runner::{self, PlatformExecuteRequest, RuntimeSandboxPolicy},
 };
+pub use crate::sandbox::{
+    MountAccess, MountScope, MountSource, MountSourceSnapshot, RegisteredSandboxMount,
+    SandboxMountSpec,
+};
 use crate::session::SessionManager;
 
 pub use crate::app_tool_registry::{
@@ -454,6 +458,36 @@ impl DaemonHandle {
         self.sandbox_registry.lock().await.create_session(config)
     }
 
+    pub async fn register_sandbox_mount(
+        &self,
+        session_id: &str,
+        spec: SandboxMountSpec,
+    ) -> SandboxResult<RegisteredSandboxMount> {
+        self.sandbox_registry
+            .lock()
+            .await
+            .register_mount(session_id, spec)
+    }
+
+    pub async fn unregister_sandbox_mount(
+        &self,
+        session_id: &str,
+        mount_id: &str,
+        scope: MountScope,
+    ) -> SandboxResult<()> {
+        self.sandbox_registry
+            .lock()
+            .await
+            .unregister_mount(session_id, mount_id, scope)
+    }
+
+    pub async fn list_sandbox_mounts(
+        &self,
+        session_id: &str,
+    ) -> SandboxResult<Vec<RegisteredSandboxMount>> {
+        self.sandbox_registry.lock().await.list_mounts(session_id)
+    }
+
     pub async fn update_sandbox_permission_mode(
         &self,
         session_id: &str,
@@ -532,6 +566,7 @@ impl DaemonHandle {
                 cwd: request.cwd,
                 env,
                 timeout: request.timeout.or(Some(provider.default_timeout)),
+                context: None,
             },
         )
         .await
@@ -593,21 +628,28 @@ pub(crate) async fn execute_sandbox_command_with_registry(
     session_id: &str,
     request: SandboxExecRequest,
 ) -> SandboxResult<SandboxExecResult> {
-    let (workspace_root, network, exec_env): (PathBuf, NetworkPolicy, RegisteredExecEnvironment) = {
-        let registry = sandbox_registry.lock().await;
-        let session = registry.session(session_id)?;
-        (
-            session.workspace_root.clone(),
-            session.network,
-            session.exec_environment(),
-        )
-    };
     let SandboxExecRequest {
         command,
         cwd,
         env: request_env,
         timeout: request_timeout,
+        context,
     } = request;
+    let (workspace_root, network, exec_env, reserved_mount_env): (
+        PathBuf,
+        NetworkPolicy,
+        RegisteredExecEnvironment,
+        HashSet<String>,
+    ) = {
+        let registry = sandbox_registry.lock().await;
+        let session = registry.session(session_id)?;
+        (
+            session.workspace_root.clone(),
+            session.network,
+            session.exec_environment_for(context.as_ref()),
+            session.registered_mount_env_vars().into_iter().collect(),
+        )
+    };
 
     std::fs::create_dir_all(&workspace_root).map_err(|e| {
         crate::sandbox::SandboxError::unavailable(format!(
@@ -625,13 +667,31 @@ pub(crate) async fn execute_sandbox_command_with_registry(
         })?,
     };
     let command = runner::command_argv_from_sandbox_command(&command)?;
+    let active_mount_env = exec_env
+        .mounts
+        .iter()
+        .filter_map(|mount| mount.env_var.clone())
+        .collect::<HashSet<_>>();
+    if let Some((key, _)) = request_env
+        .iter()
+        .find(|(key, _)| reserved_mount_env.contains(*key) && !active_mount_env.contains(*key))
+    {
+        return Err(crate::sandbox::SandboxError::mount_scope_mismatch(format!(
+            "sandbox mount env var '{key}' is not active for this invocation context"
+        )));
+    }
     let mut env = exec_env.env;
     merge_path_entries(&mut env, &exec_env.path_entries);
-    env.extend(request_env);
+    env.extend(
+        request_env
+            .into_iter()
+            .filter(|(key, _)| !active_mount_env.contains(key)),
+    );
     let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
     let policy = RuntimeSandboxPolicy {
         writable_root: workspace_root,
         readonly_roots: exec_env.readonly_roots,
+        mounts: exec_env.mounts,
         network,
     };
 
@@ -1225,6 +1285,7 @@ mod tests {
                 permission_mode: SandboxPermissionMode::Readonly,
                 workspace_root,
                 network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
             })
             .await
             .unwrap();
@@ -1237,6 +1298,7 @@ mod tests {
                     cwd: None,
                     env: HashMap::new(),
                     timeout: Some(Duration::from_secs(1)),
+                    context: None,
                 },
             )
             .await
@@ -1262,6 +1324,7 @@ mod tests {
                 permission_mode: SandboxPermissionMode::Readonly,
                 workspace_root,
                 network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
             })
             .await
             .unwrap();
@@ -1276,6 +1339,7 @@ mod tests {
                     cwd: None,
                     env: HashMap::new(),
                     timeout: Some(Duration::from_secs(5)),
+                    context: None,
                 },
             )
             .await;

@@ -14,7 +14,7 @@ use crate::sandbox::{
     types::{
         CommitResult, FileVersion, HostFileRef, RegisterVersionRequest, RuntimeExecuteResult,
         SandboxCommand, SandboxError, SandboxExecRequest, SandboxExecResult, SandboxFile,
-        SandboxResult,
+        SandboxInvocationContext, SandboxResult,
     },
 };
 
@@ -23,13 +23,6 @@ pub const CODE_SANDBOX_CONTEXT_REQUIRED: &str = "SANDBOX_CONTEXT_REQUIRED";
 #[derive(Debug, Clone, Copy)]
 pub struct SandboxToolProviderOptions {
     pub include_compat_aliases: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxInvocationContext {
-    pub session_id: String,
-    pub run_id: Option<String>,
-    pub scope_id: Option<String>,
 }
 
 pub trait SandboxInvocationResolver: Send + Sync {
@@ -80,6 +73,7 @@ impl SandboxInvocationResolver for FixedSandboxInvocationResolver {
             session_id,
             run_id: trusted_string(context, "runId"),
             scope_id: trusted_string(context, "scopeId"),
+            invocation_id: trusted_string(context, "invocationId"),
         })
     }
 }
@@ -233,14 +227,16 @@ impl SandboxToolProvider {
         let cwd = optional_string_arg(&invocation.args, "cwd")?.map(PathBuf::from);
         let env = optional_string_map_arg(&invocation.args, "env")?;
         let timeout = optional_timeout_arg(&invocation.args, "timeoutSeconds")?;
+        let session_id = context.session_id.clone();
         let result = self
             .execute_command(
-                &context.session_id,
+                &session_id,
                 SandboxExecRequest {
                     command,
                     cwd,
                     env,
                     timeout,
+                    context: Some(context),
                 },
             )
             .await
@@ -260,14 +256,16 @@ impl SandboxToolProvider {
         let command = SandboxCommand::Argv {
             command: std::iter::once("node".to_string()).chain(args).collect(),
         };
+        let session_id = context.session_id.clone();
         let result = self
             .execute_command(
-                &context.session_id,
+                &session_id,
                 SandboxExecRequest {
                     command,
                     cwd,
                     env: HashMap::new(),
                     timeout,
+                    context: Some(context),
                 },
             )
             .await
@@ -711,6 +709,7 @@ mod tests {
                 permission_mode,
                 workspace_root,
                 network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
             })
             .unwrap();
         Arc::new(AsyncMutex::new(registry))

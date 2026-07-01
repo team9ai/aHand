@@ -12,6 +12,16 @@ pub const CODE_UNKNOWN_VERSION: &str = "UNKNOWN_VERSION";
 pub const CODE_RUNTIME_NOT_REGISTERED: &str = "RUNTIME_NOT_REGISTERED";
 pub const CODE_INVALID_COMMAND: &str = "INVALID_COMMAND";
 pub const CODE_COMMAND_NOT_FOUND: &str = "COMMAND_NOT_FOUND";
+pub const CODE_MOUNT_SOURCE_NOT_FOUND: &str = "MOUNT_SOURCE_NOT_FOUND";
+pub const CODE_MOUNT_SOURCE_UNSUPPORTED: &str = "MOUNT_SOURCE_UNSUPPORTED";
+pub const CODE_MOUNT_TARGET_INVALID: &str = "MOUNT_TARGET_INVALID";
+pub const CODE_MOUNT_TARGET_CONFLICT: &str = "MOUNT_TARGET_CONFLICT";
+pub const CODE_MOUNT_ACCESS_DENIED: &str = "MOUNT_ACCESS_DENIED";
+pub const CODE_MOUNT_ALREADY_REGISTERED: &str = "MOUNT_ALREADY_REGISTERED";
+pub const CODE_MOUNT_NOT_REGISTERED: &str = "MOUNT_NOT_REGISTERED";
+pub const CODE_MOUNT_SCOPE_MISMATCH: &str = "MOUNT_SCOPE_MISMATCH";
+pub const CODE_MOUNT_ENV_CONFLICT: &str = "MOUNT_ENV_CONFLICT";
+pub const CODE_MOUNT_PLATFORM_UNSUPPORTED: &str = "MOUNT_PLATFORM_UNSUPPORTED";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -45,11 +55,69 @@ pub struct RuntimeProviderConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxMountSpec {
+    pub mount_id: String,
+    pub source: MountSource,
+    pub access: MountAccess,
+    pub scope: MountScope,
+    pub target: Option<PathBuf>,
+    pub env_var: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredSandboxMount {
+    pub mount_id: String,
+    pub source: MountSource,
+    pub access: MountAccess,
+    pub scope: MountScope,
+    pub target: PathBuf,
+    pub env_var: Option<String>,
+    pub source_snapshot: MountSourceSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountSource {
+    HostPath(PathBuf),
+    SandboxPath(PathBuf),
+    RuntimePath(PathBuf),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+    CopyOnWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MountScope {
+    Session,
+    Run { run_id: String },
+    Invocation { invocation_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountSourceSnapshot {
+    pub exists: bool,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxInvocationContext {
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub scope_id: Option<String>,
+    pub invocation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxSessionConfig {
     pub session_id: String,
     pub permission_mode: SandboxPermissionMode,
     pub workspace_root: PathBuf,
     pub network: NetworkPolicy,
+    pub mounts: Vec<SandboxMountSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +159,7 @@ pub struct SandboxExecRequest {
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub timeout: Option<Duration>,
+    pub context: Option<SandboxInvocationContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +177,7 @@ pub struct RegisteredExecEnvironment {
     pub path_entries: Vec<PathBuf>,
     pub readonly_roots: Vec<PathBuf>,
     pub env: HashMap<String, String>,
+    pub mounts: Vec<RegisteredSandboxMount>,
     pub default_timeout: Duration,
 }
 
@@ -195,6 +265,46 @@ impl SandboxError {
     pub fn unknown_version(message: impl Into<String>) -> Self {
         Self::new(CODE_UNKNOWN_VERSION, message)
     }
+
+    pub fn mount_source_not_found(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_SOURCE_NOT_FOUND, message)
+    }
+
+    pub fn mount_source_unsupported(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_SOURCE_UNSUPPORTED, message)
+    }
+
+    pub fn mount_target_invalid(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_TARGET_INVALID, message)
+    }
+
+    pub fn mount_target_conflict(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_TARGET_CONFLICT, message)
+    }
+
+    pub fn mount_access_denied(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_ACCESS_DENIED, message)
+    }
+
+    pub fn mount_already_registered(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_ALREADY_REGISTERED, message)
+    }
+
+    pub fn mount_not_registered(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_NOT_REGISTERED, message)
+    }
+
+    pub fn mount_scope_mismatch(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_SCOPE_MISMATCH, message)
+    }
+
+    pub fn mount_env_conflict(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_ENV_CONFLICT, message)
+    }
+
+    pub fn mount_platform_unsupported(message: impl Into<String>) -> Self {
+        Self::new(CODE_MOUNT_PLATFORM_UNSUPPORTED, message)
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +374,7 @@ mod tests {
             cwd: Some(PathBuf::from("workspace")),
             env: HashMap::from([("EXAMPLE".to_string(), "1".to_string())]),
             timeout: Some(Duration::from_secs(7)),
+            context: None,
         };
 
         assert_eq!(
@@ -290,6 +401,7 @@ mod tests {
             cwd: Some(PathBuf::from("workspace")),
             env: HashMap::from([("EXAMPLE".to_string(), "1".to_string())]),
             timeout: Some(Duration::from_secs(7)),
+            context: None,
         };
 
         assert_eq!(
@@ -309,12 +421,14 @@ mod tests {
             path_entries: vec![PathBuf::from("/runtime/python/bin")],
             readonly_roots: vec![PathBuf::from("/runtime/python")],
             env: HashMap::from([("PYTHONNOUSERSITE".to_string(), "1".to_string())]),
+            mounts: Vec::new(),
             default_timeout: Duration::from_secs(30),
         };
 
         assert_eq!(env.path_entries, vec![PathBuf::from("/runtime/python/bin")]);
         assert_eq!(env.readonly_roots, vec![PathBuf::from("/runtime/python")]);
         assert_eq!(env.env["PYTHONNOUSERSITE"], "1");
+        assert!(env.mounts.is_empty());
         assert_eq!(env.default_timeout, Duration::from_secs(30));
     }
 
@@ -325,6 +439,20 @@ mod tests {
 
         assert_eq!(invalid.code, "INVALID_COMMAND");
         assert_eq!(missing.code, "COMMAND_NOT_FOUND");
+    }
+
+    #[test]
+    fn mount_scope_mismatch_constructor_preserves_code() {
+        let err = SandboxError::mount_scope_mismatch("mount scope does not match invocation");
+
+        assert_eq!(err.code, "MOUNT_SCOPE_MISMATCH");
+    }
+
+    #[test]
+    fn mount_env_conflict_constructor_preserves_code() {
+        let err = SandboxError::mount_env_conflict("mount env var is already registered");
+
+        assert_eq!(err.code, "MOUNT_ENV_CONFLICT");
     }
 
     #[test]

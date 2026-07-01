@@ -175,6 +175,7 @@ mod tests {
         let policy = RuntimeSandboxPolicy {
             writable_root: PathBuf::from("/sessions/s1"),
             readonly_roots: vec![PathBuf::from("/runtimes/python")],
+            mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
         };
 
@@ -195,6 +196,7 @@ mod tests {
         let policy = RuntimeSandboxPolicy {
             writable_root: PathBuf::from("/sessions/s1"),
             readonly_roots: vec![PathBuf::from("/runtime/python")],
+            mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
         };
 
@@ -242,6 +244,7 @@ mod tests {
             policy: RuntimeSandboxPolicy {
                 writable_root: temp.path().to_path_buf(),
                 readonly_roots: vec![PathBuf::from("/bin")],
+                mounts: Vec::new(),
                 network: NetworkPolicy::Enabled,
             },
         })
