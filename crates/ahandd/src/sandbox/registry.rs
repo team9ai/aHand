@@ -122,8 +122,7 @@ fn mount_scope_active(scope: &MountScope, context: Option<&SandboxInvocationCont
     match scope {
         MountScope::Session => true,
         MountScope::Run { run_id } => {
-            context
-                .and_then(|context| context.run_id.as_deref().or(context.scope_id.as_deref()))
+            context.and_then(|context| context.run_id.as_deref().or(context.scope_id.as_deref()))
                 == Some(run_id.as_str())
         }
         MountScope::Invocation { invocation_id } => {
