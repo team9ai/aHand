@@ -68,8 +68,7 @@ mod tests {
         let state_root = temp.path().join("windows-sandbox");
         std::fs::create_dir_all(&workspace).unwrap();
         let request = PlatformExecuteRequest {
-            executable: PathBuf::from("tool.exe"),
-            args: vec![],
+            command: vec!["tool.exe".to_string()],
             cwd: workspace.clone(),
             env: HashMap::new(),
             timeout: Duration::from_secs(1),
@@ -97,8 +96,7 @@ mod tests {
         let state_root = temp.path().join("windows-sandbox");
         std::fs::create_dir_all(&workspace).unwrap();
         let request = PlatformExecuteRequest {
-            executable: PathBuf::from("tool.exe"),
-            args: vec![],
+            command: vec!["tool.exe".to_string()],
             cwd: workspace.clone(),
             env: HashMap::new(),
             timeout: Duration::from_secs(1),

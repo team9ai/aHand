@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use ahandd::sandbox::{
@@ -12,8 +11,7 @@ async fn proxy_only_is_unsupported_for_sandbox_execution() {
     let temp = tempfile::tempdir().unwrap();
 
     let err = runner::execute(PlatformExecuteRequest {
-        executable: PathBuf::from("ignored"),
-        args: vec![],
+        command: vec!["ignored".to_string()],
         cwd: temp.path().to_path_buf(),
         env: HashMap::new(),
         timeout: Duration::from_secs(1),

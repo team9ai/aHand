@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use super::platform;
 use super::types::{
-    NetworkPolicy, RuntimeExecuteResult, RuntimeProviderConfig, SandboxError, SandboxResult,
+    NetworkPolicy, RuntimeExecuteResult, RuntimeProviderConfig, SandboxCommand, SandboxError,
+    SandboxResult,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,8 +33,7 @@ impl RuntimeSandboxPolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformExecuteRequest {
-    pub executable: PathBuf,
-    pub args: Vec<String>,
+    pub command: Vec<String>,
     pub cwd: PathBuf,
     pub env: HashMap<String, String>,
     pub timeout: Duration,
@@ -48,96 +50,72 @@ pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeEx
     platform::execute(request).await
 }
 
-fn executable_candidates(program: &str) -> Vec<String> {
-    #[cfg(windows)]
-    {
-        let pathext = std::env::var("PATHEXT").ok();
-        windows_executable_candidates(program, pathext.as_deref())
-    }
-
-    #[cfg(not(windows))]
-    {
-        vec![program.to_string()]
-    }
-}
-
-#[cfg(any(windows, test))]
-fn windows_executable_candidates(program: &str, pathext: Option<&str>) -> Vec<String> {
-    if std::path::Path::new(program).extension().is_some() {
-        return vec![program.to_string()];
-    }
-
-    let mut candidates = vec![program.to_string()];
-    let pathext = pathext
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(".COM;.EXE;.BAT;.CMD");
-    for ext in pathext
-        .split(';')
-        .map(str::trim)
-        .filter(|ext| !ext.is_empty())
-    {
-        let suffix = if ext.starts_with('.') {
-            ext.to_string()
-        } else {
-            format!(".{ext}")
-        };
-        candidates.push(format!("{program}{suffix}"));
-    }
-    candidates
-}
-
-pub fn resolve_executable(program: &str, path_entries: &[PathBuf]) -> SandboxResult<PathBuf> {
-    if program.trim().is_empty() {
-        return Err(SandboxError::invalid_command(
-            "command program must not be empty",
-        ));
-    }
-
-    let program_path = PathBuf::from(program);
-    if program_path.is_absolute() {
-        let is_registered_entry_path = path_entries
-            .iter()
-            .any(|entry| program_path.starts_with(entry));
-        let resolved = program_path.canonicalize().map_err(|e| {
-            SandboxError::command_not_found(format!(
-                "failed to resolve sandbox command '{}': {e}",
-                program
-            ))
-        })?;
-        if is_registered_entry_path || path_entries.iter().any(|entry| resolved.starts_with(entry))
-        {
-            return Ok(resolved);
-        }
-        return Err(SandboxError::invalid_command(format!(
-            "absolute sandbox command '{}' is outside registered runtime PATH",
-            program
-        )));
-    }
-
-    if program.contains('/') || program.contains('\\') {
-        return Err(SandboxError::invalid_command(format!(
-            "relative command paths are not allowed: {program}"
-        )));
-    }
-
-    let candidates = executable_candidates(program);
-    for entry in path_entries {
-        for candidate in &candidates {
-            let candidate = entry.join(candidate);
-            if candidate.exists() {
-                return candidate.canonicalize().map_err(|e| {
-                    SandboxError::command_not_found(format!(
-                        "failed to resolve sandbox command '{}': {e}",
-                        candidate.display()
-                    ))
-                });
+pub fn command_argv_from_sandbox_command(command: &SandboxCommand) -> SandboxResult<Vec<String>> {
+    match command {
+        SandboxCommand::Shell { cmd } => shell_argv(cmd),
+        SandboxCommand::Argv { command } => {
+            if command
+                .first()
+                .map(|program| program.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return Err(SandboxError::invalid_command(
+                    "sandbox command must not be empty",
+                ));
             }
+            Ok(command.clone())
         }
     }
+}
 
-    Err(SandboxError::command_not_found(format!(
-        "sandbox command '{program}' was not found in registered runtime PATH"
-    )))
+#[cfg(unix)]
+fn shell_argv(cmd: &str) -> SandboxResult<Vec<String>> {
+    if cmd.trim().is_empty() {
+        return Err(SandboxError::invalid_command("cmd must not be empty"));
+    }
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|value| {
+            value.ends_with("/zsh") || value.ends_with("/bash") || value.ends_with("/sh")
+        })
+        .filter(|value| Path::new(value).exists())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    Ok(vec![shell, "-c".to_string(), cmd.to_string()])
+}
+
+#[cfg(windows)]
+fn shell_argv(cmd: &str) -> SandboxResult<Vec<String>> {
+    if cmd.trim().is_empty() {
+        return Err(SandboxError::invalid_command("cmd must not be empty"));
+    }
+    if let Some(shell) =
+        find_windows_shell("pwsh.exe").or_else(|| find_windows_shell("powershell.exe"))
+    {
+        return Ok(vec![
+            shell,
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            cmd.to_string(),
+        ]);
+    }
+    if let Some(shell) = find_windows_shell("cmd.exe") {
+        return Ok(vec![shell, "/c".to_string(), cmd.to_string()]);
+    }
+    Err(SandboxError::command_not_found(
+        "no Windows shell found for sandbox command",
+    ))
+}
+
+#[cfg(windows)]
+fn find_windows_shell(name: &str) -> Option<String> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -171,107 +149,60 @@ mod tests {
         assert_eq!(policy.network, NetworkPolicy::Enabled);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn resolve_executable_finds_bare_command_in_registered_path_entries() {
-        let temp = tempfile::tempdir().unwrap();
-        let bin = temp.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let python = bin.join("python");
-        std::fs::write(&python, "").unwrap();
+    fn shell_command_uses_posix_shell_c() {
+        let command = command_argv_from_sandbox_command(&SandboxCommand::Shell {
+            cmd: "echo ok".to_string(),
+        })
+        .unwrap();
 
-        let resolved = resolve_executable("python", std::slice::from_ref(&bin)).unwrap();
-
-        assert_eq!(resolved, python.canonicalize().unwrap());
-    }
-
-    #[test]
-    fn windows_executable_candidates_add_pathext_suffixes() {
-        let candidates = windows_executable_candidates("python", Some(".EXE;.CMD"));
-
-        assert_eq!(
-            candidates,
-            vec![
-                "python".to_string(),
-                "python.EXE".to_string(),
-                "python.CMD".to_string()
-            ]
+        assert_eq!(command.len(), 3);
+        assert_eq!(command[1], "-c");
+        assert_eq!(command[2], "echo ok");
+        assert!(
+            command[0].ends_with("/zsh")
+                || command[0].ends_with("/bash")
+                || command[0].ends_with("/sh")
         );
     }
 
     #[test]
-    fn windows_executable_candidates_preserve_explicit_extension() {
-        let candidates = windows_executable_candidates("node.exe", Some(".EXE;.CMD"));
+    fn argv_command_passes_through_without_runtime_resolution() {
+        let command = command_argv_from_sandbox_command(&SandboxCommand::Argv {
+            command: vec![
+                "python".to_string(),
+                "-c".to_string(),
+                "print('ok')".to_string(),
+            ],
+        })
+        .unwrap();
 
-        assert_eq!(candidates, vec!["node.exe".to_string()]);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn resolve_executable_finds_exe_suffix_from_registered_path_entries() {
-        let temp = tempfile::tempdir().unwrap();
-        let python = temp.path().join("python.exe");
-        std::fs::write(&python, "").unwrap();
-
-        let resolved = resolve_executable("python", &[temp.path().to_path_buf()]).unwrap();
-
-        assert_eq!(resolved, python.canonicalize().unwrap());
+        assert_eq!(command, vec!["python", "-c", "print('ok')"]);
     }
 
     #[test]
-    fn resolve_executable_rejects_unknown_bare_command() {
-        let temp = tempfile::tempdir().unwrap();
-        let err = resolve_executable("python", &[temp.path().to_path_buf()]).unwrap_err();
-
-        assert_eq!(err.code, "COMMAND_NOT_FOUND");
-    }
-
-    #[test]
-    fn resolve_executable_rejects_relative_program_paths() {
-        let err = resolve_executable("./python", &[PathBuf::from("/bin")]).unwrap_err();
+    fn empty_argv_command_is_invalid() {
+        let err = command_argv_from_sandbox_command(&SandboxCommand::Argv { command: vec![] })
+            .unwrap_err();
 
         assert_eq!(err.code, "INVALID_COMMAND");
     }
 
     #[test]
-    fn resolve_executable_rejects_absolute_program_outside_registered_path_entries() {
-        let temp = tempfile::tempdir().unwrap();
-        let allowed = temp.path().join("allowed");
-        let denied = temp.path().join("denied");
-        std::fs::create_dir_all(&allowed).unwrap();
-        std::fs::create_dir_all(&denied).unwrap();
-        let denied_program = denied.join("python");
-        std::fs::write(&denied_program, "").unwrap();
-
-        let err = resolve_executable(&denied_program.to_string_lossy(), &[allowed]).unwrap_err();
+    fn blank_shell_command_is_invalid() {
+        let err = command_argv_from_sandbox_command(&SandboxCommand::Shell {
+            cmd: "   ".to_string(),
+        })
+        .unwrap_err();
 
         assert_eq!(err.code, "INVALID_COMMAND");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn resolve_executable_allows_absolute_alias_under_registered_path_entry() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().unwrap();
-        let bin = temp.path().join("bin");
-        let target_dir = temp.path().join("target");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::create_dir_all(&target_dir).unwrap();
-        let target_program = target_dir.join("python3");
-        std::fs::write(&target_program, "").unwrap();
-        let alias = bin.join("python");
-        symlink(&target_program, &alias).unwrap();
-
-        let resolved = resolve_executable(&alias.to_string_lossy(), &[bin]).unwrap();
-
-        assert_eq!(resolved, target_program.canonicalize().unwrap());
     }
 
     #[tokio::test]
     async fn proxy_only_network_policy_is_rejected_before_platform_dispatch() {
         let request = PlatformExecuteRequest {
-            executable: PathBuf::from("ignored"),
-            args: vec![],
+            command: vec!["ignored".into()],
             cwd: PathBuf::from("."),
             env: HashMap::new(),
             timeout: Duration::from_secs(1),
@@ -292,8 +223,7 @@ mod tests {
     #[tokio::test]
     async fn unsupported_platform_fails_closed() {
         let request = PlatformExecuteRequest {
-            executable: PathBuf::from("/bin/echo"),
-            args: vec!["hello".into()],
+            command: vec!["/bin/echo".into(), "hello".into()],
             cwd: PathBuf::from("/tmp"),
             env: HashMap::new(),
             timeout: Duration::from_secs(1),

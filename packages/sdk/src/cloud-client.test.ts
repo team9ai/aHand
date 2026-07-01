@@ -2122,6 +2122,30 @@ describe("CloudClient.invokeAppTool", () => {
     expect("args" in body).toBe(false);
   });
 
+  it("happy path: context included when provided", async () => {
+    const { fn, calls } = mockFetch([
+      () => jsonResponse({ toolCallId: "tc-context", result: { ok: true } }),
+    ]);
+    const client = new CloudClient({ ...BASE_OPTS, fetch: fn });
+    await client.invokeAppTool("d", "run_command", undefined, {
+      context: {
+        source: "coffice",
+        scopeType: "run",
+        runId: "run-1",
+        sessionId: "session-1",
+      },
+      timeoutMs: 10_000,
+    });
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body.context).toEqual({
+      source: "coffice",
+      scopeType: "run",
+      runId: "run-1",
+      sessionId: "session-1",
+    });
+    expect(body.timeoutMs).toBe(10_000);
+  });
+
   it("happy path: returns null when result field is missing", async () => {
     const { fn } = mockFetch([
       () => jsonResponse({ toolCallId: "tc-004" }),

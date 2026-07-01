@@ -32,7 +32,9 @@
 //! follow-up; today's worker semantics rely on best-effort retries
 //! via fresh requests.
 
+use std::collections::hash_map::DefaultHasher;
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
 use ahand_hub_core::auth::ControlPlaneJwtClaims;
@@ -49,6 +51,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine as _;
 use futures_util::Stream;
+use governor::clock::{Clock, MonotonicClock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -113,6 +116,45 @@ fn header_bearer(value: &HeaderValue) -> Option<String> {
         .map(String::from)
 }
 
+fn control_rate_limit_ok(
+    state: &AppState,
+    external_user_id: &String,
+    endpoint: &'static str,
+) -> bool {
+    match state.control_rate_limiter.check_key(external_user_id) {
+        Ok(()) => {
+            if std::env::var_os("AHAND_HUB_RATE_LIMIT_TRACE").is_some() {
+                tracing::info!(
+                    endpoint,
+                    external_user_hash = %external_user_hash(external_user_id),
+                    external_user_len = external_user_id.len(),
+                    "control-plane rate-limit allow",
+                );
+            }
+            true
+        }
+        Err(not_until) => {
+            let wait_ms = not_until
+                .wait_time_from(MonotonicClock::default().now())
+                .as_millis();
+            tracing::warn!(
+                endpoint,
+                external_user_hash = %external_user_hash(external_user_id),
+                external_user_len = external_user_id.len(),
+                wait_ms,
+                "control-plane rate limited",
+            );
+            false
+        }
+    }
+}
+
+fn external_user_hash(external_user_id: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    external_user_id.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateJobRequest {
@@ -165,11 +207,7 @@ async fn create_job(
 
     // Rate-limit BEFORE the expensive ownership lookup so a storm of
     // bogus POSTs can't DOS the device store.
-    if state
-        .control_rate_limiter
-        .check_key(&claims.external_user_id)
-        .is_err()
-    {
+    if !control_rate_limit_ok(&state, &claims.external_user_id, "create_job") {
         return Err(ControlError::RateLimited);
     }
 
@@ -317,11 +355,7 @@ async fn stream_job(
     // to open unlimited concurrent SSE streams (each allocates a
     // broadcast::Receiver + an Arc handle) by hammering this
     // endpoint. Same budget as create_job — per-user token bucket.
-    if state
-        .control_rate_limiter
-        .check_key(&claims.external_user_id)
-        .is_err()
-    {
+    if !control_rate_limit_ok(&state, &claims.external_user_id, "stream_job") {
         return Err(ControlError::RateLimited);
     }
     let channels = state
@@ -396,11 +430,7 @@ async fn stream_job_output(
     if claims.scope != "jobs:execute" {
         return Err(ControlError::Forbidden);
     }
-    if state
-        .control_rate_limiter
-        .check_key(&claims.external_user_id)
-        .is_err()
-    {
+    if !control_rate_limit_ok(&state, &claims.external_user_id, "stream_job_output") {
         return Err(ControlError::RateLimited);
     }
 
@@ -497,11 +527,7 @@ async fn cancel_job(
     // Rate-limit BEFORE the job lookup: prevents a valid JWT from
     // spamming /cancel unbounded, which would otherwise fan out an
     // unbounded stream of CancelJob envelopes to the daemon.
-    if state
-        .control_rate_limiter
-        .check_key(&claims.external_user_id)
-        .is_err()
-    {
+    if !control_rate_limit_ok(&state, &claims.external_user_id, "cancel_job") {
         return Err(ControlError::RateLimited);
     }
     let channels = state
@@ -588,11 +614,7 @@ async fn get_device_app_tools(
 
     // Rate-limit BEFORE the expensive ownership lookup so a storm of
     // bogus GETs can't DOS the device store.
-    if state
-        .control_rate_limiter
-        .check_key(&claims.external_user_id)
-        .is_err()
-    {
+    if !control_rate_limit_ok(&state, &claims.external_user_id, "get_device_app_tools") {
         return Err(ControlError::RateLimited);
     }
 
@@ -890,11 +912,7 @@ pub async fn browser_command_control(
     // Per-user rate-limit BEFORE any DB / WS work, mirroring the jobs
     // handler. A storm of bogus POSTs from one tenant can't DOS the
     // device store or burn WS dispatch slots for other tenants.
-    if state
-        .control_rate_limiter
-        .check_key(&claims.external_user_id)
-        .is_err()
-    {
+    if !control_rate_limit_ok(&state, &claims.external_user_id, "browser_command_control") {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "RATE_LIMITED",
@@ -1051,11 +1069,7 @@ pub async fn control_files_upload_url(
     if body.device_id.is_empty() {
         return Err(ApiError::validation("device_id must not be empty"));
     }
-    if state
-        .control_rate_limiter
-        .check_key(&claims.external_user_id)
-        .is_err()
-    {
+    if !control_rate_limit_ok(&state, &claims.external_user_id, "control_files_upload_url") {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "RATE_LIMITED",
@@ -1116,11 +1130,7 @@ pub async fn control_files(
     // and browser handlers. A storm of bogus POSTs from one tenant
     // can't DOS the device store or burn WS dispatch slots for other
     // tenants.
-    if state
-        .control_rate_limiter
-        .check_key(&claims.external_user_id)
-        .is_err()
-    {
+    if !control_rate_limit_ok(&state, &claims.external_user_id, "control_files") {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "RATE_LIMITED",
@@ -1290,6 +1300,10 @@ pub struct InvokeAppToolRequest {
     /// Tool arguments as a JSON object. Defaults to `{}` when absent.
     #[serde(default)]
     pub args: Option<serde_json::Value>,
+    /// Trusted invocation context supplied by the control-plane caller.
+    /// Defaults to no context when absent.
+    #[serde(default)]
+    pub context: Option<serde_json::Value>,
     /// Hub-side timeout in milliseconds. Clamped to `[1_000, 300_000]`.
     /// Defaults to 60_000 (60 s) when absent or zero.
     #[serde(default)]
@@ -1381,14 +1395,17 @@ async fn invoke_app_tool(
             "args must be a JSON object".into(),
         ));
     }
+    if let Some(context) = &req.context
+        && !context.is_object()
+    {
+        return Err(ControlError::BadRequest(
+            "context must be a JSON object".into(),
+        ));
+    }
 
     // Rate-limit BEFORE the ownership lookup so storms can't DOS the
     // device store — same order as create_job.
-    if state
-        .control_rate_limiter
-        .check_key(&claims.external_user_id)
-        .is_err()
-    {
+    if !control_rate_limit_ok(&state, &claims.external_user_id, "invoke_app_tool") {
         return Err(ControlError::RateLimited);
     }
 
@@ -1438,6 +1455,12 @@ async fn invoke_app_tool(
         .as_ref()
         .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".into());
+    let context_json = req
+        .context
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|_| ControlError::BadRequest("context must be serializable JSON".into()))?;
 
     let timeout_ms = req.timeout_ms.unwrap_or(0); // 0 → service default
 
@@ -1455,6 +1478,7 @@ async fn invoke_app_tool(
             device_id: device.id.clone(),
             name: req.name.clone(),
             args_json,
+            context_json,
             timeout_ms,
         },
     )

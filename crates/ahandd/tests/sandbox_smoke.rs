@@ -10,7 +10,7 @@ use std::time::Duration;
 use ahandd::{
     DaemonConfig,
     sandbox::{
-        HostFileRef, NetworkPolicy, RegisterVersionRequest, RuntimeProviderConfig,
+        HostFileRef, NetworkPolicy, RegisterVersionRequest, RuntimeProviderConfig, SandboxCommand,
         SandboxExecRequest, SandboxPermissionMode, SandboxSessionConfig,
     },
 };
@@ -134,14 +134,16 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
         .execute_sandbox_command(
             "session-1",
             SandboxExecRequest {
-                command: vec![
-                    "python".to_string(),
-                    "-c".to_string(),
-                    format!(
-                        "from pathlib import Path; print(Path({:?}).read_text())",
-                        imported.sandbox_path.to_string_lossy()
-                    ),
-                ],
+                command: SandboxCommand::Argv {
+                    command: vec![
+                        "python".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "from pathlib import Path; print(Path({:?}).read_text())",
+                            imported.sandbox_path.to_string_lossy()
+                        ),
+                    ],
+                },
                 cwd: None,
                 env: HashMap::new(),
                 timeout: Some(Duration::from_secs(10)),
@@ -156,11 +158,13 @@ async fn coffice_sandbox_smoke_import_run_register_and_user_commit() {
         .execute_sandbox_command(
             "session-1",
             SandboxExecRequest {
-                command: vec![
-                    "node".to_string(),
-                    "-e".to_string(),
-                    "require('fs').writeFileSync('workspace/out.txt', 'changed')".to_string(),
-                ],
+                command: SandboxCommand::Argv {
+                    command: vec![
+                        "node".to_string(),
+                        "-e".to_string(),
+                        "require('fs').writeFileSync('workspace/out.txt', 'changed')".to_string(),
+                    ],
+                },
                 cwd: None,
                 env: HashMap::new(),
                 timeout: Some(Duration::from_secs(10)),
