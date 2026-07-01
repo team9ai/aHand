@@ -225,16 +225,15 @@ impl SandboxRegistry {
                 spec.mount_id
             )));
         }
-        if let Some(env_var) = &spec.env_var {
-            if session
+        if let Some(env_var) = &spec.env_var
+            && session
                 .mounts
                 .values()
                 .any(|mount| mount.env_var.as_deref() == Some(env_var.as_str()))
-            {
-                return Err(SandboxError::mount_env_conflict(format!(
-                    "sandbox mount env var '{env_var}' is already registered"
-                )));
-            }
+        {
+            return Err(SandboxError::mount_env_conflict(format!(
+                "sandbox mount env var '{env_var}' is already registered"
+            )));
         }
         let existing_targets = session
             .mounts

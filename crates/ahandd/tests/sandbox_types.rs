@@ -73,8 +73,8 @@ fn sandbox_types_preserve_registered_mount_resolution() {
         registered.target,
         PathBuf::from("/sandbox/workspace/mounts/runtime-cache")
     );
-    assert_eq!(registered.source_snapshot.exists, true);
-    assert_eq!(registered.source_snapshot.is_dir, true);
+    assert!(registered.source_snapshot.exists);
+    assert!(registered.source_snapshot.is_dir);
 }
 
 #[test]
