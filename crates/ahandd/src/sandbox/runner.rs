@@ -38,9 +38,15 @@ pub struct PlatformExecuteRequest {
     pub env: HashMap<String, String>,
     pub timeout: Duration,
     pub policy: RuntimeSandboxPolicy,
+    pub sandbox_state_root: PathBuf,
 }
 
 pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
+    if request.policy.network == NetworkPolicy::ProxyOnly {
+        return Err(SandboxError::unavailable(
+            "NetworkPolicy::ProxyOnly is not supported by the aHand sandbox yet",
+        ));
+    }
     platform::execute(request).await
 }
 
@@ -194,6 +200,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_only_network_policy_is_rejected_before_platform_dispatch() {
+        let request = PlatformExecuteRequest {
+            command: vec!["ignored".into()],
+            cwd: PathBuf::from("."),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(1),
+            policy: RuntimeSandboxPolicy {
+                writable_root: PathBuf::from("."),
+                readonly_roots: vec![],
+                network: NetworkPolicy::ProxyOnly,
+            },
+            sandbox_state_root: PathBuf::from(".ahand-sandbox-state"),
+        };
+
+        let err = execute(request).await.unwrap_err();
+
+        assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
+        assert!(err.message.contains("ProxyOnly"));
+    }
+
+    #[tokio::test]
     async fn unsupported_platform_fails_closed() {
         let request = PlatformExecuteRequest {
             command: vec!["/bin/echo".into(), "hello".into()],
@@ -205,6 +232,7 @@ mod tests {
                 readonly_roots: vec![],
                 network: NetworkPolicy::Enabled,
             },
+            sandbox_state_root: PathBuf::from("/tmp/.ahand-sandbox-state"),
         };
 
         let err = platform::unsupported::execute(request).await.unwrap_err();

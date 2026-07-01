@@ -244,6 +244,7 @@ mod tests {
                 readonly_roots: vec![PathBuf::from("/bin")],
                 network: NetworkPolicy::Enabled,
             },
+            sandbox_state_root: temp.path().join("windows-sandbox"),
         })
         .await
         .unwrap();

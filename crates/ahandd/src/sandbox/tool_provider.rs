@@ -89,6 +89,7 @@ pub struct SandboxToolProvider {
     registry: Arc<AsyncMutex<SandboxRegistry>>,
     resolver: Arc<dyn SandboxInvocationResolver>,
     options: SandboxToolProviderOptions,
+    sandbox_state_root: PathBuf,
     #[cfg(test)]
     captured_exec: Option<Arc<AsyncMutex<Option<SandboxExecRequest>>>>,
 }
@@ -99,10 +100,20 @@ impl SandboxToolProvider {
         resolver: Arc<dyn SandboxInvocationResolver>,
         options: SandboxToolProviderOptions,
     ) -> Self {
+        Self::new_with_sandbox_state_root(registry, resolver, options, default_sandbox_state_root())
+    }
+
+    pub fn new_with_sandbox_state_root(
+        registry: Arc<AsyncMutex<SandboxRegistry>>,
+        resolver: Arc<dyn SandboxInvocationResolver>,
+        options: SandboxToolProviderOptions,
+        sandbox_state_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             registry,
             resolver,
             options,
+            sandbox_state_root: sandbox_state_root.into(),
             #[cfg(test)]
             captured_exec: None,
         }
@@ -119,6 +130,7 @@ impl SandboxToolProvider {
             registry,
             resolver,
             options,
+            sandbox_state_root: default_sandbox_state_root(),
             captured_exec: Some(captured_exec),
         }
     }
@@ -340,11 +352,16 @@ impl SandboxToolProvider {
 
         crate::public_api::execute_sandbox_command_with_registry(
             Arc::clone(&self.registry),
+            self.sandbox_state_root.clone(),
             session_id,
             request,
         )
         .await
     }
+}
+
+fn default_sandbox_state_root() -> PathBuf {
+    std::env::temp_dir().join("ahand-windows-sandbox")
 }
 
 pub fn invalid_arg(argument: &str, message: impl Into<String>) -> AppToolError {
