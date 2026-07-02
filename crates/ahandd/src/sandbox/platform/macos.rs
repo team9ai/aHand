@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::io::AsyncReadExt;
@@ -45,12 +46,21 @@ const SYSTEM_EXECUTABLE_ROOTS: &[&str] = &[
     "/Library/Apple",
 ];
 
-pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
+pub async fn execute(mut request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
     if request.command.is_empty() {
         return Err(SandboxError::invalid_command(
             "sandbox command must not be empty",
         ));
     }
+    let writable_root = request.policy.writable_root.to_string_lossy().to_string();
+    request
+        .env
+        .entry("HOME".to_string())
+        .or_insert_with(|| writable_root.clone());
+    request
+        .env
+        .entry("TMPDIR".to_string())
+        .or_insert(writable_root);
     let policy = render_policy(&request.policy);
     let args = sandbox_exec_args(policy, &request.command);
     let mut command = Command::new(SANDBOX_EXEC);
@@ -137,10 +147,23 @@ pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
             "(allow file-map-executable (subpath \"{root}\"))\n"
         ));
     }
+    let mut literal_read_paths = Vec::new();
     for root in &policy.readonly_roots {
+        collect_read_literal_ancestors(&mut literal_read_paths, root);
         sbpl.push_str(&format!(
             "(allow file-read* (subpath \"{}\"))\n",
             escape_sbpl(&root.to_string_lossy())
+        ));
+        sbpl.push_str(&format!(
+            "(allow file-map-executable (subpath \"{}\"))\n",
+            escape_sbpl(&root.to_string_lossy())
+        ));
+    }
+    collect_read_literal_ancestors(&mut literal_read_paths, &policy.writable_root);
+    for path in literal_read_paths {
+        sbpl.push_str(&format!(
+            "(allow file-read* (literal \"{}\"))\n",
+            escape_sbpl(&path)
         ));
     }
     sbpl.push_str(&format!(
@@ -151,10 +174,51 @@ pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
         "(allow file-write* (subpath \"{}\"))\n",
         escape_sbpl(&policy.writable_root.to_string_lossy())
     ));
+    append_artifact_tool_socket_rules(&mut sbpl);
     if policy.network == NetworkPolicy::Enabled {
         sbpl.push_str("(allow network*)\n");
     }
     sbpl
+}
+
+fn collect_read_literal_ancestors(paths: &mut Vec<String>, path: &Path) {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::CurDir => continue,
+            Component::ParentDir => current.push(component.as_os_str()),
+            Component::Normal(part) => current.push(part),
+        }
+
+        let current = current.to_string_lossy();
+        if current == "/" || current.is_empty() {
+            continue;
+        }
+        push_unique_literal_path(paths, current.as_ref());
+    }
+}
+
+fn push_unique_literal_path(paths: &mut Vec<String>, path: &str) {
+    if !paths.iter().any(|existing| existing == path) {
+        paths.push(path.to_string());
+    }
+
+    let trailing_path = format!("{}/", path.trim_end_matches('/'));
+    if trailing_path != path && !paths.iter().any(|existing| existing == &trailing_path) {
+        paths.push(trailing_path);
+    }
+}
+
+fn append_artifact_tool_socket_rules(sbpl: &mut String) {
+    sbpl.push_str("(allow file-read* (literal \"/tmp\"))\n");
+    sbpl.push_str("(allow file-read* (literal \"/private\"))\n");
+    sbpl.push_str("(allow file-read* (literal \"/private/tmp\"))\n");
+    sbpl.push_str("(allow file-write* (regex #\"^/tmp/artifact_tool_rpc_[^/]+\\.sock$\"))\n");
+    sbpl.push_str(
+        "(allow file-write* (regex #\"^/private/tmp/artifact_tool_rpc_[^/]+\\.sock$\"))\n",
+    );
 }
 
 fn escape_sbpl(value: &str) -> String {
@@ -201,10 +265,69 @@ mod tests {
         let sbpl = render_policy(&policy);
 
         assert!(sbpl.contains("(allow file-read* (subpath \"/runtime/python\"))"));
+        assert!(sbpl.contains("(allow file-map-executable (subpath \"/runtime/python\"))"));
         assert!(sbpl.contains("(allow file-read* (subpath \"/sessions/s1\"))"));
         assert!(sbpl.contains("(allow file-write* (subpath \"/sessions/s1\"))"));
         assert!(!sbpl.contains("(allow file-write* (subpath \"/runtime/python\"))"));
+        assert!(!sbpl.contains("(allow file-map-executable (subpath \"/sessions/s1\"))"));
         assert!(sbpl.contains("(allow network*"));
+    }
+
+    #[test]
+    fn rendered_policy_allows_literal_parent_reads_for_runtime_roots() {
+        let policy = RuntimeSandboxPolicy {
+            writable_root: PathBuf::from(
+                "/Users/winrey/Library/Application Support/app/sessions/s1",
+            ),
+            readonly_roots: vec![PathBuf::from(
+                "/Users/winrey/Library/Application Support/app/python-sandbox/venv",
+            )],
+            network: NetworkPolicy::Enabled,
+        };
+
+        let sbpl = render_policy(&policy);
+
+        for literal in [
+            "/Users",
+            "/Users/winrey",
+            "/Users/winrey/Library",
+            "/Users/winrey/Library/Application Support",
+            "/Users/winrey/Library/Application Support/app",
+            "/Users/winrey/Library/Application Support/app/python-sandbox",
+            "/Users/winrey/Library/Application Support/app/python-sandbox/venv",
+            "/Users/winrey/Library/Application Support/app/sessions",
+            "/Users/winrey/Library/Application Support/app/sessions/s1",
+        ] {
+            assert!(
+                sbpl.contains(&format!("(allow file-read* (literal \"{literal}\"))")),
+                "missing literal read for {literal}\n{sbpl}"
+            );
+        }
+
+        assert!(!sbpl.contains("(allow file-read* (subpath \"/Users\"))"));
+    }
+
+    #[test]
+    fn rendered_policy_allows_only_artifact_tool_tmp_sockets() {
+        let policy = RuntimeSandboxPolicy {
+            writable_root: PathBuf::from("/sessions/s1"),
+            readonly_roots: vec![PathBuf::from("/runtime/python")],
+            network: NetworkPolicy::Enabled,
+        };
+
+        let sbpl = render_policy(&policy);
+
+        assert!(sbpl.contains("(allow file-read* (literal \"/tmp\"))"));
+        assert!(sbpl.contains("(allow file-read* (literal \"/private\"))"));
+        assert!(sbpl.contains("(allow file-read* (literal \"/private/tmp\"))"));
+        assert!(
+            sbpl.contains("(allow file-write* (regex #\"^/tmp/artifact_tool_rpc_[^/]+\\.sock$\"))")
+        );
+        assert!(sbpl.contains(
+            "(allow file-write* (regex #\"^/private/tmp/artifact_tool_rpc_[^/]+\\.sock$\"))"
+        ));
+        assert!(!sbpl.contains("(allow file-write* (subpath \"/tmp\"))"));
+        assert!(!sbpl.contains("(allow file-write* (subpath \"/private/tmp\"))"));
     }
 
     #[test]
@@ -250,5 +373,35 @@ mod tests {
 
         assert_ne!(result.exit_code, Some(0));
         assert!(!result.stdout.contains("root:"));
+    }
+
+    #[tokio::test]
+    async fn macos_runtime_defaults_home_and_tmpdir_to_writable_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = execute(PlatformExecuteRequest {
+            command: vec!["/usr/bin/env".into()],
+            cwd: temp.path().to_path_buf(),
+            env: HashMap::new(),
+            timeout: Duration::from_secs(5),
+            policy: RuntimeSandboxPolicy {
+                writable_root: temp.path().to_path_buf(),
+                readonly_roots: vec![PathBuf::from("/usr/bin")],
+                network: NetworkPolicy::Enabled,
+            },
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.exit_code, Some(0));
+        assert!(
+            result
+                .stdout
+                .contains(&format!("HOME={}", temp.path().to_string_lossy()))
+        );
+        assert!(
+            result
+                .stdout
+                .contains(&format!("TMPDIR={}", temp.path().to_string_lossy()))
+        );
     }
 }
