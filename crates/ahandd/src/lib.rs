@@ -21,7 +21,8 @@ pub use device_identity::DeviceIdentity;
 pub use public_api::{
     AppToolArgsHandler, AppToolDef, AppToolError, AppToolHandler, AppToolInvocation,
     ApprovalSubscription, DaemonConfig, DaemonConfigBuilder, DaemonHandle, DaemonStatus, ErrorKind,
-    SessionMode, args_only_handler, load_or_create_identity, spawn,
+    MountAccess, MountScope, MountSource, MountSourceSnapshot, RegisteredSandboxMount,
+    SandboxMountSpec, SessionMode, args_only_handler, load_or_create_identity, spawn,
 };
 pub use sandbox::{
     FixedSandboxInvocationResolver, SandboxInvocationContext, SandboxInvocationResolver,

@@ -37,6 +37,7 @@ mod tests {
         let policy = WindowsRuntimePolicy::from_runtime_policy(RuntimeSandboxPolicy {
             writable_root: PathBuf::from(r"C:\sessions\s1"),
             readonly_roots: vec![PathBuf::from(r"C:\runtimes\python")],
+            mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
         });
 
