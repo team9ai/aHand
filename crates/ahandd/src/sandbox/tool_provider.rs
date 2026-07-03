@@ -38,6 +38,15 @@ pub trait SandboxInvocationResolver: Send + Sync {
             "unknown host file reference '{file_ref_id}'"
         )))
     }
+
+    fn ensure_session(
+        &self,
+        registry: &mut SandboxRegistry,
+        context: &SandboxInvocationContext,
+    ) -> SandboxResult<()> {
+        let _ = (registry, context);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -195,6 +204,16 @@ impl SandboxToolProvider {
         })
     }
 
+    async fn ensure_context_session(
+        &self,
+        context: &SandboxInvocationContext,
+    ) -> Result<(), AppToolError> {
+        let mut registry = self.registry.lock().await;
+        self.resolver
+            .ensure_session(&mut registry, context)
+            .map_err(app_tool_error_from_sandbox)
+    }
+
     async fn import_file(&self, invocation: AppToolInvocation) -> Result<Value, AppToolError> {
         let context = self
             .resolver
@@ -208,6 +227,7 @@ impl SandboxToolProvider {
         if host_file_ref.conversation_id.is_none() {
             host_file_ref.conversation_id = context.run_id.clone();
         }
+        self.ensure_context_session(&context).await?;
 
         let file = {
             let mut registry = self.registry.lock().await;
@@ -227,6 +247,7 @@ impl SandboxToolProvider {
         let cwd = optional_string_arg(&invocation.args, "cwd")?.map(PathBuf::from);
         let env = optional_string_map_arg(&invocation.args, "env")?;
         let timeout = optional_timeout_arg(&invocation.args, "timeoutSeconds")?;
+        self.ensure_context_session(&context).await?;
         let session_id = context.session_id.clone();
         let result = self
             .execute_command(
@@ -256,6 +277,7 @@ impl SandboxToolProvider {
         let command = SandboxCommand::Argv {
             command: std::iter::once("node".to_string()).chain(args).collect(),
         };
+        self.ensure_context_session(&context).await?;
         let session_id = context.session_id.clone();
         let result = self
             .execute_command(
@@ -284,6 +306,7 @@ impl SandboxToolProvider {
             .map_err(app_tool_error_from_sandbox)?;
         let sandbox_path = require_string_arg(&invocation.args, "sandboxPath")?;
         let source_file_ref_id = optional_string_arg(&invocation.args, "sourceFileRefId")?;
+        self.ensure_context_session(&context).await?;
 
         let version = {
             let mut registry = self.registry.lock().await;
@@ -310,6 +333,7 @@ impl SandboxToolProvider {
             .resolve(&invocation)
             .map_err(app_tool_error_from_sandbox)?;
         let version_id = require_string_arg(&invocation.args, "versionId")?;
+        self.ensure_context_session(&context).await?;
 
         let result = {
             let mut registry = self.registry.lock().await;
@@ -749,6 +773,54 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct EnsuringHostFileResolver {
+        source_path: PathBuf,
+        workspace_root: PathBuf,
+    }
+
+    impl SandboxInvocationResolver for EnsuringHostFileResolver {
+        fn resolve(
+            &self,
+            invocation: &AppToolInvocation,
+        ) -> SandboxResult<SandboxInvocationContext> {
+            FixedSandboxInvocationResolver::new("device-session").resolve(invocation)
+        }
+
+        fn ensure_session(
+            &self,
+            registry: &mut SandboxRegistry,
+            context: &SandboxInvocationContext,
+        ) -> SandboxResult<()> {
+            if registry.session(&context.session_id).is_ok() {
+                return Ok(());
+            }
+            std::fs::create_dir_all(&self.workspace_root).unwrap();
+            registry.create_session(SandboxSessionConfig {
+                session_id: context.session_id.clone(),
+                permission_mode: SandboxPermissionMode::Readonly,
+                workspace_root: self.workspace_root.clone(),
+                network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
+            })
+        }
+
+        fn resolve_host_file_ref(
+            &self,
+            _context: &SandboxInvocationContext,
+            file_ref_id: &str,
+        ) -> SandboxResult<HostFileRef> {
+            Ok(HostFileRef {
+                file_ref_id: file_ref_id.to_string(),
+                source_path: self.source_path.clone(),
+                display_name: "source.txt".to_string(),
+                size: 5,
+                mtime_ms: None,
+                conversation_id: None,
+            })
+        }
+    }
+
     #[test]
     fn provider_registers_run_command_and_compat_aliases() {
         let names = tool_names(&provider(true));
@@ -1055,6 +1127,42 @@ mod tests {
             .get("public-file-1")
             .unwrap();
         assert_eq!(file_ref.conversation_id.as_deref(), Some("run-1"));
+    }
+
+    #[tokio::test]
+    async fn import_file_ensures_context_session_before_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("run-1");
+        let source = temp.path().join("source.txt");
+        std::fs::write(&source, "hello").unwrap();
+        let registry = Arc::new(AsyncMutex::new(SandboxRegistry::default()));
+        let provider = SandboxToolProvider::new(
+            Arc::clone(&registry),
+            Arc::new(EnsuringHostFileResolver {
+                source_path: source,
+                workspace_root: workspace_root.clone(),
+            }),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+        );
+
+        let result = handler(&provider, "import_file")(invocation(
+            json!({"fileRefId": "public-file-1"}),
+            Some(json!({
+                "sessionId": "run-1",
+                "runId": "run-1",
+                "scopeId": "run-1",
+            })),
+        ))
+        .await
+        .unwrap();
+
+        let sandbox_path = PathBuf::from(result["sandboxPath"].as_str().unwrap());
+        assert!(sandbox_path.starts_with(workspace_root.canonicalize().unwrap().join("input")));
+        assert_eq!(std::fs::read_to_string(&sandbox_path).unwrap(), "hello");
+        let registry = registry.lock().await;
+        assert!(registry.session("run-1").is_ok());
     }
 
     #[tokio::test]
