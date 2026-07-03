@@ -93,6 +93,9 @@ pub struct SandboxRegistry {
 
 impl SandboxRegistry {
     pub fn create_session(&mut self, config: SandboxSessionConfig) -> SandboxResult<()> {
+        if self.sessions.contains_key(&config.session_id) {
+            return Ok(());
+        }
         let workspace_root = config.workspace_root.canonicalize().map_err(|e| {
             SandboxError::unavailable(format!("failed to resolve sandbox workspace root: {e}"))
         })?;
@@ -174,6 +177,40 @@ mod tests {
         assert_eq!(
             registry.session("session-1").unwrap().workspace_root,
             workspace_root.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn create_session_preserves_existing_session_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry
+            .create_session(config(workspace_root.clone()))
+            .unwrap();
+        registry
+            .session_mut("session-1")
+            .unwrap()
+            .imported_files
+            .insert(
+                "file-ref-1".to_string(),
+                SandboxFile {
+                    sandbox_file_id: "file-1".to_string(),
+                    file_ref_id: "file-ref-1".to_string(),
+                    sandbox_path: workspace_root.join("input/source.txt"),
+                    size: 5,
+                },
+            );
+
+        registry.create_session(config(workspace_root)).unwrap();
+
+        assert!(
+            registry
+                .session("session-1")
+                .unwrap()
+                .imported_files
+                .contains_key("file-ref-1")
         );
     }
 

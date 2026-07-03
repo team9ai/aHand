@@ -18,10 +18,25 @@ pub fn import_file(
     file_ref: HostFileRef,
 ) -> SandboxResult<SandboxFile> {
     let session = registry.session_mut(session_id)?;
+    let scoped_file_ref_key = scoped_file_ref_key(&file_ref);
+    session
+        .host_file_refs
+        .insert(file_ref.file_ref_id.clone(), file_ref.clone());
+    if scoped_file_ref_key != file_ref.file_ref_id {
+        session
+            .host_file_refs
+            .insert(scoped_file_ref_key.clone(), file_ref.clone());
+    }
+    if let Some(existing) = session.imported_files.get(&scoped_file_ref_key)
+        && existing.sandbox_path.is_file()
+    {
+        return Ok(existing.clone());
+    }
+
     let input_dir = session
         .workspace_root
         .join("input")
-        .join(safe_file_ref_dir(&file_ref.file_ref_id));
+        .join(safe_file_ref_dir(&scoped_file_ref_key));
     fs::create_dir_all(&input_dir).map_err(|e| {
         SandboxError::unavailable(format!("failed to create sandbox input dir: {e}"))
     })?;
@@ -35,18 +50,15 @@ pub fn import_file(
     let sandbox_file = SandboxFile {
         sandbox_file_id: format!(
             "sandbox-file-{}",
-            sha256_hex(file_ref.file_ref_id.as_bytes())
+            sha256_hex(scoped_file_ref_key.as_bytes())
         ),
         file_ref_id: file_ref.file_ref_id.clone(),
         sandbox_path,
         size,
     };
     session
-        .host_file_refs
-        .insert(file_ref.file_ref_id.clone(), file_ref.clone());
-    session
         .imported_files
-        .insert(file_ref.file_ref_id, sandbox_file.clone());
+        .insert(scoped_file_ref_key, sandbox_file.clone());
     Ok(sandbox_file)
 }
 
@@ -332,6 +344,18 @@ fn safe_file_name(name: &str) -> String {
         .to_string()
 }
 
+fn scoped_file_ref_key(file_ref: &HostFileRef) -> String {
+    match file_ref
+        .conversation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(conversation_id) => format!("{conversation_id}\0{}", file_ref.file_ref_id),
+        None => file_ref.file_ref_id.clone(),
+    }
+}
+
 fn safe_file_ref_dir(file_ref_id: &str) -> String {
     format!("file-ref-{}", sha256_hex(file_ref_id.as_bytes()))
 }
@@ -475,6 +499,100 @@ mod tests {
                 .unwrap()
                 .host_file_refs
                 .contains_key("../escape")
+        );
+    }
+
+    #[test]
+    fn import_file_reuses_existing_file_within_same_conversation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sandbox");
+        let source = temp.path().join("source.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, "first").unwrap();
+        let mut registry = registry_with_session(&root);
+
+        let first = import_file(
+            &mut registry,
+            "session-1",
+            HostFileRef {
+                file_ref_id: "file-ref-1".to_string(),
+                source_path: source.clone(),
+                display_name: "source.txt".to_string(),
+                size: 5,
+                mtime_ms: None,
+                conversation_id: Some("run-1".to_string()),
+            },
+        )
+        .unwrap();
+
+        fs::write(&source, "second").unwrap();
+        let second = import_file(
+            &mut registry,
+            "session-1",
+            HostFileRef {
+                file_ref_id: "file-ref-1".to_string(),
+                source_path: source,
+                display_name: "source.txt".to_string(),
+                size: 6,
+                mtime_ms: None,
+                conversation_id: Some("run-1".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(fs::read_to_string(&second.sandbox_path).unwrap(), "first");
+    }
+
+    #[test]
+    fn import_file_isolates_same_file_ref_between_conversations() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sandbox");
+        let source = temp.path().join("source.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&source, "run one").unwrap();
+        let mut registry = registry_with_session(&root);
+
+        let run_one = import_file(
+            &mut registry,
+            "session-1",
+            HostFileRef {
+                file_ref_id: "file-ref-1".to_string(),
+                source_path: source.clone(),
+                display_name: "source.txt".to_string(),
+                size: 7,
+                mtime_ms: None,
+                conversation_id: Some("run-1".to_string()),
+            },
+        )
+        .unwrap();
+
+        fs::write(&source, "run two").unwrap();
+        let run_two = import_file(
+            &mut registry,
+            "session-1",
+            HostFileRef {
+                file_ref_id: "file-ref-1".to_string(),
+                source_path: source,
+                display_name: "source.txt".to_string(),
+                size: 7,
+                mtime_ms: None,
+                conversation_id: Some("run-2".to_string()),
+            },
+        )
+        .unwrap();
+
+        assert_ne!(run_two.sandbox_file_id, run_one.sandbox_file_id);
+        assert_ne!(run_two.sandbox_path, run_one.sandbox_path);
+        assert_eq!(run_one.file_ref_id, "file-ref-1");
+        assert_eq!(run_two.file_ref_id, "file-ref-1");
+        assert_eq!(
+            fs::read_to_string(&run_one.sandbox_path).unwrap(),
+            "run one"
+        );
+        assert_eq!(
+            fs::read_to_string(&run_two.sandbox_path).unwrap(),
+            "run two"
         );
     }
 
