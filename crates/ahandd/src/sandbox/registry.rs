@@ -132,6 +132,23 @@ fn mount_scope_active(scope: &MountScope, context: Option<&SandboxInvocationCont
     }
 }
 
+fn mount_scopes_can_overlap(left: &MountScope, right: &MountScope) -> bool {
+    match (left, right) {
+        (MountScope::Session, _) | (_, MountScope::Session) => true,
+        (MountScope::Run { run_id: left }, MountScope::Run { run_id: right }) => left == right,
+        (
+            MountScope::Invocation {
+                invocation_id: left,
+            },
+            MountScope::Invocation {
+                invocation_id: right,
+            },
+        ) => left == right,
+        (MountScope::Run { .. }, MountScope::Invocation { .. })
+        | (MountScope::Invocation { .. }, MountScope::Run { .. }) => true,
+    }
+}
+
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
@@ -232,7 +249,10 @@ impl SandboxRegistry {
             if session
                 .mounts
                 .values()
-                .any(|mount| mount.env_var.as_deref() == Some(env_var.as_str()))
+                .any(|mount| {
+                    mount.env_var.as_deref() == Some(env_var.as_str())
+                        && mount_scopes_can_overlap(&mount.scope, &spec.scope)
+                })
             {
                 return Err(SandboxError::mount_env_conflict(format!(
                     "sandbox mount env var '{env_var}' is already registered"
@@ -559,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_registry_duplicate_mount_env_var_is_rejected() {
+    fn sandbox_registry_overlapping_mount_env_var_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let workspace_root = temp.path().join("sandbox");
         let source = temp.path().join("host");
@@ -588,7 +608,7 @@ mod tests {
                     "selected-folder-2",
                     source,
                     MountScope::Run {
-                        run_id: "run-2".to_string(),
+                        run_id: "run-1".to_string(),
                     },
                     "COFFICE_SELECTED_FOLDER_DIR",
                 ),
@@ -596,6 +616,78 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.code, "MOUNT_ENV_CONFLICT");
+    }
+
+    #[test]
+    fn sandbox_registry_allows_same_mount_env_var_for_disjoint_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        let mut registry = SandboxRegistry::default();
+        registry
+            .create_session(config(workspace_root.clone()))
+            .unwrap();
+
+        let first = registry
+            .register_mount(
+                "session-1",
+                readonly_mount_with_env(
+                    "target-folder",
+                    source.clone(),
+                    MountScope::Run {
+                        run_id: "run-1".to_string(),
+                    },
+                    "COFFICE_TARGET_FOLDER_DIR",
+                ),
+            )
+            .unwrap();
+        let second = registry
+            .register_mount(
+                "session-1",
+                readonly_mount_with_env(
+                    "target-folder",
+                    source,
+                    MountScope::Run {
+                        run_id: "run-2".to_string(),
+                    },
+                    "COFFICE_TARGET_FOLDER_DIR",
+                ),
+            )
+            .unwrap();
+
+        let run_1_env =
+            registry
+                .session("session-1")
+                .unwrap()
+                .exec_environment_for(Some(&SandboxInvocationContext {
+                    session_id: "session-1".to_string(),
+                    run_id: Some("run-1".to_string()),
+                    scope_id: None,
+                    invocation_id: None,
+                }));
+        let run_2_env =
+            registry
+                .session("session-1")
+                .unwrap()
+                .exec_environment_for(Some(&SandboxInvocationContext {
+                    session_id: "session-1".to_string(),
+                    run_id: Some("run-2".to_string()),
+                    scope_id: None,
+                    invocation_id: None,
+                }));
+
+        assert_eq!(
+            run_1_env.env["COFFICE_TARGET_FOLDER_DIR"],
+            first.target.to_string_lossy()
+        );
+        assert_eq!(
+            run_2_env.env["COFFICE_TARGET_FOLDER_DIR"],
+            second.target.to_string_lossy()
+        );
+        assert_eq!(run_1_env.mounts, vec![first]);
+        assert_eq!(run_2_env.mounts, vec![second]);
     }
 
     #[test]
@@ -619,7 +711,7 @@ mod tests {
                 "selected-folder-2",
                 source,
                 MountScope::Run {
-                    run_id: "run-2".to_string(),
+                    run_id: "run-1".to_string(),
                 },
                 "COFFICE_SELECTED_FOLDER_DIR",
             ),
