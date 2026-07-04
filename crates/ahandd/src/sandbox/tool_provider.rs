@@ -12,9 +12,8 @@ use crate::sandbox::{
     file_lifecycle,
     registry::SandboxRegistry,
     types::{
-        CommitResult, FileVersion, HostFileRef, RegisterVersionRequest, RuntimeExecuteResult,
-        SandboxCommand, SandboxError, SandboxExecRequest, SandboxExecResult, SandboxFile,
-        SandboxInvocationContext, SandboxResult,
+        HostFileRef, RuntimeExecuteResult, SandboxCommand, SandboxError, SandboxExecRequest,
+        SandboxExecResult, SandboxFile, SandboxInvocationContext, SandboxResult,
     },
 };
 
@@ -133,14 +132,6 @@ impl SandboxToolProvider {
                 run_command_def("run_command"),
                 self.run_command_handler("run_command"),
             ),
-            (
-                register_file_version_def(),
-                self.register_file_version_handler(),
-            ),
-            (
-                commit_file_version_def(),
-                self.commit_file_version_handler(),
-            ),
         ];
 
         if self.options.include_compat_aliases {
@@ -170,26 +161,6 @@ impl SandboxToolProvider {
             let provider = provider.clone();
             let future: BoxFuture<'static, Result<Value, AppToolError>> =
                 Box::pin(async move { provider.run_command(invocation).await });
-            future
-        })
-    }
-
-    fn register_file_version_handler(&self) -> AppToolHandler {
-        let provider = self.clone();
-        Arc::new(move |invocation| {
-            let provider = provider.clone();
-            let future: BoxFuture<'static, Result<Value, AppToolError>> =
-                Box::pin(async move { provider.register_file_version(invocation).await });
-            future
-        })
-    }
-
-    fn commit_file_version_handler(&self) -> AppToolHandler {
-        let provider = self.clone();
-        Arc::new(move |invocation| {
-            let provider = provider.clone();
-            let future: BoxFuture<'static, Result<Value, AppToolError>> =
-                Box::pin(async move { provider.commit_file_version(invocation).await });
             future
         })
     }
@@ -294,54 +265,6 @@ impl SandboxToolProvider {
             .map_err(app_tool_error_from_sandbox)?;
 
         Ok(runtime_execute_result_json(&result))
-    }
-
-    async fn register_file_version(
-        &self,
-        invocation: AppToolInvocation,
-    ) -> Result<Value, AppToolError> {
-        let context = self
-            .resolver
-            .resolve(&invocation)
-            .map_err(app_tool_error_from_sandbox)?;
-        let sandbox_path = require_string_arg(&invocation.args, "sandboxPath")?;
-        let source_file_ref_id = optional_string_arg(&invocation.args, "sourceFileRefId")?;
-        self.ensure_context_session(&context).await?;
-
-        let version = {
-            let mut registry = self.registry.lock().await;
-            file_lifecycle::register_file_version(
-                &mut registry,
-                &context.session_id,
-                RegisterVersionRequest {
-                    sandbox_path: PathBuf::from(sandbox_path),
-                    source_file_ref_id,
-                },
-            )
-        }
-        .map_err(app_tool_error_from_sandbox)?;
-
-        Ok(file_version_json(&version))
-    }
-
-    async fn commit_file_version(
-        &self,
-        invocation: AppToolInvocation,
-    ) -> Result<Value, AppToolError> {
-        let context = self
-            .resolver
-            .resolve(&invocation)
-            .map_err(app_tool_error_from_sandbox)?;
-        let version_id = require_string_arg(&invocation.args, "versionId")?;
-        self.ensure_context_session(&context).await?;
-
-        let result = {
-            let mut registry = self.registry.lock().await;
-            file_lifecycle::commit_file_version(&mut registry, &context.session_id, &version_id)
-        }
-        .map_err(app_tool_error_from_sandbox)?;
-
-        Ok(commit_result_json(&result))
     }
 
     async fn execute_command(
@@ -513,32 +436,6 @@ fn sandbox_file_json(file: &SandboxFile) -> Value {
     })
 }
 
-fn file_version_json(version: &FileVersion) -> Value {
-    json!({
-        "versionId": version.version_id,
-        "sandboxPath": version.sandbox_path.to_string_lossy().to_string(),
-        "sourceFileRefId": version.source_file_ref_id,
-        "size": version.size,
-        "hash": version.hash,
-        "status": serde_json::to_value(&version.status)
-            .expect("file version status serializes to JSON"),
-    })
-}
-
-fn commit_result_json(result: &CommitResult) -> Value {
-    json!({
-        "versionId": result.version_id,
-        "sourceFileRefId": result.source_file_ref_id,
-        "backupId": result.backup_id,
-        "oldHash": result.old_hash,
-        "newHash": result.new_hash,
-        "bytesWritten": result.bytes_written,
-        "permissionMode": serde_json::to_value(result.permission_mode)
-            .expect("sandbox permission mode serializes to JSON"),
-        "permissionVersion": result.permission_version,
-    })
-}
-
 fn trusted_string(context: &Value, name: &str) -> Option<String> {
     context
         .get(name)
@@ -619,39 +516,6 @@ fn run_node_def() -> AppToolDef {
                 }
             },
             "required": ["args"],
-            "additionalProperties": false
-        }),
-        requires_approval: false,
-    }
-}
-
-fn register_file_version_def() -> AppToolDef {
-    AppToolDef {
-        name: "register_file_version".to_string(),
-        description: "Register a sandbox file as a candidate file version".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "sandboxPath": { "type": "string" },
-                "sourceFileRefId": { "type": "string" }
-            },
-            "required": ["sandboxPath"],
-            "additionalProperties": false
-        }),
-        requires_approval: false,
-    }
-}
-
-fn commit_file_version_def() -> AppToolDef {
-    AppToolDef {
-        name: "commit_file_version".to_string(),
-        description: "Commit a sandbox file version back to its source file".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "versionId": { "type": "string" }
-            },
-            "required": ["versionId"],
             "additionalProperties": false
         }),
         requires_approval: false,
@@ -822,15 +686,15 @@ mod tests {
     }
 
     #[test]
-    fn provider_registers_run_command_and_compat_aliases() {
+    fn provider_registers_command_tools_without_version_lifecycle_tools() {
         let names = tool_names(&provider(true));
 
         assert!(names.contains("run_command"));
         assert!(names.contains("sandbox_exec"));
         assert!(names.contains("run_node"));
         assert!(names.contains("import_file"));
-        assert!(names.contains("register_file_version"));
-        assert!(names.contains("commit_file_version"));
+        assert!(!names.contains("register_file_version"));
+        assert!(!names.contains("commit_file_version"));
     }
 
     #[test]
@@ -838,8 +702,11 @@ mod tests {
         let names = tool_names(&provider(false));
 
         assert!(names.contains("run_command"));
+        assert!(names.contains("import_file"));
         assert!(!names.contains("sandbox_exec"));
         assert!(!names.contains("run_node"));
+        assert!(!names.contains("register_file_version"));
+        assert!(!names.contains("commit_file_version"));
     }
 
     #[test]
@@ -1196,59 +1063,5 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&sandbox_path).unwrap(), "hello");
         assert!(!workspace_root.join("escape/source.txt").exists());
         assert_eq!(result["fileRefId"], json!("../escape"));
-    }
-
-    #[tokio::test]
-    async fn register_and_commit_file_handlers_call_lifecycle() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace_root = temp.path().join("sandbox");
-        let source = temp.path().join("source.txt");
-        std::fs::write(&source, "original").unwrap();
-        let registry = registry_with_session(workspace_root.clone(), SandboxPermissionMode::Full);
-        let provider = SandboxToolProvider::new(
-            Arc::clone(&registry),
-            Arc::new(HostFileResolver {
-                source_path: source.clone(),
-                file_ref_id: None,
-            }),
-            SandboxToolProviderOptions {
-                include_compat_aliases: true,
-            },
-        );
-        let import_result = handler(&provider, "import_file")(invocation(
-            json!({"fileRefId": "public-file-1"}),
-            Some(trusted_context()),
-        ))
-        .await
-        .unwrap();
-        let sandbox_path = PathBuf::from(import_result["sandboxPath"].as_str().unwrap());
-        let sandbox_relative_path = sandbox_path
-            .strip_prefix(workspace_root.canonicalize().unwrap())
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        std::fs::write(&sandbox_path, "updated").unwrap();
-
-        let version = handler(&provider, "register_file_version")(invocation(
-            json!({
-                "sandboxPath": sandbox_relative_path,
-                "sourceFileRefId": "public-file-1"
-            }),
-            Some(trusted_context()),
-        ))
-        .await
-        .unwrap();
-
-        assert_eq!(version["status"], json!("candidate"));
-        let commit = handler(&provider, "commit_file_version")(invocation(
-            json!({"versionId": version["versionId"].as_str().unwrap()}),
-            Some(trusted_context()),
-        ))
-        .await
-        .unwrap();
-
-        assert_eq!(commit["sourceFileRefId"], json!("public-file-1"));
-        assert_eq!(commit["bytesWritten"], json!(7));
-        assert_eq!(std::fs::read_to_string(source).unwrap(), "updated");
     }
 }
