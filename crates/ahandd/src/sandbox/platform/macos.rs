@@ -26,8 +26,13 @@ const SYSTEM_READONLY_ROOTS: &[&str] = &[
     "/System/Library/PrivateFrameworks",
     "/System/Library/SubFrameworks",
     "/System/Volumes/Preboot/Cryptexes/OS",
+    "/System/Library/OpenSSL",
+    "/private/etc/ssl",
+    "/etc/ssl",
     "/Library/Apple",
     "/Library/Preferences",
+    "/Library/Developer/CommandLineTools",
+    "/Applications/Xcode.app/Contents/Developer",
 ];
 const SYSTEM_EXECUTABLE_ROOTS: &[&str] = &[
     "/bin",
@@ -44,6 +49,8 @@ const SYSTEM_EXECUTABLE_ROOTS: &[&str] = &[
     "/System/Library/SubFrameworks",
     "/System/Volumes/Preboot/Cryptexes/OS",
     "/Library/Apple",
+    "/Library/Developer/CommandLineTools",
+    "/Applications/Xcode.app/Contents/Developer",
 ];
 
 pub async fn execute(mut request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
@@ -332,6 +339,49 @@ mod tests {
         ));
         assert!(!sbpl.contains("(allow file-write* (subpath \"/tmp\"))"));
         assert!(!sbpl.contains("(allow file-write* (subpath \"/private/tmp\"))"));
+    }
+
+    #[test]
+    fn rendered_policy_allows_macos_tls_config_for_system_curl() {
+        let policy = RuntimeSandboxPolicy {
+            writable_root: PathBuf::from("/sessions/s1"),
+            readonly_roots: vec![PathBuf::from("/runtime/python")],
+            mounts: Vec::new(),
+            network: NetworkPolicy::Enabled,
+        };
+
+        let sbpl = render_policy(&policy);
+
+        assert!(sbpl.contains("(allow network*)"));
+        assert!(sbpl.contains("(allow file-read* (subpath \"/private/etc/ssl\"))"));
+        assert!(sbpl.contains("(allow file-read* (subpath \"/etc/ssl\"))"));
+        assert!(sbpl.contains("(allow file-read* (subpath \"/System/Library/OpenSSL\"))"));
+    }
+
+    #[test]
+    fn rendered_policy_allows_apple_developer_tools_for_usr_bin_git() {
+        let policy = RuntimeSandboxPolicy {
+            writable_root: PathBuf::from("/sessions/s1"),
+            readonly_roots: vec![PathBuf::from("/runtime/python")],
+            mounts: Vec::new(),
+            network: NetworkPolicy::Enabled,
+        };
+
+        let sbpl = render_policy(&policy);
+
+        for root in [
+            "/Library/Developer/CommandLineTools",
+            "/Applications/Xcode.app/Contents/Developer",
+        ] {
+            assert!(
+                sbpl.contains(&format!("(allow file-read* (subpath \"{root}\"))")),
+                "missing developer tool read root for {root}\n{sbpl}"
+            );
+            assert!(
+                sbpl.contains(&format!("(allow file-map-executable (subpath \"{root}\"))")),
+                "missing developer tool executable mapping root for {root}\n{sbpl}"
+            );
+        }
     }
 
     #[test]
