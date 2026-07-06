@@ -33,6 +33,8 @@ const SYSTEM_READONLY_ROOTS: &[&str] = &[
     "/Library/Preferences",
     "/Library/Developer/CommandLineTools",
     "/Applications/Xcode.app/Contents/Developer",
+    "/Applications/Xcode.app/Contents/Frameworks",
+    "/Applications/Xcode.app/Contents/SharedFrameworks",
 ];
 const SYSTEM_EXECUTABLE_ROOTS: &[&str] = &[
     "/bin",
@@ -51,6 +53,8 @@ const SYSTEM_EXECUTABLE_ROOTS: &[&str] = &[
     "/Library/Apple",
     "/Library/Developer/CommandLineTools",
     "/Applications/Xcode.app/Contents/Developer",
+    "/Applications/Xcode.app/Contents/Frameworks",
+    "/Applications/Xcode.app/Contents/SharedFrameworks",
 ];
 
 pub async fn execute(mut request: PlatformExecuteRequest) -> SandboxResult<RuntimeExecuteResult> {
@@ -181,6 +185,7 @@ pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
         "(allow file-write* (subpath \"{}\"))\n",
         escape_sbpl(&policy.writable_root.to_string_lossy())
     ));
+    append_common_device_rules(&mut sbpl);
     append_artifact_tool_socket_rules(&mut sbpl);
     if policy.network == NetworkPolicy::Enabled {
         sbpl.push_str("(allow network*)\n");
@@ -216,6 +221,11 @@ fn push_unique_literal_path(paths: &mut Vec<String>, path: &str) {
     if trailing_path != path && !paths.iter().any(|existing| existing == &trailing_path) {
         paths.push(trailing_path);
     }
+}
+
+fn append_common_device_rules(sbpl: &mut String) {
+    sbpl.push_str("(allow file-read* (literal \"/dev/null\"))\n");
+    sbpl.push_str("(allow file-write* (literal \"/dev/null\"))\n");
 }
 
 fn append_artifact_tool_socket_rules(sbpl: &mut String) {
@@ -342,6 +352,23 @@ mod tests {
     }
 
     #[test]
+    fn rendered_policy_allows_null_device_for_common_unix_tools() {
+        let policy = RuntimeSandboxPolicy {
+            writable_root: PathBuf::from("/sessions/s1"),
+            readonly_roots: Vec::new(),
+            mounts: Vec::new(),
+            network: NetworkPolicy::Enabled,
+        };
+
+        let sbpl = render_policy(&policy);
+
+        assert!(sbpl.contains("(allow file-read* (literal \"/dev/null\"))"));
+        assert!(sbpl.contains("(allow file-write* (literal \"/dev/null\"))"));
+        assert!(!sbpl.contains("(allow file-read* (subpath \"/dev\"))"));
+        assert!(!sbpl.contains("(allow file-write* (subpath \"/dev\"))"));
+    }
+
+    #[test]
     fn rendered_policy_allows_macos_tls_config_for_system_curl() {
         let policy = RuntimeSandboxPolicy {
             writable_root: PathBuf::from("/sessions/s1"),
@@ -372,6 +399,8 @@ mod tests {
         for root in [
             "/Library/Developer/CommandLineTools",
             "/Applications/Xcode.app/Contents/Developer",
+            "/Applications/Xcode.app/Contents/Frameworks",
+            "/Applications/Xcode.app/Contents/SharedFrameworks",
         ] {
             assert!(
                 sbpl.contains(&format!("(allow file-read* (subpath \"{root}\"))")),
