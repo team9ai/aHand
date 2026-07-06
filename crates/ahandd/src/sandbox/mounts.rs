@@ -48,6 +48,7 @@ pub(crate) fn register_mount_with_existing_targets<'a>(
             &mount_namespace,
             &slug_from_mount_id(&spec.mount_id),
             &existing_targets,
+            &source,
         ),
     };
 
@@ -250,6 +251,7 @@ fn allocate_auto_target(
     canonical_namespace: &Path,
     slug: &str,
     existing_targets: &[PathBuf],
+    source: &MountSource,
 ) -> PathBuf {
     let mut suffix = 1;
     loop {
@@ -259,11 +261,40 @@ fn allocate_auto_target(
             format!("{slug}-{suffix}")
         };
         let candidate = canonical_namespace.join(name);
-        if !path_exists(&candidate) && !target_conflicts(&candidate, existing_targets) {
+        if !target_conflicts(&candidate, existing_targets)
+            && (!path_exists(&candidate) || existing_target_points_to_source(&candidate, source))
+        {
             return candidate;
         }
         suffix += 1;
     }
+}
+
+fn existing_target_points_to_source(candidate: &Path, source: &MountSource) -> bool {
+    let MountSource::HostPath(source) = source else {
+        return false;
+    };
+    let Ok(metadata) = fs::symlink_metadata(candidate) else {
+        return false;
+    };
+    if !metadata.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(link_target) = fs::read_link(candidate) else {
+        return false;
+    };
+    let Some(parent) = candidate.parent() else {
+        return false;
+    };
+    let resolved = if link_target.is_absolute() {
+        link_target
+    } else {
+        parent.join(link_target)
+    };
+    resolved
+        .canonicalize()
+        .map(|target| target == *source)
+        .unwrap_or(false)
 }
 
 fn target_conflicts(candidate: &Path, existing_targets: &[PathBuf]) -> bool {
@@ -412,6 +443,42 @@ mod tests {
         );
         assert!(mount.source_snapshot.exists);
         assert!(mount.source_snapshot.is_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_target_reuses_existing_symlink_to_same_source() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let namespace = workspace_root.join("workspace").join("mounts");
+        let source = temp.path().join("host").join("Private Client");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&namespace).unwrap();
+        symlink(
+            source.canonicalize().unwrap(),
+            namespace.join("selected-folder"),
+        )
+        .unwrap();
+
+        let mount = register_for_test(
+            &workspace_root,
+            readonly_host_spec("selected-folder", source.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mount.target,
+            workspace_root
+                .canonicalize()
+                .unwrap()
+                .join("workspace/mounts/selected-folder")
+        );
+        assert_eq!(
+            mount.source,
+            MountSource::HostPath(source.canonicalize().unwrap())
+        );
     }
 
     #[test]

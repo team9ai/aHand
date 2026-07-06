@@ -4,12 +4,13 @@ use std::{path::PathBuf, time::Duration};
 
 #[cfg(target_os = "macos")]
 use ahandd::sandbox::{RuntimeExecuteRequest, RuntimeProviderConfig};
+#[cfg(target_os = "macos")]
+use ahandd::sandbox::{SandboxCommand, SandboxExecRequest, SandboxInvocationContext};
 use ahandd::{
     AppToolDef, AppToolHandler, DaemonConfig, args_only_handler,
     sandbox::{
         HostFileRef, MountAccess, MountScope, MountSource, NetworkPolicy, RegisterVersionRequest,
-        SandboxCommand, SandboxExecRequest, SandboxInvocationContext, SandboxMountSpec,
-        SandboxPermissionMode, SandboxSessionConfig,
+        SandboxMountSpec, SandboxPermissionMode, SandboxSessionConfig,
     },
 };
 
