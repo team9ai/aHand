@@ -245,19 +245,15 @@ impl SandboxRegistry {
                 spec.mount_id
             )));
         }
-        if let Some(env_var) = &spec.env_var {
-            if session
-                .mounts
-                .values()
-                .any(|mount| {
-                    mount.env_var.as_deref() == Some(env_var.as_str())
-                        && mount_scopes_can_overlap(&mount.scope, &spec.scope)
-                })
-            {
-                return Err(SandboxError::mount_env_conflict(format!(
-                    "sandbox mount env var '{env_var}' is already registered"
-                )));
-            }
+        if let Some(env_var) = &spec.env_var
+            && session.mounts.values().any(|mount| {
+                mount.env_var.as_deref() == Some(env_var.as_str())
+                    && mount_scopes_can_overlap(&mount.scope, &spec.scope)
+            })
+        {
+            return Err(SandboxError::mount_env_conflict(format!(
+                "sandbox mount env var '{env_var}' is already registered"
+            )));
         }
         let existing_targets = session
             .mounts
@@ -657,26 +653,24 @@ mod tests {
             )
             .unwrap();
 
-        let run_1_env =
-            registry
-                .session("session-1")
-                .unwrap()
-                .exec_environment_for(Some(&SandboxInvocationContext {
-                    session_id: "session-1".to_string(),
-                    run_id: Some("run-1".to_string()),
-                    scope_id: None,
-                    invocation_id: None,
-                }));
-        let run_2_env =
-            registry
-                .session("session-1")
-                .unwrap()
-                .exec_environment_for(Some(&SandboxInvocationContext {
-                    session_id: "session-1".to_string(),
-                    run_id: Some("run-2".to_string()),
-                    scope_id: None,
-                    invocation_id: None,
-                }));
+        let run_1_env = registry
+            .session("session-1")
+            .unwrap()
+            .exec_environment_for(Some(&SandboxInvocationContext {
+                session_id: "session-1".to_string(),
+                run_id: Some("run-1".to_string()),
+                scope_id: None,
+                invocation_id: None,
+            }));
+        let run_2_env = registry
+            .session("session-1")
+            .unwrap()
+            .exec_environment_for(Some(&SandboxInvocationContext {
+                session_id: "session-1".to_string(),
+                run_id: Some("run-2".to_string()),
+                scope_id: None,
+                invocation_id: None,
+            }));
 
         assert_eq!(
             run_1_env.env["COFFICE_TARGET_FOLDER_DIR"],
