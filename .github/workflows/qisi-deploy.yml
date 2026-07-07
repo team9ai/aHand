@@ -1,0 +1,222 @@
+name: Qisi aHand Deploy
+
+on:
+  push:
+    branches: [dev, staging, main]
+    paths:
+      - ".dockerignore"
+      - "apps/hub-dashboard/**"
+      - "crates/**"
+      - "proto/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Cross.toml"
+      - "package.json"
+      - "packages/**"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "tsconfig.base.json"
+      - "turbo.json"
+      - "deploy/hub/Dockerfile"
+      - ".github/workflows/qisi-deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: qisi-ahand-deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: registry.image.cofficeai.cn
+  IMAGE_NAMESPACE: coffice/ahand
+
+jobs:
+  resolve-target:
+    runs-on: ubuntu-latest
+    outputs:
+      env_name: ${{ steps.target.outputs.env_name }}
+      k8s_namespace: ${{ steps.target.outputs.k8s_namespace }}
+    steps:
+      - id: target
+        shell: bash
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            dev)
+              echo "env_name=dev" >> "$GITHUB_OUTPUT"
+              echo "k8s_namespace=coffice-dev" >> "$GITHUB_OUTPUT"
+              ;;
+            staging)
+              echo "env_name=staging" >> "$GITHUB_OUTPUT"
+              echo "k8s_namespace=coffice-staging" >> "$GITHUB_OUTPUT"
+              ;;
+            main)
+              echo "env_name=production" >> "$GITHUB_OUTPUT"
+              echo "k8s_namespace=coffice-prod" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "unsupported branch: ${GITHUB_REF_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+  build-images:
+    needs: resolve-target
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ahand-hub
+            target: hub
+            deployment: ahand-hub
+            container: hub
+            component_dir: hub
+            image_env: AHAND_HUB_IMAGE
+          - image: ahand-hub-dashboard
+            target: dashboard
+            deployment: ahand-dashboard
+            container: dashboard
+            component_dir: dashboard
+            image_env: AHAND_HUB_DASHBOARD_IMAGE
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.QISI_REGISTRY_USERNAME }}
+          password: ${{ secrets.QISI_REGISTRY_PASSWORD }}
+
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/hub/Dockerfile
+          target: ${{ matrix.target }}
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ needs.resolve-target.outputs.env_name }}-${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ needs.resolve-target.outputs.env_name }}
+          cache-from: type=gha,scope=qisi-ahand-${{ matrix.image }}
+          cache-to: type=gha,scope=qisi-ahand-${{ matrix.image }},mode=max
+
+      - name: Prepare GitOps image metadata
+        env:
+          K8S_NAMESPACE: ${{ needs.resolve-target.outputs.k8s_namespace }}
+          ENV_NAME: ${{ needs.resolve-target.outputs.env_name }}
+          IMAGE_NAME: ${{ matrix.image }}
+          DEPLOYMENT: ${{ matrix.deployment }}
+          CONTAINER: ${{ matrix.container }}
+          COMPONENT_DIR: ${{ matrix.component_dir }}
+          IMAGE_ENV: ${{ matrix.image_env }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${IMAGE_DIGEST:-}" ]]; then
+            echo "missing build image digest" >&2
+            exit 1
+          fi
+
+          image_ref="${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${ENV_NAME}-${GITHUB_SHA}"
+          image_with_digest="${image_ref}@${IMAGE_DIGEST}"
+          env_json=$(jq -nc --arg image_key "$IMAGE_ENV" --arg image "$image_with_digest" --arg sha "$GITHUB_SHA" \
+            '{($image_key): $image, GIT_SHA: $sha, SENTRY_RELEASE: $sha}')
+
+          jq -nc \
+            --arg namespace "$K8S_NAMESPACE" \
+            --arg deployment "$DEPLOYMENT" \
+            --arg container "$CONTAINER" \
+            --arg componentDir "$COMPONENT_DIR" \
+            --arg imageName "$IMAGE_NAME" \
+            --arg image "$image_ref" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg imageWithDigest "$image_with_digest" \
+            --argjson env "$env_json" \
+            '{namespace:$namespace,deployment:$deployment,container:$container,componentDir:$componentDir,imageName:$imageName,image:$image,digest:$digest,imageWithDigest:$imageWithDigest,env:$env}' \
+            > "qisi-image-${IMAGE_NAME}.json"
+
+      - name: Upload GitOps image metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: qisi-image-${{ matrix.image }}
+          path: qisi-image-${{ matrix.image }}.json
+          retention-days: 1
+
+      - name: Dispatch GitOps image update
+        env:
+          GH_TOKEN: ${{ secrets.COFFICE_GITOPS_TOKEN }}
+          IMAGE_NAME: ${{ matrix.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "missing COFFICE_GITOPS_TOKEN" >&2
+            exit 1
+          fi
+
+          jq -nc \
+            --slurpfile metadata "qisi-image-${IMAGE_NAME}.json" \
+            '{event_type:"update-app-image",client_payload:{
+              namespace:$metadata[0].namespace,
+              deployment:$metadata[0].deployment,
+              container:$metadata[0].container,
+              image:$metadata[0].image,
+              digest:$metadata[0].digest,
+              env:$metadata[0].env
+            }}' \
+            > /tmp/gitops-dispatch.json
+
+          gh api repos/weightwave/coffice-cn-gitops/dispatches \
+            --method POST \
+            --input /tmp/gitops-dispatch.json
+
+  verify-gitops-manifests:
+    needs: [resolve-target, build-images]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download GitOps image metadata
+        uses: actions/download-artifact@v8
+        with:
+          pattern: qisi-image-*
+          path: qisi-images
+          merge-multiple: true
+
+      - name: Verify GitOps manifests
+        env:
+          GH_TOKEN: ${{ secrets.COFFICE_GITOPS_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "missing COFFICE_GITOPS_TOKEN" >&2
+            exit 1
+          fi
+
+          for attempt in {1..18}; do
+            rm -rf /tmp/coffice-cn-gitops
+            gh repo clone weightwave/coffice-cn-gitops /tmp/coffice-cn-gitops -- --branch main --depth 1
+
+            if node scripts/verify-qisi-gitops-manifests.mjs \
+              --metadata-dir qisi-images \
+              --gitops-root /tmp/coffice-cn-gitops; then
+              exit 0
+            fi
+
+            if [[ "$attempt" == "18" ]]; then
+              echo "GitOps manifests did not converge after ${attempt} attempts." >&2
+              exit 1
+            fi
+
+            sleep 10
+          done
