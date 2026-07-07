@@ -237,14 +237,18 @@ async fn read_node_major_version(node_bin: &Path) -> Option<u32> {
 async fn install_node(dirs: &Dirs, progress: &(dyn Fn(ProgressEvent) + Send + Sync)) -> Result<()> {
     let (os, arch) = platform_info();
 
-    if cfg!(target_os = "windows") {
+    #[cfg(target_os = "windows")]
+    {
         install_node_windows(dirs, progress, os, arch).await
-    } else {
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
         install_node_unix(dirs, progress, os, arch).await
     }
 }
 
 /// Unix path: download `.tar.xz`, extract preserving the `bin/` layout.
+#[cfg(not(target_os = "windows"))]
 async fn install_node_unix(
     dirs: &Dirs,
     progress: &(dyn Fn(ProgressEvent) + Send + Sync),

@@ -451,6 +451,7 @@ mod tests {
                 mounts: Vec::new(),
                 network: NetworkPolicy::Enabled,
             },
+            sandbox_state_root: temp.path().join("windows-sandbox"),
         })
         .await
         .unwrap();

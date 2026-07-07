@@ -252,6 +252,7 @@ pub struct DaemonHandle {
     approval_mgr: Arc<ApprovalManager>,
     session_mgr: Arc<SessionManager>,
     sandbox_registry: Arc<AsyncMutex<SandboxRegistry>>,
+    sandbox_state_root: PathBuf,
 }
 
 impl std::fmt::Debug for DaemonHandle {
@@ -361,10 +362,11 @@ impl DaemonHandle {
         resolver: Arc<dyn crate::sandbox::SandboxInvocationResolver>,
         options: crate::sandbox::SandboxToolProviderOptions,
     ) -> anyhow::Result<()> {
-        let provider = crate::sandbox::SandboxToolProvider::new(
+        let provider = crate::sandbox::SandboxToolProvider::new_with_sandbox_state_root(
             Arc::clone(&self.sandbox_registry),
             resolver,
             options,
+            self.sandbox_state_root.clone(),
         );
         self.app_tools.register_many(provider.tool_handlers()).await
     }
@@ -527,6 +529,7 @@ impl DaemonHandle {
     ) -> SandboxResult<SandboxExecResult> {
         execute_sandbox_command_with_registry(
             Arc::clone(&self.sandbox_registry),
+            self.sandbox_state_root.clone(),
             session_id,
             request,
         )
@@ -625,6 +628,7 @@ impl DaemonHandle {
 
 pub(crate) async fn execute_sandbox_command_with_registry(
     sandbox_registry: Arc<AsyncMutex<SandboxRegistry>>,
+    sandbox_state_root: PathBuf,
     session_id: &str,
     request: SandboxExecRequest,
 ) -> SandboxResult<SandboxExecResult> {
@@ -701,6 +705,7 @@ pub(crate) async fn execute_sandbox_command_with_registry(
         env,
         timeout,
         policy,
+        sandbox_state_root,
     })
     .await
 }
@@ -799,6 +804,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     }));
 
     let inner_config = build_inner_config(&config, &identity_path);
+    let sandbox_state_root = config.identity_dir.join("windows-sandbox");
     // FileManager is policy-driven; library callers don't yet expose
     // file-policy config so we hand it the inner config's `file_policy`
     // (defaulted in `build_inner_config`).
@@ -867,6 +873,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         approval_mgr: approval_mgr_for_handle,
         session_mgr: session_mgr_for_handle,
         sandbox_registry: Arc::new(AsyncMutex::new(SandboxRegistry::default())),
+        sandbox_state_root,
     })
 }
 
