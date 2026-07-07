@@ -171,6 +171,9 @@ pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
         ));
     }
     collect_read_literal_ancestors(&mut literal_read_paths, &policy.writable_root);
+    for root in &policy.writable_roots {
+        collect_read_literal_ancestors(&mut literal_read_paths, root);
+    }
     for path in literal_read_paths {
         sbpl.push_str(&format!(
             "(allow file-read* (literal \"{}\"))\n",
@@ -185,6 +188,16 @@ pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
         "(allow file-write* (subpath \"{}\"))\n",
         escape_sbpl(&policy.writable_root.to_string_lossy())
     ));
+    for root in &policy.writable_roots {
+        sbpl.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            escape_sbpl(&root.to_string_lossy())
+        ));
+        sbpl.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))\n",
+            escape_sbpl(&root.to_string_lossy())
+        ));
+    }
     append_common_device_rules(&mut sbpl);
     append_artifact_tool_socket_rules(&mut sbpl);
     if policy.network == NetworkPolicy::Enabled {

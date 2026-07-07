@@ -6,40 +6,60 @@ use crate::sandbox::types::{RuntimeExecuteResult, SandboxError, SandboxResult};
 
 pub(super) fn run_capture(
     request: PlatformExecuteRequest,
-    _timeout: Duration,
+    timeout: Duration,
 ) -> SandboxResult<RuntimeExecuteResult> {
     let env = super::env::normalize_env(request.env, request.policy.network)?;
     let network_mode = super::network::mode_for_policy(request.policy.network)?;
-    if !process_execution_enabled() {
-        return match network_mode {
-            super::network::WindowsNetworkMode::Offline => Err(SandboxError::unavailable(
-                "NetworkPolicy::Disabled requires the Windows offline sandbox user runner before execution can be enabled",
-            )),
-            super::network::WindowsNetworkMode::Online => Err(SandboxError::unavailable(
-                "Windows sandbox execution requires filesystem default-deny isolation before process launch can be enabled",
-            )),
-        };
-    }
     let network_context =
         super::setup::prepare_network_context(network_mode, &env, &request.sandbox_state_root)?;
-    let runner_launch = resolve_sandbox_user_runner_launch(&network_context)?;
+    let sandbox_creds = network_context.sandbox_creds.as_ref().ok_or_else(|| {
+        SandboxError::unavailable("Windows sandbox setup did not return sandbox user credentials")
+    })?;
+    let mut roots = filesystem_roots_for_security(&request.policy, &request.sandbox_state_root);
+    add_runner_read_roots(&mut roots);
+    let capability =
+        super::cap::capability_for_root(&request.policy.writable_root).map_err(|err| {
+            SandboxError::unavailable(format!(
+                "failed to prepare Windows sandbox capability SID: {err}"
+            ))
+        })?;
+    let mut sandbox_group_sid =
+        super::sandbox_users::resolve_sandbox_users_group_sid().map_err(|err| {
+            SandboxError::unavailable(format!(
+                "failed to resolve Windows sandbox users group SID: {err}"
+            ))
+        })?;
+    let mut capability_sid = super::winutil::sid_bytes_from_string(capability.sid_string())
+        .map_err(|err| {
+            SandboxError::unavailable(format!(
+                "failed to convert Windows sandbox capability SID: {err}"
+            ))
+        })?;
+    let sandbox_group_sid_ptr = sandbox_group_sid.as_mut_ptr() as *mut std::ffi::c_void;
+    let capability_sid_ptr = capability_sid.as_mut_ptr() as *mut std::ffi::c_void;
+    super::acl::apply_filesystem_roots(&roots, sandbox_group_sid_ptr, capability_sid_ptr).map_err(
+        |err| {
+            SandboxError::unavailable(format!(
+                "failed to apply Windows sandbox filesystem ACLs: {err}"
+            ))
+        },
+    )?;
+    super::acl::allow_null_device(capability_sid_ptr).map_err(|err| {
+        SandboxError::unavailable(format!(
+            "failed to allow Windows NUL device for sandbox: {err}"
+        ))
+    })?;
 
-    match runner_launch {}
-}
-
-fn process_execution_enabled() -> bool {
-    false
-}
-
-#[derive(Debug)]
-enum SandboxUserRunnerLaunch {}
-
-fn resolve_sandbox_user_runner_launch(
-    _network_context: &super::setup::WindowsNetworkContext,
-) -> SandboxResult<SandboxUserRunnerLaunch> {
-    Err(SandboxError::unavailable(
-        "Windows sandbox execution requires sandbox user runner/logon integration with CreateProcessWithLogonW before process launch can be enabled",
-    ))
+    super::runner_ipc::spawn_capture(
+        sandbox_creds,
+        super::runner_ipc::RunnerRequest {
+            command: request.command,
+            cwd: request.cwd,
+            env,
+            timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            capability_sid: capability.sid_string().to_string(),
+        },
+    )
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -50,10 +70,26 @@ fn filesystem_roots_for_security(
     super::roots::derive_filesystem_roots(policy, state_root)
 }
 
+fn add_runner_read_roots(roots: &mut super::roots::DerivedFilesystemRoots) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(parent) = exe.parent() else {
+        return;
+    };
+    let root = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    if !roots.write_roots.iter().any(|existing| existing == &root)
+        && !roots.read_roots.iter().any(|existing| existing == &root)
+    {
+        roots.read_roots.push(root);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::path::PathBuf;
     use std::time::Duration;
 
     use crate::sandbox::runner::{PlatformExecuteRequest, RuntimeSandboxPolicy};
@@ -62,7 +98,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enabled_network_fails_before_capability_sid_creation_until_filesystem_isolation_exists() {
+    fn enabled_network_reaches_setup_instead_of_static_filesystem_gate() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let state_root = temp.path().join("windows-sandbox");
@@ -74,6 +110,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             policy: RuntimeSandboxPolicy {
                 writable_root: workspace.clone(),
+                writable_roots: Vec::new(),
                 readonly_roots: vec![],
                 mounts: Vec::new(),
                 network: NetworkPolicy::Enabled,
@@ -84,14 +121,13 @@ mod tests {
         let err = run_capture(request, Duration::from_secs(1)).unwrap_err();
 
         assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
-        assert!(err.message.contains("filesystem default-deny"));
+        assert!(err.message.contains("sandbox user setup"));
         assert!(!workspace.join(".ahand-sandbox").join("cap_sid").exists());
         assert!(!workspace.join(".ahand-sandbox").exists());
-        assert!(!super::super::setup::sandbox_dir(&state_root).exists());
     }
 
     #[test]
-    fn disabled_network_fails_before_capability_sid_creation_until_runner_exists() {
+    fn disabled_network_reaches_offline_setup_instead_of_static_runner_gate() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let state_root = temp.path().join("windows-sandbox");
@@ -103,6 +139,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             policy: RuntimeSandboxPolicy {
                 writable_root: workspace.clone(),
+                writable_roots: Vec::new(),
                 readonly_roots: vec![],
                 mounts: Vec::new(),
                 network: NetworkPolicy::Disabled,
@@ -113,9 +150,8 @@ mod tests {
         let err = run_capture(request, Duration::from_secs(1)).unwrap_err();
 
         assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
-        assert!(err.message.contains("offline sandbox user runner"));
+        assert!(err.message.contains("hard network blocking"));
         assert!(!workspace.join(".ahand-sandbox").exists());
-        assert!(!super::super::setup::sandbox_dir(&state_root).exists());
     }
 
     #[test]
@@ -134,6 +170,7 @@ mod tests {
         let roots = filesystem_roots_for_security(
             &RuntimeSandboxPolicy {
                 writable_root: workspace.clone(),
+                writable_roots: Vec::new(),
                 readonly_roots: vec![runtime.clone(), sandbox_dir, secrets_dir],
                 mounts: Vec::new(),
                 network: NetworkPolicy::Enabled,
@@ -146,20 +183,14 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_user_runner_launch_is_unavailable_until_logon_runner_exists() {
-        let context = super::super::setup::WindowsNetworkContext {
-            mode: super::super::network::WindowsNetworkMode::Online,
-            state_root: PathBuf::from("state"),
-            sandbox_creds: Some(super::super::identity::SandboxCreds {
-                username: super::super::setup::ONLINE_USERNAME.to_string(),
-                password: "password".to_string(),
-            }),
+    fn runner_read_roots_include_current_executable_parent() {
+        let mut roots = super::super::roots::DerivedFilesystemRoots {
+            write_roots: Vec::new(),
+            read_roots: Vec::new(),
         };
 
-        let err = resolve_sandbox_user_runner_launch(&context).unwrap_err();
+        add_runner_read_roots(&mut roots);
 
-        assert_eq!(err.code, "SANDBOX_UNAVAILABLE");
-        assert!(err.message.contains("sandbox user runner/logon"));
-        assert!(err.message.contains("CreateProcessWithLogonW"));
+        assert!(!roots.read_roots.is_empty());
     }
 }

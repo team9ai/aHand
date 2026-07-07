@@ -14,6 +14,11 @@ pub(super) fn normalize_env(
     insert_default(&mut env, "NULL_DEVICE", "NUL");
     inherit_case_insensitive(&mut env, "PATH", "");
     inherit_case_insensitive(&mut env, "PATHEXT", ".COM;.EXE;.BAT;.CMD");
+    inherit_case_insensitive(&mut env, "SystemRoot", r"C:\Windows");
+    inherit_case_insensitive(&mut env, "WINDIR", r"C:\Windows");
+    inherit_case_insensitive(&mut env, "COMSPEC", r"C:\Windows\System32\cmd.exe");
+    inherit_case_insensitive(&mut env, "TEMP", "");
+    inherit_case_insensitive(&mut env, "TMP", "");
 
     match network {
         NetworkPolicy::Enabled => {}
@@ -87,6 +92,11 @@ mod tests {
         assert_eq!(env.get("NULL_DEVICE").map(String::as_str), Some("NUL"));
         assert!(env.keys().any(|key| key.eq_ignore_ascii_case("PATH")));
         assert!(env.keys().any(|key| key.eq_ignore_ascii_case("PATHEXT")));
+        assert!(env.keys().any(|key| key.eq_ignore_ascii_case("SystemRoot")));
+        assert!(env.keys().any(|key| key.eq_ignore_ascii_case("WINDIR")));
+        assert!(env.keys().any(|key| key.eq_ignore_ascii_case("COMSPEC")));
+        assert!(env.keys().any(|key| key.eq_ignore_ascii_case("TEMP")));
+        assert!(env.keys().any(|key| key.eq_ignore_ascii_case("TMP")));
     }
 
     #[test]

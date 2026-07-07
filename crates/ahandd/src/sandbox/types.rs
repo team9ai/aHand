@@ -50,6 +50,7 @@ pub struct RuntimeProviderConfig {
     pub name: String,
     pub executable: PathBuf,
     pub readonly_roots: Vec<PathBuf>,
+    pub writable_roots: Vec<PathBuf>,
     pub env: HashMap<String, String>,
     pub default_timeout: Duration,
 }
@@ -176,6 +177,7 @@ pub type SandboxExecResult = RuntimeExecuteResult;
 pub struct RegisteredExecEnvironment {
     pub path_entries: Vec<PathBuf>,
     pub readonly_roots: Vec<PathBuf>,
+    pub writable_roots: Vec<PathBuf>,
     pub env: HashMap<String, String>,
     pub mounts: Vec<RegisteredSandboxMount>,
     pub default_timeout: Duration,
@@ -341,6 +343,7 @@ mod tests {
             name: "python".to_string(),
             executable: PathBuf::from("/opt/coffice/python/bin/python"),
             readonly_roots: vec![PathBuf::from("/opt/coffice/python")],
+            writable_roots: vec![PathBuf::from("/opt/coffice/agent")],
             env: HashMap::from([(
                 "PYTHONPATH".to_string(),
                 "/opt/coffice/python/lib".to_string(),
@@ -356,6 +359,10 @@ mod tests {
         assert_eq!(
             provider.readonly_roots,
             vec![PathBuf::from("/opt/coffice/python")]
+        );
+        assert_eq!(
+            provider.writable_roots,
+            vec![PathBuf::from("/opt/coffice/agent")]
         );
         assert_eq!(provider.env["PYTHONPATH"], "/opt/coffice/python/lib");
         assert_eq!(provider.default_timeout, Duration::from_secs(30));
@@ -420,6 +427,7 @@ mod tests {
         let env = RegisteredExecEnvironment {
             path_entries: vec![PathBuf::from("/runtime/python/bin")],
             readonly_roots: vec![PathBuf::from("/runtime/python")],
+            writable_roots: vec![PathBuf::from("/workspace/agent")],
             env: HashMap::from([("PYTHONNOUSERSITE".to_string(), "1".to_string())]),
             mounts: Vec::new(),
             default_timeout: Duration::from_secs(30),
@@ -427,6 +435,7 @@ mod tests {
 
         assert_eq!(env.path_entries, vec![PathBuf::from("/runtime/python/bin")]);
         assert_eq!(env.readonly_roots, vec![PathBuf::from("/runtime/python")]);
+        assert_eq!(env.writable_roots, vec![PathBuf::from("/workspace/agent")]);
         assert_eq!(env.env["PYTHONNOUSERSITE"], "1");
         assert!(env.mounts.is_empty());
         assert_eq!(env.default_timeout, Duration::from_secs(30));
