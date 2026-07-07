@@ -159,10 +159,13 @@ fn push_unique_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 fn path_key(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "/")
-        .trim_end_matches('/')
-        .to_ascii_lowercase()
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let normalized = normalized
+        .strip_prefix("//?/UNC/")
+        .map(|rest| format!("//{rest}"))
+        .or_else(|| normalized.strip_prefix("//?/").map(ToOwned::to_owned))
+        .unwrap_or(normalized);
+    normalized.trim_end_matches('/').to_ascii_lowercase()
 }
 
 #[cfg(windows)]
@@ -649,6 +652,39 @@ mod inheritance_tests {
                 PathBuf::from(r"C:\Program Files (x86)"),
                 PathBuf::from(r"C:\ProgramData"),
                 PathBuf::from(r"C:\Users\AhandSandboxOnline"),
+                PathBuf::from(r"C:\runtime"),
+            ],
+        };
+
+        let plan = plan_filesystem_acls(&roots);
+
+        assert_eq!(
+            plan,
+            vec![
+                PlannedAcl {
+                    path: PathBuf::from(r"C:\workspace"),
+                    access: AppliedAccess::Writable,
+                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                },
+                PlannedAcl {
+                    path: PathBuf::from(r"C:\runtime"),
+                    access: AppliedAccess::Readonly,
+                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn filesystem_acl_plan_does_not_rewrite_verbatim_ambient_windows_read_roots() {
+        let roots = super::super::roots::DerivedFilesystemRoots {
+            write_roots: vec![PathBuf::from(r"C:\workspace")],
+            read_roots: vec![
+                PathBuf::from(r"\\?\C:\Windows"),
+                PathBuf::from(r"\\?\C:\Windows\System32"),
+                PathBuf::from(r"\\?\C:\Program Files"),
+                PathBuf::from(r"\\?\C:\ProgramData"),
+                PathBuf::from(r"\\?\C:\Users\AhandSandboxOnline"),
                 PathBuf::from(r"C:\runtime"),
             ],
         };
