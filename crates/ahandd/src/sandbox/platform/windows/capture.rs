@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::sandbox::runner::{PlatformExecuteRequest, RuntimeSandboxPolicy};
@@ -16,7 +17,7 @@ pub(super) fn run_capture(
         SandboxError::unavailable("Windows sandbox setup did not return sandbox user credentials")
     })?;
     let mut roots = filesystem_roots_for_security(&request.policy, &request.sandbox_state_root);
-    add_runner_read_roots(&mut roots);
+    add_windows_default_read_roots(&mut roots);
     let capability =
         super::cap::capability_for_root(&request.policy.writable_root).map_err(|err| {
             SandboxError::unavailable(format!(
@@ -70,6 +71,16 @@ fn filesystem_roots_for_security(
     super::roots::derive_filesystem_roots(policy, state_root)
 }
 
+fn add_windows_default_read_roots(roots: &mut super::roots::DerivedFilesystemRoots) {
+    add_runner_read_roots(roots);
+    #[cfg(windows)]
+    {
+        for root in windows_default_read_root_candidates() {
+            push_existing_read_root(roots, root);
+        }
+    }
+}
+
 fn add_runner_read_roots(roots: &mut super::roots::DerivedFilesystemRoots) {
     let Ok(exe) = std::env::current_exe() else {
         return;
@@ -77,9 +88,14 @@ fn add_runner_read_roots(roots: &mut super::roots::DerivedFilesystemRoots) {
     let Some(parent) = exe.parent() else {
         return;
     };
-    let root = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
+    push_existing_read_root(roots, parent.to_path_buf());
+}
+
+fn push_existing_read_root(roots: &mut super::roots::DerivedFilesystemRoots, root: PathBuf) {
+    if !root.exists() {
+        return;
+    }
+    let root = root.canonicalize().unwrap_or(root);
     if !roots.write_roots.iter().any(|existing| existing == &root)
         && !roots.read_roots.iter().any(|existing| existing == &root)
     {
@@ -87,9 +103,72 @@ fn add_runner_read_roots(roots: &mut super::roots::DerivedFilesystemRoots) {
     }
 }
 
+#[cfg(windows)]
+fn windows_default_read_root_candidates() -> Vec<PathBuf> {
+    windows_default_read_root_candidates_from_env(|key| std::env::var(key).ok())
+}
+
+#[cfg(windows)]
+fn windows_default_read_root_candidates_from_env<F>(mut env: F) -> Vec<PathBuf>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut candidates = Vec::new();
+    let system_root = env("SystemRoot").unwrap_or_else(|| r"C:\Windows".to_string());
+    push_candidate(&mut candidates, PathBuf::from(&system_root));
+    for child in [
+        "System32",
+        "SysWOW64",
+        "WinSxS",
+        "Fonts",
+        r"System32\WindowsPowerShell\v1.0",
+    ] {
+        push_candidate(&mut candidates, PathBuf::from(&system_root).join(child));
+    }
+    for key in [
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "ProgramData",
+    ] {
+        if let Some(path) = env(key).filter(|value| !value.trim().is_empty()) {
+            push_candidate(&mut candidates, PathBuf::from(path));
+        }
+    }
+    let system_drive = env("SystemDrive").unwrap_or_else(|| "C:".to_string());
+    push_candidate(
+        &mut candidates,
+        PathBuf::from(format!(
+            "{}\\Users\\{}",
+            system_drive.trim_end_matches(['\\', '/']),
+            super::setup::ONLINE_USERNAME
+        )),
+    );
+    candidates
+}
+
+#[cfg(windows)]
+fn push_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    let key = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if !candidates.iter().any(|existing| {
+        existing
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(&key)
+    }) {
+        candidates.push(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use crate::sandbox::runner::{PlatformExecuteRequest, RuntimeSandboxPolicy};
@@ -192,5 +271,35 @@ mod tests {
         add_runner_read_roots(&mut roots);
 
         assert!(!roots.read_roots.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_default_read_root_candidates_cover_system_runtime_and_profile_roots() {
+        let candidates = windows_default_read_root_candidates_from_env(|key| match key {
+            "SystemRoot" => Some(r"D:\Windows".to_string()),
+            "ProgramFiles" => Some(r"D:\Program Files".to_string()),
+            "ProgramFiles(x86)" => Some(r"D:\Program Files (x86)".to_string()),
+            "ProgramW6432" => Some(r"D:\Program Files".to_string()),
+            "ProgramData" => Some(r"D:\ProgramData".to_string()),
+            "SystemDrive" => Some("D:".to_string()),
+            _ => None,
+        });
+
+        assert!(candidates.contains(&PathBuf::from(r"D:\Windows")));
+        assert!(candidates.contains(&PathBuf::from(r"D:\Windows\System32")));
+        assert!(candidates.contains(&PathBuf::from(r"D:\Windows\SysWOW64")));
+        assert!(candidates.contains(&PathBuf::from(r"D:\Windows\WinSxS")));
+        assert!(candidates.contains(&PathBuf::from(r"D:\Program Files")));
+        assert!(candidates.contains(&PathBuf::from(r"D:\Program Files (x86)")));
+        assert!(candidates.contains(&PathBuf::from(r"D:\ProgramData")));
+        assert!(candidates.contains(&PathBuf::from(r"D:\Users\AhandSandboxOnline")));
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|path| **path == PathBuf::from(r"D:\Program Files"))
+                .count(),
+            1
+        );
     }
 }
