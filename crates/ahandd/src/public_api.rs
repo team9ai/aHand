@@ -32,14 +32,21 @@ use crate::registry::JobRegistry;
 use crate::sandbox::{
     CommitResult, FileVersion, HostFileRef, NetworkPolicy, PermissionSnapshot,
     RegisterVersionRequest, RegisteredExecEnvironment, RuntimeExecuteRequest, RuntimeExecuteResult,
-    RuntimeProviderConfig, SandboxExecRequest, SandboxExecResult, SandboxFile,
+    RuntimeProviderConfig, SandboxCommand, SandboxExecRequest, SandboxExecResult, SandboxFile,
     SandboxPermissionMode, SandboxResult, SandboxSessionConfig, file_lifecycle, path_policy,
     registry::SandboxRegistry,
     runner::{self, PlatformExecuteRequest, RuntimeSandboxPolicy},
 };
+pub use crate::sandbox::{
+    MountAccess, MountScope, MountSource, MountSourceSnapshot, RegisteredSandboxMount,
+    SandboxMountSpec,
+};
 use crate::session::SessionManager;
 
-pub use crate::app_tool_registry::{AppToolDef, AppToolError, AppToolHandler};
+pub use crate::app_tool_registry::{
+    AppToolArgsHandler, AppToolDef, AppToolError, AppToolHandler, AppToolInvocation,
+    args_only_handler,
+};
 
 use crate::device_identity::IDENTITY_FILE as IDENTITY_FILE_NAME;
 
@@ -245,6 +252,7 @@ pub struct DaemonHandle {
     approval_mgr: Arc<ApprovalManager>,
     session_mgr: Arc<SessionManager>,
     sandbox_registry: Arc<AsyncMutex<SandboxRegistry>>,
+    sandbox_state_root: PathBuf,
 }
 
 impl std::fmt::Debug for DaemonHandle {
@@ -345,6 +353,24 @@ impl DaemonHandle {
         self.app_tools.register(def, handler).await
     }
 
+    /// Register the built-in sandbox tool provider as app tools.
+    ///
+    /// The provider catalog is registered as one snapshot mutation so the hub
+    /// never observes a partially-registered sandbox tool set.
+    pub async fn register_sandbox_tools(
+        &self,
+        resolver: Arc<dyn crate::sandbox::SandboxInvocationResolver>,
+        options: crate::sandbox::SandboxToolProviderOptions,
+    ) -> anyhow::Result<()> {
+        let provider = crate::sandbox::SandboxToolProvider::new_with_sandbox_state_root(
+            Arc::clone(&self.sandbox_registry),
+            resolver,
+            options,
+            self.sandbox_state_root.clone(),
+        );
+        self.app_tools.register_many(provider.tool_handlers()).await
+    }
+
     /// Unregister an app-defined tool by name. Returns `true` if the tool
     /// existed. The daemon pushes a new snapshot (without the tool) to the
     /// hub immediately if connected.
@@ -434,6 +460,36 @@ impl DaemonHandle {
         self.sandbox_registry.lock().await.create_session(config)
     }
 
+    pub async fn register_sandbox_mount(
+        &self,
+        session_id: &str,
+        spec: SandboxMountSpec,
+    ) -> SandboxResult<RegisteredSandboxMount> {
+        self.sandbox_registry
+            .lock()
+            .await
+            .register_mount(session_id, spec)
+    }
+
+    pub async fn unregister_sandbox_mount(
+        &self,
+        session_id: &str,
+        mount_id: &str,
+        scope: MountScope,
+    ) -> SandboxResult<()> {
+        self.sandbox_registry
+            .lock()
+            .await
+            .unregister_mount(session_id, mount_id, scope)
+    }
+
+    pub async fn list_sandbox_mounts(
+        &self,
+        session_id: &str,
+    ) -> SandboxResult<Vec<RegisteredSandboxMount>> {
+        self.sandbox_registry.lock().await.list_mounts(session_id)
+    }
+
     pub async fn update_sandbox_permission_mode(
         &self,
         session_id: &str,
@@ -471,63 +527,12 @@ impl DaemonHandle {
         session_id: &str,
         request: SandboxExecRequest,
     ) -> SandboxResult<SandboxExecResult> {
-        let (workspace_root, network, exec_env): (
-            PathBuf,
-            NetworkPolicy,
-            RegisteredExecEnvironment,
-        ) = {
-            let registry = self.sandbox_registry.lock().await;
-            let session = registry.session(session_id)?;
-            (
-                session.workspace_root.clone(),
-                session.network,
-                session.exec_environment(),
-            )
-        };
-        let SandboxExecRequest {
-            command,
-            cwd,
-            env: request_env,
-            timeout: request_timeout,
-        } = request;
-        let (program, args) = command.split_first().ok_or_else(|| {
-            crate::sandbox::SandboxError::invalid_command("sandbox command must not be empty")
-        })?;
-
-        std::fs::create_dir_all(&workspace_root).map_err(|e| {
-            crate::sandbox::SandboxError::unavailable(format!(
-                "failed to create sandbox workspace root: {e}"
-            ))
-        })?;
-        let cwd = match cwd {
-            Some(cwd) => {
-                path_policy::resolve_existing_sandbox_path(&workspace_root, &cwd.to_string_lossy())?
-            }
-            None => workspace_root.canonicalize().map_err(|e| {
-                crate::sandbox::SandboxError::invalid_sandbox_path(format!(
-                    "failed to resolve sandbox workspace root: {e}"
-                ))
-            })?,
-        };
-        let executable = runner::resolve_executable(program, &exec_env.path_entries)?;
-        let mut env = exec_env.env;
-        merge_path_entries(&mut env, &exec_env.path_entries);
-        env.extend(request_env);
-        let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
-        let policy = RuntimeSandboxPolicy {
-            writable_root: workspace_root,
-            readonly_roots: exec_env.readonly_roots,
-            network,
-        };
-
-        runner::execute(PlatformExecuteRequest {
-            executable,
-            args: args.to_vec(),
-            cwd,
-            env,
-            timeout,
-            policy,
-        })
+        execute_sandbox_command_with_registry(
+            Arc::clone(&self.sandbox_registry),
+            self.sandbox_state_root.clone(),
+            session_id,
+            request,
+        )
         .await
     }
 
@@ -560,10 +565,11 @@ impl DaemonHandle {
         self.execute_sandbox_command(
             session_id,
             SandboxExecRequest {
-                command,
+                command: SandboxCommand::Argv { command },
                 cwd: request.cwd,
                 env,
                 timeout: request.timeout.or(Some(provider.default_timeout)),
+                context: None,
             },
         )
         .await
@@ -618,6 +624,90 @@ impl DaemonHandle {
             target_path.to_path_buf(),
         )
     }
+}
+
+pub(crate) async fn execute_sandbox_command_with_registry(
+    sandbox_registry: Arc<AsyncMutex<SandboxRegistry>>,
+    sandbox_state_root: PathBuf,
+    session_id: &str,
+    request: SandboxExecRequest,
+) -> SandboxResult<SandboxExecResult> {
+    let SandboxExecRequest {
+        command,
+        cwd,
+        env: request_env,
+        timeout: request_timeout,
+        context,
+    } = request;
+    let (workspace_root, network, exec_env, reserved_mount_env): (
+        PathBuf,
+        NetworkPolicy,
+        RegisteredExecEnvironment,
+        HashSet<String>,
+    ) = {
+        let registry = sandbox_registry.lock().await;
+        let session = registry.session(session_id)?;
+        (
+            session.workspace_root.clone(),
+            session.network,
+            session.exec_environment_for(context.as_ref()),
+            session.registered_mount_env_vars().into_iter().collect(),
+        )
+    };
+
+    std::fs::create_dir_all(&workspace_root).map_err(|e| {
+        crate::sandbox::SandboxError::unavailable(format!(
+            "failed to create sandbox workspace root: {e}"
+        ))
+    })?;
+    let cwd = match cwd {
+        Some(cwd) => {
+            path_policy::resolve_existing_sandbox_path(&workspace_root, &cwd.to_string_lossy())?
+        }
+        None => workspace_root.canonicalize().map_err(|e| {
+            crate::sandbox::SandboxError::invalid_sandbox_path(format!(
+                "failed to resolve sandbox workspace root: {e}"
+            ))
+        })?,
+    };
+    let command = runner::command_argv_from_sandbox_command(&command)?;
+    let active_mount_env = exec_env
+        .mounts
+        .iter()
+        .filter_map(|mount| mount.env_var.clone())
+        .collect::<HashSet<_>>();
+    if let Some((key, _)) = request_env
+        .iter()
+        .find(|(key, _)| reserved_mount_env.contains(*key) && !active_mount_env.contains(*key))
+    {
+        return Err(crate::sandbox::SandboxError::mount_scope_mismatch(format!(
+            "sandbox mount env var '{key}' is not active for this invocation context"
+        )));
+    }
+    let mut env = exec_env.env;
+    merge_path_entries(&mut env, &exec_env.path_entries);
+    env.extend(
+        request_env
+            .into_iter()
+            .filter(|(key, _)| !active_mount_env.contains(key)),
+    );
+    let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
+    let policy = RuntimeSandboxPolicy {
+        writable_root: workspace_root,
+        readonly_roots: exec_env.readonly_roots,
+        mounts: exec_env.mounts,
+        network,
+    };
+
+    runner::execute(PlatformExecuteRequest {
+        command,
+        cwd,
+        env,
+        timeout,
+        policy,
+        sandbox_state_root,
+    })
+    .await
 }
 
 fn canonicalize_runtime_provider(
@@ -714,6 +804,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     }));
 
     let inner_config = build_inner_config(&config, &identity_path);
+    let sandbox_state_root = config.identity_dir.join("windows-sandbox");
     // FileManager is policy-driven; library callers don't yet expose
     // file-policy config so we hand it the inner config's `file_policy`
     // (defaulted in `build_inner_config`).
@@ -782,6 +873,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
         approval_mgr: approval_mgr_for_handle,
         session_mgr: session_mgr_for_handle,
         sandbox_registry: Arc::new(AsyncMutex::new(SandboxRegistry::default())),
+        sandbox_state_root,
     })
 }
 
@@ -1200,6 +1292,7 @@ mod tests {
                 permission_mode: SandboxPermissionMode::Readonly,
                 workspace_root,
                 network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
             })
             .await
             .unwrap();
@@ -1208,16 +1301,61 @@ mod tests {
             .execute_sandbox_command(
                 "session-1",
                 SandboxExecRequest {
-                    command: vec![],
+                    command: SandboxCommand::Argv { command: vec![] },
                     cwd: None,
                     env: HashMap::new(),
                     timeout: Some(Duration::from_secs(1)),
+                    context: None,
                 },
             )
             .await
             .unwrap_err();
 
         assert_eq!(err.code, "INVALID_COMMAND");
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execute_sandbox_command_accepts_shell_command_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity_dir = temp.path().join("identity");
+        let workspace_root = temp.path().join("sandbox");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
+            .heartbeat_interval(Duration::from_millis(50))
+            .build();
+        let handle = spawn(cfg).await.unwrap();
+        handle
+            .create_sandbox_session(SandboxSessionConfig {
+                session_id: "session-1".to_string(),
+                permission_mode: SandboxPermissionMode::Readonly,
+                workspace_root,
+                network: NetworkPolicy::Enabled,
+                mounts: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let result = handle
+            .execute_sandbox_command(
+                "session-1",
+                SandboxExecRequest {
+                    command: SandboxCommand::Shell {
+                        cmd: "echo ok".to_string(),
+                    },
+                    cwd: None,
+                    env: HashMap::new(),
+                    timeout: Some(Duration::from_secs(5)),
+                    context: None,
+                },
+            )
+            .await;
+
+        #[cfg(target_os = "macos")]
+        assert_eq!(result.unwrap().stdout.trim(), "ok");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(result.unwrap_err().code, "SANDBOX_UNAVAILABLE");
+
         handle.shutdown().await.unwrap();
     }
 

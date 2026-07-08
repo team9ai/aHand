@@ -41,6 +41,7 @@ fn app_tool_request_roundtrips() {
         name: "list_documents".into(),
         args_json: r#"{"limit":5}"#.into(),
         timeout_ms: 30_000,
+        context_json: r#"{"source":"coffice","scopeType":"run","runId":"run-1"}"#.into(),
     };
     match roundtrip(envelope::Payload::AppToolRequest(req.clone())) {
         envelope::Payload::AppToolRequest(got) => assert_eq!(got, req),

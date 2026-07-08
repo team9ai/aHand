@@ -455,6 +455,11 @@ export interface ListAppToolsOptions {
 /** Options for `invokeAppTool()`. */
 export interface InvokeAppToolOptions {
   /**
+   * Trusted invocation context forwarded to the device as
+   * `AppToolRequest.context_json`. The hub validates this as a JSON object.
+   */
+  context?: Record<string, unknown>;
+  /**
    * Per-request timeout in milliseconds. Defaults to `60_000` (60 s)
    * when omitted. The hub clamps the value to `[1_000, 300_000]`
    * (1 s – 5 min).
@@ -1934,10 +1939,12 @@ export class CloudClient {
    * Hub-level errors (auth, offline, timeout) throw `CloudClientError`.
    * Daemon-level failures surface as `CloudClientError("app_tool_error")`
    * with the daemon error code in `jobErrorCode`. The well-known daemon
-   * error codes are: `TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE |
-   * APPROVAL_DENIED | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT |
-   * HANDLER_PANIC | CONCURRENCY_LIMIT`. Handler-supplied codes pass
-   * through verbatim; `HANDLER_ERROR` is only the empty-code fallback.
+   * error codes are: `TOOL_NOT_FOUND | INVALID_ARGS | INVALID_CONTEXT |
+   * SESSION_INACTIVE | APPROVAL_DENIED | APPROVAL_TIMEOUT |
+   * EXECUTION_TIMEOUT | HANDLER_PANIC | HANDLER_ERROR |
+   * CONCURRENCY_LIMIT`.
+   * Handler-supplied codes pass through verbatim; `HANDLER_ERROR` is only
+   * the empty-code fallback.
    * Do not treat this set as closed — future daemon versions may add
    * codes. See `proto/ahand/v1/app_tool.proto` comments for details.
    *
@@ -1969,6 +1976,7 @@ export class CloudClient {
     // camelCase body; omit undefined optional fields
     const requestBody: Record<string, unknown> = { deviceId, name };
     if (args !== undefined) requestBody.args = args;
+    if (opts?.context !== undefined) requestBody.context = opts.context;
     if (opts?.timeoutMs !== undefined) requestBody.timeoutMs = opts.timeoutMs;
 
     let res: Response;
