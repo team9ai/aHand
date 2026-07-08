@@ -47,11 +47,39 @@ pub struct AppToolError {
     pub message: String,
 }
 
+// Bin target never constructs this directly; AppToolInvocation is consumed by
+// embedder-registered handlers through the lib API.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct AppToolInvocation {
+    pub tool_call_id: String,
+    pub name: String,
+    pub args: serde_json::Value,
+    /// Daemon-clamped execution budget delivered to the handler. For
+    /// approval-gated calls this may be the remaining budget after approval
+    /// wait, not the original request timeout.
+    pub timeout_ms: u32,
+    pub context: Option<serde_json::Value>,
+}
+
+#[allow(dead_code)]
 pub type AppToolHandler = Arc<
+    dyn Fn(AppToolInvocation) -> BoxFuture<'static, Result<serde_json::Value, AppToolError>>
+        + Send
+        + Sync,
+>;
+
+#[allow(dead_code)]
+pub type AppToolArgsHandler = Arc<
     dyn Fn(serde_json::Value) -> BoxFuture<'static, Result<serde_json::Value, AppToolError>>
         + Send
         + Sync,
 >;
+
+#[allow(dead_code)]
+pub fn args_only_handler(handler: AppToolArgsHandler) -> AppToolHandler {
+    Arc::new(move |invocation: AppToolInvocation| handler(invocation.args))
+}
 
 #[derive(Debug, Clone)]
 pub struct CompletedAppToolCall {
@@ -137,35 +165,61 @@ impl AppToolRegistry {
     // `DaemonHandle::register_app_tool` on the lib API.
     #[allow(dead_code)]
     pub async fn register(&self, def: AppToolDef, handler: AppToolHandler) -> anyhow::Result<()> {
-        if !valid_name(&def.name) {
-            anyhow::bail!(
-                "invalid tool name {:?}: must match ^[a-z0-9_-]{{1,64}}$",
-                def.name
-            );
+        self.register_many(vec![(def, handler)]).await
+    }
+
+    /// Register a set of tools as one catalog mutation.
+    ///
+    /// The full batch is validated before any tool is inserted. A failed batch
+    /// leaves the registry and revision unchanged.
+    pub async fn register_many(
+        &self,
+        registrations: Vec<(AppToolDef, AppToolHandler)>,
+    ) -> anyhow::Result<()> {
+        if registrations.is_empty() {
+            return Ok(());
         }
-        if !def.input_schema.is_object() {
-            anyhow::bail!("input_schema for tool {:?} must be a JSON object", def.name);
+
+        let mut seen = HashSet::new();
+        for (def, _) in &registrations {
+            if !valid_name(&def.name) {
+                anyhow::bail!(
+                    "invalid tool name {:?}: must match ^[a-z0-9_-]{{1,64}}$",
+                    def.name
+                );
+            }
+            if !def.input_schema.is_object() {
+                anyhow::bail!("input_schema for tool {:?} must be a JSON object", def.name);
+            }
+            if !seen.insert(def.name.clone()) {
+                anyhow::bail!("tool {:?} is already registered", def.name);
+            }
         }
 
         let mut tools = self.tools.lock().await;
-        if tools.contains_key(&def.name) {
-            anyhow::bail!("tool {:?} is already registered", def.name);
+        for (def, _) in &registrations {
+            if tools.contains_key(&def.name) {
+                anyhow::bail!("tool {:?} is already registered", def.name);
+            }
         }
-        let descriptor = AppToolDescriptor {
-            name: def.name.clone(),
-            description: def.description.clone(),
-            input_schema_json: def.input_schema.to_string(),
-            requires_approval: def.requires_approval,
-        };
-        tools.insert(
-            def.name,
-            Registered {
-                descriptor,
-                handler,
-            },
-        );
-        // Publish new revision while the tools lock is still held, so
-        // snapshot content and revision always move atomically.
+
+        for (def, handler) in registrations {
+            let descriptor = AppToolDescriptor {
+                name: def.name.clone(),
+                description: def.description.clone(),
+                input_schema_json: def.input_schema.to_string(),
+                requires_approval: def.requires_approval,
+            };
+            tools.insert(
+                def.name,
+                Registered {
+                    descriptor,
+                    handler,
+                },
+            );
+        }
+        // Publish one revision for the complete batch while the tools lock is
+        // still held, so snapshot content and revision move atomically.
         self.revision_tx.send_modify(|r| *r += 1);
         Ok(())
     }
@@ -279,7 +333,7 @@ mod tests {
     use serde_json::json;
 
     fn make_handler() -> AppToolHandler {
-        Arc::new(|_args| Box::pin(async move { Ok(json!({"ok": true})) }))
+        Arc::new(|_invocation| Box::pin(async move { Ok(json!({"ok": true})) }))
     }
 
     fn make_def(name: &str) -> AppToolDef {

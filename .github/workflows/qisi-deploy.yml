@@ -18,7 +18,6 @@ on:
       - "tsconfig.base.json"
       - "turbo.json"
       - "deploy/hub/Dockerfile"
-      - "deploy/qisi/**"
       - ".github/workflows/qisi-deploy.yml"
   workflow_dispatch:
 
@@ -27,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  REGISTRY: registry.image.coffice.qisiai.top
+  REGISTRY: registry.image.cofficeai.cn
   IMAGE_NAMESPACE: coffice/ahand
 
 jobs:
@@ -35,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       env_name: ${{ steps.target.outputs.env_name }}
-      deploy_dir: ${{ steps.target.outputs.deploy_dir }}
+      k8s_namespace: ${{ steps.target.outputs.k8s_namespace }}
     steps:
       - id: target
         shell: bash
@@ -43,15 +42,15 @@ jobs:
           case "${GITHUB_REF_NAME}" in
             dev)
               echo "env_name=dev" >> "$GITHUB_OUTPUT"
-              echo "deploy_dir=/opt/ahand-hub/dev" >> "$GITHUB_OUTPUT"
+              echo "k8s_namespace=coffice-dev" >> "$GITHUB_OUTPUT"
               ;;
             staging)
               echo "env_name=staging" >> "$GITHUB_OUTPUT"
-              echo "deploy_dir=/opt/ahand-hub/staging" >> "$GITHUB_OUTPUT"
+              echo "k8s_namespace=coffice-staging" >> "$GITHUB_OUTPUT"
               ;;
             main)
               echo "env_name=production" >> "$GITHUB_OUTPUT"
-              echo "deploy_dir=/opt/ahand-hub/production" >> "$GITHUB_OUTPUT"
+              echo "k8s_namespace=coffice-prod" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "unsupported branch: ${GITHUB_REF_NAME}" >&2
@@ -70,8 +69,16 @@ jobs:
         include:
           - image: ahand-hub
             target: hub
+            deployment: ahand-hub
+            container: hub
+            component_dir: hub
+            image_env: AHAND_HUB_IMAGE
           - image: ahand-hub-dashboard
             target: dashboard
+            deployment: ahand-dashboard
+            container: dashboard
+            component_dir: dashboard
+            image_env: AHAND_HUB_DASHBOARD_IMAGE
     steps:
       - uses: actions/checkout@v6
 
@@ -83,7 +90,8 @@ jobs:
           username: ${{ secrets.QISI_REGISTRY_USERNAME }}
           password: ${{ secrets.QISI_REGISTRY_PASSWORD }}
 
-      - uses: docker/build-push-action@v7
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/hub/Dockerfile
@@ -95,7 +103,80 @@ jobs:
           cache-from: type=gha,scope=qisi-ahand-${{ matrix.image }}
           cache-to: type=gha,scope=qisi-ahand-${{ matrix.image }},mode=max
 
-  deploy:
+      - name: Prepare GitOps image metadata
+        env:
+          K8S_NAMESPACE: ${{ needs.resolve-target.outputs.k8s_namespace }}
+          ENV_NAME: ${{ needs.resolve-target.outputs.env_name }}
+          IMAGE_NAME: ${{ matrix.image }}
+          DEPLOYMENT: ${{ matrix.deployment }}
+          CONTAINER: ${{ matrix.container }}
+          COMPONENT_DIR: ${{ matrix.component_dir }}
+          IMAGE_ENV: ${{ matrix.image_env }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${IMAGE_DIGEST:-}" ]]; then
+            echo "missing build image digest" >&2
+            exit 1
+          fi
+
+          image_ref="${REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${ENV_NAME}-${GITHUB_SHA}"
+          image_with_digest="${image_ref}@${IMAGE_DIGEST}"
+          env_json=$(jq -nc --arg image_key "$IMAGE_ENV" --arg image "$image_with_digest" --arg sha "$GITHUB_SHA" \
+            '{($image_key): $image, GIT_SHA: $sha, SENTRY_RELEASE: $sha}')
+
+          jq -nc \
+            --arg namespace "$K8S_NAMESPACE" \
+            --arg deployment "$DEPLOYMENT" \
+            --arg container "$CONTAINER" \
+            --arg componentDir "$COMPONENT_DIR" \
+            --arg imageName "$IMAGE_NAME" \
+            --arg image "$image_ref" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg imageWithDigest "$image_with_digest" \
+            --argjson env "$env_json" \
+            '{namespace:$namespace,deployment:$deployment,container:$container,componentDir:$componentDir,imageName:$imageName,image:$image,digest:$digest,imageWithDigest:$imageWithDigest,env:$env}' \
+            > "qisi-image-${IMAGE_NAME}.json"
+
+      - name: Upload GitOps image metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: qisi-image-${{ matrix.image }}
+          path: qisi-image-${{ matrix.image }}.json
+          retention-days: 1
+
+      - name: Dispatch GitOps image update
+        env:
+          GH_TOKEN: ${{ secrets.COFFICE_GITOPS_TOKEN }}
+          IMAGE_NAME: ${{ matrix.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "missing COFFICE_GITOPS_TOKEN" >&2
+            exit 1
+          fi
+
+          jq -nc \
+            --slurpfile metadata "qisi-image-${IMAGE_NAME}.json" \
+            '{event_type:"update-app-image",client_payload:{
+              namespace:$metadata[0].namespace,
+              deployment:$metadata[0].deployment,
+              container:$metadata[0].container,
+              image:$metadata[0].image,
+              digest:$metadata[0].digest,
+              env:$metadata[0].env
+            }}' \
+            > /tmp/gitops-dispatch.json
+
+          gh api repos/weightwave/coffice-cn-gitops/dispatches \
+            --method POST \
+            --input /tmp/gitops-dispatch.json
+
+  verify-gitops-manifests:
     needs: [resolve-target, build-images]
     runs-on: ubuntu-latest
     permissions:
@@ -103,55 +184,39 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Resolve SSH host
+      - name: Download GitOps image metadata
+        uses: actions/download-artifact@v8
+        with:
+          pattern: qisi-image-*
+          path: qisi-images
+          merge-multiple: true
+
+      - name: Verify GitOps manifests
+        env:
+          GH_TOKEN: ${{ secrets.COFFICE_GITOPS_TOKEN }}
         shell: bash
         run: |
-          case "${GITHUB_REF_NAME}" in
-            dev|staging)
-              echo "SSH_HOST=${{ secrets.QISI_DEV_SSH_HOST }}" >> "$GITHUB_ENV"
-              ;;
-            main)
-              echo "SSH_HOST=${{ secrets.QISI_SSH_HOST }}" >> "$GITHUB_ENV"
-              ;;
-            *)
-              echo "unsupported branch: ${GITHUB_REF_NAME}" >&2
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "missing COFFICE_GITOPS_TOKEN" >&2
+            exit 1
+          fi
+
+          for attempt in {1..18}; do
+            rm -rf /tmp/coffice-cn-gitops
+            gh repo clone weightwave/coffice-cn-gitops /tmp/coffice-cn-gitops -- --branch main --depth 1
+
+            if node scripts/verify-qisi-gitops-manifests.mjs \
+              --metadata-dir qisi-images \
+              --gitops-root /tmp/coffice-cn-gitops; then
+              exit 0
+            fi
+
+            if [[ "$attempt" == "18" ]]; then
+              echo "GitOps manifests did not converge after ${attempt} attempts." >&2
               exit 1
-              ;;
-          esac
+            fi
 
-      - name: Configure SSH
-        shell: bash
-        run: |
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "${{ secrets.QISI_SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          printf '%s\n' "${{ secrets.QISI_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
-          chmod 600 ~/.ssh/known_hosts
-
-      - name: Write image env
-        shell: bash
-        run: |
-          cat > .env.images.next <<EOF
-          AHAND_HUB_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ahand-hub:${{ needs.resolve-target.outputs.env_name }}-${{ github.sha }}
-          AHAND_HUB_DASHBOARD_IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/ahand-hub-dashboard:${{ needs.resolve-target.outputs.env_name }}-${{ github.sha }}
-          GIT_SHA=${{ github.sha }}
-          SENTRY_RELEASE=${{ github.sha }}
-          EOF
-
-      - name: Sync deploy files
-        shell: bash
-        run: |
-          ssh -i ~/.ssh/id_ed25519 "${{ secrets.QISI_SSH_USER }}@$SSH_HOST" \
-            "mkdir -p '${{ needs.resolve-target.outputs.deploy_dir }}/scripts'"
-          scp -i ~/.ssh/id_ed25519 deploy/qisi/compose.yml \
-            "${{ secrets.QISI_SSH_USER }}@$SSH_HOST:${{ needs.resolve-target.outputs.deploy_dir }}/compose.yml"
-          scp -i ~/.ssh/id_ed25519 deploy/qisi/scripts/deploy.sh deploy/qisi/scripts/healthcheck.sh \
-            "${{ secrets.QISI_SSH_USER }}@$SSH_HOST:${{ needs.resolve-target.outputs.deploy_dir }}/scripts/"
-          scp -i ~/.ssh/id_ed25519 .env.images.next \
-            "${{ secrets.QISI_SSH_USER }}@$SSH_HOST:${{ needs.resolve-target.outputs.deploy_dir }}/.env.images.next"
-
-      - name: Deploy on host
-        shell: bash
-        run: |
-          ssh -i ~/.ssh/id_ed25519 "${{ secrets.QISI_SSH_USER }}@$SSH_HOST" \
-            "cd '${{ needs.resolve-target.outputs.deploy_dir }}' && bash scripts/deploy.sh .env.images.next"
+            sleep 10
+          done

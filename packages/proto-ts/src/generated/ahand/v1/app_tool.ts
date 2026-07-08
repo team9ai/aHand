@@ -39,18 +39,22 @@ export interface AppToolRequest {
   name: string;
   /** JSON object matching input_schema_json */
   argsJson: string;
-  /** daemon clamps to [1_000, 300_000]; 0 => 60_000 */
+  /** daemon clamps to [1_000, 300_000]; 0 => 60_000; bounds approval wait + execution for approval-gated tools */
   timeoutMs: number;
+  /** Optional trusted invocation context JSON object supplied by the hub/host path, never by tool args */
+  contextJson: string;
 }
 
 /** AppToolError - structured failure for one invocation; code is machine-readable, message is a human-readable remediation hint. */
 export interface AppToolError {
-  /** TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE | APPROVAL_DENIED */
-  code: string;
   /**
-   * | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT | HANDLER_PANIC
-   * | HANDLER_ERROR | CONCURRENCY_LIMIT
+   * Well-known daemon codes:
+   * TOOL_NOT_FOUND | INVALID_ARGS | INVALID_CONTEXT | SESSION_INACTIVE
+   * | APPROVAL_DENIED | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT
+   * | HANDLER_PANIC | HANDLER_ERROR | CONCURRENCY_LIMIT
    */
+  code: string;
+  /** human-readable, host-neutral remediation hint */
   message: string;
 }
 
@@ -254,7 +258,7 @@ export const AppToolsUpdate: MessageFns<AppToolsUpdate> = {
 };
 
 function createBaseAppToolRequest(): AppToolRequest {
-  return { toolCallId: "", name: "", argsJson: "", timeoutMs: 0 };
+  return { toolCallId: "", name: "", argsJson: "", timeoutMs: 0, contextJson: "" };
 }
 
 export const AppToolRequest: MessageFns<AppToolRequest> = {
@@ -270,6 +274,9 @@ export const AppToolRequest: MessageFns<AppToolRequest> = {
     }
     if (message.timeoutMs !== 0) {
       writer.uint32(32).uint32(message.timeoutMs);
+    }
+    if (message.contextJson !== "") {
+      writer.uint32(42).string(message.contextJson);
     }
     return writer;
   },
@@ -313,6 +320,14 @@ export const AppToolRequest: MessageFns<AppToolRequest> = {
           message.timeoutMs = reader.uint32();
           continue;
         }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.contextJson = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -340,6 +355,11 @@ export const AppToolRequest: MessageFns<AppToolRequest> = {
         : isSet(object.timeout_ms)
         ? globalThis.Number(object.timeout_ms)
         : 0,
+      contextJson: isSet(object.contextJson)
+        ? globalThis.String(object.contextJson)
+        : isSet(object.context_json)
+        ? globalThis.String(object.context_json)
+        : "",
     };
   },
 
@@ -357,6 +377,9 @@ export const AppToolRequest: MessageFns<AppToolRequest> = {
     if (message.timeoutMs !== 0) {
       obj.timeoutMs = Math.round(message.timeoutMs);
     }
+    if (message.contextJson !== "") {
+      obj.contextJson = message.contextJson;
+    }
     return obj;
   },
 
@@ -369,6 +392,7 @@ export const AppToolRequest: MessageFns<AppToolRequest> = {
     message.name = object.name ?? "";
     message.argsJson = object.argsJson ?? "";
     message.timeoutMs = object.timeoutMs ?? 0;
+    message.contextJson = object.contextJson ?? "";
     return message;
   },
 };

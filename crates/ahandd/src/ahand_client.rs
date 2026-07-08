@@ -73,6 +73,7 @@ struct QueuedEnvelope {
 #[allow(clippy::large_enum_variant)] // Envelope is the hot path; boxing adds indirection cost
 enum OutboundFrame {
     Envelope(QueuedEnvelope),
+    #[cfg(not(feature = "disable-ws-ping"))]
     WsPing(Vec<u8>),
     DirectEnvelope(Envelope),
 }
@@ -84,6 +85,7 @@ impl BufferedEnvelopeSender {
 
     /// Send a raw WebSocket Ping. Returns Err only if the receiver task has
     /// already exited (session tearing down).
+    #[cfg(not(feature = "disable-ws-ping"))]
     fn send_ping(&self, payload: Vec<u8>) -> Result<(), ()> {
         self.tx.send(OutboundFrame::WsPing(payload)).map_err(|_| ())
     }
@@ -500,6 +502,7 @@ async fn connect_with_auth(
                     }
                     tungstenite::Message::Binary(queued.frame)
                 }
+                #[cfg(not(feature = "disable-ws-ping"))]
                 OutboundFrame::WsPing(payload) => tungstenite::Message::Ping(payload),
                 // Direct envelopes (e.g. AppToolsUpdate snapshots) bypass
                 // outbox sequencing/replay but are still trace-logged.
@@ -1864,7 +1867,8 @@ fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: St
 ///      * Allow (Trust/AutoAccept) + requires_approval=false → fall through.
 ///      * Allow + requires_approval=true OR Strict → NeedsApproval path:
 ///        mark_running first (idempotency), send ApprovalRequest, spawn waiter.
-///   4. Parse args — INVALID_ARGS on bad JSON or non-object.
+///   4. Parse args/context — INVALID_ARGS on bad args JSON or non-object;
+///      INVALID_CONTEXT on bad context JSON or non-object.
 ///   5. Concurrency permit — CONCURRENCY_LIMIT if all slots taken.
 ///   6. Execute (spawned).
 ///
@@ -2091,6 +2095,7 @@ async fn handle_app_tool_request<T>(
         let tool_call_id = req.tool_call_id.clone();
         let tool_name = req.name.clone();
         let args_json = req.args_json.clone();
+        let context_json = req.context_json.clone();
         let approval_job_id_clone = approval_job_id.clone();
 
         tokio::spawn(async move {
@@ -2119,6 +2124,7 @@ async fn handle_app_tool_request<T>(
                         tool_call_id,
                         tool_name,
                         args_json,
+                        context_json,
                         remaining_ms,
                         handler,
                         &tx_clone,
@@ -2189,6 +2195,7 @@ async fn handle_app_tool_request<T>(
         req.tool_call_id,
         req.name,
         req.args_json,
+        req.context_json,
         req.timeout_ms,
         handler,
         tx,
@@ -2198,10 +2205,10 @@ async fn handle_app_tool_request<T>(
 }
 
 /// Record a failed app-tool call in the idempotency cache and send the error
-/// envelope to the WS. Used at all five fail paths (deny, timeout, bad-JSON,
-/// non-object args, concurrency limit) to keep them DRY and avoid the
-/// double-construction drift risk where code and message diverge between
-/// mark_completed and the envelope.
+/// envelope to the WS. Used at app-tool fail paths (deny, timeout, bad-JSON,
+/// non-object args, invalid context, concurrency limit) to keep them DRY and
+/// avoid the double-construction drift risk where code and message diverge
+/// between mark_completed and the envelope.
 async fn fail_app_tool_call<T: crate::executor::EnvelopeSink>(
     app_tools: &Arc<AppToolRegistry>,
     tx: &T,
@@ -2230,6 +2237,27 @@ async fn fail_app_tool_call<T: crate::executor::EnvelopeSink>(
     ));
 }
 
+fn parse_app_tool_context(
+    tool_call_id: &str,
+    tool_name: &str,
+    context_json: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    if context_json.trim().is_empty() {
+        return Ok(None);
+    }
+    let value: serde_json::Value = serde_json::from_str(context_json)
+        .map_err(|err| format!("context_json is not valid JSON: {err}"))?;
+    if !value.is_object() {
+        return Err("context_json must be a JSON object".to_string());
+    }
+    tracing::debug!(
+        tool_call_id = %tool_call_id,
+        tool_name = %tool_name,
+        "parsed app tool context"
+    );
+    Ok(Some(value))
+}
+
 /// Post-gate tail: parse args, acquire permit, mark_running, spawn execute.
 ///
 /// Called from two sites:
@@ -2247,6 +2275,7 @@ async fn validate_and_execute_app_tool<T>(
     tool_call_id: String,
     tool_name: String,
     args_json: String,
+    context_json: String,
     timeout_ms_req: u32,
     handler: crate::app_tool_registry::AppToolHandler,
     tx: &T,
@@ -2295,6 +2324,26 @@ async fn validate_and_execute_app_tool<T>(
         .await;
         return;
     }
+    let context = match parse_app_tool_context(&tool_call_id, &tool_name, &context_json) {
+        Ok(context) => context,
+        Err(message) => {
+            warn!(
+                tool_call_id = %tool_call_id,
+                tool_name = %tool_name,
+                "invalid app tool context"
+            );
+            fail_app_tool_call(
+                app_tools,
+                tx,
+                device_id,
+                &tool_call_id,
+                "INVALID_CONTEXT",
+                message,
+            )
+            .await;
+            return;
+        }
+    };
 
     // ── Concurrency permit (fail-fast) ────────────────────────────────────
     let permit = match app_tools.try_acquire_permit() {
@@ -2329,13 +2378,18 @@ async fn validate_and_execute_app_tool<T>(
     let did = device_id.to_string();
     let app_tools_clone = Arc::clone(app_tools);
     let timeout_ms = AppToolRegistry::clamp_timeout(timeout_ms_req);
+    let invocation = crate::app_tool_registry::AppToolInvocation {
+        tool_call_id,
+        name: tool_name,
+        args,
+        timeout_ms,
+        context,
+    };
 
     tokio::spawn(async move {
         execute_app_tool(
             &did,
-            tool_call_id,
-            tool_name,
-            args,
+            invocation,
             handler,
             permit,
             timeout_ms,
@@ -2356,9 +2410,7 @@ async fn validate_and_execute_app_tool<T>(
 #[allow(clippy::too_many_arguments)]
 async fn execute_app_tool<T>(
     device_id: &str,
-    tool_call_id: String,
-    tool_name: String,
-    args: serde_json::Value,
+    invocation: crate::app_tool_registry::AppToolInvocation,
     handler: crate::app_tool_registry::AppToolHandler,
     permit: tokio::sync::OwnedSemaphorePermit,
     timeout_ms: u32,
@@ -2369,6 +2421,8 @@ async fn execute_app_tool<T>(
 {
     let started = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+    let tool_call_id = invocation.tool_call_id.clone();
+    let tool_name = invocation.name.clone();
 
     // Spawn the handler inside its own task for panic isolation.
     // The permit is moved into the task so it is released when the task
@@ -2376,7 +2430,7 @@ async fn execute_app_tool<T>(
     // abort() the task because the handler may hold app-owned locks).
     let handler_task = tokio::spawn(async move {
         let _permit = permit; // keep permit alive until handler completes
-        handler(args).await
+        handler(invocation).await
     });
 
     let (code, message, result_json) = match tokio::time::timeout(timeout, handler_task).await {

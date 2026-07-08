@@ -184,6 +184,63 @@ async fn happy_path_dispatches_and_returns_result() {
     server.shutdown().await;
 }
 
+#[tokio::test]
+async fn app_tool_invoke_forwards_context_json_to_device() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+
+    let mut socket = attach_owned_device(&server, "device-context", "user-context").await;
+    let token = mint_cp_jwt("user-context");
+
+    let device_task = tokio::spawn(async move {
+        let req = recv_app_tool_request(&mut socket).await;
+        assert_eq!(req.name, "run_command");
+        let context: serde_json::Value = serde_json::from_str(&req.context_json).unwrap();
+        assert_eq!(context["source"], "coffice");
+        assert_eq!(context["scopeType"], "run");
+        assert_eq!(context["runId"], "run-1");
+        assert_eq!(context["sessionId"], "session-1");
+        let tool_call_id = req.tool_call_id.clone();
+        send_app_tool_response(
+            "device-context",
+            &mut socket,
+            AppToolResponse {
+                tool_call_id: tool_call_id.clone(),
+                result: Some(app_tool_response::Result::ResultJson(
+                    r#"{"ok":true}"#.into(),
+                )),
+            },
+        )
+        .await;
+        tool_call_id
+    });
+
+    let resp = post_invoke(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "device-context",
+            "name": "run_command",
+            "args": { "command": ["python", "-c", "print(1)"] },
+            "context": {
+                "source": "coffice",
+                "scopeType": "run",
+                "runId": "run-1",
+                "sessionId": "session-1"
+            },
+            "timeoutMs": 5000
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let tool_call_id = device_task.await.unwrap();
+    assert_eq!(body["toolCallId"], tool_call_id);
+    assert_eq!(body["result"]["ok"], true);
+
+    server.shutdown().await;
+}
+
 // ────────────────────────────────────────────────────────────
 // Offline fast-fail → 409
 // ────────────────────────────────────────────────────────────
@@ -874,6 +931,33 @@ async fn non_object_args_returns_400() {
         resp.status(),
         StatusCode::BAD_REQUEST,
         "expected 400 for non-object args"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "VALIDATION_ERROR");
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn non_object_context_returns_400() {
+    let state = test_state().await;
+    let server = spawn_server_with_state(state).await;
+    let token = mint_cp_jwt("user-validate-context");
+
+    let resp = post_invoke(
+        &server,
+        &token,
+        serde_json::json!({
+            "deviceId": "some-device",
+            "name": "some_tool",
+            "context": ["not", "an", "object"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "expected 400 for non-object context"
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "VALIDATION_ERROR");

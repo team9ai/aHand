@@ -18,9 +18,9 @@ Released alongside `@ahandai/proto@0.3.0`.
     is returned for a stable contract (callers can use `result ?? default`).
   - Daemon-level failures throw `CloudClientError("app_tool_error")` with
     the daemon code in `jobErrorCode`. Daemon error code set:
-    `TOOL_NOT_FOUND | INVALID_ARGS | SESSION_INACTIVE | APPROVAL_DENIED |
-    APPROVAL_TIMEOUT | EXECUTION_TIMEOUT | HANDLER_PANIC | HANDLER_ERROR |
-    CONCURRENCY_LIMIT`.
+    `TOOL_NOT_FOUND | INVALID_ARGS | INVALID_CONTEXT | SESSION_INACTIVE |
+    APPROVAL_DENIED | APPROVAL_TIMEOUT | EXECUTION_TIMEOUT | HANDLER_PANIC |
+    HANDLER_ERROR | CONCURRENCY_LIMIT`.
   - Hub-level error codes reuse existing taxonomy:
     `409 DEVICE_OFFLINE → device_offline` (same as `files()`),
     `504 → timeout` (same as `files()` / `browser()`).
