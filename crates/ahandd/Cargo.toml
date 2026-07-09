@@ -63,6 +63,7 @@ chardetng = "0.1"
 # transitive dep so deduplicates cleanly.
 nix = { version = "0.28", features = ["fs", "dir"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+calamine = "0.36.0"
 
 [target.'cfg(not(windows))'.dependencies]
 xz2 = { version = "0.1", features = ["static"] }
