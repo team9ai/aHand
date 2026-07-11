@@ -419,10 +419,10 @@ pub fn optional_timeout_arg(args: &Value, name: &str) -> Result<Option<Duration>
     }
 
     let Some(seconds) = value.as_u64() else {
-        return Err(invalid_arg(name, "must be an integer from 1 to 120"));
+        return Err(invalid_arg(name, "must be an integer from 1 to 300"));
     };
-    if !(1..=120).contains(&seconds) {
-        return Err(invalid_arg(name, "must be an integer from 1 to 120"));
+    if !(1..=300).contains(&seconds) {
+        return Err(invalid_arg(name, "must be an integer from 1 to 300"));
     }
 
     Ok(Some(Duration::from_secs(seconds)))
@@ -501,7 +501,7 @@ fn run_command_def(name: &'static str) -> AppToolDef {
                 "timeoutSeconds": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 120
+                    "maximum": 300
                 }
             },
             "oneOf": [
@@ -529,7 +529,7 @@ fn run_node_def() -> AppToolDef {
                 "timeoutSeconds": {
                     "type": "integer",
                     "minimum": 1,
-                    "maximum": 120
+                    "maximum": 300
                 }
             },
             "required": ["args"],
@@ -801,6 +801,29 @@ mod tests {
                 .unwrap_err();
 
         assert_eq!(err.code, CODE_SANDBOX_CONTEXT_REQUIRED);
+    }
+
+    #[test]
+    fn sandbox_command_timeout_supports_five_minutes() {
+        let args = json!({"timeoutSeconds": 300});
+        assert_eq!(
+            optional_timeout_arg(&args, "timeoutSeconds").unwrap(),
+            Some(Duration::from_secs(300))
+        );
+
+        let error =
+            optional_timeout_arg(&json!({"timeoutSeconds": 301}), "timeoutSeconds").unwrap_err();
+        assert_eq!(error.code, "INVALID_ARGUMENT");
+        assert!(error.message.contains("1 to 300"));
+
+        assert_eq!(
+            run_command_def("run_command").input_schema["properties"]["timeoutSeconds"]["maximum"],
+            json!(300)
+        );
+        assert_eq!(
+            run_node_def().input_schema["properties"]["timeoutSeconds"]["maximum"],
+            json!(300)
+        );
     }
 
     #[tokio::test]
