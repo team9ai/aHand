@@ -14,6 +14,24 @@ use ahandd::{
     },
 };
 
+#[test]
+fn sandbox_timeout_parser_supports_five_minutes() {
+    let timeout = ahandd::sandbox::tool_provider::optional_timeout_arg(
+        &serde_json::json!({"timeoutSeconds": 300}),
+        "timeoutSeconds",
+    )
+    .unwrap();
+    assert_eq!(timeout, Some(Duration::from_secs(300)));
+
+    let error = ahandd::sandbox::tool_provider::optional_timeout_arg(
+        &serde_json::json!({"timeoutSeconds": 301}),
+        "timeoutSeconds",
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "INVALID_ARGUMENT");
+    assert!(error.message.contains("1 to 300"));
+}
+
 #[tokio::test]
 async fn daemon_handle_exposes_sandbox_permission_updates() {
     let temp = tempfile::tempdir().unwrap();
