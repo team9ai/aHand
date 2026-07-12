@@ -569,7 +569,7 @@ impl DaemonHandle {
                 cwd: request.cwd,
                 env,
                 timeout: request.timeout.or(Some(provider.default_timeout)),
-                context: None,
+                context: request.context,
             },
         )
         .await

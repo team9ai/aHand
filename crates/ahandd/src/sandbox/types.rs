@@ -146,6 +146,7 @@ pub struct RuntimeExecuteRequest {
     pub cwd: Option<PathBuf>,
     pub env: HashMap<String, String>,
     pub timeout: Option<Duration>,
+    pub context: Option<SandboxInvocationContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
