@@ -14,6 +14,24 @@ use ahandd::{
     },
 };
 
+#[test]
+fn sandbox_timeout_parser_supports_five_minutes() {
+    let timeout = ahandd::sandbox::tool_provider::optional_timeout_arg(
+        &serde_json::json!({"timeoutSeconds": 300}),
+        "timeoutSeconds",
+    )
+    .unwrap();
+    assert_eq!(timeout, Some(Duration::from_secs(300)));
+
+    let error = ahandd::sandbox::tool_provider::optional_timeout_arg(
+        &serde_json::json!({"timeoutSeconds": 301}),
+        "timeoutSeconds",
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "INVALID_ARGUMENT");
+    assert!(error.message.contains("1 to 300"));
+}
+
 #[tokio::test]
 async fn daemon_handle_exposes_sandbox_permission_updates() {
     let temp = tempfile::tempdir().unwrap();
@@ -155,6 +173,7 @@ async fn sandbox_api_execute_sandbox_command_request_env_cannot_override_active_
                 name: "shell".to_string(),
                 executable: PathBuf::from("/bin/sh"),
                 readonly_roots: vec![PathBuf::from("/bin")],
+                writable_roots: Vec::new(),
                 env: HashMap::new(),
                 default_timeout: Duration::from_secs(3),
             },
@@ -243,6 +262,7 @@ async fn sandbox_api_execute_sandbox_command_request_env_for_inactive_mount_fail
                 name: "shell".to_string(),
                 executable: PathBuf::from("/bin/sh"),
                 readonly_roots: vec![PathBuf::from("/bin")],
+                writable_roots: Vec::new(),
                 env: HashMap::new(),
                 default_timeout: Duration::from_secs(3),
             },
@@ -326,6 +346,7 @@ async fn sandbox_api_execute_sandbox_command_inactive_mount_without_request_env_
                 name: "shell".to_string(),
                 executable: PathBuf::from("/bin/sh"),
                 readonly_roots: vec![PathBuf::from("/bin")],
+                writable_roots: Vec::new(),
                 env: HashMap::new(),
                 default_timeout: Duration::from_secs(3),
             },
@@ -581,7 +602,9 @@ async fn daemon_handle_executes_registered_runtime_inside_sandbox() {
     let temp = tempfile::tempdir().unwrap();
     let identity_dir = temp.path().join("identity");
     let sandbox_root = temp.path().join("sandbox");
+    let source = temp.path().join("host");
     std::fs::create_dir_all(&sandbox_root).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
 
     let cfg = DaemonConfig::builder("ws://127.0.0.1:9/ws", "test-token", &identity_dir)
         .heartbeat_interval(Duration::from_millis(50))
@@ -601,11 +624,28 @@ async fn daemon_handle_executes_registered_runtime_inside_sandbox() {
         .register_sandbox_runtime(
             "session-1",
             RuntimeProviderConfig {
-                name: "echo".to_string(),
-                executable: PathBuf::from("/bin/echo"),
+                name: "shell".to_string(),
+                executable: PathBuf::from("/bin/sh"),
                 readonly_roots: vec![PathBuf::from("/bin")],
+                writable_roots: Vec::new(),
                 env: HashMap::new(),
                 default_timeout: Duration::from_secs(5),
+            },
+        )
+        .await
+        .unwrap();
+    let registered = handle
+        .register_sandbox_mount(
+            "session-1",
+            SandboxMountSpec {
+                mount_id: "selected-folder".to_string(),
+                source: MountSource::HostPath(source),
+                access: MountAccess::ReadOnly,
+                scope: MountScope::Run {
+                    run_id: "run-1".to_string(),
+                },
+                target: None,
+                env_var: Some("COFFICE_SELECTED_FOLDER_DIR".to_string()),
             },
         )
         .await
@@ -615,19 +655,27 @@ async fn daemon_handle_executes_registered_runtime_inside_sandbox() {
         .execute_sandbox_runtime(
             "session-1",
             RuntimeExecuteRequest {
-                runtime: "echo".to_string(),
-                args: vec!["hello".to_string()],
+                runtime: "shell".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "printf '%s' \"$COFFICE_SELECTED_FOLDER_DIR\"".to_string(),
+                ],
                 cwd: None,
                 env: HashMap::new(),
                 timeout: None,
-                context: None,
+                context: Some(SandboxInvocationContext {
+                    session_id: "session-1".to_string(),
+                    run_id: Some("run-1".to_string()),
+                    scope_id: None,
+                    invocation_id: None,
+                }),
             },
         )
         .await
         .unwrap();
 
     assert_eq!(result.exit_code, Some(0));
-    assert_eq!(result.stdout, "hello\n");
+    assert_eq!(result.stdout, registered.target.to_string_lossy());
     assert_eq!(result.stderr, "");
     assert!(!result.timed_out);
 
