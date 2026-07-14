@@ -7,6 +7,7 @@ mod capture;
 mod dpapi;
 mod env;
 mod firewall;
+mod hide_users;
 mod identity;
 mod network;
 mod path;

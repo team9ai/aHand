@@ -103,6 +103,7 @@ pub(super) fn provision_sandbox_user_accounts(
     let online_password = random_password();
     ensure_sandbox_user(OFFLINE_USERNAME, &offline_password, log)?;
     ensure_sandbox_user(ONLINE_USERNAME, &online_password, log)?;
+    super::hide_users::hide_sandbox_users_from_logon(log);
     Ok(ProvisionedSandboxUsers {
         offline_password,
         online_password,
