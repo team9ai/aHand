@@ -638,6 +638,7 @@ async fn daemon_handle_executes_registered_runtime_inside_sandbox() {
                 cwd: None,
                 env: HashMap::new(),
                 timeout: None,
+                context: None,
             },
         )
         .await

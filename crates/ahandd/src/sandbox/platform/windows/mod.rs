@@ -12,6 +12,7 @@ mod network;
 mod path;
 mod process;
 mod roots;
+mod runner_ipc;
 mod sandbox_users;
 mod setup;
 mod setup_error;
@@ -25,4 +26,11 @@ pub async fn execute(request: PlatformExecuteRequest) -> SandboxResult<RuntimeEx
         .map_err(|err| {
             SandboxError::unavailable(format!("Windows sandbox worker failed to join: {err}"))
         })?
+}
+
+pub fn try_run_helper_from_args() -> Result<bool, String> {
+    if runner_ipc::try_run_from_args()? {
+        return Ok(true);
+    }
+    setup::try_run_helper_from_args()
 }
