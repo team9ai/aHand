@@ -15,21 +15,21 @@ use ahandd::{
 };
 
 #[test]
-fn sandbox_timeout_parser_supports_five_minutes() {
+fn sandbox_timeout_parser_supports_ten_minutes() {
     let timeout = ahandd::sandbox::tool_provider::optional_timeout_arg(
-        &serde_json::json!({"timeoutSeconds": 300}),
+        &serde_json::json!({"timeoutSeconds": 600}),
         "timeoutSeconds",
     )
     .unwrap();
-    assert_eq!(timeout, Some(Duration::from_secs(300)));
+    assert_eq!(timeout, Some(Duration::from_secs(600)));
 
     let error = ahandd::sandbox::tool_provider::optional_timeout_arg(
-        &serde_json::json!({"timeoutSeconds": 301}),
+        &serde_json::json!({"timeoutSeconds": 601}),
         "timeoutSeconds",
     )
     .unwrap_err();
     assert_eq!(error.code, "INVALID_ARGUMENT");
-    assert!(error.message.contains("1 to 300"));
+    assert!(error.message.contains("1 to 600"));
 }
 
 #[tokio::test]
