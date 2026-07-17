@@ -27,7 +27,7 @@ use crate::state::AppState;
 /// hub never waits longer than the daemon ever could).
 pub const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 pub const MIN_TIMEOUT_MS: u64 = 1_000;
-pub const MAX_TIMEOUT_MS: u64 = 300_000;
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
 /// Extra grace period added on top of the caller-supplied timeout so that
 /// the hub waits slightly longer than the daemon's own execution window. This
@@ -165,7 +165,7 @@ pub async fn invoke(
                 tool_call_id: tool_call_id.clone(),
                 name: input.name.clone(),
                 args_json: input.args_json,
-                // Daemon field is u32; clamp guarantees [1_000, 300_000].
+                // Daemon field is u32; clamp guarantees [1_000, 600_000].
                 timeout_ms: clamped as u32,
                 context_json: input.context_json.unwrap_or_default(),
             },

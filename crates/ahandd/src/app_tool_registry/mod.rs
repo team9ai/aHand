@@ -24,7 +24,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 
 pub const DEFAULT_TIMEOUT_MS: u32 = 60_000;
 pub const MIN_TIMEOUT_MS: u32 = 1_000;
-pub const MAX_TIMEOUT_MS: u32 = 300_000;
+pub const MAX_TIMEOUT_MS: u32 = 600_000;
 /// Maximum number of concurrent in-flight app tool calls.
 const MAX_CONCURRENT_APP_TOOLS: usize = 16;
 /// Maximum number of completed call results retained for idempotency replay.
@@ -571,9 +571,9 @@ mod tests {
             "500 → clamped to MIN_TIMEOUT_MS"
         );
         assert_eq!(
-            AppToolRegistry::clamp_timeout(400_000),
+            AppToolRegistry::clamp_timeout(700_000),
             MAX_TIMEOUT_MS,
-            "400000 → clamped to MAX_TIMEOUT_MS"
+            "700000 → clamped to MAX_TIMEOUT_MS"
         );
         assert_eq!(
             AppToolRegistry::clamp_timeout(30_000),
