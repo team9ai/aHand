@@ -24,9 +24,9 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
 
 pub const DEFAULT_TIMEOUT_MS: u32 = 60_000;
 pub const MIN_TIMEOUT_MS: u32 = 1_000;
-pub const MAX_TIMEOUT_MS: u32 = 300_000;
+pub const MAX_TIMEOUT_MS: u32 = 600_000;
 /// Maximum number of concurrent in-flight app tool calls.
-const MAX_CONCURRENT_APP_TOOLS: usize = 4;
+const MAX_CONCURRENT_APP_TOOLS: usize = 16;
 /// Maximum number of completed call results retained for idempotency replay.
 const MAX_COMPLETED_CALLS: usize = 256;
 
@@ -536,27 +536,20 @@ mod tests {
     // ── permits ───────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn permits_4_ok_5th_none_drop_recover() {
+    async fn permits_16_ok_17th_none_drop_recover() {
         let reg = AppToolRegistry::new();
 
-        let p1 = reg.try_acquire_permit();
-        let p2 = reg.try_acquire_permit();
-        let p3 = reg.try_acquire_permit();
-        let p4 = reg.try_acquire_permit();
+        let mut permits: Vec<_> = (0..16).map(|_| reg.try_acquire_permit()).collect();
+        assert!(permits.iter().all(Option::is_some));
 
-        assert!(p1.is_some());
-        assert!(p2.is_some());
-        assert!(p3.is_some());
-        assert!(p4.is_some());
-
-        // 5th attempt should fail (fail-fast)
+        // 17th attempt should fail (fail-fast)
         assert!(
             reg.try_acquire_permit().is_none(),
-            "5th permit should return None"
+            "17th permit should return None"
         );
 
         // Drop one permit, then acquire should succeed
-        drop(p1);
+        drop(permits.pop());
         assert!(
             reg.try_acquire_permit().is_some(),
             "permit should be available after drop"
@@ -578,9 +571,9 @@ mod tests {
             "500 → clamped to MIN_TIMEOUT_MS"
         );
         assert_eq!(
-            AppToolRegistry::clamp_timeout(400_000),
+            AppToolRegistry::clamp_timeout(700_000),
             MAX_TIMEOUT_MS,
-            "400000 → clamped to MAX_TIMEOUT_MS"
+            "700000 → clamped to MAX_TIMEOUT_MS"
         );
         assert_eq!(
             AppToolRegistry::clamp_timeout(30_000),

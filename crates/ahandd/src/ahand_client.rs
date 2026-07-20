@@ -1887,7 +1887,7 @@ fn app_tool_result_envelope(device_id: &str, tool_call_id: &str, result_json: St
 /// Contrast with handle_file_request (which also spawns its approval-wait leg):
 /// file requests front-load a quick policy check inline and only spawn the
 /// approval waiter; here the entire execution is spawned because handler
-/// duration is unbounded (up to MAX_TIMEOUT_MS = 300s).
+/// duration is unbounded (up to MAX_TIMEOUT_MS = 600s).
 ///
 /// Timeout semantics: `timeout_ms` bounds the WHOLE invocation (approval +
 /// execution). Approval wait = min(approval_timeout, clamp_timeout(timeout_ms));

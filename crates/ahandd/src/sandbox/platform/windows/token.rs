@@ -18,8 +18,8 @@ use windows_sys::Win32::Security::{
     ACL, AdjustTokenPrivileges, CopySid, CreateRestrictedToken, CreateWellKnownSid, GetLengthSid,
     GetTokenInformation, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES,
     SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ADJUST_SESSIONID,
-    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenDefaultDacl,
-    TokenGroups, WinWorldSid,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
+    TokenDefaultDacl, TokenGroups, TokenUser, WinWorldSid,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -85,6 +85,30 @@ pub(super) fn create(capability: &CapabilitySid) -> io::Result<RestrictedToken> 
         handle: token,
         capability_sid: psid.into_raw(),
     })
+}
+
+#[cfg(windows)]
+pub(super) fn create_for_sandbox_user_sid_string(sid_string: &str) -> io::Result<RestrictedToken> {
+    let psid = LocalMemory::new(convert_string_sid_to_sid(sid_string)?).ok_or_else(|| {
+        io::Error::other(format!("failed to convert capability SID '{sid_string}'"))
+    })?;
+    let base = HandleGuard::new(get_current_token_for_restriction()?);
+    let token =
+        create_workspace_write_token_with_caps_and_user_from(base.handle(), &[psid.as_ptr()])?;
+
+    Ok(RestrictedToken {
+        handle: token,
+        capability_sid: psid.into_raw(),
+    })
+}
+
+#[cfg(not(windows))]
+pub(super) fn create_for_sandbox_user_sid_string(sid_string: &str) -> io::Result<RestrictedToken> {
+    let _ = sid_string;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Windows restricted token support is unavailable on this platform",
+    ))
 }
 
 #[cfg(not(windows))]
@@ -287,6 +311,45 @@ fn get_logon_sid_bytes(token: HANDLE) -> io::Result<Vec<u8>> {
 }
 
 #[cfg(windows)]
+fn get_user_sid_bytes(token: HANDLE) -> io::Result<Vec<u8>> {
+    unsafe {
+        let mut needed: u32 = 0;
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            return Err(io::Error::other("TokenUser size query returned 0"));
+        }
+
+        let mut buffer = vec![0u8; needed as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr() as *mut c_void,
+            needed,
+            &mut needed,
+        );
+        if ok == 0 || (needed as usize) < std::mem::size_of::<TOKEN_USER>() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let token_user = std::ptr::read_unaligned(buffer.as_ptr() as *const TOKEN_USER);
+        let sid_len = GetLengthSid(token_user.User.Sid);
+        if sid_len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut out = vec![0u8; sid_len as usize];
+        if CopySid(
+            sid_len,
+            out.as_mut_ptr() as *mut c_void,
+            token_user.User.Sid,
+        ) == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(windows)]
 fn world_sid() -> io::Result<Vec<u8>> {
     unsafe {
         let mut size: u32 = 0;
@@ -412,6 +475,7 @@ fn enable_single_privilege(token: HANDLE, name: &str) -> io::Result<()> {
 fn create_token_with_caps_from(
     base_token: HANDLE,
     psid_capabilities: &[*mut c_void],
+    extra_restricting_sids: &[*mut c_void],
 ) -> io::Result<HANDLE> {
     if psid_capabilities.is_empty() {
         return Err(io::Error::new(
@@ -430,12 +494,16 @@ fn create_token_with_caps_from(
             Sid: std::ptr::null_mut(),
             Attributes: 0,
         };
-        psid_capabilities.len() + 2
+        psid_capabilities.len() + extra_restricting_sids.len() + 2
     ];
     for (index, psid) in psid_capabilities.iter().enumerate() {
         entries[index].Sid = *psid;
     }
-    let logon_index = psid_capabilities.len();
+    let extras_index = psid_capabilities.len();
+    for (index, psid) in extra_restricting_sids.iter().enumerate() {
+        entries[extras_index + index].Sid = *psid;
+    }
+    let logon_index = extras_index + extra_restricting_sids.len();
     entries[logon_index].Sid = psid_logon;
     entries[logon_index + 1].Sid = psid_everyone;
 
@@ -478,7 +546,17 @@ fn create_workspace_write_token_with_caps_from(
     base_token: HANDLE,
     psid_capabilities: &[*mut c_void],
 ) -> io::Result<HANDLE> {
-    create_token_with_caps_from(base_token, psid_capabilities)
+    create_token_with_caps_from(base_token, psid_capabilities, &[])
+}
+
+#[cfg(windows)]
+fn create_workspace_write_token_with_caps_and_user_from(
+    base_token: HANDLE,
+    psid_capabilities: &[*mut c_void],
+) -> io::Result<HANDLE> {
+    let mut user_sid_bytes = get_user_sid_bytes(base_token)?;
+    let psid_user = user_sid_bytes.as_mut_ptr() as *mut c_void;
+    create_token_with_caps_from(base_token, psid_capabilities, &[psid_user])
 }
 
 #[cfg(all(test, windows))]

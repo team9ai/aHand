@@ -132,6 +132,11 @@ enum PluginCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    if ahandd::try_run_windows_sandbox_helper_from_args().map_err(anyhow::Error::msg)? {
+        return Ok(());
+    }
+
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();

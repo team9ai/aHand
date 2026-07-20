@@ -220,3 +220,34 @@ jobs:
 
             sleep 10
           done
+
+  notify-coffice-ahand-dependency:
+    needs: [resolve-target, build-images, verify-gitops-manifests]
+    if: github.ref_name == 'dev'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Dispatch Coffice aHand dependency sync
+        env:
+          GH_TOKEN: ${{ secrets.COFFICE_REPO_DISPATCH_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::COFFICE_REPO_DISPATCH_TOKEN is required to notify Coffice after aHand dev deploys"
+            exit 1
+          fi
+
+          jq -nc \
+            '{event_type:"ahand-dev-updated",client_payload:{
+              sha:env.GITHUB_SHA,
+              ref:env.GITHUB_REF_NAME,
+              source_repository:env.GITHUB_REPOSITORY
+            }}' \
+            > /tmp/coffice-ahand-dispatch.json
+
+          gh api repos/weightwave/Coffice/dispatches \
+            --method POST \
+            --input /tmp/coffice-ahand-dispatch.json

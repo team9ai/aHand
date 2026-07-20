@@ -73,6 +73,7 @@ impl SandboxSessionState {
     ) -> RegisteredExecEnvironment {
         let mut path_entries = Vec::new();
         let mut readonly_roots = Vec::new();
+        let mut writable_roots = Vec::new();
         let mut env = HashMap::new();
         let mut active_mounts = Vec::new();
 
@@ -82,6 +83,9 @@ impl SandboxSessionState {
             }
             for root in &provider.readonly_roots {
                 push_unique_path(&mut readonly_roots, root.clone());
+            }
+            for root in &provider.writable_roots {
+                push_unique_path(&mut writable_roots, root.clone());
             }
             for (key, value) in &provider.env {
                 env.insert(key.clone(), value.clone());
@@ -100,10 +104,12 @@ impl SandboxSessionState {
 
         path_entries.sort();
         readonly_roots.sort();
+        writable_roots.sort();
 
         RegisteredExecEnvironment {
             path_entries,
             readonly_roots,
+            writable_roots,
             env,
             mounts: active_mounts,
             default_timeout: Duration::from_secs(30),
@@ -755,6 +761,7 @@ mod tests {
                 name: "python".to_string(),
                 executable: python_bin.join("python").canonicalize().unwrap(),
                 readonly_roots: vec![python_root.canonicalize().unwrap()],
+                writable_roots: Vec::new(),
                 env: std::collections::HashMap::from([(
                     "PYTHONNOUSERSITE".to_string(),
                     "1".to_string(),
@@ -768,6 +775,7 @@ mod tests {
                 name: "node".to_string(),
                 executable: node_bin.join("node").canonicalize().unwrap(),
                 readonly_roots: vec![node_root.canonicalize().unwrap()],
+                writable_roots: Vec::new(),
                 env: std::collections::HashMap::from([(
                     "NODE_PATH".to_string(),
                     node_root.join("node_modules").to_string_lossy().to_string(),
@@ -814,6 +822,7 @@ mod tests {
                     name: name.to_string(),
                     executable: runtime_bin.join(name).canonicalize().unwrap(),
                     readonly_roots: vec![runtime_root.canonicalize().unwrap()],
+                    writable_roots: Vec::new(),
                     env: std::collections::HashMap::new(),
                     default_timeout: std::time::Duration::from_secs(30),
                 },

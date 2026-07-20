@@ -2,14 +2,19 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 #[cfg(windows)]
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+
 use super::network::WindowsNetworkMode;
-#[cfg(windows)]
-use super::setup_error::SetupErrorCode;
 use super::setup_error::SetupFailure;
+use super::setup_error::{
+    SetupErrorCode, clear_setup_error_report, read_setup_error_report, write_setup_error_report,
+};
 use crate::sandbox::types::{SandboxError, SandboxResult};
 
 pub(super) const SETUP_VERSION: u32 = 1;
@@ -136,12 +141,130 @@ const PROXY_ENV_KEYS: &[&str] = &[
 const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "AHAND_NETWORK_ALLOW_LOCAL_BINDING";
 #[cfg(all(windows, test))]
 const ALLOW_REAL_SETUP_IN_TESTS_ENV_KEY: &str = "AHAND_WINDOWS_SANDBOX_ALLOW_REAL_SETUP_IN_TESTS";
+const SETUP_HELPER_ARG: &str = "--ahand-windows-sandbox-setup";
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SetupHelperMode {
+    Online,
+    Offline,
+}
+
+impl SetupHelperMode {
+    fn network_identity(self) -> SandboxNetworkIdentity {
+        match self {
+            Self::Online => SandboxNetworkIdentity::Online,
+            Self::Offline => SandboxNetworkIdentity::Offline,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct SetupHelperPayload {
+    version: u32,
+    mode: SetupHelperMode,
+    state_root: PathBuf,
+    env: HashMap<String, String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WindowsNetworkContext {
     pub(super) mode: WindowsNetworkMode,
     pub(super) state_root: PathBuf,
     pub(super) sandbox_creds: Option<super::identity::SandboxCreds>,
+}
+
+pub(super) fn try_run_helper_from_args() -> Result<bool, String> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let Some(payload_arg) = setup_helper_payload_arg(&args)? else {
+        return Ok(false);
+    };
+    run_setup_helper_payload_b64(&payload_arg.to_string_lossy()).map_err(|err| err.to_string())?;
+    Ok(true)
+}
+
+fn setup_helper_payload_arg(args: &[OsString]) -> Result<Option<OsString>, String> {
+    let Some(first) = args.first() else {
+        return Ok(None);
+    };
+    if first != OsStr::new(SETUP_HELPER_ARG) {
+        return Ok(None);
+    }
+    if args.len() != 2 {
+        return Err(format!(
+            "{SETUP_HELPER_ARG} requires exactly one payload argument"
+        ));
+    }
+    Ok(Some(args[1].clone()))
+}
+
+fn run_setup_helper_payload_b64(payload_b64: &str) -> Result<(), SetupFailure> {
+    let payload = decode_setup_helper_payload(payload_b64)?;
+    let result = run_setup_helper_payload(&payload);
+    match result {
+        Ok(()) => {
+            let _ = clear_setup_error_report(&payload.state_root);
+            Ok(())
+        }
+        Err(err) => {
+            let _ = write_setup_error_report(&payload.state_root, &err);
+            Err(err)
+        }
+    }
+}
+
+fn decode_setup_helper_payload(payload_b64: &str) -> Result<SetupHelperPayload, SetupFailure> {
+    let bytes = BASE64_STANDARD
+        .decode(payload_b64.as_bytes())
+        .map_err(|err| {
+            SetupFailure::new(
+                SetupErrorCode::SetupHelperPayloadDecodeFailed,
+                format!("failed to base64-decode Windows sandbox setup payload: {err}"),
+            )
+        })?;
+    let payload: SetupHelperPayload = serde_json::from_slice(&bytes).map_err(|err| {
+        SetupFailure::new(
+            SetupErrorCode::SetupHelperPayloadDecodeFailed,
+            format!("failed to decode Windows sandbox setup payload JSON: {err}"),
+        )
+    })?;
+    if payload.version != SETUP_VERSION {
+        return Err(SetupFailure::new(
+            SetupErrorCode::SetupHelperPayloadDecodeFailed,
+            format!(
+                "Windows sandbox setup payload version {} does not match required version {}",
+                payload.version, SETUP_VERSION
+            ),
+        ));
+    }
+    Ok(payload)
+}
+
+fn encode_setup_helper_payload(payload: &SetupHelperPayload) -> Result<String, SetupFailure> {
+    let json = serde_json::to_vec(payload).map_err(|err| {
+        SetupFailure::new(
+            SetupErrorCode::SetupHelperPayloadEncodeFailed,
+            format!("failed to serialize Windows sandbox setup payload: {err}"),
+        )
+    })?;
+    Ok(BASE64_STANDARD.encode(json))
+}
+
+#[cfg(windows)]
+fn run_setup_helper_payload(payload: &SetupHelperPayload) -> Result<(), SetupFailure> {
+    match payload.mode {
+        SetupHelperMode::Online => run_online_setup_elevated(&payload.env, &payload.state_root),
+        SetupHelperMode::Offline => run_offline_setup_elevated(&payload.env, &payload.state_root),
+    }
+    .map(|_| ())
+}
+
+#[cfg(not(windows))]
+fn run_setup_helper_payload(payload: &SetupHelperPayload) -> Result<(), SetupFailure> {
+    Err(SetupFailure::unavailable(format!(
+        "Windows sandbox setup helper cannot run on this platform for {:?}",
+        payload.mode
+    )))
 }
 
 pub(super) fn prepare_network_context(
@@ -212,15 +335,24 @@ fn run_online_setup_inner(
         ));
     }
 
+    if is_elevated()? {
+        return run_online_setup_elevated(env, state_root);
+    }
+
+    run_elevated_setup_helper(SetupHelperMode::Online, env, state_root, loader_error)
+}
+
+#[cfg(windows)]
+fn run_online_setup_elevated(
+    env: &HashMap<String, String>,
+    state_root: &Path,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
     if !is_elevated()? {
         return Err(SetupFailure::new(
             SetupErrorCode::ElevationRequired,
-            format!(
-                "online sandbox user setup requires elevation; helper launch is not wired in this slice; existing setup is missing or unverified: {loader_error}"
-            ),
+            "online sandbox user setup helper must run from an elevated process",
         ));
     }
-
     let sandbox_dir = sandbox_dir(state_root);
     std::fs::create_dir_all(&sandbox_dir).map_err(|err| {
         SetupFailure::new(
@@ -334,15 +466,24 @@ fn run_offline_setup_inner(
         ));
     }
 
+    if is_elevated()? {
+        return run_offline_setup_elevated(env, state_root);
+    }
+
+    run_elevated_setup_helper(SetupHelperMode::Offline, env, state_root, loader_error)
+}
+
+#[cfg(windows)]
+fn run_offline_setup_elevated(
+    env: &HashMap<String, String>,
+    state_root: &Path,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
     if !is_elevated()? {
         return Err(SetupFailure::new(
             SetupErrorCode::ElevationRequired,
-            format!(
-                "offline hard network block setup requires elevation; helper launch is not wired in this slice; existing setup is missing or unverified: {loader_error}"
-            ),
+            "offline hard network block setup helper must run from an elevated process",
         ));
     }
-
     let sandbox_dir = sandbox_dir(state_root);
     std::fs::create_dir_all(&sandbox_dir).map_err(|err| {
         SetupFailure::new(
@@ -380,6 +521,124 @@ fn run_offline_setup_inner(
         },
     )?;
     load_verified_offline_setup(env, state_root)
+}
+
+#[cfg(windows)]
+fn run_elevated_setup_helper(
+    mode: SetupHelperMode,
+    env: &HashMap<String, String>,
+    state_root: &Path,
+    loader_error: SetupFailure,
+) -> Result<super::identity::SandboxCreds, SetupFailure> {
+    launch_elevated_setup_helper(mode, env, state_root).map_err(|err| {
+        SetupFailure::new(
+            err.code,
+            format!(
+                "Windows sandbox setup helper failed: {err}; existing setup is missing or unverified: {loader_error}"
+            ),
+        )
+    })?;
+    super::identity::load_sandbox_creds_for_identity(mode.network_identity(), state_root, env)
+}
+
+#[cfg(windows)]
+fn launch_elevated_setup_helper(
+    mode: SetupHelperMode,
+    env: &HashMap<String, String>,
+    state_root: &Path,
+) -> Result<(), SetupFailure> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, INFINITE, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+
+    let sandbox_dir = sandbox_dir(state_root);
+    std::fs::create_dir_all(&sandbox_dir).map_err(|err| {
+        SetupFailure::new(
+            SetupErrorCode::SetupLogFailed,
+            format!(
+                "failed to create {} before setup helper launch: {err}",
+                sandbox_dir.display()
+            ),
+        )
+    })?;
+    let _ = clear_setup_error_report(state_root);
+
+    let payload = SetupHelperPayload {
+        version: SETUP_VERSION,
+        mode,
+        state_root: state_root.to_path_buf(),
+        env: env.clone(),
+    };
+    let payload_b64 = encode_setup_helper_payload(&payload)?;
+    let exe = std::env::current_exe().map_err(|err| {
+        SetupFailure::new(
+            SetupErrorCode::SetupHelperLaunchFailed,
+            format!("failed to resolve current executable for setup helper: {err}"),
+        )
+    })?;
+    let params = format!("{SETUP_HELPER_ARG} {payload_b64}");
+    let exe_w = super::winutil::to_wide(exe.as_os_str());
+    let params_w = super::winutil::to_wide(OsStr::new(&params));
+    let verb_w = super::winutil::to_wide(OsStr::new("runas"));
+    let mut shell_info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    shell_info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    shell_info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    shell_info.lpVerb = verb_w.as_ptr();
+    shell_info.lpFile = exe_w.as_ptr();
+    shell_info.lpParameters = params_w.as_ptr();
+    shell_info.nShow = 0;
+    let ok = unsafe { ShellExecuteExW(&mut shell_info) };
+    if ok == 0 || shell_info.hProcess.is_null() {
+        let last_error = unsafe { GetLastError() };
+        let code = if last_error == ERROR_CANCELLED {
+            SetupErrorCode::SetupHelperLaunchCanceled
+        } else {
+            SetupErrorCode::SetupHelperLaunchFailed
+        };
+        return Err(SetupFailure::new(
+            code,
+            format!("ShellExecuteExW failed to launch Windows sandbox setup helper: {last_error}"),
+        ));
+    }
+
+    let mut exit_code: u32 = 1;
+    unsafe {
+        WaitForSingleObject(shell_info.hProcess, INFINITE);
+        if GetExitCodeProcess(shell_info.hProcess, &mut exit_code) == 0 {
+            let last_error = GetLastError();
+            CloseHandle(shell_info.hProcess);
+            return Err(SetupFailure::new(
+                SetupErrorCode::SetupHelperExitFailed,
+                format!("failed to read Windows sandbox setup helper exit code: {last_error}"),
+            ));
+        }
+        CloseHandle(shell_info.hProcess);
+    }
+    if exit_code != 0 {
+        match read_setup_error_report(state_root) {
+            Ok(Some(report)) => return Err(SetupFailure::from_report(report)),
+            Ok(None) => {
+                return Err(SetupFailure::new(
+                    SetupErrorCode::SetupHelperExitFailed,
+                    format!("Windows sandbox setup helper exited with code {exit_code}"),
+                ));
+            }
+            Err(err) => {
+                return Err(SetupFailure::new(
+                    err.code,
+                    format!(
+                        "Windows sandbox setup helper exited with code {exit_code}; failed to read setup_error.json: {err}"
+                    ),
+                ));
+            }
+        }
+    }
+    let _ = clear_setup_error_report(state_root);
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -497,7 +756,7 @@ fn loopback_proxy_port_from_url(url: &str) -> Option<u16> {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::super::network::WindowsNetworkMode;
     use super::*;
@@ -536,6 +795,40 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn setup_helper_payload_arg_ignores_normal_invocations() {
+        assert_eq!(
+            setup_helper_payload_arg(&[OsString::from("--not-setup")]).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn setup_helper_payload_arg_requires_one_payload() {
+        let err = setup_helper_payload_arg(&[OsString::from(SETUP_HELPER_ARG)])
+            .expect_err("missing payload should fail");
+
+        assert!(err.contains("requires exactly one payload"));
+    }
+
+    #[test]
+    fn setup_helper_payload_round_trips() {
+        let payload = SetupHelperPayload {
+            version: SETUP_VERSION,
+            mode: SetupHelperMode::Online,
+            state_root: PathBuf::from(r"C:\coffice\sandbox-state"),
+            env: HashMap::from([(
+                "HTTP_PROXY".to_string(),
+                "http://127.0.0.1:8080".to_string(),
+            )]),
+        };
+
+        let encoded = encode_setup_helper_payload(&payload).unwrap();
+        let decoded = decode_setup_helper_payload(&encoded).unwrap();
+
+        assert_eq!(decoded, payload);
     }
 
     #[test]

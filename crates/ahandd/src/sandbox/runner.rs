@@ -14,6 +14,7 @@ use super::types::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSandboxPolicy {
     pub writable_root: PathBuf,
+    pub writable_roots: Vec<PathBuf>,
     pub readonly_roots: Vec<PathBuf>,
     pub mounts: Vec<RegisteredSandboxMount>,
     pub network: NetworkPolicy,
@@ -27,6 +28,7 @@ impl RuntimeSandboxPolicy {
     ) -> Self {
         Self {
             writable_root,
+            writable_roots: provider.writable_roots,
             readonly_roots: provider.readonly_roots,
             mounts: Vec::new(),
             network,
@@ -461,6 +463,7 @@ mod tests {
             name: "python".into(),
             executable: PathBuf::from("/runtimes/python/bin/python"),
             readonly_roots: vec![PathBuf::from("/runtimes/python")],
+            writable_roots: vec![PathBuf::from("/shared/agent")],
             env: HashMap::new(),
             default_timeout: Duration::from_secs(30),
         };
@@ -471,6 +474,7 @@ mod tests {
         );
 
         assert_eq!(policy.writable_root, PathBuf::from("/sessions/s1"));
+        assert_eq!(policy.writable_roots, vec![PathBuf::from("/shared/agent")]);
         assert_eq!(
             policy.readonly_roots,
             vec![PathBuf::from("/runtimes/python")]
@@ -537,6 +541,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             policy: RuntimeSandboxPolicy {
                 writable_root: PathBuf::from("."),
+                writable_roots: Vec::new(),
                 readonly_roots: vec![],
                 mounts: Vec::new(),
                 network: NetworkPolicy::ProxyOnly,
@@ -559,6 +564,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             policy: RuntimeSandboxPolicy {
                 writable_root: PathBuf::from("/tmp"),
+                writable_roots: Vec::new(),
                 readonly_roots: vec![],
                 mounts: Vec::new(),
                 network: NetworkPolicy::Enabled,
@@ -597,6 +603,7 @@ mod tests {
     ) -> RuntimeSandboxPolicy {
         RuntimeSandboxPolicy {
             writable_root: workspace_root,
+            writable_roots: Vec::new(),
             readonly_roots: Vec::new(),
             mounts: vec![readonly_host_dir_mount("selected-folder", source, target)],
             network: NetworkPolicy::Enabled,
