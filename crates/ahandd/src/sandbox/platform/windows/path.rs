@@ -20,6 +20,7 @@ pub(super) fn wide_null(path: &Path) -> Vec<u16> {
         .collect()
 }
 
+#[cfg(windows)]
 pub(super) fn process_cwd_wide_null(path: &Path) -> Vec<u16> {
     string_wide_null(&process_cwd_string(path))
 }

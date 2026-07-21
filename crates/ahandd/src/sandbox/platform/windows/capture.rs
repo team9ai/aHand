@@ -1,8 +1,12 @@
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(windows)]
 use std::time::Duration;
 
-use crate::sandbox::runner::{PlatformExecuteRequest, RuntimeSandboxPolicy};
+#[cfg(windows)]
+use crate::sandbox::runner::PlatformExecuteRequest;
+use crate::sandbox::runner::RuntimeSandboxPolicy;
+#[cfg(windows)]
 use crate::sandbox::types::{RuntimeExecuteResult, SandboxError, SandboxResult};
 
 #[cfg(windows)]
@@ -72,6 +76,7 @@ fn filesystem_roots_for_security(
     super::roots::derive_filesystem_roots(policy, state_root)
 }
 
+#[cfg(windows)]
 fn add_windows_default_read_roots(roots: &mut super::roots::DerivedFilesystemRoots) {
     add_runner_read_roots(roots);
     #[cfg(windows)]
@@ -168,11 +173,16 @@ fn push_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use std::collections::HashMap;
+    #[cfg(windows)]
     use std::path::PathBuf;
+    #[cfg(windows)]
     use std::time::Duration;
 
-    use crate::sandbox::runner::{PlatformExecuteRequest, RuntimeSandboxPolicy};
+    #[cfg(windows)]
+    use crate::sandbox::runner::PlatformExecuteRequest;
+    use crate::sandbox::runner::RuntimeSandboxPolicy;
     use crate::sandbox::types::NetworkPolicy;
 
     use super::*;
@@ -300,7 +310,7 @@ mod tests {
         assert_eq!(
             candidates
                 .iter()
-                .filter(|path| **path == PathBuf::from(r"D:\Program Files"))
+                .filter(|path| path.as_path() == Path::new(r"D:\Program Files"))
                 .count(),
             1
         );

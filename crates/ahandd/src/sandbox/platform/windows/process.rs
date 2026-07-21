@@ -7,7 +7,9 @@ use std::collections::hash_map::DefaultHasher;
 #[cfg(windows)]
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::sandbox::types::RuntimeExecuteResult;
@@ -730,6 +732,7 @@ fn read_handle_to_vec(handle: HANDLE) -> std::thread::JoinHandle<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    #[cfg(windows)]
     use std::path::PathBuf;
     use std::time::Duration;
 
