@@ -1,5 +1,7 @@
 use std::fs;
 use std::io;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use super::registry::SandboxSessionState;
@@ -72,9 +74,9 @@ fn ensure_mount_namespace(workspace_root: &Path, mount_namespace: &Path) -> Sand
 fn ensure_plain_directory(path: &Path, label: &str) -> SandboxResult<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
+            if metadata_is_link_or_reparse_point(&metadata) {
                 return Err(SandboxError::mount_target_invalid(format!(
-                    "{label} must not be a symlink"
+                    "{label} must not be a symlink or reparse point"
                 )));
             }
             if !metadata.is_dir() {
@@ -135,9 +137,9 @@ fn validate_mount_namespace(
     let metadata = fs::symlink_metadata(mount_namespace).map_err(|e| {
         SandboxError::mount_target_invalid(format!("failed to inspect mount namespace: {e}"))
     })?;
-    if metadata.file_type().is_symlink() {
+    if metadata_is_link_or_reparse_point(&metadata) {
         return Err(SandboxError::mount_target_invalid(
-            "mount namespace must not be a symlink",
+            "mount namespace must not be a symlink or reparse point",
         ));
     }
     if !metadata.is_dir() {
@@ -277,11 +279,28 @@ fn existing_target_points_to_source(candidate: &Path, source: &MountSource) -> b
     let Ok(metadata) = fs::symlink_metadata(candidate) else {
         return false;
     };
-    if !metadata.file_type().is_symlink() {
-        return false;
-    }
-    let Ok(link_target) = fs::read_link(candidate) else {
-        return false;
+    #[cfg(windows)]
+    let link_target = {
+        if !metadata_is_link_or_reparse_point(&metadata) {
+            return false;
+        }
+        let Ok(true) = junction::exists(candidate) else {
+            return false;
+        };
+        let Ok(target) = junction::get_target(candidate) else {
+            return false;
+        };
+        target
+    };
+    #[cfg(not(windows))]
+    let link_target = {
+        if !metadata.file_type().is_symlink() {
+            return false;
+        }
+        let Ok(target) = fs::read_link(candidate) else {
+            return false;
+        };
+        target
     };
     let Some(parent) = candidate.parent() else {
         return false;
@@ -295,6 +314,19 @@ fn existing_target_points_to_source(candidate: &Path, source: &MountSource) -> b
         .canonicalize()
         .map(|target| target == *source)
         .unwrap_or(false)
+}
+
+fn metadata_is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 fn target_conflicts(candidate: &Path, existing_targets: &[PathBuf]) -> bool {
@@ -415,6 +447,27 @@ mod tests {
         assert_eq!(err.code, "MOUNT_TARGET_INVALID");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn auto_target_rejects_junctioned_mount_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let outside = temp.path().join("outside-mounts");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(workspace_root.join("workspace")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        junction::create(&outside, workspace_root.join("workspace").join("mounts")).unwrap();
+
+        let err = register_for_test(
+            &workspace_root,
+            readonly_host_spec("selected-folder", source),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_TARGET_INVALID");
+    }
+
     #[test]
     fn auto_target_uses_mount_id_not_host_path() {
         let temp = tempfile::tempdir().unwrap();
@@ -478,6 +531,33 @@ mod tests {
         assert_eq!(
             mount.source,
             MountSource::HostPath(source.canonicalize().unwrap())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn auto_target_reuses_existing_junction_to_same_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let target = workspace_root.join("workspace/mounts/selected-folder");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        junction::create(&canonical_source, &target).unwrap();
+
+        let mount = register_for_test(
+            &workspace_root,
+            readonly_host_spec("selected-folder", canonical_source),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mount.target,
+            workspace_root
+                .canonicalize()
+                .unwrap()
+                .join("workspace/mounts/selected-folder")
         );
     }
 
