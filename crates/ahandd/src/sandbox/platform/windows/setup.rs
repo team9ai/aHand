@@ -12,9 +12,9 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
 use super::network::WindowsNetworkMode;
 use super::setup_error::SetupFailure;
-use super::setup_error::{
-    SetupErrorCode, clear_setup_error_report, read_setup_error_report, write_setup_error_report,
-};
+#[cfg(windows)]
+use super::setup_error::read_setup_error_report;
+use super::setup_error::{SetupErrorCode, clear_setup_error_report, write_setup_error_report};
 use crate::sandbox::types::{SandboxError, SandboxResult};
 
 pub(super) const SETUP_VERSION: u32 = 1;
@@ -151,6 +151,7 @@ enum SetupHelperMode {
 }
 
 impl SetupHelperMode {
+    #[cfg(windows)]
     fn network_identity(self) -> SandboxNetworkIdentity {
         match self {
             Self::Online => SandboxNetworkIdentity::Online,

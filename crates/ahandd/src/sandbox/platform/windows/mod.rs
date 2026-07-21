@@ -1,4 +1,6 @@
+#[cfg(windows)]
 use crate::sandbox::runner::PlatformExecuteRequest;
+#[cfg(windows)]
 use crate::sandbox::types::{RuntimeExecuteResult, SandboxError, SandboxResult};
 
 mod acl;

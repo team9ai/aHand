@@ -185,7 +185,7 @@ fn create_runner_pipe(name: &str, sandbox_username: &str) -> io::Result<HANDLE> 
         return Err(io::Error::last_os_error());
     }
 
-    let mut security_attributes = SECURITY_ATTRIBUTES {
+    let security_attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: sd,
         bInheritHandle: 0,
@@ -200,7 +200,7 @@ fn create_runner_pipe(name: &str, sandbox_username: &str) -> io::Result<HANDLE> 
             65536,
             65536,
             0,
-            &mut security_attributes,
+            &security_attributes,
         )
     };
     unsafe {
