@@ -20,10 +20,12 @@ pub(super) fn wide_null(path: &Path) -> Vec<u16> {
         .collect()
 }
 
+#[cfg(windows)]
 pub(super) fn process_cwd_wide_null(path: &Path) -> Vec<u16> {
     string_wide_null(&process_cwd_string(path))
 }
 
+#[cfg(windows)]
 fn process_cwd_string(path: &Path) -> String {
     ahand_platform::paths::simplify(path)
         .to_string_lossy()
@@ -48,6 +50,7 @@ mod tests {
         assert_eq!(wide_null(Path::new("NUL")), vec![78, 85, 76, 0]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn process_cwd_string_strips_verbatim_drive_prefix() {
         assert_eq!(
@@ -56,6 +59,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn process_cwd_string_preserves_plain_drive_path() {
         assert_eq!(
