@@ -329,12 +329,12 @@ fn is_directory_alias(target: &Path, metadata: &fs::Metadata) -> SandboxResult<b
         {
             return Ok(false);
         }
-        return junction::exists(target).map_err(|e| {
+        junction::exists(target).map_err(|e| {
             SandboxError::mount_target_invalid(format!(
                 "failed to inspect mount target junction '{}': {e}",
                 target.display()
             ))
-        });
+        })
     }
     #[cfg(not(windows))]
     {
