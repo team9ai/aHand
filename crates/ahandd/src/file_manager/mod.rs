@@ -10,6 +10,7 @@ pub mod fs_ops;
 pub mod io_safe;
 pub mod pdf_read;
 pub mod policy;
+pub mod spreadsheet_preview;
 pub mod text_read;
 pub mod write_ops;
 

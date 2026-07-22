@@ -4,6 +4,7 @@
 //! WebSocket involved), with a permissive policy scoped to a per-test temp dir.
 
 use std::fs;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use ahand_protocol::{
     StringReplace, WriteAction, file_edit, file_position, file_read_text, file_request,
     file_response, file_write, full_write,
 };
+use base64::Engine as _;
 // FileCreateSymlink is used in both #[cfg(unix)] and #[cfg(windows)] tests.
 // UnixPermission and file_chmod are only used in #[cfg(unix)] tests.
 // AclEntry, AclEntryType, WindowsAcl are used in #[cfg(windows)] ACL tests.
@@ -239,6 +241,118 @@ fn write_test_pdf(path: &Path, pages: usize) {
     ));
 
     fs::write(path, out).expect("failed to write test PDF");
+}
+
+fn build_test_xlsx() -> Vec<u8> {
+    let cursor = Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, content) in [
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/worksheets/sheet3.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>"#,
+        ),
+        (
+            "xl/workbook.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Scores" sheetId="1" r:id="rId1"/>
+    <sheet name="Notes" sheetId="2" r:id="rId2"/>
+    <sheet name="Hidden" sheetId="3" state="hidden" r:id="rId3"/>
+  </sheets>
+</workbook>"#,
+        ),
+        (
+            "xl/_rels/workbook.xml.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet3.xml"/>
+</Relationships>"#,
+        ),
+        (
+            "xl/worksheets/sheet1.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="2">
+      <c r="B2" t="inlineStr"><is><t>Report title</t></is></c>
+    </row>
+    <row r="4">
+      <c r="A4" t="inlineStr"><is><t>Name</t></is></c>
+      <c r="B4" t="inlineStr"><is><t>Score</t></is></c>
+      <c r="C4" t="inlineStr"><is><t>Passed</t></is></c>
+      <c r="D4" t="inlineStr"><is><t>Total</t></is></c>
+    </row>
+    <row r="5">
+      <c r="A5" t="inlineStr"><is><t>Alice</t></is></c>
+      <c r="B5"><v>97</v></c>
+      <c r="C5" t="b"><v>1</v></c>
+      <c r="D5"><f>B5+3</f></c>
+    </row>
+    <row r="6">
+      <c r="A6" t="inlineStr"><is><t>Bob</t></is></c>
+      <c r="B6"><v>81</v></c>
+      <c r="C6" t="b"><v>0</v></c>
+      <c r="D6"><f>B6+19</f></c>
+    </row>
+  </sheetData>
+</worksheet>"#,
+        ),
+        (
+            "xl/worksheets/sheet2.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>Generated fixture</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#,
+        ),
+        (
+            "xl/worksheets/sheet3.xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1">
+      <c r="A1" t="inlineStr"><is><t>Hidden data</t></is></c>
+    </row>
+  </sheetData>
+</worksheet>"#,
+        ),
+    ] {
+        zip.start_file(name, opts).unwrap();
+        zip.write_all(content.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+fn build_test_xls() -> Vec<u8> {
+    let encoded = include_str!("fixtures/spreadsheet_fixture.xls.b64")
+        .lines()
+        .collect::<String>();
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap()
 }
 
 fn expect_write(resp: ahand_protocol::FileResponse) -> ahand_protocol::FileWriteResult {
@@ -894,6 +1008,94 @@ async fn read_text_basic_reads_all_lines() {
     assert_eq!(result.total_file_bytes, 18);
     assert_eq!(result.remaining_bytes, 0);
     assert_eq!(result.detected_encoding, "UTF-8");
+}
+
+#[tokio::test]
+async fn read_text_xlsx_returns_spreadsheet_preview() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("scores.xlsx");
+    fs::write(&file, build_test_xlsx()).unwrap();
+
+    let resp = mgr.handle(&wrap_read_text(read_text_request(&file))).await;
+    let result = expect_read_text(resp);
+    let content = result
+        .lines
+        .iter()
+        .map(|line| line.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(result.detected_encoding, "spreadsheet");
+    assert!(content.contains("## overview"));
+    assert!(content.contains("Workbook: scores.xlsx"));
+    assert!(content.contains("Sheets: 3 total, 1 hidden"));
+    assert!(content.contains("Previewed sheets: Scores, Notes"));
+    assert!(content.contains("Structured format: ndjson"));
+    assert!(content.contains("## inventory"));
+    assert!(content.contains(r#""part":"inventory","kind":"workbook""#));
+    assert!(content.contains(r#""name":"Scores","visible":true,"hidden":false"#));
+    assert!(content.contains(r#""name":"Hidden","visible":false,"hidden":true"#));
+    assert!(content.contains("## notes"));
+    assert!(content.contains("Hidden sheet 'Hidden' was detected but not sampled."));
+    assert!(content.contains("Formula cached values may be unavailable in sheet 'Scores'"));
+    assert!(content.contains("## sheet_info:Scores"));
+    assert!(content.contains(r#""usedRange":"A2:D6""#));
+    assert!(content.contains("## signals:Scores"));
+    assert!(content.contains(r#""signal":"starts_away_from_a1""#));
+    assert!(content.contains(r#""signal":"has_formulas","formulaCellCount":2"#));
+    assert!(content.contains(r#""signal":"likely_data_sheet""#));
+    assert!(content.contains("## structure:Scores"));
+    assert!(content.contains(r#""range":"B2:B2","role":"cell_group""#));
+    assert!(content.contains(r#""range":"A4:D6","role":"table_like_region""#));
+    assert!(content.contains("## samples:Scores"));
+    assert!(
+        content.contains(r#""address":"Scores!B2","sourceRange":"B2:B2","value":"Report title""#)
+    );
+    assert!(content.contains(r#""address":"Scores!A5","sourceRange":"A4:D6","value":"Alice""#));
+    assert!(content.contains(r#""address":"Scores!D5","sourceRange":"A4:D6","value":null,"formula":"=B5+3","cachedValueUnavailable":true"#));
+    assert!(content.contains("## formulas:Scores"));
+    assert!(
+        content
+            .contains(r#""address":"Scores!D6","formula":"=B6+19","cachedValueUnavailable":true"#)
+    );
+    assert!(content.contains("## sheet_info:Notes"));
+    assert!(content.contains("## samples:Notes"));
+    assert!(content.contains("Generated fixture"));
+    assert_eq!(result.stop_reason, StopReason::FileEnd as i32);
+}
+
+#[tokio::test]
+async fn read_text_xls_returns_spreadsheet_preview() {
+    let dir = TempDir::new().unwrap();
+    let (mgr, root) = test_manager(&dir);
+    let file = root.join("scores.xls");
+    fs::write(&file, build_test_xls()).unwrap();
+
+    let resp = mgr.handle(&wrap_read_text(read_text_request(&file))).await;
+    let result = expect_read_text(resp);
+    let content = result
+        .lines
+        .iter()
+        .map(|line| line.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(result.detected_encoding, "spreadsheet");
+    assert!(content.contains("## overview"));
+    assert!(content.contains("Workbook: scores.xls"));
+    assert!(content.contains("## inventory"));
+    assert!(content.contains(r#""part":"inventory","kind":"workbook""#));
+    assert!(content.contains("## sheet_info:Scores"));
+    assert!(content.contains("## structure:Scores"));
+    assert!(content.contains("## samples:Scores"));
+    assert!(content.contains(r#""address":"Scores!A1""#));
+    assert!(content.contains("Alice"));
+    assert!(content.contains("Bob"));
+    assert!(content.contains("## sheet_info:Notes"));
+    assert!(content.contains("## samples:Notes"));
+    assert!(content.contains("Generated fixture"));
+    assert_eq!(result.stop_reason, StopReason::FileEnd as i32);
 }
 
 #[tokio::test]
