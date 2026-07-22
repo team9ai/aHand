@@ -171,6 +171,9 @@ pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
         ));
     }
     collect_read_literal_ancestors(&mut literal_read_paths, &policy.writable_root);
+    for root in &policy.writable_roots {
+        collect_read_literal_ancestors(&mut literal_read_paths, root);
+    }
     for path in literal_read_paths {
         sbpl.push_str(&format!(
             "(allow file-read* (literal \"{}\"))\n",
@@ -185,6 +188,16 @@ pub fn render_policy(policy: &RuntimeSandboxPolicy) -> String {
         "(allow file-write* (subpath \"{}\"))\n",
         escape_sbpl(&policy.writable_root.to_string_lossy())
     ));
+    for root in &policy.writable_roots {
+        sbpl.push_str(&format!(
+            "(allow file-read* (subpath \"{}\"))\n",
+            escape_sbpl(&root.to_string_lossy())
+        ));
+        sbpl.push_str(&format!(
+            "(allow file-write* (subpath \"{}\"))\n",
+            escape_sbpl(&root.to_string_lossy())
+        ));
+    }
     append_common_device_rules(&mut sbpl);
     append_artifact_tool_socket_rules(&mut sbpl);
     if policy.network == NetworkPolicy::Enabled {
@@ -255,6 +268,7 @@ mod tests {
     fn rendered_policy_allows_writable_root_and_runtime_reads() {
         let policy = RuntimeSandboxPolicy {
             writable_root: PathBuf::from("/sessions/s1"),
+            writable_roots: Vec::new(),
             readonly_roots: vec![PathBuf::from("/runtimes/python")],
             mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
@@ -276,6 +290,7 @@ mod tests {
     fn rendered_policy_allows_runtime_path_and_workspace_only_for_writes() {
         let policy = RuntimeSandboxPolicy {
             writable_root: PathBuf::from("/sessions/s1"),
+            writable_roots: Vec::new(),
             readonly_roots: vec![PathBuf::from("/runtime/python")],
             mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
@@ -298,6 +313,7 @@ mod tests {
             writable_root: PathBuf::from(
                 "/Users/winrey/Library/Application Support/app/sessions/s1",
             ),
+            writable_roots: Vec::new(),
             readonly_roots: vec![PathBuf::from(
                 "/Users/winrey/Library/Application Support/app/python-sandbox/venv",
             )],
@@ -331,6 +347,7 @@ mod tests {
     fn rendered_policy_allows_only_artifact_tool_tmp_sockets() {
         let policy = RuntimeSandboxPolicy {
             writable_root: PathBuf::from("/sessions/s1"),
+            writable_roots: Vec::new(),
             readonly_roots: vec![PathBuf::from("/runtime/python")],
             mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
@@ -355,6 +372,7 @@ mod tests {
     fn rendered_policy_allows_null_device_for_common_unix_tools() {
         let policy = RuntimeSandboxPolicy {
             writable_root: PathBuf::from("/sessions/s1"),
+            writable_roots: Vec::new(),
             readonly_roots: Vec::new(),
             mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
@@ -372,6 +390,7 @@ mod tests {
     fn rendered_policy_allows_macos_tls_config_for_system_curl() {
         let policy = RuntimeSandboxPolicy {
             writable_root: PathBuf::from("/sessions/s1"),
+            writable_roots: Vec::new(),
             readonly_roots: vec![PathBuf::from("/runtime/python")],
             mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
@@ -389,6 +408,7 @@ mod tests {
     fn rendered_policy_allows_apple_developer_tools_for_usr_bin_git() {
         let policy = RuntimeSandboxPolicy {
             writable_root: PathBuf::from("/sessions/s1"),
+            writable_roots: Vec::new(),
             readonly_roots: vec![PathBuf::from("/runtime/python")],
             mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
@@ -447,6 +467,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             policy: RuntimeSandboxPolicy {
                 writable_root: temp.path().to_path_buf(),
+                writable_roots: Vec::new(),
                 readonly_roots: vec![PathBuf::from("/bin")],
                 mounts: Vec::new(),
                 network: NetworkPolicy::Enabled,
@@ -470,10 +491,12 @@ mod tests {
             timeout: Duration::from_secs(5),
             policy: RuntimeSandboxPolicy {
                 writable_root: temp.path().to_path_buf(),
+                writable_roots: Vec::new(),
                 readonly_roots: vec![PathBuf::from("/usr/bin")],
                 mounts: Vec::new(),
                 network: NetworkPolicy::Enabled,
             },
+            sandbox_state_root: temp.path().join("windows-sandbox"),
         })
         .await
         .unwrap();

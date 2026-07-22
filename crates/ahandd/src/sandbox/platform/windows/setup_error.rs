@@ -36,6 +36,11 @@ pub(super) enum SetupErrorCode {
     FirewallRuleVerifyFailed,
     SetupLogFailed,
     ElevationRequired,
+    SetupHelperPayloadDecodeFailed,
+    SetupHelperPayloadEncodeFailed,
+    SetupHelperLaunchFailed,
+    SetupHelperLaunchCanceled,
+    SetupHelperExitFailed,
 }
 
 impl SetupErrorCode {
@@ -65,6 +70,11 @@ impl SetupErrorCode {
             Self::FirewallRuleVerifyFailed => "firewall_rule_verify_failed",
             Self::SetupLogFailed => "setup_log_failed",
             Self::ElevationRequired => "elevation_required",
+            Self::SetupHelperPayloadDecodeFailed => "setup_helper_payload_decode_failed",
+            Self::SetupHelperPayloadEncodeFailed => "setup_helper_payload_encode_failed",
+            Self::SetupHelperLaunchFailed => "setup_helper_launch_failed",
+            Self::SetupHelperLaunchCanceled => "setup_helper_launch_canceled",
+            Self::SetupHelperExitFailed => "setup_helper_exit_failed",
         }
     }
 }
@@ -142,4 +152,35 @@ pub(super) fn clear_setup_error_report(state_root: &Path) -> Result<(), SetupFai
             format!("failed to remove {}: {err}", path.display()),
         )),
     }
+}
+
+pub(super) fn write_setup_error_report(
+    state_root: &Path,
+    failure: &SetupFailure,
+) -> Result<(), SetupFailure> {
+    let path = setup_error_path(state_root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            SetupFailure::new(
+                SetupErrorCode::SetupErrorReportWriteFailed,
+                format!("failed to create {}: {err}", parent.display()),
+            )
+        })?;
+    }
+    let report = SetupErrorReport {
+        code: failure.code,
+        message: failure.message.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&report).map_err(|err| {
+        SetupFailure::new(
+            SetupErrorCode::SetupErrorReportWriteFailed,
+            format!("failed to serialize setup_error.json: {err}"),
+        )
+    })?;
+    fs::write(&path, bytes).map_err(|err| {
+        SetupFailure::new(
+            SetupErrorCode::SetupErrorReportWriteFailed,
+            format!("failed to write {}: {err}", path.display()),
+        )
+    })
 }
