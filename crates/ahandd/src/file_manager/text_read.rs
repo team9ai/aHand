@@ -33,6 +33,7 @@ use ahand_protocol::{
 
 use super::file_error;
 use super::fs_ops::io_to_file_error;
+use super::spreadsheet_preview;
 
 const DEFAULT_MAX_LINES: u32 = 200;
 const DEFAULT_MAX_BYTES: u64 = 64 * 1024;
@@ -74,6 +75,31 @@ pub async fn handle_read_text(
         ));
     }
 
+    if spreadsheet_preview::is_spreadsheet_path(resolved) {
+        let resolved_path = resolved.to_path_buf();
+        let req_path = req.path.clone();
+        let preview = tokio::task::spawn_blocking(move || {
+            spreadsheet_preview::render_spreadsheet_preview(&resolved_path, &req_path)
+        })
+        .await
+        .map_err(|err| {
+            file_error(
+                FileErrorCode::Io,
+                &req.path,
+                format!("spreadsheet preview task failed: {err}"),
+            )
+        })??;
+        let preview_bytes = preview.as_bytes();
+        return handle_read_text_bytes(
+            req,
+            preview_bytes,
+            max_read_bytes,
+            preview_bytes.len() as u64,
+            encoding_rs::UTF_8,
+            "spreadsheet".to_string(),
+        );
+    }
+
     let raw = tokio::fs::read(resolved)
         .await
         .map_err(|e| io_to_file_error(e, resolved))?;
@@ -82,9 +108,27 @@ pub async fn handle_read_text(
     let encoding = resolve_encoding(&raw, req.encoding.as_deref(), &req.path)?;
     let detected_encoding = encoding.name().to_string();
 
+    handle_read_text_bytes(
+        req,
+        &raw,
+        max_read_bytes,
+        total_file_bytes,
+        encoding,
+        detected_encoding,
+    )
+}
+
+fn handle_read_text_bytes(
+    req: &FileReadText,
+    raw: &[u8],
+    max_read_bytes: u64,
+    total_file_bytes: u64,
+    encoding: &'static encoding_rs::Encoding,
+    detected_encoding: String,
+) -> Result<FileReadTextResult, FileError> {
     // Line offsets computed on RAW bytes. `\n` (0x0A) is a single-byte in
     // every encoding_rs-supported charset so this is safe.
-    let line_offsets = compute_line_offsets_raw(&raw);
+    let line_offsets = compute_line_offsets_raw(raw);
     let total_lines = line_offsets.len() as u64;
 
     let (start_byte, start_line_idx) = resolve_start_raw(&req.start, &line_offsets, raw.len())?;

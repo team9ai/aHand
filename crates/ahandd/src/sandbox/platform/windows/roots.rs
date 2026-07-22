@@ -15,7 +15,10 @@ pub(super) fn derive_filesystem_roots(
     policy: &RuntimeSandboxPolicy,
     state_root: &Path,
 ) -> DerivedFilesystemRoots {
-    let mut write_roots = canonical_existing(std::slice::from_ref(&policy.writable_root));
+    let mut writable_candidates = Vec::with_capacity(policy.writable_roots.len() + 1);
+    writable_candidates.push(policy.writable_root.clone());
+    writable_candidates.extend(policy.writable_roots.iter().cloned());
+    let mut write_roots = canonical_existing(&writable_candidates);
     filter_sensitive_state_roots(&mut write_roots, state_root);
     let write_keys = write_roots
         .iter()
@@ -86,6 +89,7 @@ mod tests {
     fn policy(writable_root: PathBuf, readonly_roots: Vec<PathBuf>) -> RuntimeSandboxPolicy {
         RuntimeSandboxPolicy {
             writable_root,
+            writable_roots: Vec::new(),
             readonly_roots,
             mounts: Vec::new(),
             network: NetworkPolicy::Enabled,
@@ -103,6 +107,30 @@ mod tests {
         let roots = derive_filesystem_roots(&policy(workspace.clone(), vec![]), &state_root);
 
         assert_eq!(roots.write_roots, vec![workspace.canonicalize().unwrap()]);
+        assert!(roots.read_roots.is_empty());
+    }
+
+    #[test]
+    fn write_roots_include_existing_extra_writable_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let agent = temp.path().join("agent");
+        let state_root = temp.path().join("state");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&state_root).unwrap();
+
+        let mut policy = policy(workspace.clone(), vec![]);
+        policy.writable_roots.push(agent.clone());
+        let roots = derive_filesystem_roots(&policy, &state_root);
+
+        assert_eq!(
+            roots.write_roots,
+            vec![
+                workspace.canonicalize().unwrap(),
+                agent.canonicalize().unwrap()
+            ]
+        );
         assert!(roots.read_roots.is_empty());
     }
 

@@ -17,7 +17,7 @@
 //!   * Invalid JSON args / non-object args → INVALID_ARGS.
 //!   * Handler sleeping past clamped timeout → EXECUTION_TIMEOUT.
 //!   * Panicking handler → HANDLER_PANIC; daemon survives.
-//!   * 5 concurrent slow calls → exactly one CONCURRENCY_LIMIT.
+//!   * 17 concurrent slow calls → exactly one CONCURRENCY_LIMIT.
 //!   * Duplicate tool_call_id while running → ignored; after completion →
 //!     cached response re-sent with identical payload.
 //!
@@ -909,10 +909,10 @@ async fn panic_isolated_daemon_survives() {
     handle.shutdown().await.expect("shutdown clean");
 }
 
-/// 5 concurrent slow calls → 4 succeed + exactly 1 CONCURRENCY_LIMIT immediately.
-/// MAX_CONCURRENT_APP_TOOLS is 4.
+/// 17 concurrent slow calls → 16 succeed + exactly 1 CONCURRENCY_LIMIT immediately.
+/// MAX_CONCURRENT_APP_TOOLS is 16.
 #[tokio::test]
-async fn concurrency_limit_fifth_call() {
+async fn concurrency_limit_seventeenth_call() {
     let (mock, handle, _tmp) = setup_dispatch_daemon().await;
 
     // Register a slow tool that sleeps ~2.5s.
@@ -938,8 +938,8 @@ async fn concurrency_limit_fifth_call() {
         .await
         .expect("tool snapshot");
 
-    // Fire 5 requests back-to-back before any complete.
-    for i in 0..5 {
+    // Fire 17 requests back-to-back before any complete.
+    for i in 0..17 {
         mock.send_app_tool_request(
             format!("call-concurrent-{i}"),
             "slow_concurrent",
@@ -949,11 +949,11 @@ async fn concurrency_limit_fifth_call() {
         .expect("send ok");
     }
 
-    // Wait for all 5 responses with generous timeout (slow_tool ~2.5s + buffer).
+    // Wait for all 17 responses with generous timeout (slow_tool ~2.5s + buffer).
     let responses = mock
-        .wait_for_app_tool_responses(5, Duration::from_secs(15))
+        .wait_for_app_tool_responses(17, Duration::from_secs(15))
         .await
-        .expect("5 responses not received within 15s");
+        .expect("17 responses not received within 15s");
 
     let concurrency_errors = responses
         .iter()
@@ -972,12 +972,12 @@ async fn concurrency_limit_fifth_call() {
     assert_eq!(
         concurrency_errors,
         1,
-        "exactly 1 CONCURRENCY_LIMIT expected, got {concurrency_errors} out of 5 responses: {:?}",
+        "exactly 1 CONCURRENCY_LIMIT expected, got {concurrency_errors} out of 17 responses: {:?}",
         responses.iter().map(|r| &r.result).collect::<Vec<_>>()
     );
     assert_eq!(
-        successes, 4,
-        "exactly 4 successes expected, got {successes}"
+        successes, 16,
+        "exactly 16 successes expected, got {successes}"
     );
 
     handle.shutdown().await.expect("shutdown clean");

@@ -727,7 +727,7 @@ async fn audit_entry_written_for_timeout() {
 /// Three invocations share one device socket (the device replies immediately
 /// each time so the handler doesn't block on the timeout):
 ///   1. timeoutMs=500  → device receives timeout_ms == MIN_TIMEOUT_MS (1 000)
-///   2. timeoutMs=400000 → device receives timeout_ms == MAX_TIMEOUT_MS (300 000)
+///   2. timeoutMs=700000 → device receives timeout_ms == MAX_TIMEOUT_MS (600 000)
 ///   3. omitted timeoutMs  → device receives timeout_ms == DEFAULT_TIMEOUT_MS (60 000)
 #[tokio::test]
 async fn timeout_clamping_is_applied_before_dispatch() {
@@ -800,13 +800,13 @@ async fn timeout_clamping_is_applied_before_dispatch() {
         serde_json::json!({
             "deviceId": "clamp-dev",
             "name": "tool_b",
-            "timeoutMs": 400_000u64,
+            "timeoutMs": 700_000u64,
         }),
     )
     .await;
     assert_eq!(
         tm2, MAX_TIMEOUT_MS as u32,
-        "400 000ms should be clamped to MAX ({MAX_TIMEOUT_MS})"
+        "700 000ms should be clamped to MAX ({MAX_TIMEOUT_MS})"
     );
 
     // 3. Omitted → default.

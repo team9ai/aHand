@@ -2,18 +2,28 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+#[cfg(windows)]
+use std::collections::hash_map::DefaultHasher;
+#[cfg(windows)]
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::Path;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::sandbox::types::RuntimeExecuteResult;
 
 #[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, WAIT_FAILED, WAIT_TIMEOUT,
 };
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::ReadFile;
+use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT, ReadFile};
 #[cfg(windows)]
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -104,7 +114,9 @@ fn spawn_restricted_capture_inner(
         .map_or(std::ptr::null(), |wide| wide.as_ptr());
     let mut command_line = super::path::string_wide_null(&launch.command_line);
     let env_block = make_env_block(env)?;
-    let cwd_wide = super::path::wide_null(cwd);
+    let effective_cwd = effective_process_cwd(cwd);
+    let _cwd_guard = CurrentDirGuard::enter(&effective_cwd)?;
+    let cwd_wide = super::path::process_cwd_wide_null(&effective_cwd);
     let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
     let ok = unsafe {
@@ -256,7 +268,7 @@ fn launch_command(executable: &Path, args: &[String]) -> io::Result<LaunchComman
     }
 
     Ok(LaunchCommand {
-        application_name: Some(executable_string.clone()),
+        application_name: None,
         command_line: command_line(&executable_string, args),
     })
 }
@@ -342,6 +354,112 @@ fn windows_arg_needs_quotes(ch: char) -> bool {
 
 fn wait_timeout_ms(timeout: Duration) -> u32 {
     timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32
+}
+
+#[cfg(windows)]
+fn effective_process_cwd(cwd: &Path) -> PathBuf {
+    create_cwd_junction(cwd).unwrap_or_else(|| ahand_platform::paths::simplify(cwd))
+}
+
+#[cfg(windows)]
+fn create_cwd_junction(requested_cwd: &Path) -> Option<PathBuf> {
+    let userprofile = std::env::var_os("USERPROFILE")?;
+    create_cwd_junction_for_userprofile(requested_cwd, Path::new(&userprofile))
+}
+
+#[cfg(windows)]
+fn create_cwd_junction_for_userprofile(
+    requested_cwd: &Path,
+    userprofile: &Path,
+) -> Option<PathBuf> {
+    let junction_path = cwd_junction_path_for_userprofile(userprofile, requested_cwd);
+    let parent = junction_path.parent()?;
+    if std::fs::create_dir_all(parent).is_err() {
+        return None;
+    }
+
+    if junction_path.exists() {
+        match is_reparse_point(&junction_path) {
+            Ok(true) => return Some(junction_path),
+            Ok(false) => {
+                if std::fs::remove_dir(&junction_path).is_err() {
+                    return None;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let link = junction_path.to_string_lossy().to_string();
+    let target = ahand_platform::paths::simplify(requested_cwd)
+        .to_string_lossy()
+        .to_string();
+    let link_quoted = format!("\"{link}\"");
+    let target_quoted = format!("\"{target}\"");
+    let output = std::process::Command::new("cmd")
+        .raw_arg("/c")
+        .raw_arg("mklink")
+        .raw_arg("/J")
+        .raw_arg(&link_quoted)
+        .raw_arg(&target_quoted)
+        .output()
+        .ok()?;
+
+    if output.status.success() && junction_path.exists() {
+        Some(junction_path)
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn cwd_junction_path_for_userprofile(userprofile: &Path, requested_cwd: &Path) -> PathBuf {
+    userprofile
+        .join(".ahand")
+        .join("sandbox")
+        .join("cwd")
+        .join(cwd_junction_name(requested_cwd))
+}
+
+#[cfg(windows)]
+fn cwd_junction_name(path: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    ahand_platform::paths::simplify(path)
+        .to_string_lossy()
+        .hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(path: &Path) -> io::Result<bool> {
+    Ok((std::fs::symlink_metadata(path)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+}
+
+#[cfg(windows)]
+struct CurrentDirGuard {
+    original: PathBuf,
+}
+
+#[cfg(windows)]
+impl CurrentDirGuard {
+    fn enter(cwd: &Path) -> io::Result<Self> {
+        let original = std::env::current_dir()?;
+        let target = ahand_platform::paths::simplify(cwd);
+        std::env::set_current_dir(&target).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("failed to enter sandbox cwd '{}': {err}", target.display()),
+            )
+        })?;
+        Ok(Self { original })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+    }
 }
 
 #[cfg(windows)]
@@ -614,6 +732,8 @@ fn read_handle_to_vec(handle: HANDLE) -> std::thread::JoinHandle<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    #[cfg(windows)]
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use super::*;
@@ -665,6 +785,15 @@ mod tests {
     }
 
     #[test]
+    fn launch_command_lets_windows_resolve_bare_executable_names() {
+        let launch =
+            launch_command(Path::new("cmd"), &["/c".to_string(), "echo ok".to_string()]).unwrap();
+
+        assert_eq!(launch.application_name, None);
+        assert_eq!(launch.command_line, "cmd /c \"echo ok\"");
+    }
+
+    #[test]
     fn launch_command_quotes_batch_args_with_cmd_metacharacters() {
         let launch =
             launch_command(Path::new(r"C:\tools\npm.cmd"), &["foo&whoami".to_string()]).unwrap();
@@ -712,6 +841,60 @@ mod tests {
         assert_eq!(
             wait_timeout_ms(Duration::from_millis(u64::MAX)),
             u32::MAX - 1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_dir_guard_enters_simplified_cwd_and_restores_original() {
+        let original = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let verbatim = PathBuf::from(format!(r"\\?\{}", temp.path().display()));
+
+        {
+            let _guard = CurrentDirGuard::enter(&verbatim).unwrap();
+            assert_eq!(
+                ahand_platform::paths::simplify(&std::env::current_dir().unwrap()),
+                ahand_platform::paths::simplify(temp.path())
+            );
+        }
+
+        assert_eq!(
+            ahand_platform::paths::simplify(&std::env::current_dir().unwrap()),
+            ahand_platform::paths::simplify(&original)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cwd_junction_path_is_stable_under_userprofile() {
+        let userprofile = Path::new(r"C:\Users\SandboxUser");
+        let cwd = Path::new(r"C:\sandbox\workspace\session");
+
+        let first = cwd_junction_path_for_userprofile(userprofile, cwd);
+        let second = cwd_junction_path_for_userprofile(userprofile, cwd);
+
+        assert_eq!(first, second);
+        assert!(first.starts_with(userprofile.join(".ahand").join("sandbox").join("cwd")));
+        assert_ne!(first, cwd);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_cwd_junction_for_userprofile_points_to_requested_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let userprofile = temp.path().join("profile");
+        let cwd = temp.path().join("workspace").join("session");
+        std::fs::create_dir_all(&userprofile).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let junction = create_cwd_junction_for_userprofile(&cwd, &userprofile).unwrap();
+
+        assert!(junction.exists());
+        assert!(is_reparse_point(&junction).unwrap());
+        assert_eq!(
+            ahand_platform::paths::simplify(&std::fs::canonicalize(junction).unwrap()),
+            ahand_platform::paths::simplify(&std::fs::canonicalize(cwd).unwrap())
         );
     }
 }

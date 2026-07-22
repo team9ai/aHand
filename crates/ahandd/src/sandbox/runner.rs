@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -14,6 +16,7 @@ use super::types::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSandboxPolicy {
     pub writable_root: PathBuf,
+    pub writable_roots: Vec<PathBuf>,
     pub readonly_roots: Vec<PathBuf>,
     pub mounts: Vec<RegisteredSandboxMount>,
     pub network: NetworkPolicy,
@@ -27,6 +30,7 @@ impl RuntimeSandboxPolicy {
     ) -> Self {
         Self {
             writable_root,
+            writable_roots: provider.writable_roots,
             readonly_roots: provider.readonly_roots,
             mounts: Vec::new(),
             network,
@@ -80,7 +84,7 @@ fn materialize_active_mounts(policy: &mut RuntimeSandboxPolicy) -> SandboxResult
 }
 
 fn platform_supports_readonly_host_directory_mounts() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", windows))
 }
 
 fn materialize_active_mounts_with_platform_support(
@@ -152,11 +156,11 @@ fn materialize_readonly_host_directory_mount(
         ));
     }
 
-    materialize_mount_target_symlink(&policy.writable_root, &mount.target, &canonical_source)?;
+    materialize_mount_target_alias(&policy.writable_root, &mount.target, &canonical_source)?;
     Ok(canonical_source)
 }
 
-fn materialize_mount_target_symlink(
+fn materialize_mount_target_alias(
     workspace_root: &Path,
     target: &Path,
     canonical_source: &Path,
@@ -173,25 +177,8 @@ fn materialize_mount_target_symlink(
     let parent = validate_mount_target_parent(&canonical_namespace, target)?;
 
     match fs::symlink_metadata(target) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            let link_target = fs::read_link(target).map_err(|e| {
-                SandboxError::mount_target_invalid(format!(
-                    "failed to read mount target symlink '{}': {e}",
-                    target.display()
-                ))
-            })?;
-            let resolved_link = if link_target.is_absolute() {
-                link_target
-            } else {
-                parent.join(link_target)
-            }
-            .canonicalize()
-            .map_err(|e| {
-                SandboxError::mount_target_invalid(format!(
-                    "failed to resolve mount target symlink '{}': {e}",
-                    target.display()
-                ))
-            })?;
+        Ok(metadata) if is_directory_alias(target, &metadata)? => {
+            let resolved_link = resolve_directory_alias(target, &parent)?;
             if resolved_link == canonical_source {
                 return Ok(());
             }
@@ -216,7 +203,7 @@ fn materialize_mount_target_symlink(
     }
 
     validate_mount_target_parent(&canonical_namespace, target)?;
-    create_symlink(canonical_source, target)
+    create_directory_alias(canonical_source, target)
 }
 
 fn prepare_mount_namespace(canonical_workspace: &Path) -> SandboxResult<PathBuf> {
@@ -267,9 +254,9 @@ fn ensure_existing_plain_directory(path: &Path, label: &str) -> SandboxResult<()
     let metadata = fs::symlink_metadata(path).map_err(|e| {
         SandboxError::mount_target_invalid(format!("failed to inspect {label}: {e}"))
     })?;
-    if metadata.file_type().is_symlink() {
+    if metadata_is_link_or_reparse_point(&metadata) {
         return Err(SandboxError::mount_target_invalid(format!(
-            "{label} must not be a symlink"
+            "{label} must not be a symlink or reparse point"
         )));
     }
     if !metadata.is_dir() {
@@ -307,7 +294,7 @@ fn validate_mount_target_parent(
 }
 
 #[cfg(unix)]
-fn create_symlink(source: &Path, target: &Path) -> SandboxResult<()> {
+fn create_directory_alias(source: &Path, target: &Path) -> SandboxResult<()> {
     symlink(source, target).map_err(|e| {
         SandboxError::mount_target_invalid(format!(
             "failed to create mount target symlink '{}': {e}",
@@ -316,11 +303,85 @@ fn create_symlink(source: &Path, target: &Path) -> SandboxResult<()> {
     })
 }
 
-#[cfg(not(unix))]
-fn create_symlink(_source: &Path, _target: &Path) -> SandboxResult<()> {
+#[cfg(windows)]
+fn create_directory_alias(source: &Path, target: &Path) -> SandboxResult<()> {
+    junction::create(source, target).map_err(|e| {
+        SandboxError::mount_target_invalid(format!(
+            "failed to create mount target junction '{}': {e}",
+            target.display()
+        ))
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_directory_alias(_source: &Path, _target: &Path) -> SandboxResult<()> {
     Err(SandboxError::mount_platform_unsupported(
-        "read-only host directory mounts require symlink support",
+        "read-only host directory mounts require directory alias support",
     ))
+}
+
+fn is_directory_alias(target: &Path, metadata: &fs::Metadata) -> SandboxResult<bool> {
+    #[cfg(windows)]
+    {
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            == 0
+        {
+            return Ok(false);
+        }
+        junction::exists(target).map_err(|e| {
+            SandboxError::mount_target_invalid(format!(
+                "failed to inspect mount target junction '{}': {e}",
+                target.display()
+            ))
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = target;
+        Ok(metadata.file_type().is_symlink())
+    }
+}
+
+fn resolve_directory_alias(target: &Path, parent: &Path) -> SandboxResult<PathBuf> {
+    #[cfg(windows)]
+    let link_target = junction::get_target(target).map_err(|e| {
+        SandboxError::mount_target_invalid(format!(
+            "failed to read mount target junction '{}': {e}",
+            target.display()
+        ))
+    })?;
+    #[cfg(not(windows))]
+    let link_target = fs::read_link(target).map_err(|e| {
+        SandboxError::mount_target_invalid(format!(
+            "failed to read mount target symlink '{}': {e}",
+            target.display()
+        ))
+    })?;
+    let resolved_link = if link_target.is_absolute() {
+        link_target
+    } else {
+        parent.join(link_target)
+    };
+    resolved_link.canonicalize().map_err(|e| {
+        SandboxError::mount_target_invalid(format!(
+            "failed to resolve mount target directory alias '{}': {e}",
+            target.display()
+        ))
+    })
+}
+
+fn metadata_is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
@@ -461,6 +522,7 @@ mod tests {
             name: "python".into(),
             executable: PathBuf::from("/runtimes/python/bin/python"),
             readonly_roots: vec![PathBuf::from("/runtimes/python")],
+            writable_roots: vec![PathBuf::from("/shared/agent")],
             env: HashMap::new(),
             default_timeout: Duration::from_secs(30),
         };
@@ -471,6 +533,7 @@ mod tests {
         );
 
         assert_eq!(policy.writable_root, PathBuf::from("/sessions/s1"));
+        assert_eq!(policy.writable_roots, vec![PathBuf::from("/shared/agent")]);
         assert_eq!(
             policy.readonly_roots,
             vec![PathBuf::from("/runtimes/python")]
@@ -537,6 +600,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             policy: RuntimeSandboxPolicy {
                 writable_root: PathBuf::from("."),
+                writable_roots: Vec::new(),
                 readonly_roots: vec![],
                 mounts: Vec::new(),
                 network: NetworkPolicy::ProxyOnly,
@@ -559,6 +623,7 @@ mod tests {
             timeout: Duration::from_secs(1),
             policy: RuntimeSandboxPolicy {
                 writable_root: PathBuf::from("/tmp"),
+                writable_roots: Vec::new(),
                 readonly_roots: vec![],
                 mounts: Vec::new(),
                 network: NetworkPolicy::Enabled,
@@ -597,6 +662,7 @@ mod tests {
     ) -> RuntimeSandboxPolicy {
         RuntimeSandboxPolicy {
             writable_root: workspace_root,
+            writable_roots: Vec::new(),
             readonly_roots: Vec::new(),
             mounts: vec![readonly_host_dir_mount("selected-folder", source, target)],
             network: NetworkPolicy::Enabled,
@@ -644,6 +710,57 @@ mod tests {
         assert_eq!(policy.readonly_roots, vec![source.canonicalize().unwrap()]);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn sandbox_mount_materialization_creates_junction_and_adds_readonly_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let target = workspace_root.join("workspace/mounts/selected-folder");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("data.txt"), "mounted data").unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        let mut policy =
+            policy_with_mount(workspace_root, canonical_source.clone(), target.clone());
+
+        materialize_active_mounts_with_platform_support(&mut policy, true).unwrap();
+
+        assert!(junction::exists(&target).unwrap());
+        assert_eq!(
+            junction::get_target(&target)
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            canonical_source
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("data.txt")).unwrap(),
+            "mounted data"
+        );
+        assert_eq!(policy.readonly_roots, vec![source.canonicalize().unwrap()]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sandbox_mount_materialization_accepts_existing_correct_junction() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let target = workspace_root.join("workspace/mounts/selected-folder");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        junction::create(&canonical_source, &target).unwrap();
+        let mut policy =
+            policy_with_mount(workspace_root, canonical_source.clone(), target.clone());
+
+        materialize_active_mounts_with_platform_support(&mut policy, true).unwrap();
+
+        assert!(junction::exists(&target).unwrap());
+        assert_eq!(policy.readonly_roots, vec![canonical_source]);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn sandbox_mount_materialization_rejects_existing_conflicting_path() {
@@ -676,6 +793,28 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         symlink(&outside, workspace_root.join("workspace")).unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+        let mut policy = policy_with_mount(workspace_root, canonical_source, target);
+
+        let err = materialize_active_mounts_with_platform_support(&mut policy, true).unwrap_err();
+
+        assert_eq!(err.code, "MOUNT_TARGET_INVALID");
+        assert!(!outside.join("mounts").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sandbox_mount_materialization_rejects_junctioned_workspace_without_creating_outside_mounts()
+    {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_root = temp.path().join("sandbox");
+        let source = temp.path().join("host");
+        let outside = temp.path().join("outside");
+        let target = workspace_root.join("workspace/mounts/selected-folder");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        junction::create(&outside, workspace_root.join("workspace")).unwrap();
         let canonical_source = source.canonicalize().unwrap();
         let mut policy = policy_with_mount(workspace_root, canonical_source, target);
 
