@@ -28,3 +28,13 @@ pub use sandbox::{
     FixedSandboxInvocationResolver, SandboxInvocationContext, SandboxInvocationResolver,
     SandboxToolProviderOptions,
 };
+
+#[cfg(windows)]
+pub fn try_run_windows_sandbox_helper_from_args() -> Result<bool, String> {
+    sandbox::platform::windows::try_run_helper_from_args()
+}
+
+#[cfg(not(windows))]
+pub fn try_run_windows_sandbox_helper_from_args() -> Result<bool, String> {
+    Ok(false)
+}

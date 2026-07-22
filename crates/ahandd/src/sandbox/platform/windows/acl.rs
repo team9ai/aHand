@@ -2,9 +2,7 @@
 
 use std::ffi::c_void;
 use std::io;
-#[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
@@ -75,6 +73,9 @@ fn plan_filesystem_acls(roots: &super::roots::DerivedFilesystemRoots) -> Vec<Pla
         });
     }
     for root in &roots.read_roots {
+        if is_ambient_windows_read_root(root) {
+            continue;
+        }
         plan.push(PlannedAcl {
             path: root.clone(),
             access: AppliedAccess::Readonly,
@@ -82,6 +83,89 @@ fn plan_filesystem_acls(roots: &super::roots::DerivedFilesystemRoots) -> Vec<Pla
         });
     }
     plan
+}
+
+fn is_ambient_windows_read_root(path: &Path) -> bool {
+    ambient_windows_read_root_candidates()
+        .iter()
+        .any(|candidate| path_key(candidate) == path_key(path))
+}
+
+fn ambient_windows_read_root_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(system_root) = std::env::var("SystemRoot") {
+        push_ambient_windows_read_root_candidates(&mut candidates, system_root);
+    }
+    push_ambient_windows_read_root_candidates(&mut candidates, r"C:\Windows".to_string());
+    for key in [
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "ProgramData",
+    ] {
+        push_candidate_from_env(&mut candidates, key);
+    }
+    for path in [
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+        r"C:\ProgramData",
+    ] {
+        push_unique_candidate(&mut candidates, PathBuf::from(path));
+    }
+    let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+    push_unique_candidate(
+        &mut candidates,
+        PathBuf::from(format!(
+            "{}\\Users\\{}",
+            system_drive.trim_end_matches(['\\', '/']),
+            super::setup::ONLINE_USERNAME
+        )),
+    );
+    push_unique_candidate(
+        &mut candidates,
+        PathBuf::from(format!(r"C:\Users\{}", super::setup::ONLINE_USERNAME)),
+    );
+    candidates
+}
+
+fn push_ambient_windows_read_root_candidates(candidates: &mut Vec<PathBuf>, system_root: String) {
+    let system_root = PathBuf::from(system_root);
+    push_unique_candidate(candidates, system_root.clone());
+    for child in [
+        "System32",
+        "SysWOW64",
+        "WinSxS",
+        "Fonts",
+        r"System32\WindowsPowerShell\v1.0",
+    ] {
+        push_unique_candidate(candidates, system_root.join(child));
+    }
+}
+
+fn push_candidate_from_env(candidates: &mut Vec<PathBuf>, key: &str) {
+    let Ok(path) = std::env::var(key) else {
+        return;
+    };
+    if !path.trim().is_empty() {
+        push_unique_candidate(candidates, PathBuf::from(path));
+    }
+}
+
+fn push_unique_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
+    let key = path_key(&path);
+    if !candidates.iter().any(|existing| path_key(existing) == key) {
+        candidates.push(path);
+    }
+}
+
+fn path_key(path: &Path) -> String {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let normalized = normalized
+        .strip_prefix("//?/UNC/")
+        .map(|rest| format!("//{rest}"))
+        .or_else(|| normalized.strip_prefix("//?/").map(ToOwned::to_owned))
+        .unwrap_or(normalized);
+    normalized.trim_end_matches('/').to_ascii_lowercase()
 }
 
 #[cfg(windows)]
@@ -536,6 +620,73 @@ mod inheritance_tests {
         let roots = super::super::roots::DerivedFilesystemRoots {
             write_roots: vec![PathBuf::from(r"C:\workspace")],
             read_roots: vec![PathBuf::from(r"C:\runtime")],
+        };
+
+        let plan = plan_filesystem_acls(&roots);
+
+        assert_eq!(
+            plan,
+            vec![
+                PlannedAcl {
+                    path: PathBuf::from(r"C:\workspace"),
+                    access: AppliedAccess::Writable,
+                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                },
+                PlannedAcl {
+                    path: PathBuf::from(r"C:\runtime"),
+                    access: AppliedAccess::Readonly,
+                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn filesystem_acl_plan_does_not_rewrite_ambient_windows_read_roots() {
+        let roots = super::super::roots::DerivedFilesystemRoots {
+            write_roots: vec![PathBuf::from(r"C:\workspace")],
+            read_roots: vec![
+                PathBuf::from(r"C:\Windows"),
+                PathBuf::from(r"C:\Windows\System32"),
+                PathBuf::from(r"C:\Program Files"),
+                PathBuf::from(r"C:\Program Files (x86)"),
+                PathBuf::from(r"C:\ProgramData"),
+                PathBuf::from(r"C:\Users\AhandSandboxOnline"),
+                PathBuf::from(r"C:\runtime"),
+            ],
+        };
+
+        let plan = plan_filesystem_acls(&roots);
+
+        assert_eq!(
+            plan,
+            vec![
+                PlannedAcl {
+                    path: PathBuf::from(r"C:\workspace"),
+                    access: AppliedAccess::Writable,
+                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                },
+                PlannedAcl {
+                    path: PathBuf::from(r"C:\runtime"),
+                    access: AppliedAccess::Readonly,
+                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn filesystem_acl_plan_does_not_rewrite_verbatim_ambient_windows_read_roots() {
+        let roots = super::super::roots::DerivedFilesystemRoots {
+            write_roots: vec![PathBuf::from(r"C:\workspace")],
+            read_roots: vec![
+                PathBuf::from(r"\\?\C:\Windows"),
+                PathBuf::from(r"\\?\C:\Windows\System32"),
+                PathBuf::from(r"\\?\C:\Program Files"),
+                PathBuf::from(r"\\?\C:\ProgramData"),
+                PathBuf::from(r"\\?\C:\Users\AhandSandboxOnline"),
+                PathBuf::from(r"C:\runtime"),
+            ],
         };
 
         let plan = plan_filesystem_acls(&roots);

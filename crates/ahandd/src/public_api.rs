@@ -569,7 +569,7 @@ impl DaemonHandle {
                 cwd: request.cwd,
                 env,
                 timeout: request.timeout.or(Some(provider.default_timeout)),
-                context: None,
+                context: request.context,
             },
         )
         .await
@@ -694,6 +694,7 @@ pub(crate) async fn execute_sandbox_command_with_registry(
     let timeout = request_timeout.unwrap_or(exec_env.default_timeout);
     let policy = RuntimeSandboxPolicy {
         writable_root: workspace_root,
+        writable_roots: exec_env.writable_roots,
         readonly_roots: exec_env.readonly_roots,
         mounts: exec_env.mounts,
         network,
@@ -745,6 +746,20 @@ fn canonicalize_runtime_provider(
         .collect::<SandboxResult<Vec<_>>>()?;
     provider.readonly_roots.sort();
     provider.readonly_roots.dedup();
+    provider.writable_roots = provider
+        .writable_roots
+        .into_iter()
+        .map(|root| {
+            root.canonicalize().map_err(|e| {
+                crate::sandbox::SandboxError::unavailable(format!(
+                    "failed to resolve sandbox runtime writable root '{}': {e}",
+                    root.display()
+                ))
+            })
+        })
+        .collect::<SandboxResult<Vec<_>>>()?;
+    provider.writable_roots.sort();
+    provider.writable_roots.dedup();
     Ok(provider)
 }
 
@@ -1374,6 +1389,7 @@ mod tests {
             name: "python".to_string(),
             executable: alias.clone(),
             readonly_roots: vec![bin.clone(), PathBuf::from("/bin")],
+            writable_roots: Vec::new(),
             env: HashMap::new(),
             default_timeout: Duration::from_secs(10),
         })

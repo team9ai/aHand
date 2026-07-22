@@ -17,6 +17,7 @@ async fn proxy_only_is_unsupported_for_sandbox_execution() {
         timeout: Duration::from_secs(1),
         policy: RuntimeSandboxPolicy {
             writable_root: temp.path().to_path_buf(),
+            writable_roots: Vec::new(),
             readonly_roots: vec![],
             mounts: Vec::new(),
             network: NetworkPolicy::ProxyOnly,
