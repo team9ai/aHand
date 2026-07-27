@@ -22,7 +22,7 @@ pub use public_api::{
     AppToolArgsHandler, AppToolDef, AppToolError, AppToolHandler, AppToolInvocation,
     ApprovalSubscription, DaemonConfig, DaemonConfigBuilder, DaemonHandle, DaemonStatus, ErrorKind,
     MountAccess, MountScope, MountSource, MountSourceSnapshot, RegisteredSandboxMount,
-    SandboxMountSpec, SessionMode, args_only_handler, load_or_create_identity, spawn,
+    SandboxMountSpec, SessionMode, args_only_handler, load_or_create_identity, spawn, spawn_paused,
 };
 pub use sandbox::{
     FixedSandboxInvocationResolver, SandboxInvocationContext, SandboxInvocationResolver,
