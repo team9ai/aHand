@@ -24,6 +24,10 @@ pub struct SandboxToolProviderOptions {
     pub include_compat_aliases: bool,
 }
 
+pub trait SandboxInvocationPermit: Send {}
+
+impl<T: Send> SandboxInvocationPermit for T {}
+
 pub trait SandboxInvocationResolver: Send + Sync {
     fn resolve(&self, invocation: &AppToolInvocation) -> SandboxResult<SandboxInvocationContext>;
 
@@ -45,6 +49,15 @@ pub trait SandboxInvocationResolver: Send + Sync {
     ) -> SandboxResult<()> {
         let _ = (registry, context);
         Ok(())
+    }
+
+    fn acquire_session(
+        &self,
+        registry: &mut SandboxRegistry,
+        context: &SandboxInvocationContext,
+    ) -> SandboxResult<Box<dyn SandboxInvocationPermit>> {
+        self.ensure_session(registry, context)?;
+        Ok(Box::new(()))
     }
 }
 
@@ -86,6 +99,13 @@ impl SandboxInvocationResolver for FixedSandboxInvocationResolver {
     }
 }
 
+#[cfg(test)]
+#[derive(Default)]
+struct ExecutionCaptureGate {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 #[derive(Clone)]
 pub struct SandboxToolProvider {
     registry: Arc<AsyncMutex<SandboxRegistry>>,
@@ -94,6 +114,8 @@ pub struct SandboxToolProvider {
     sandbox_state_root: PathBuf,
     #[cfg(test)]
     captured_exec: Option<Arc<AsyncMutex<Option<SandboxExecRequest>>>>,
+    #[cfg(test)]
+    captured_exec_gate: Option<Arc<ExecutionCaptureGate>>,
 }
 
 impl SandboxToolProvider {
@@ -118,6 +140,8 @@ impl SandboxToolProvider {
             sandbox_state_root: sandbox_state_root.into(),
             #[cfg(test)]
             captured_exec: None,
+            #[cfg(test)]
+            captured_exec_gate: None,
         }
     }
 
@@ -134,6 +158,7 @@ impl SandboxToolProvider {
             options,
             sandbox_state_root: default_sandbox_state_root(),
             captured_exec: Some(captured_exec),
+            captured_exec_gate: None,
         }
     }
 
@@ -187,13 +212,13 @@ impl SandboxToolProvider {
         })
     }
 
-    async fn ensure_context_session(
+    async fn acquire_context_session(
         &self,
         context: &SandboxInvocationContext,
-    ) -> Result<(), AppToolError> {
+    ) -> Result<Box<dyn SandboxInvocationPermit>, AppToolError> {
         let mut registry = self.registry.lock().await;
         self.resolver
-            .ensure_session(&mut registry, context)
+            .acquire_session(&mut registry, context)
             .map_err(app_tool_error_from_sandbox)
     }
 
@@ -210,13 +235,14 @@ impl SandboxToolProvider {
         if host_file_ref.conversation_id.is_none() {
             host_file_ref.conversation_id = context.run_id.clone();
         }
-        self.ensure_context_session(&context).await?;
+        let permit = self.acquire_context_session(&context).await?;
 
         let file = {
             let mut registry = self.registry.lock().await;
             file_lifecycle::import_file(&mut registry, &context.session_id, host_file_ref)
         }
         .map_err(app_tool_error_from_sandbox)?;
+        drop(permit);
 
         Ok(sandbox_file_json(&file))
     }
@@ -230,7 +256,7 @@ impl SandboxToolProvider {
         let cwd = optional_string_arg(&invocation.args, "cwd")?.map(PathBuf::from);
         let env = optional_string_map_arg(&invocation.args, "env")?;
         let timeout = optional_timeout_arg(&invocation.args, "timeoutSeconds")?;
-        self.ensure_context_session(&context).await?;
+        let permit = self.acquire_context_session(&context).await?;
         let session_id = context.session_id.clone();
         let result = self
             .execute_command(
@@ -245,6 +271,7 @@ impl SandboxToolProvider {
             )
             .await
             .map_err(app_tool_error_from_sandbox)?;
+        drop(permit);
 
         Ok(runtime_execute_result_json(&result))
     }
@@ -260,7 +287,7 @@ impl SandboxToolProvider {
         let command = SandboxCommand::Argv {
             command: std::iter::once("node".to_string()).chain(args).collect(),
         };
-        self.ensure_context_session(&context).await?;
+        let permit = self.acquire_context_session(&context).await?;
         let session_id = context.session_id.clone();
         let result = self
             .execute_command(
@@ -275,6 +302,7 @@ impl SandboxToolProvider {
             )
             .await
             .map_err(app_tool_error_from_sandbox)?;
+        drop(permit);
 
         Ok(runtime_execute_result_json(&result))
     }
@@ -287,6 +315,10 @@ impl SandboxToolProvider {
         #[cfg(test)]
         if let Some(captured_exec) = &self.captured_exec {
             *captured_exec.lock().await = Some(request);
+            if let Some(gate) = &self.captured_exec_gate {
+                gate.started.notify_one();
+                gate.release.notified().await;
+            }
             return Ok(RuntimeExecuteResult {
                 stdout: String::new(),
                 stderr: String::new(),
@@ -544,6 +576,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use serde_json::{Value, json};
@@ -700,6 +733,144 @@ mod tests {
                 conversation_id: None,
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct TrackingPermit {
+        active: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TrackingPermit {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug)]
+    struct PermitTrackingResolver {
+        active: Arc<AtomicUsize>,
+    }
+
+    impl SandboxInvocationResolver for PermitTrackingResolver {
+        fn resolve(
+            &self,
+            _invocation: &AppToolInvocation,
+        ) -> SandboxResult<SandboxInvocationContext> {
+            Ok(SandboxInvocationContext {
+                session_id: "session-1".to_string(),
+                run_id: Some("run-1".to_string()),
+                scope_id: None,
+                invocation_id: None,
+            })
+        }
+
+        fn acquire_session(
+            &self,
+            registry: &mut SandboxRegistry,
+            context: &SandboxInvocationContext,
+        ) -> SandboxResult<Box<dyn SandboxInvocationPermit>> {
+            registry.session(&context.session_id)?;
+            self.active.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(TrackingPermit {
+                active: Arc::clone(&self.active),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct LegacyEnsuringResolver {
+        ensure_calls: Arc<AtomicUsize>,
+    }
+
+    impl SandboxInvocationResolver for LegacyEnsuringResolver {
+        fn resolve(
+            &self,
+            _invocation: &AppToolInvocation,
+        ) -> SandboxResult<SandboxInvocationContext> {
+            Ok(SandboxInvocationContext {
+                session_id: "session-1".to_string(),
+                run_id: Some("run-1".to_string()),
+                scope_id: None,
+                invocation_id: None,
+            })
+        }
+
+        fn ensure_session(
+            &self,
+            registry: &mut SandboxRegistry,
+            context: &SandboxInvocationContext,
+        ) -> SandboxResult<()> {
+            registry.session(&context.session_id)?;
+            self.ensure_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_retains_invocation_permit_through_command_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let captured_exec = Arc::new(AsyncMutex::new(None));
+        let captured_exec_gate = Arc::new(ExecutionCaptureGate::default());
+        let provider = SandboxToolProvider {
+            registry: registry_with_session(
+                temp.path().join("sandbox"),
+                SandboxPermissionMode::Readonly,
+            ),
+            resolver: Arc::new(PermitTrackingResolver {
+                active: Arc::clone(&active),
+            }),
+            options: SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+            sandbox_state_root: default_sandbox_state_root(),
+            captured_exec: Some(captured_exec),
+            captured_exec_gate: Some(Arc::clone(&captured_exec_gate)),
+        };
+
+        let run_command = handler(&provider, "run_command");
+        let invocation_task = tokio::spawn(async move {
+            run_command(invocation(
+                json!({"command": ["python", "-V"]}),
+                Some(trusted_context()),
+            ))
+            .await
+        });
+
+        captured_exec_gate.started.notified().await;
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        captured_exec_gate.release.notify_one();
+
+        let result = invocation_task.await.unwrap().unwrap();
+        assert_eq!(result["exitCode"], json!(0));
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_resolver_uses_default_noop_invocation_permit() {
+        let temp = tempfile::tempdir().unwrap();
+        let ensure_calls = Arc::new(AtomicUsize::new(0));
+        let captured_exec = Arc::new(AsyncMutex::new(None));
+        let provider = SandboxToolProvider::new_for_test_with_exec_capture(
+            registry_with_session(temp.path().join("sandbox"), SandboxPermissionMode::Readonly),
+            Arc::new(LegacyEnsuringResolver {
+                ensure_calls: Arc::clone(&ensure_calls),
+            }),
+            SandboxToolProviderOptions {
+                include_compat_aliases: true,
+            },
+            captured_exec,
+        );
+
+        let result = handler(&provider, "run_command")(invocation(
+            json!({"command": ["python", "-V"]}),
+            Some(trusted_context()),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(result["exitCode"], json!(0));
+        assert_eq!(ensure_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

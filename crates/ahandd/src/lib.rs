@@ -25,8 +25,8 @@ pub use public_api::{
     SandboxMountSpec, SessionMode, args_only_handler, load_or_create_identity, spawn, spawn_paused,
 };
 pub use sandbox::{
-    FixedSandboxInvocationResolver, SandboxInvocationContext, SandboxInvocationResolver,
-    SandboxToolProviderOptions,
+    FixedSandboxInvocationResolver, SandboxInvocationContext, SandboxInvocationPermit,
+    SandboxInvocationResolver, SandboxToolProviderOptions,
 };
 
 #[cfg(windows)]
