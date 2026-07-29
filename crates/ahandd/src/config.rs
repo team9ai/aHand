@@ -707,15 +707,10 @@ path_allowlist = ["/etc/passwd", "/var/log/**"]
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("definitely_does_not_exist.toml");
         let err = Config::load(&path).unwrap_err();
-        let msg = err.to_string();
-        // Accept both Unix ("No such file") and Windows ("cannot find the file")
-        // phrasing for OS-level "file not found" errors.
-        assert!(
-            msg.to_lowercase().contains("no such file")
-                || msg.to_lowercase().contains("not found")
-                || msg.to_lowercase().contains("cannot find"),
-            "expected NotFound IO error, got: {msg}"
-        );
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .expect("missing config should return an IO error");
+        assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
     }
 }
 

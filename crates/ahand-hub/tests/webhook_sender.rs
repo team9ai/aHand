@@ -614,9 +614,12 @@ fn backoff_schedule_exposed_for_callers() {
 /// tightly attempting the same failing DLQ write on every tick.
 #[tokio::test]
 async fn dlq_write_failure_applies_backoff_not_spin() {
-    // /dev/null is not a directory, so create_dir_all inside append_dlq
-    // will fail with ENOTDIR — a reliable way to simulate a broken DLQ path.
-    let bad_dlq = PathBuf::from("/dev/null/subdir/webhook_dlq.jsonl");
+    // Put a regular file where append_dlq expects a directory. This makes
+    // create_dir_all fail reliably on every platform.
+    let bad_dlq_root = tempfile::tempdir().unwrap();
+    let bad_parent = bad_dlq_root.path().join("not-a-directory");
+    std::fs::write(&bad_parent, b"not a directory").unwrap();
+    let bad_dlq = bad_parent.join("subdir").join("webhook_dlq.jsonl");
 
     // Point the webhook at an address that will immediately refuse connections.
     // Port 1 is reserved and always fails on all platforms.
