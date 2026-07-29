@@ -7,12 +7,147 @@
 //!   3. `shutdown()` returns cleanly and the inner task finishes.
 //!   4. `load_or_create_identity` is idempotent on a temp directory.
 
-use std::time::Duration;
+use std::{
+    sync::{Arc, Barrier},
+    time::Duration,
+};
 
-use ahandd::{DaemonConfig, DaemonStatus, ErrorKind, load_or_create_identity, spawn};
+use ahandd::{DaemonConfig, DaemonStatus, ErrorKind, load_or_create_identity, spawn, spawn_paused};
 use tempfile::TempDir;
 
 mod mock_hub;
+
+#[tokio::test]
+async fn spawn_paused_stays_idle_until_connect() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path()).build();
+
+    let handle = spawn_paused(config).await.expect("spawn paused ok");
+    assert_eq!(handle.status(), DaemonStatus::Idle);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(mock.connection_count(), 0);
+
+    handle.connect().expect("connect ok");
+    let mut status = handle.subscribe_status();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(*status.borrow(), DaemonStatus::Online { .. }) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("did not reach Online within 5s");
+
+    assert_eq!(mock.connection_count(), 1);
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+#[tokio::test]
+async fn paused_connect_is_idempotent_for_concurrent_callers() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path()).build();
+    let handle = Arc::new(spawn_paused(config).await.expect("spawn paused ok"));
+
+    let barrier = Arc::new(Barrier::new(3));
+    let first_handle = Arc::clone(&handle);
+    let first_barrier = Arc::clone(&barrier);
+    let first_task = tokio::task::spawn_blocking(move || {
+        first_barrier.wait();
+        first_handle.connect()
+    });
+    let second_handle = Arc::clone(&handle);
+    let second_barrier = Arc::clone(&barrier);
+    let second_task = tokio::task::spawn_blocking(move || {
+        second_barrier.wait();
+        second_handle.connect()
+    });
+
+    barrier.wait();
+    let (first, second) = tokio::join!(first_task, second_task);
+    first
+        .expect("first connect task joined")
+        .expect("first connect ok");
+    second
+        .expect("second connect task joined")
+        .expect("second connect ok");
+
+    let mut status = handle.subscribe_status();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(*status.borrow(), DaemonStatus::Online { .. }) {
+                break;
+            }
+            status.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("did not reach Online within 5s");
+
+    assert_eq!(mock.connection_count(), 1);
+    Arc::try_unwrap(handle)
+        .expect("all concurrent handle references dropped")
+        .shutdown()
+        .await
+        .expect("shutdown clean");
+}
+
+#[tokio::test]
+async fn shutdown_before_connect_never_contacts_hub_and_releases_reservation() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path()).build();
+
+    let handle = spawn_paused(config.clone()).await.expect("spawn paused ok");
+    tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .expect("paused shutdown did not complete within 1s")
+        .expect("paused shutdown clean");
+    assert_eq!(mock.connection_count(), 0);
+
+    let replacement = spawn_paused(config)
+        .await
+        .expect("shutdown should release active daemon reservation");
+    replacement
+        .shutdown()
+        .await
+        .expect("replacement shutdown clean");
+    assert_eq!(mock.connection_count(), 0);
+}
+
+#[tokio::test]
+async fn dropping_paused_handle_releases_reservation_without_connecting() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path()).build();
+
+    let handle = spawn_paused(config.clone()).await.expect("spawn paused ok");
+    drop(handle);
+
+    let replacement = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match spawn_paused(config.clone()).await {
+                Ok(handle) => break handle,
+                Err(err) if err.to_string().contains("already running") => {
+                    tokio::task::yield_now().await;
+                }
+                Err(err) => panic!("unexpected replacement spawn error: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("dropped paused handle did not release reservation within 1s");
+
+    replacement
+        .shutdown()
+        .await
+        .expect("replacement shutdown clean");
+    assert_eq!(mock.connection_count(), 0);
+}
 
 #[tokio::test]
 async fn spawn_connects_and_reports_online() {

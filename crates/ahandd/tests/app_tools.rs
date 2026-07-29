@@ -6,9 +6,8 @@
 //!   * Initial empty snapshot sent right after Hello.
 //!   * Registering a tool causes a snapshot with the new tool.
 //!   * Unregistering removes the tool and increments the revision.
-//!   * Tools registered before the connection is established arrive in the
-//!     initial snapshot (or at least with strictly increasing revisions —
-//!     see note in `registration_racing_connect_yields_monotonic_revisions`).
+//!   * Tools registered while paused arrive in the first catalog snapshot.
+//!   * Registering immediately after eager `spawn` preserves monotonic revisions.
 //!   * Reconnect after a hub-initiated close re-sends the snapshot.
 //!
 //! Also covers AppToolRequest dispatch (Task 5):
@@ -47,7 +46,7 @@ use std::time::Duration;
 use ahand_protocol::app_tool_response;
 use ahandd::{
     AppToolArgsHandler, AppToolDef, AppToolHandler, AppToolInvocation, DaemonConfig, DaemonStatus,
-    SessionMode, args_only_handler, spawn,
+    SessionMode, args_only_handler, spawn, spawn_paused,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -250,22 +249,50 @@ async fn unregister_pushes_snapshot_without_tool() {
     handle.shutdown().await.expect("shutdown clean");
 }
 
-/// Registering immediately after `spawn` may race the first connection attempt.
-/// Regardless of timing, all received revisions must be strictly increasing and
-/// the last snapshot must contain `demo_echo`.
-///
-/// Note: Because `DaemonHandle` is only available after `spawn()` returns,
-/// strictly-before-connect registration is not constructible via the public
-/// API. Instead, this test registers immediately after spawn (which may
-/// race with the first connection attempt) and verifies that:
-///   - Each received revision is strictly increasing (no duplicate revisions).
-///   - Every snapshot sent carries a consistent tools list.
-///
-/// If the tool was registered before the connection completed, the initial
-/// snapshot will have revision=1 (not 0). If registered after, revisions will
-/// be 0, then 1. Either way, revisions must be strictly increasing.
 #[tokio::test]
-async fn registration_racing_connect_yields_monotonic_revisions() {
+async fn tool_registered_while_paused_is_in_first_catalog_snapshot() {
+    let mock = mock_hub::start_accepting().await;
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
+        .heartbeat_interval(Duration::from_secs(60))
+        .build();
+
+    let handle = spawn_paused(config).await.expect("spawn paused ok");
+    handle
+        .register_app_tool(demo_echo_def(), echo_handler())
+        .await
+        .expect("register ok");
+
+    assert_eq!(mock.connection_count(), 0);
+    assert!(
+        mock.captured_app_tools_updates().is_empty(),
+        "paused daemon must not publish a catalog update"
+    );
+
+    handle.connect().expect("connect ok");
+    wait_online(&handle).await;
+
+    let updates = mock
+        .wait_for_app_tools_updates(1, Duration::from_secs(5))
+        .await
+        .expect("first AppToolsUpdate not received within 5s");
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].revision, 1);
+    let names = updates[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["demo_echo"]);
+
+    handle.shutdown().await.expect("shutdown clean");
+}
+
+/// Registering immediately after eager [`spawn`] races the first handshake,
+/// but every observed catalog revision must remain strictly increasing and
+/// the registered tool must eventually be advertised.
+#[tokio::test]
+async fn registration_racing_eager_spawn_yields_monotonic_revisions() {
     let mock = mock_hub::start_accepting().await;
     let tmp = TempDir::new().unwrap();
     let config = DaemonConfig::builder(mock.ws_url(), mock.valid_jwt(), tmp.path())
@@ -273,8 +300,6 @@ async fn registration_racing_connect_yields_monotonic_revisions() {
         .build();
 
     let handle = spawn(config).await.expect("spawn ok");
-
-    // Register immediately — may race connection, intentionally.
     handle
         .register_app_tool(demo_echo_def(), echo_handler())
         .await
@@ -282,13 +307,12 @@ async fn registration_racing_connect_yields_monotonic_revisions() {
 
     wait_online(&handle).await;
 
-    // Poll until a snapshot containing demo_echo appears.
     let found_snap = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let updates = mock.captured_app_tools_updates();
             if let Some(snap) = updates
                 .iter()
-                .find(|u| u.tools.iter().any(|t| t.name == "demo_echo"))
+                .find(|update| update.tools.iter().any(|tool| tool.name == "demo_echo"))
             {
                 return snap.clone();
             }
@@ -299,20 +323,21 @@ async fn registration_racing_connect_yields_monotonic_revisions() {
     .expect("snapshot containing demo_echo not received within 5s");
 
     assert_eq!(
-        found_snap.tools.len(),
-        1,
-        "snapshot must contain the registered tool"
+        found_snap
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["demo_echo"]
     );
-    assert_eq!(found_snap.tools[0].name, "demo_echo");
 
-    // Revisions across all received snapshots must be strictly increasing.
     let updates = mock.captured_app_tools_updates();
-    for window in updates.windows(2) {
+    for revisions in updates.windows(2) {
         assert!(
-            window[1].revision > window[0].revision,
+            revisions[1].revision > revisions[0].revision,
             "revisions must be strictly increasing: got {} then {}",
-            window[0].revision,
-            window[1].revision
+            revisions[0].revision,
+            revisions[1].revision
         );
     }
 

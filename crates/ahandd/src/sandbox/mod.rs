@@ -8,8 +8,8 @@ pub mod tool_provider;
 pub mod types;
 
 pub use tool_provider::{
-    FixedSandboxInvocationResolver, SandboxInvocationResolver, SandboxToolProvider,
-    SandboxToolProviderOptions,
+    FixedSandboxInvocationResolver, SandboxInvocationPermit, SandboxInvocationResolver,
+    SandboxToolProvider, SandboxToolProviderOptions,
 };
 pub use types::{
     CommitResult, FileVersion, FileVersionStatus, HostFileRef, MountAccess, MountScope,

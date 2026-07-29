@@ -4,16 +4,19 @@
 //! (e.g. the Tauri desktop shell) need to spawn and supervise the daemon
 //! without depending on its CLI binary entry point. The heavy lifting
 //! (WebSocket client, job execution, approvals, etc.) still lives in
-//! `crate::ahand_client::run`; `spawn()` wires up the shared state, kicks
-//! the client off on a background task, and returns a [`DaemonHandle`]
-//! that lets the caller observe status and request a graceful shutdown.
+//! `crate::ahand_client::run`; [`spawn`] wires up the shared state and starts
+//! connecting immediately, while [`spawn_paused`] waits for an explicit
+//! [`DaemonHandle::connect`] call before touching the hub.
 //!
 //! Only the `ahand-cloud` connection mode is supported here — the
 //! `openclaw-gateway` path remains CLI-only for now.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicU8, Ordering},
+};
 use std::time::Duration;
 
 use tokio::sync::{Mutex as AsyncMutex, broadcast, oneshot, watch};
@@ -239,12 +242,46 @@ impl ApprovalSubscription {
     }
 }
 
-/// Handle returned by [`spawn`]. Drop-safe — `shutdown()` is the preferred
-/// cleanup path, but dropping the handle also cancels the inner task via
-/// the embedded `oneshot` sender going out of scope.
+const DAEMON_PAUSED: u8 = 0;
+const DAEMON_CONNECT_REQUESTED: u8 = 1;
+const DAEMON_STOPPED: u8 = 2;
+
+struct DaemonCompletionGuard {
+    lifecycle: Arc<AtomicU8>,
+    status_tx: watch::Sender<DaemonStatus>,
+}
+
+impl DaemonCompletionGuard {
+    fn new(lifecycle: Arc<AtomicU8>, status_tx: watch::Sender<DaemonStatus>) -> Self {
+        Self {
+            lifecycle,
+            status_tx,
+        }
+    }
+}
+
+impl Drop for DaemonCompletionGuard {
+    fn drop(&mut self) {
+        self.lifecycle.store(DAEMON_STOPPED, Ordering::SeqCst);
+        self.status_tx.send_if_modified(|status| match status {
+            DaemonStatus::Offline | DaemonStatus::Error { .. } => false,
+            _ => {
+                *status = DaemonStatus::Offline;
+                true
+            }
+        });
+    }
+}
+
+/// Handle returned by [`spawn`] or [`spawn_paused`]. Drop-safe —
+/// [`DaemonHandle::shutdown`] is the preferred cleanup path, but dropping the
+/// handle also closes its lifecycle channels so the inner task can finish.
 pub struct DaemonHandle {
+    connect_tx: Mutex<Option<oneshot::Sender<()>>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     join: JoinHandle<anyhow::Result<()>>,
+    lifecycle: Arc<AtomicU8>,
+    status_tx: watch::Sender<DaemonStatus>,
     status_rx: watch::Receiver<DaemonStatus>,
     device_id: String,
     app_tools: Arc<AppToolRegistry>,
@@ -296,8 +333,46 @@ fn reserve_active_daemon(hub_url: &str, device_id: &str) -> anyhow::Result<Activ
 }
 
 impl DaemonHandle {
+    /// Start connecting a handle created by [`spawn_paused`].
+    ///
+    /// While the daemon is live, concurrent and repeated calls are idempotent:
+    /// only the first caller signals the background task, while later callers
+    /// observe that a connection was already requested and return successfully.
+    /// Calling `connect` after the daemon has stopped returns an error.
+    pub fn connect(&self) -> anyhow::Result<()> {
+        match self.lifecycle.compare_exchange(
+            DAEMON_PAUSED,
+            DAEMON_CONNECT_REQUESTED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {}
+            Err(DAEMON_CONNECT_REQUESTED) => return Ok(()),
+            Err(DAEMON_STOPPED) => anyhow::bail!("daemon stopped before connect"),
+            Err(state) => anyhow::bail!("invalid daemon lifecycle state {state}"),
+        }
+
+        let connect_tx = self
+            .connect_tx
+            .lock()
+            .expect("daemon connect sender poisoned")
+            .take();
+        let _ = self.status_tx.send(DaemonStatus::Connecting);
+        if connect_tx.is_none_or(|tx| tx.send(()).is_err()) {
+            self.lifecycle.store(DAEMON_STOPPED, Ordering::SeqCst);
+            let _ = self.status_tx.send(DaemonStatus::Offline);
+            anyhow::bail!("daemon stopped before connect");
+        }
+        Ok(())
+    }
+
     /// Request a graceful shutdown and wait for the inner task to finish.
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        self.lifecycle.store(DAEMON_STOPPED, Ordering::SeqCst);
+        self.connect_tx
+            .lock()
+            .expect("daemon connect sender poisoned")
+            .take();
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -780,12 +855,26 @@ fn merge_path_entries(env: &mut HashMap<String, String>, path_entries: &[PathBuf
     env.insert("PATH".to_string(), path);
 }
 
-/// Spawn an `ahandd` instance wired against the cloud hub described by `config`.
+/// Spawn an `ahandd` instance and immediately request its hub connection.
 ///
-/// Returns once the identity has been loaded and the background task has been
-/// started. Status transitions (`Connecting → Online → Offline`/`Error`) are
-/// surfaced through [`DaemonHandle::subscribe_status`].
+/// This preserves the original eager-start behavior. Call [`spawn_paused`] when
+/// setup work such as app-tool registration must finish before the daemon takes
+/// its first app-tools catalog snapshot.
 pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
+    let handle = spawn_paused(config).await?;
+    if let Err(error) = handle.connect() {
+        let _ = handle.shutdown().await;
+        return Err(error);
+    }
+    Ok(handle)
+}
+
+/// Spawn an `ahandd` instance without contacting the hub.
+///
+/// The returned handle starts in [`DaemonStatus::Idle`]. Call
+/// [`DaemonHandle::connect`] after completing any pre-connection setup. A
+/// paused handle may be shut down or dropped without opening a hub connection.
+pub async fn spawn_paused(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     // Load identity up-front so bad paths surface synchronously to the caller
     // rather than getting buried inside the spawned task.
     let identity_path = config.identity_dir.join(IDENTITY_FILE_NAME);
@@ -805,8 +894,10 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     );
     let active_guard = reserve_active_daemon(&config.hub_url, &device_id)?;
 
-    let (status_tx, status_rx) = watch::channel(DaemonStatus::Connecting);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let (status_tx, status_rx) = watch::channel(DaemonStatus::Idle);
+    let (connect_tx, connect_rx) = oneshot::channel::<()>();
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let lifecycle = Arc::new(AtomicU8::new(DAEMON_PAUSED));
 
     let session_mgr = Arc::new(SessionManager::new(config.trust_timeout_mins));
     session_mgr.set_default_mode(config.session_mode).await;
@@ -839,8 +930,22 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
     let session_mgr_for_handle = Arc::clone(&session_mgr);
 
     let app_tools_for_task = Arc::clone(&app_tools);
+    let lifecycle_for_task = Arc::clone(&lifecycle);
     let join = tokio::spawn(async move {
+        let _completion_guard =
+            DaemonCompletionGuard::new(Arc::clone(&lifecycle_for_task), status_tx_task.clone());
         let _active_guard = active_guard;
+        let should_connect = tokio::select! {
+            biased;
+            _ = &mut shutdown_rx => false,
+            connect = connect_rx => connect.is_ok(),
+        };
+        if !should_connect {
+            lifecycle_for_task.store(DAEMON_STOPPED, Ordering::SeqCst);
+            let _ = status_tx_task.send(DaemonStatus::Offline);
+            return Ok(());
+        }
+
         let run_fut = ahand_client::run_with_reporter(
             inner_config,
             device_id_for_task,
@@ -855,7 +960,7 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
             reporter,
         );
 
-        tokio::select! {
+        let result = tokio::select! {
             res = run_fut => {
                 match &res {
                     Ok(()) => {
@@ -875,12 +980,17 @@ pub async fn spawn(config: DaemonConfig) -> anyhow::Result<DaemonHandle> {
                 let _ = status_tx_task.send(DaemonStatus::Offline);
                 Ok(())
             }
-        }
+        };
+        lifecycle_for_task.store(DAEMON_STOPPED, Ordering::SeqCst);
+        result
     });
 
     Ok(DaemonHandle {
+        connect_tx: Mutex::new(Some(connect_tx)),
         shutdown_tx: Some(shutdown_tx),
         join,
+        lifecycle,
+        status_tx,
         status_rx,
         device_id,
         app_tools,
@@ -1060,6 +1170,52 @@ impl ClientReporter for StatusReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_completion_guard_stops_lifecycle_and_publishes_offline_on_unwind() {
+        for initial_status in [
+            DaemonStatus::Connecting,
+            DaemonStatus::Online {
+                device_id: "device-1".to_string(),
+            },
+        ] {
+            let lifecycle = Arc::new(AtomicU8::new(DAEMON_CONNECT_REQUESTED));
+            let (status_tx, status_rx) = watch::channel(initial_status);
+
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = DaemonCompletionGuard::new(Arc::clone(&lifecycle), status_tx.clone());
+                panic!("forced daemon task unwind");
+            }));
+
+            assert!(unwind.is_err());
+            assert_eq!(lifecycle.load(Ordering::SeqCst), DAEMON_STOPPED);
+            assert_eq!(*status_rx.borrow(), DaemonStatus::Offline);
+        }
+    }
+
+    #[test]
+    fn daemon_completion_guard_preserves_error_on_unwind() {
+        let lifecycle = Arc::new(AtomicU8::new(DAEMON_CONNECT_REQUESTED));
+        let (status_tx, status_rx) = watch::channel(DaemonStatus::Error {
+            kind: ErrorKind::Other,
+            message: "original error".to_string(),
+        });
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = DaemonCompletionGuard::new(Arc::clone(&lifecycle), status_tx.clone());
+            panic!("forced daemon task unwind");
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(lifecycle.load(Ordering::SeqCst), DAEMON_STOPPED);
+        assert!(matches!(
+            &*status_rx.borrow(),
+            DaemonStatus::Error {
+                kind: ErrorKind::Other,
+                message,
+            } if message == "original error"
+        ));
+    }
 
     #[test]
     fn classify_error_detects_auth_markers() {

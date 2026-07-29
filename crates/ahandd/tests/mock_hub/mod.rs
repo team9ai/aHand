@@ -30,6 +30,7 @@ use ahand_protocol::{
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
@@ -47,6 +48,7 @@ type InjectSlot = Arc<Mutex<Option<(u64, tokio::sync::mpsc::UnboundedSender<Enve
 /// Handle returned by `start_*` helpers. Drop stops the listener task.
 pub struct Mock {
     pub port: u16,
+    connection_count: Arc<AtomicU64>,
     heartbeats: Arc<Mutex<Vec<Heartbeat>>>,
     file_responses: Arc<Mutex<Vec<FileResponse>>>,
     app_tools_updates: Arc<Mutex<Vec<AppToolsUpdate>>>,
@@ -65,6 +67,10 @@ impl Mock {
 
     pub fn valid_jwt(&self) -> String {
         "test-bootstrap-token".to_string()
+    }
+
+    pub fn connection_count(&self) -> u64 {
+        self.connection_count.load(Ordering::SeqCst)
     }
 
     /// Snapshot of every `Heartbeat` envelope observed from any connected
@@ -320,9 +326,7 @@ async fn start(behavior: Behavior) -> Mock {
     let app_tool_responses: Arc<Mutex<Vec<AppToolResponse>>> = Arc::new(Mutex::new(Vec::new()));
     let approval_requests: Arc<Mutex<Vec<ApprovalRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let inject_tx: InjectSlot = Arc::new(Mutex::new(None));
-    // Monotonically increasing connection generation counter.
-    let conn_gen: Arc<std::sync::atomic::AtomicU64> =
-        Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let connection_count = Arc::new(AtomicU64::new(0));
 
     let heartbeats_for_task = heartbeats.clone();
     let file_responses_for_task = file_responses.clone();
@@ -330,7 +334,7 @@ async fn start(behavior: Behavior) -> Mock {
     let app_tool_responses_for_task = app_tool_responses.clone();
     let approval_requests_for_task = approval_requests.clone();
     let inject_tx_for_task = inject_tx.clone();
-    let conn_gen_for_task = conn_gen.clone();
+    let connection_count_for_task = connection_count.clone();
     let task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -340,9 +344,8 @@ async fn start(behavior: Behavior) -> Mock {
                         Ok(pair) => pair,
                         Err(_) => break,
                     };
-                    let conn_gen_id = conn_gen_for_task
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                        + 1;
+                    let conn_gen_id =
+                        connection_count_for_task.fetch_add(1, Ordering::SeqCst) + 1;
                     tokio::spawn(handle_conn(
                         stream,
                         behavior.clone(),
@@ -361,6 +364,7 @@ async fn start(behavior: Behavior) -> Mock {
 
     Mock {
         port,
+        connection_count,
         heartbeats,
         file_responses,
         app_tools_updates,
