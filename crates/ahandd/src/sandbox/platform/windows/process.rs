@@ -34,7 +34,7 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
@@ -127,7 +127,7 @@ fn spawn_restricted_capture_inner(
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             1,
-            CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+            restricted_process_creation_flags(),
             env_block.as_ptr() as *mut std::ffi::c_void,
             cwd_wide.as_ptr(),
             &startup_info.StartupInfo,
@@ -196,6 +196,11 @@ fn spawn_restricted_capture_inner(
         exit_code,
         timed_out,
     })
+}
+
+#[cfg(windows)]
+fn restricted_process_creation_flags() -> u32 {
+    CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT
 }
 
 fn make_env_block(env: &HashMap<String, String>) -> io::Result<Vec<u16>> {
@@ -842,6 +847,17 @@ mod tests {
             wait_timeout_ms(Duration::from_millis(u64::MAX)),
             u32::MAX - 1
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restricted_process_creation_flags_suppress_console_and_preserve_launch_contract() {
+        let flags = restricted_process_creation_flags();
+
+        assert_ne!(flags & CREATE_NO_WINDOW, 0);
+        assert_ne!(flags & CREATE_SUSPENDED, 0);
+        assert_ne!(flags & CREATE_UNICODE_ENVIRONMENT, 0);
+        assert_ne!(flags & EXTENDED_STARTUPINFO_PRESENT, 0);
     }
 
     #[cfg(windows)]
