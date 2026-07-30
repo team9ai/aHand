@@ -2,6 +2,22 @@
 use crate::sandbox::runner::PlatformExecuteRequest;
 #[cfg(windows)]
 use crate::sandbox::types::{RuntimeExecuteResult, SandboxError, SandboxResult};
+#[cfg(windows)]
+use std::time::Duration;
+
+#[cfg(windows)]
+pub(super) const SANDBOX_TIMING_PREFIX: &str = "coffice-sandbox-timing-v1 ";
+
+#[cfg(windows)]
+pub(super) fn append_sandbox_timing(stderr: &mut String, stage: &str, duration: Duration) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(
+        stderr,
+        r#"{SANDBOX_TIMING_PREFIX}{{"stage":"{stage}","durationMs":{}}}"#,
+        duration.as_millis()
+    );
+}
 
 mod acl;
 mod cap;

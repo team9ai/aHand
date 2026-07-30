@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::mpsc;
 use std::time::Duration;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -76,12 +77,16 @@ pub(super) fn spawn_capture(
     creds: &super::identity::SandboxCreds,
     request: RunnerRequest,
 ) -> SandboxResult<RuntimeExecuteResult> {
+    let total_started = Instant::now();
+    let pipe_started = Instant::now();
     let pipe_name = format!(r"\\.\pipe\ahand-sandbox-runner-{}", Uuid::new_v4());
     let pipe = create_runner_pipe(&pipe_name, &creds.username).map_err(|err| {
         SandboxError::unavailable(format!(
             "failed to create Windows sandbox runner pipe: {err}"
         ))
     })?;
+    let pipe_duration = pipe_started.elapsed();
+    let logon_started = Instant::now();
     let process = match spawn_runner_process(creds, &pipe_name, &request.cwd) {
         Ok(process) => process,
         Err(err) => {
@@ -93,26 +98,42 @@ pub(super) fn spawn_capture(
             )));
         }
     };
+    let logon_duration = logon_started.elapsed();
 
-    let result = (|| -> SandboxResult<RuntimeExecuteResult> {
+    let mut connect_duration = Duration::ZERO;
+    let mut request_duration = Duration::ZERO;
+    let mut result = (|| -> SandboxResult<RuntimeExecuteResult> {
+        let connect_started = Instant::now();
         connect_pipe_with_timeout(pipe).map_err(|err| {
             SandboxError::unavailable(format!(
                 "Windows sandbox runner did not connect to IPC pipe: {err}"
             ))
         })?;
+        connect_duration = connect_started.elapsed();
         let mut pipe_file = unsafe { File::from_raw_handle(pipe as _) };
+        let request_started = Instant::now();
         write_frame(&mut pipe_file, &request).map_err(|err| {
             SandboxError::unavailable(format!(
                 "failed to send Windows sandbox runner request: {err}"
             ))
         })?;
+        request_duration = request_started.elapsed();
+        let response_started = Instant::now();
         let response: RunnerResponse = read_frame(&mut pipe_file).map_err(|err| {
             SandboxError::unavailable(format!(
                 "failed to read Windows sandbox runner response: {err}"
             ))
         })?;
+        let response_duration = response_started.elapsed();
         match response {
-            RunnerResponse::Ok(result) => Ok(result),
+            RunnerResponse::Ok(mut result) => {
+                super::append_sandbox_timing(
+                    &mut result.stderr,
+                    "runner.response",
+                    response_duration,
+                );
+                Ok(result)
+            }
             RunnerResponse::Err { code, message } => Err(SandboxError::new(code, message)),
         }
     })();
@@ -129,6 +150,13 @@ pub(super) fn spawn_capture(
         }
     }
 
+    if let Ok(result) = &mut result {
+        super::append_sandbox_timing(&mut result.stderr, "runner.pipe", pipe_duration);
+        super::append_sandbox_timing(&mut result.stderr, "runner.logon", logon_duration);
+        super::append_sandbox_timing(&mut result.stderr, "runner.connect", connect_duration);
+        super::append_sandbox_timing(&mut result.stderr, "runner.request", request_duration);
+        super::append_sandbox_timing(&mut result.stderr, "runner.total", total_started.elapsed());
+    }
     result
 }
 
@@ -147,15 +175,18 @@ fn run_runner(pipe_name: &str) -> io::Result<()> {
 }
 
 fn run_runner_request(request: RunnerRequest) -> SandboxResult<RuntimeExecuteResult> {
+    let token_started = Instant::now();
     let token = super::token::create_for_sandbox_user_sid_string(&request.capability_sid).map_err(
         |err| SandboxError::unavailable(format!("failed to create restricted token: {err}")),
     )?;
+    let token_duration = token_started.elapsed();
     let Some((executable, args)) = request.command.split_first() else {
         return Err(SandboxError::invalid_command(
             "Windows sandbox runner command must not be empty",
         ));
     };
-    super::process::spawn_restricted_capture(
+    let child_started = Instant::now();
+    let mut result = super::process::spawn_restricted_capture(
         token.handle(),
         Path::new(executable),
         args,
@@ -165,7 +196,10 @@ fn run_runner_request(request: RunnerRequest) -> SandboxResult<RuntimeExecuteRes
     )
     .map_err(|err| {
         SandboxError::unavailable(format!("Windows sandbox process launch failed: {err}"))
-    })
+    })?;
+    super::append_sandbox_timing(&mut result.stderr, "runner.token", token_duration);
+    super::append_sandbox_timing(&mut result.stderr, "runner.child", child_started.elapsed());
+    Ok(result)
 }
 
 fn create_runner_pipe(name: &str, sandbox_username: &str) -> io::Result<HANDLE> {

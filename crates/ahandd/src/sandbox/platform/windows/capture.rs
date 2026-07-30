@@ -14,10 +14,13 @@ pub(super) fn run_capture(
     request: PlatformExecuteRequest,
     timeout: Duration,
 ) -> SandboxResult<RuntimeExecuteResult> {
+    let total_started = std::time::Instant::now();
+    let environment_started = std::time::Instant::now();
     let env = super::env::normalize_env(request.env, request.policy.network)?;
     let network_mode = super::network::mode_for_policy(request.policy.network)?;
     let network_context =
         super::setup::prepare_network_context(network_mode, &env, &request.sandbox_state_root)?;
+    let environment_duration = environment_started.elapsed();
     let sandbox_creds = network_context.sandbox_creds.as_ref().ok_or_else(|| {
         SandboxError::unavailable("Windows sandbox setup did not return sandbox user credentials")
     })?;
@@ -43,6 +46,7 @@ pub(super) fn run_capture(
         })?;
     let sandbox_group_sid_ptr = sandbox_group_sid.as_mut_ptr() as *mut std::ffi::c_void;
     let capability_sid_ptr = capability_sid.as_mut_ptr() as *mut std::ffi::c_void;
+    let acl_started = std::time::Instant::now();
     super::acl::apply_filesystem_roots(&roots, sandbox_group_sid_ptr, capability_sid_ptr).map_err(
         |err| {
             SandboxError::unavailable(format!(
@@ -55,8 +59,10 @@ pub(super) fn run_capture(
             "failed to allow Windows NUL device for sandbox: {err}"
         ))
     })?;
+    let acl_duration = acl_started.elapsed();
 
-    super::runner_ipc::spawn_capture(
+    let runner_started = std::time::Instant::now();
+    let mut result = super::runner_ipc::spawn_capture(
         sandbox_creds,
         super::runner_ipc::RunnerRequest {
             command: request.command,
@@ -65,7 +71,17 @@ pub(super) fn run_capture(
             timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
             capability_sid: capability.sid_string().to_string(),
         },
-    )
+    )?;
+    let runner_duration = runner_started.elapsed();
+    super::append_sandbox_timing(
+        &mut result.stderr,
+        "capture.environment",
+        environment_duration,
+    );
+    super::append_sandbox_timing(&mut result.stderr, "capture.acl", acl_duration);
+    super::append_sandbox_timing(&mut result.stderr, "capture.runner", runner_duration);
+    super::append_sandbox_timing(&mut result.stderr, "capture.total", total_started.elapsed());
+    Ok(result)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

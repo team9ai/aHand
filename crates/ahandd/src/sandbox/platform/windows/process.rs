@@ -11,6 +11,8 @@ use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use crate::sandbox::types::RuntimeExecuteResult;
 
@@ -81,6 +83,8 @@ fn spawn_restricted_capture_inner(
     env: &HashMap<String, String>,
     timeout: Duration,
 ) -> io::Result<RuntimeExecuteResult> {
+    let total_started = Instant::now();
+    let setup_started = Instant::now();
     let pipes = PipeSet::new()?;
     let job = JobGuard::new_kill_on_close()?;
     let mut startup_info: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -118,7 +122,9 @@ fn spawn_restricted_capture_inner(
     let _cwd_guard = CurrentDirGuard::enter(&effective_cwd)?;
     let cwd_wide = super::path::process_cwd_wide_null(&effective_cwd);
     let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let setup_duration = setup_started.elapsed();
 
+    let create_started = Instant::now();
     let ok = unsafe {
         CreateProcessAsUserW(
             token,
@@ -137,6 +143,7 @@ fn spawn_restricted_capture_inner(
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
+    let create_duration = create_started.elapsed();
 
     let process = ProcessGuard::new(process_info);
     let assigned = unsafe { AssignProcessToJobObject(job.raw(), process.process_handle()) };
@@ -163,7 +170,9 @@ fn spawn_restricted_capture_inner(
     let stdout_thread = read_handle_to_vec(stdout_read);
     let stderr_thread = read_handle_to_vec(stderr_read);
 
+    let wait_started = Instant::now();
     let wait = unsafe { WaitForSingleObject(process.process_handle(), wait_timeout_ms(timeout)) };
+    let wait_duration = wait_started.elapsed();
     if wait == WAIT_FAILED {
         unsafe {
             let _ = TerminateProcess(process.process_handle(), 1);
@@ -190,12 +199,17 @@ fn spawn_restricted_capture_inner(
     let stdout = stdout_thread.join().unwrap_or_default();
     let stderr = stderr_thread.join().unwrap_or_default();
 
-    Ok(RuntimeExecuteResult {
+    let mut result = RuntimeExecuteResult {
         stdout: String::from_utf8_lossy(&stdout).to_string(),
         stderr: String::from_utf8_lossy(&stderr).to_string(),
         exit_code,
         timed_out,
-    })
+    };
+    super::append_sandbox_timing(&mut result.stderr, "child.setup", setup_duration);
+    super::append_sandbox_timing(&mut result.stderr, "child.create", create_duration);
+    super::append_sandbox_timing(&mut result.stderr, "child.wait", wait_duration);
+    super::append_sandbox_timing(&mut result.stderr, "child.total", total_started.elapsed());
+    Ok(result)
 }
 
 #[cfg(windows)]
