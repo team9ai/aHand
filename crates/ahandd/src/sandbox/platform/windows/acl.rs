@@ -3,6 +3,8 @@
 use std::ffi::c_void;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
@@ -39,6 +41,13 @@ pub(super) struct AppliedAcl {
 pub(super) enum AppliedAccess {
     Writable,
     Readonly,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(super) struct AclTiming {
+    pub(super) stage: String,
+    pub(super) duration: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +184,16 @@ pub(super) fn apply_filesystem_roots(
     sandbox_users_group_sid: *mut c_void,
     capability_sid: *mut c_void,
 ) -> io::Result<Vec<AppliedAcl>> {
+    apply_filesystem_roots_timed(roots, sandbox_users_group_sid, capability_sid)
+        .map(|(applied, _)| applied)
+}
+
+#[cfg(windows)]
+pub(super) fn apply_filesystem_roots_timed(
+    roots: &super::roots::DerivedFilesystemRoots,
+    sandbox_users_group_sid: *mut c_void,
+    capability_sid: *mut c_void,
+) -> io::Result<(Vec<AppliedAcl>, Vec<AclTiming>)> {
     if sandbox_users_group_sid.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -190,7 +209,22 @@ pub(super) fn apply_filesystem_roots(
 
     let plan = plan_filesystem_acls(roots);
     let mut applied = Vec::with_capacity(plan.len());
+    let mut timings = Vec::new();
+    let mut write_index = 0usize;
+    let mut read_index = 0usize;
     for entry in plan {
+        let prefix = match entry.access {
+            AppliedAccess::Writable => {
+                let prefix = format!("acl.write.{write_index}");
+                write_index += 1;
+                prefix
+            }
+            AppliedAccess::Readonly => {
+                let prefix = format!("acl.read.{read_index}");
+                read_index += 1;
+                prefix
+            }
+        };
         // Group ACEs let the sandbox-user logon runner access prepared roots;
         // capability ACEs preserve the per-workspace boundary for the child.
         let sids = entry
@@ -210,13 +244,15 @@ pub(super) fn apply_filesystem_roots(
             &sids,
             allow_mask,
             CONTAINER_AND_OBJECT_INHERIT_ACE,
+            &prefix,
+            &mut timings,
         )?;
         applied.push(AppliedAcl {
             path: entry.path,
             access: entry.access,
         });
     }
-    Ok(applied)
+    Ok((applied, timings))
 }
 
 #[cfg(not(windows))]
@@ -285,7 +321,25 @@ impl Drop for LocalMemory {
 
 #[cfg(windows)]
 fn fetch_dacl_handle(path: &Path) -> io::Result<(*mut ACL, LocalMemory)> {
+    fetch_dacl_handle_timed(path, "", &mut Vec::new())
+}
+
+#[cfg(windows)]
+fn push_timing(timings: &mut Vec<AclTiming>, stage: String, started: Instant) {
+    timings.push(AclTiming {
+        stage,
+        duration: started.elapsed(),
+    });
+}
+
+#[cfg(windows)]
+fn fetch_dacl_handle_timed(
+    path: &Path,
+    prefix: &str,
+    timings: &mut Vec<AclTiming>,
+) -> io::Result<(*mut ACL, LocalMemory)> {
     let wide_path = super::path::wide_null(path);
+    let open_started = Instant::now();
     let handle = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
@@ -297,6 +351,9 @@ fn fetch_dacl_handle(path: &Path) -> io::Result<(*mut ACL, LocalMemory)> {
             std::ptr::null_mut(),
         )
     };
+    if !prefix.is_empty() {
+        push_timing(timings, format!("{prefix}.open"), open_started);
+    }
     if handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
@@ -304,6 +361,7 @@ fn fetch_dacl_handle(path: &Path) -> io::Result<(*mut ACL, LocalMemory)> {
 
     let mut security_descriptor: *mut c_void = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
+    let security_started = Instant::now();
     let code = unsafe {
         GetSecurityInfo(
             handle.handle(),
@@ -316,6 +374,9 @@ fn fetch_dacl_handle(path: &Path) -> io::Result<(*mut ACL, LocalMemory)> {
             &mut security_descriptor,
         )
     };
+    if !prefix.is_empty() {
+        push_timing(timings, format!("{prefix}.get_security"), security_started);
+    }
     let security_descriptor = LocalMemory::new(security_descriptor);
     if code != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(code as i32));
@@ -437,10 +498,14 @@ fn ensure_allow_mask_aces_with_inheritance(
     sids: &[*mut c_void],
     allow_mask: u32,
     inheritance: u32,
+    prefix: &str,
+    timings: &mut Vec<AclTiming>,
 ) -> io::Result<bool> {
-    let (dacl, _security_descriptor) = fetch_dacl_handle(path)?;
+    let total_started = Instant::now();
+    let (dacl, _security_descriptor) = fetch_dacl_handle_timed(path, prefix, timings)?;
     let mut entries = Vec::new();
 
+    let inspect_started = Instant::now();
     for sid in sids {
         if sid.is_null() {
             return Err(io::Error::new(
@@ -465,14 +530,18 @@ fn ensure_allow_mask_aces_with_inheritance(
             },
         });
     }
+    push_timing(timings, format!("{prefix}.inspect"), inspect_started);
 
     if entries.is_empty() {
+        push_timing(timings, format!("{prefix}.total"), total_started);
         return Ok(false);
     }
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let build_started = Instant::now();
     let code =
         unsafe { SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), dacl, &mut new_dacl) };
+    push_timing(timings, format!("{prefix}.build"), build_started);
     if code != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
@@ -480,6 +549,7 @@ fn ensure_allow_mask_aces_with_inheritance(
         LocalMemory::new(new_dacl as *mut c_void).ok_or_else(io::Error::last_os_error)?;
 
     let wide_path = super::path::wide_null(path);
+    let set_started = Instant::now();
     let code = unsafe {
         SetNamedSecurityInfoW(
             wide_path.as_ptr(),
@@ -491,16 +561,25 @@ fn ensure_allow_mask_aces_with_inheritance(
             std::ptr::null_mut(),
         )
     };
+    push_timing(timings, format!("{prefix}.set_security"), set_started);
     if code != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
 
+    push_timing(timings, format!("{prefix}.total"), total_started);
     Ok(true)
 }
 
 #[cfg(windows)]
 #[allow(dead_code)]
 pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
+    allow_null_device_timed(capability_sid).map(|_| ())
+}
+
+#[cfg(windows)]
+pub(super) fn allow_null_device_timed(capability_sid: *mut c_void) -> io::Result<Vec<AclTiming>> {
+    let total_started = Instant::now();
+    let mut timings = Vec::new();
     if capability_sid.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -509,6 +588,7 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
     }
 
     let null_device = super::path::string_wide_null(r"\\.\NUL");
+    let open_started = Instant::now();
     let handle = unsafe {
         CreateFileW(
             null_device.as_ptr(),
@@ -520,6 +600,7 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
             std::ptr::null_mut(),
         )
     };
+    push_timing(&mut timings, "acl.nul.open".to_string(), open_started);
     if handle == INVALID_HANDLE_VALUE || handle.is_null() {
         return Err(io::Error::last_os_error());
     }
@@ -527,6 +608,7 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
 
     let mut security_descriptor: *mut c_void = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
+    let security_started = Instant::now();
     let code = unsafe {
         GetSecurityInfo(
             handle.handle(),
@@ -539,6 +621,11 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
             &mut security_descriptor,
         )
     };
+    push_timing(
+        &mut timings,
+        "acl.nul.get_security".to_string(),
+        security_started,
+    );
     let _security_descriptor = LocalMemory::new(security_descriptor);
     if code != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(code as i32));
@@ -546,7 +633,8 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
     let _security_descriptor = _security_descriptor
         .ok_or_else(|| io::Error::other("GetSecurityInfo returned no NUL security descriptor"))?;
     if dacl.is_null() {
-        return Ok(());
+        push_timing(&mut timings, "acl.nul.total".to_string(), total_started);
+        return Ok(timings);
     }
 
     let entry = EXPLICIT_ACCESS_W {
@@ -563,13 +651,16 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
     };
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let build_started = Instant::now();
     let code = unsafe { SetEntriesInAclW(1, &entry, dacl, &mut new_dacl) };
+    push_timing(&mut timings, "acl.nul.build".to_string(), build_started);
     if code != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
     let new_dacl =
         LocalMemory::new(new_dacl as *mut c_void).ok_or_else(io::Error::last_os_error)?;
 
+    let set_started = Instant::now();
     let code = unsafe {
         SetSecurityInfo(
             handle.handle(),
@@ -581,11 +672,17 @@ pub(super) fn allow_null_device(capability_sid: *mut c_void) -> io::Result<()> {
             std::ptr::null_mut(),
         )
     };
+    push_timing(
+        &mut timings,
+        "acl.nul.set_security".to_string(),
+        set_started,
+    );
     if code != ERROR_SUCCESS {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
 
-    Ok(())
+    push_timing(&mut timings, "acl.nul.total".to_string(), total_started);
+    Ok(timings)
 }
 
 #[cfg(not(windows))]

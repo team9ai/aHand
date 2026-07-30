@@ -47,18 +47,20 @@ pub(super) fn run_capture(
     let sandbox_group_sid_ptr = sandbox_group_sid.as_mut_ptr() as *mut std::ffi::c_void;
     let capability_sid_ptr = capability_sid.as_mut_ptr() as *mut std::ffi::c_void;
     let acl_started = std::time::Instant::now();
-    super::acl::apply_filesystem_roots(&roots, sandbox_group_sid_ptr, capability_sid_ptr).map_err(
-        |err| {
+    let (_, mut acl_timings) =
+        super::acl::apply_filesystem_roots_timed(&roots, sandbox_group_sid_ptr, capability_sid_ptr)
+            .map_err(|err| {
+                SandboxError::unavailable(format!(
+                    "failed to apply Windows sandbox filesystem ACLs: {err}"
+                ))
+            })?;
+    acl_timings.extend(
+        super::acl::allow_null_device_timed(capability_sid_ptr).map_err(|err| {
             SandboxError::unavailable(format!(
-                "failed to apply Windows sandbox filesystem ACLs: {err}"
+                "failed to allow Windows NUL device for sandbox: {err}"
             ))
-        },
-    )?;
-    super::acl::allow_null_device(capability_sid_ptr).map_err(|err| {
-        SandboxError::unavailable(format!(
-            "failed to allow Windows NUL device for sandbox: {err}"
-        ))
-    })?;
+        })?,
+    );
     let acl_duration = acl_started.elapsed();
 
     let runner_started = std::time::Instant::now();
@@ -78,6 +80,9 @@ pub(super) fn run_capture(
         "capture.environment",
         environment_duration,
     );
+    for timing in acl_timings {
+        super::append_sandbox_timing(&mut result.stderr, &timing.stage, timing.duration);
+    }
     super::append_sandbox_timing(&mut result.stderr, "capture.acl", acl_duration);
     super::append_sandbox_timing(&mut result.stderr, "capture.runner", runner_duration);
     super::append_sandbox_timing(&mut result.stderr, "capture.total", total_started.elapsed());
