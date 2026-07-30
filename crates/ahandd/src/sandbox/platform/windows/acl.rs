@@ -88,7 +88,10 @@ fn plan_filesystem_acls(roots: &super::roots::DerivedFilesystemRoots) -> Vec<Pla
         plan.push(PlannedAcl {
             path: root.clone(),
             access: AppliedAccess::Readonly,
-            trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+            // Read-only runtime roots are shared across runs. Grant their stable
+            // sandbox-users group instead of adding a per-workspace capability
+            // ACE that Windows would propagate through the whole runtime tree.
+            trustees: vec![AclTrustee::SandboxUsersGroup],
         });
     }
     plan
@@ -713,7 +716,7 @@ mod inheritance_tests {
     }
 
     #[test]
-    fn filesystem_acl_plan_grants_group_and_capability_to_all_roots() {
+    fn filesystem_acl_plan_scopes_capability_to_writable_roots() {
         let roots = super::super::roots::DerivedFilesystemRoots {
             write_roots: vec![PathBuf::from(r"C:\workspace")],
             read_roots: vec![PathBuf::from(r"C:\runtime")],
@@ -732,7 +735,7 @@ mod inheritance_tests {
                 PlannedAcl {
                     path: PathBuf::from(r"C:\runtime"),
                     access: AppliedAccess::Readonly,
-                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                    trustees: vec![AclTrustee::SandboxUsersGroup],
                 },
             ]
         );
@@ -766,7 +769,7 @@ mod inheritance_tests {
                 PlannedAcl {
                     path: PathBuf::from(r"C:\runtime"),
                     access: AppliedAccess::Readonly,
-                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                    trustees: vec![AclTrustee::SandboxUsersGroup],
                 },
             ]
         );
@@ -799,7 +802,7 @@ mod inheritance_tests {
                 PlannedAcl {
                     path: PathBuf::from(r"C:\runtime"),
                     access: AppliedAccess::Readonly,
-                    trustees: vec![AclTrustee::SandboxUsersGroup, AclTrustee::Capability],
+                    trustees: vec![AclTrustee::SandboxUsersGroup],
                 },
             ]
         );
@@ -878,7 +881,7 @@ mod tests {
             .unwrap()
         );
         assert!(
-            path_mask_allows(
+            !path_mask_allows(
                 runtime.path(),
                 &[token.capability_sid()],
                 READ_EXECUTE_ALLOW_MASK,
